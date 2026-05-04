@@ -1,0 +1,15 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "rootDir": ".",
+    "outDir": "dist-test",
+    "types": [
+      "node"
+    ]
+  },
+  "include": [
+    "src/backendConfig.ts",
+    "src/panelModel.ts",
+    "test/**/*.ts"
+  ]
+}

@@ -1,0 +1,76 @@
+{
+  "name": "skillz-agent-extension",
+  "displayName": "skillz Agent",
+  "description": "VS Code shell for the skillz planner/worker agent runtime.",
+  "version": "0.0.1",
+  "publisher": "local",
+  "engines": {
+    "vscode": "^1.88.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "skillzAgent.openAgent",
+        "title": "skillz Agent: Open Agent"
+      }
+    ],
+    "configuration": {
+      "title": "skillz Agent",
+      "properties": {
+        "skillzAgent.provider": {
+          "type": "string",
+          "enum": [
+            "openai",
+            "anthropic",
+            "gemini",
+            "local",
+            "ollama-local",
+            "ollama-runpod"
+          ],
+          "default": "gemini",
+          "description": "Provider passed to the skillz agent runtime. Use local for the localhost OpenAI-compatible bridge on port 5051, ollama-local for the localhost Ollama endpoint on port 11434, or ollama-runpod for the configured Runpod Ollama endpoint."
+        },
+        "skillzAgent.model": {
+          "type": "string",
+          "default": "gemini-3-flash-preview",
+          "description": "Model passed to the skillz agent runtime."
+        },
+        "skillzAgent.skillzPath": {
+          "type": "string",
+          "default": "",
+          "description": "Optional skillz executable path for the backend process. If empty, the extension will try the repo .venv first and then skillz3/skillz."
+        },
+        "skillzAgent.backendScript": {
+          "type": "string",
+          "default": "main.py",
+          "scope": "application",
+          "description": "Backend entry script to launch from the repo root. This is a user-level setting. Use main.py for the stable runtime or live_test_loop.py or main_v2.py for the beta TreeLoop planner bridge."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "test:compile": "tsc -p ./tsconfig.test.json",
+    "test": "npm run test:compile && node --test ./dist-test/test/**/*.test.js",
+    "test:integration:compile": "tsc -p ./tsconfig.integration.json",
+    "test:integration": "npm run test:integration:compile && node ./dist-integration/integration-tests/runTest.js",
+    "watch": "tsc -watch -p ./",
+    "vscode:prepublish": "npm run compile"
+  },
+  "devDependencies": {
+    "@types/mocha": "^10.0.10",
+    "@types/node": "^20.11.30",
+    "@types/vscode": "^1.88.0",
+    "@vscode/test-electron": "^2.5.2",
+    "mocha": "^10.8.2",
+    "typescript": "^5.4.5"
+  },
+  "overrides": {
+    "serialize-javascript": "7.0.5"
+  }
+}

@@ -1,0 +1,179 @@
+export type JsonMap = Record<string, unknown>;
+
+export interface PlannerSuggestedAction extends JsonMap {
+  type: string;
+  label?: string;
+  style?: string;
+  mode?: string;
+}
+
+export interface WorkerSuggestedAction extends JsonMap {
+  type: string;
+  label?: string;
+  style?: string;
+  requires_confirmation?: boolean;
+}
+
+export interface DiagnosticItem extends JsonMap {
+  path?: string;
+  line?: number;
+  column?: number;
+  code?: string;
+  message?: string;
+}
+
+export interface LatestDiagnostics extends JsonMap {
+  path?: string;
+  message?: string;
+  diagnostic_engine?: string;
+  diagnostics?: DiagnosticItem[];
+  step?: number;
+  source?: string;
+}
+
+export interface ReviewFile extends JsonMap {
+  path?: string;
+  risk?: string;
+  validation?: string;
+  added?: number;
+  deleted?: number;
+}
+
+export interface LatestReview extends JsonMap {
+  action_type?: string;
+  summary?: string;
+  step?: number;
+  path?: string;
+  diff?: string;
+  stat?: string;
+  files?: Array<string | ReviewFile>;
+  staged?: boolean;
+  counts?: JsonMap;
+  high_risk_paths?: string[];
+  review_summary?: JsonMap;
+}
+
+export interface WorkerState extends JsonMap {
+  issue_state?: JsonMap;
+  latest_diagnostics?: LatestDiagnostics | null;
+  latest_review?: LatestReview | null;
+  suggested_next_actions?: WorkerSuggestedAction[];
+}
+
+export interface PlannerState extends JsonMap {
+  issue_state?: JsonMap;
+  suggested_next_actions?: PlannerSuggestedAction[];
+  worker_state?: WorkerState | null;
+}
+
+export interface BridgeState {
+  planner: PlannerState;
+  transcript: Array<{ role: string; content: string }>;
+  last_message?: string;
+}
+
+export interface CombinedSuggestedAction extends JsonMap {
+  type: string;
+  label?: string;
+  style?: string;
+  mode?: string;
+  issue_id?: string;
+  requires_confirmation?: boolean;
+  source: 'planner' | 'worker';
+}
+
+export function combineSuggestedActions(state: BridgeState): CombinedSuggestedAction[] {
+  const plannerActions = state.planner?.suggested_next_actions || [];
+  const workerActions = state.planner?.worker_state?.suggested_next_actions || [];
+  return [
+    ...plannerActions.map((action) => ({ ...action, source: 'planner' as const })),
+    ...workerActions.map((action) => ({ ...action, source: 'worker' as const })),
+  ];
+}
+
+export function groupLatestDiagnosticsByPath(state: BridgeState): Record<string, DiagnosticItem[]> {
+  const latestDiagnostics = state.planner?.worker_state?.latest_diagnostics;
+  const diagnostics = latestDiagnostics?.diagnostics || [];
+  const grouped: Record<string, DiagnosticItem[]> = {};
+  for (const item of diagnostics) {
+    const relativePath = String(item.path || latestDiagnostics?.path || '').trim();
+    if (!relativePath) {
+      continue;
+    }
+    if (!grouped[relativePath]) {
+      grouped[relativePath] = [];
+    }
+    grouped[relativePath].push(item);
+  }
+  return grouped;
+}
+
+export function buildReviewReport(review?: LatestReview | null): { title: string; language: string; content: string } | null {
+  if (!review || !review.action_type) {
+    return null;
+  }
+  if (review.action_type === 'review_changes') {
+    return {
+      title: 'Python Agent review_changes',
+      language: 'json',
+      content: JSON.stringify(review, null, 2),
+    };
+  }
+
+  const content = [String(review.stat || ''), String(review.diff || '')].filter(Boolean).join('\n\n').trim();
+  if (!content) {
+    return null;
+  }
+  return {
+    title: `Python Agent ${review.action_type}`,
+    language: 'diff',
+    content,
+  };
+}
+
+export function primaryPathForReview(review?: LatestReview | null): string | undefined {
+  if (!review) {
+    return undefined;
+  }
+  if (review.path) {
+    return review.path;
+  }
+  const files = Array.isArray(review.files) ? review.files : [];
+  for (const item of files) {
+    if (typeof item === 'string' && item.trim()) {
+      return item;
+    }
+    if (typeof item === 'object' && item && typeof item.path === 'string' && item.path.trim()) {
+      return item.path;
+    }
+  }
+  return undefined;
+}
+
+export function progressTimelineTarget(
+  planner: PlannerState | undefined,
+  pendingActionType: string,
+): 'plan' | 'discovery' | undefined {
+  if (planner?.executing) {
+    return 'plan';
+  }
+  if (planner?.pending_discovery || pendingActionType === 'select_discovery_mode') {
+    return 'discovery';
+  }
+  return undefined;
+}
+
+export function buildPlannerActionMessage(action: CombinedSuggestedAction): { action: string; mode?: string; payload?: JsonMap } {
+  const payload: JsonMap = {};
+  if (typeof action.mode === 'string' && action.mode.trim()) {
+    payload.mode = action.mode.trim();
+  }
+  if (typeof action.issue_id === 'string' && action.issue_id.trim()) {
+    payload.issue_id = action.issue_id.trim();
+  }
+  return {
+    action: action.type,
+    mode: typeof action.mode === 'string' ? action.mode : undefined,
+    payload: Object.keys(payload).length ? payload : undefined,
+  };
+}
