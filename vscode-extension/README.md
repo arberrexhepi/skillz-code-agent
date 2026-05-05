@@ -47,15 +47,15 @@ npm run test:integration
 
 The extension settings are defined in [package.json](package.json):
 
-- `pythonAgent.provider`
-- `pythonAgent.model`
-- `pythonAgent.pythonPath`
+- `skillzAgent.provider`
+- `skillzAgent.model`
+- `skillzAgent.pythonPath`
 
 Recommended local values for this repo:
 
-- `pythonAgent.provider = gemini` or `openai`
-- `pythonAgent.model = gemini-3-flash-preview` or your OpenAI model
-- `pythonAgent.pythonPath = /.venv/bin/python`
+- `skillzAgent.provider = gemini` or `openai`
+- `skillzAgent.model = gemini-3-flash-preview` or your OpenAI model
+- `skillzAgent.pythonPath = /.venv/bin/python`
 
 ## Use The Extension
 
@@ -78,4 +78,4 @@ Recommended local values for this repo:
 
 - The extension currently targets stable desktop VS Code APIs only.
 - The Python runtime in the parent repository remains the source of truth for planner, worker, safety, and diagnostics behavior.
-- If the panel cannot start the backend, first check `pythonAgent.pythonPath`, API keys, and that VS Code was launched from an environment that can see them.
+- If the panel cannot start the backend, first check `skillzAgent.pythonPath`, API keys, and that VS Code was launched from an environment that can see them.

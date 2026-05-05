@@ -314,10 +314,10 @@ function primaryWorkspaceFolder(): vscode.WorkspaceFolder | undefined {
   return vscode.workspace.workspaceFolders?.[0];
 }
 
-function pythonAgentConfig(resource?: vscode.Uri): vscode.WorkspaceConfiguration {
+function skillzAgentConfig(resource?: vscode.Uri): vscode.WorkspaceConfiguration {
   return resource
-    ? vscode.workspace.getConfiguration('pythonAgent', resource)
-    : vscode.workspace.getConfiguration('pythonAgent');
+    ? vscode.workspace.getConfiguration('skillzAgent', resource)
+    : vscode.workspace.getConfiguration('skillzAgent');
 }
 
 function backendScriptSettingSnapshot(config: vscode.WorkspaceConfiguration): {
@@ -368,13 +368,13 @@ function readLegacyBackendScriptSetting(filePath: string): string {
       return '';
     }
     const text = fs.readFileSync(filePath, 'utf8');
-    return String(extractJsonLikeStringSetting(text, 'pythonAgent.backendScript') || '').trim();
+    return String(extractJsonLikeStringSetting(text, 'skillzAgent.backendScript') || '').trim();
   } catch {
     return '';
   }
 }
 
-class PythonAgentBridge implements vscode.Disposable {
+class skillzAgentBridge implements vscode.Disposable {
   private process: ChildProcessWithoutNullStreams | undefined;
   private pending = new Map<string, { resolve: (value: BridgeResponse) => void; reject: (reason?: unknown) => void }>();
   private buffer = '';
@@ -410,7 +410,7 @@ class PythonAgentBridge implements vscode.Disposable {
 
   public getBackendInfo(): BackendInfo {
     const workspaceFolder = primaryWorkspaceFolder();
-    const config = pythonAgentConfig(workspaceFolder?.uri);
+    const config = skillzAgentConfig(workspaceFolder?.uri);
     const repoRoot = path.resolve(this.context.extensionPath, '..');
     const backendScriptSettings = backendScriptSettingSnapshot(config);
     const configured = describeBackendScript(repoRoot, backendScriptSettings.selectedValue);
@@ -450,7 +450,7 @@ class PythonAgentBridge implements vscode.Disposable {
       throw new Error('Open a workspace folder before starting the Python Agent extension.');
     }
 
-    const config = pythonAgentConfig(workspaceFolder.uri);
+    const config = skillzAgentConfig(workspaceFolder.uri);
     const repoRoot = path.resolve(this.context.extensionPath, '..');
     const pythonExecutable = this.resolvePythonExecutable(config, repoRoot);
     const backendScript = describeBackendScript(repoRoot, backendScriptSettingSnapshot(config).selectedValue);
@@ -765,7 +765,7 @@ class AgentPanel implements vscode.Disposable {
   private panel: vscode.WebviewPanel | undefined;
   private readonly disposables: vscode.Disposable[] = [];
 
-  public constructor(private readonly context: vscode.ExtensionContext, private readonly bridge: PythonAgentBridge) {
+  public constructor(private readonly context: vscode.ExtensionContext, private readonly bridge: skillzAgentBridge) {
     this.disposables.push(
       this.bridge.onDidUpdateState((state) => {
         if (this.panel) {
@@ -811,7 +811,7 @@ class AgentPanel implements vscode.Disposable {
   public async show(): Promise<void> {
     if (!this.panel) {
       this.panel = vscode.window.createWebviewPanel(
-        'pythonAgent.panel',
+        'skillzAgent.panel',
         'Python Agent',
         vscode.ViewColumn.Beside,
         {
@@ -969,7 +969,7 @@ class AgentPanel implements vscode.Disposable {
           throw new Error(response.message || 'Unknown runtime update failure');
         }
         suppressConfigDrivenRuntimeUpdateCount = 2;
-        const config = pythonAgentConfig(primaryWorkspaceFolder()?.uri);
+        const config = skillzAgentConfig(primaryWorkspaceFolder()?.uri);
         await config.update('provider', provider, vscode.ConfigurationTarget.Workspace);
         await config.update('model', model, vscode.ConfigurationTarget.Workspace);
         await this.panel?.webview.postMessage({ type: 'state', state: response.state });
@@ -1005,7 +1005,7 @@ class AgentPanel implements vscode.Disposable {
       const repoRoot = path.resolve(this.context.extensionPath, '..');
       const scriptName = target === 'stable' ? 'main.py' : 'live_test_loop.py';
       const scriptPath = path.join(repoRoot, scriptName);
-      const config = pythonAgentConfig(primaryWorkspaceFolder()?.uri);
+      const config = skillzAgentConfig(primaryWorkspaceFolder()?.uri);
       // application-scoped settings can only be written to Global (User) settings.
       // Writing this setting will fire onDidChangeConfiguration, which handles the restart.
       await config.update('backendScript', scriptPath, vscode.ConfigurationTarget.Global);
@@ -3353,7 +3353,7 @@ class AgentPanel implements vscode.Disposable {
 }
 
 export function activate(context: vscode.ExtensionContext): void {
-  const bridge = new PythonAgentBridge(context);
+  const bridge = new skillzAgentBridge(context);
   const panel = new AgentPanel(context, bridge);
   const diagnostics = vscode.languages.createDiagnosticCollection('python-agent');
   context.subscriptions.push(bridge, panel, diagnostics);
@@ -3375,9 +3375,9 @@ export function activate(context: vscode.ExtensionContext): void {
 
   context.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration(async (event) => {
-      const providerChanged = event.affectsConfiguration('pythonAgent.provider');
-      const modelChanged = event.affectsConfiguration('pythonAgent.model');
-      const backendScriptChanged = event.affectsConfiguration('pythonAgent.backendScript');
+      const providerChanged = event.affectsConfiguration('skillzAgent.provider');
+      const modelChanged = event.affectsConfiguration('skillzAgent.model');
+      const backendScriptChanged = event.affectsConfiguration('skillzAgent.backendScript');
       if (!providerChanged && !modelChanged && !backendScriptChanged) {
         return;
       }
@@ -3404,7 +3404,7 @@ export function activate(context: vscode.ExtensionContext): void {
       if (!bridge.isRunning()) {
         return;
       }
-      const config = pythonAgentConfig(primaryWorkspaceFolder()?.uri);
+      const config = skillzAgentConfig(primaryWorkspaceFolder()?.uri);
       const provider = String(config.get<string>('provider') || 'gemini').trim();
       const model = String(config.get<string>('model') || defaultModelForProvider(provider)).trim() || defaultModelForProvider(provider);
       try {
