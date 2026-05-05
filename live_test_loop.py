@@ -452,40 +452,48 @@ class TreeLoopPlannerWorker:
             return {
                 "mode": "patch_resolution",
                 "steps": [
-                    "Option A - refresh exact file state:",
                     f"s1: cat {repo_path}",
                     f"s2: show-diff {path}" if path else "s2: show-diff",
                     f"s3: review-changes {path} limit=20" if path else "s3: review-changes limit=20",
-                    "Option B - inspect workspace diff first if the failure looks broader than one file:",
                     "s1: show-diff",
                     f"s2: review-changes {path} limit=20" if path else "s2: review-changes limit=20",
                     f"s3: cat {repo_path}",
-                    "Option C - if the branch or assumptions are clearly wrong:",
                     "s1: drop",
+                ],
+                "strategy_blocks": [
+                    [
+                        f"s1: cat {repo_path}",
+                        f"s2: show-diff {path}" if path else "s2: show-diff",
+                        f"s3: review-changes {path} limit=20" if path else "s3: review-changes limit=20",
+                    ],
+                    [
+                        "s1: show-diff",
+                        f"s2: review-changes {path} limit=20" if path else "s2: review-changes limit=20",
+                        f"s3: cat {repo_path}",
+                    ],
+                    [
+                        "s1: drop",
+                    ],
                 ],
             }
         if self._discovery_remediation is not None:
             path = str(self._discovery_remediation.get("path", "") or "").strip()
             issue_id = str(self._discovery_remediation.get("issue_id", "") or "").strip()
             repo_path = f"/repo/{path}" if path else ""
-            steps: List[str] = ["Option A - inspect the concrete file and issue before choosing a fix:"]
+            focused_block: List[str] = []
             if path:
-                steps.append(f"s1: cat {repo_path}")
+                focused_block.append(f"s{len(focused_block) + 1}: cat {repo_path}")
             if issue_id:
-                steps.append(f"s{len(steps) + 1}: show-issue {issue_id}")
-            if len(steps) == 1:
-                steps.append("s1: list-issues")
-            steps.extend(
-                [
-                    "Option B - if the issue list itself needs triage first:",
-                    "s1: list-issues",
-                ]
-            )
+                focused_block.append(f"s{len(focused_block) + 1}: show-issue {issue_id}")
+            if not focused_block:
+                focused_block.append("s1: list-issues")
+            issue_block: List[str] = ["s1: list-issues"]
             if issue_id:
-                steps.append(f"s2: show-issue {issue_id}")
+                issue_block.append(f"s2: show-issue {issue_id}")
             return {
                 "mode": "discovery_remediation",
-                "steps": steps,
+                "steps": [line for block in [focused_block, issue_block] for line in block],
+                "strategy_blocks": [focused_block, issue_block],
             }
         if self._edit_batch_mode or self._edit_batch_pending:
             queued_paths = sorted(self._edit_batch_pending.keys())
@@ -504,13 +512,22 @@ class TreeLoopPlannerWorker:
             return {
                 "mode": "pending_verification",
                 "steps": [
-                    "Option A - verify file state directly:",
                     f"s1: cat {repo_path}",
                     f"s2: show-diff {path}" if path else "s2: show-diff",
                     f"s3: review-changes {path} limit=20" if path else "s3: review-changes limit=20",
-                    "Option B - start from diff/review if the file is large or multiple edits landed:",
                     f"s1: show-diff {path}" if path else "s1: show-diff",
                     f"s2: review-changes {path} limit=20" if path else "s2: review-changes limit=20",
+                ],
+                "strategy_blocks": [
+                    [
+                        f"s1: cat {repo_path}",
+                        f"s2: show-diff {path}" if path else "s2: show-diff",
+                        f"s3: review-changes {path} limit=20" if path else "s3: review-changes limit=20",
+                    ],
+                    [
+                        f"s1: show-diff {path}" if path else "s1: show-diff",
+                        f"s2: review-changes {path} limit=20" if path else "s2: review-changes limit=20",
+                    ],
                 ],
             }
         if self._completion_check_pending:
@@ -523,6 +540,21 @@ class TreeLoopPlannerWorker:
                 ],
             }
         return None
+
+    def _format_strategy_blocks(self, strategy: Dict[str, Any]) -> str:
+        blocks = strategy.get("strategy_blocks")
+        if not isinstance(blocks, list):
+            steps = [str(item) for item in strategy.get("steps", []) if str(item).strip()]
+            return "\n".join(steps)
+
+        rendered: List[str] = []
+        for index, block in enumerate(blocks, start=1):
+            lines = [str(item) for item in block if str(item).strip()] if isinstance(block, list) else []
+            if not lines:
+                continue
+            rendered.append(f"Executable option {index}; emit only this block if it matches:")
+            rendered.extend(lines)
+        return "\n".join(rendered)
 
     def _bridge_safe_action_types(self) -> set[str]:
         return {
@@ -959,11 +991,12 @@ class TreeLoopPlannerWorker:
                 f"Patch resolution mode is active for {path or 'the failed edit'}. "
                 "Do not keep editing. First resolve the failed patch with read_file, git_diff, show_diff, review_changes, or drop_context."
             )
-            steps = [str(item) for item in strategy.get("steps", []) if str(item).strip()]
-            if steps:
+            strategy_text = self._format_strategy_blocks(strategy)
+            if strategy_text:
                 parts.append(
                     "Choose the recovery strategy path that best matches what just failed. "
-                    "Do not mechanically run every option. Prefer a strategy block such as:\n" + "\n".join(steps)
+                    "Do not mechanically run every option. Do not return numbered prose steps. "
+                    "After >>th: and >>pl:, emit exactly one executable strategy block such as:\n" + strategy_text
                 )
             parts.append("If inspection shows the branch is wrong, emit `drop` on the next turn instead of another edit.")
         elif self._discovery_remediation is not None:
@@ -975,11 +1008,11 @@ class TreeLoopPlannerWorker:
                 f"Discovery remediation mode is active for {focus_target}. "
                 "Do not mutate or finish until you inspect the focused file or issue record."
             )
-            steps = [str(item) for item in strategy.get("steps", []) if str(item).strip()]
-            if steps:
+            strategy_text = self._format_strategy_blocks(strategy)
+            if strategy_text:
                 parts.append(
                     "Choose the remediation strategy path that matches the surfaced issue. "
-                    "Prefer a strategy block such as:\n" + "\n".join(steps)
+                    "Do not return numbered prose steps. After >>th: and >>pl:, emit exactly one executable strategy block such as:\n" + strategy_text
                 )
             parts.append("After inspection clears remediation focus, make one targeted fix on the next turn and rerun the concrete check that surfaced the issue.")
         elif self._edit_batch_mode or self._edit_batch_pending:
@@ -995,16 +1028,16 @@ class TreeLoopPlannerWorker:
                 f"Pending verification is active for {path or 'the latest mutation'}. "
                 "Confirm the landed change before any final correction or finish."
             )
-            steps = [str(item) for item in strategy.get("steps", []) if str(item).strip()]
-            if steps:
+            strategy_text = self._format_strategy_blocks(strategy)
+            if strategy_text:
                 parts.append(
                     "Choose the verification strategy path that best fits the current diff surface. "
-                    "Prefer a strategy block such as:\n" + "\n".join(steps)
+                    "Do not return numbered prose steps. After >>th: and >>pl:, emit exactly one executable strategy block such as:\n" + strategy_text
                 )
         if self._completion_check_pending and self._completion_check_reason:
             parts.append(self._completion_check_reason)
             parts.append(
-                "INNER STRATEGY: 1) run one concrete validation action, 2) finish immediately if it passes, 3) if it contradicts completion, make one corrective edit and continue."
+                "COMPLETION CHECK FORMAT: Do not return a numbered prose plan. After >>th: and >>pl:, emit one executable validation command such as `run-check typecheck`, `show-diff`, or `review-changes`; use `finish <summary>` only after validation passes."
             )
         return "\n".join(part for part in parts if part)
 

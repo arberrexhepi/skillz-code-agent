@@ -1233,6 +1233,27 @@ def parse_strategy(raw: str) -> Optional[StrategyPlan]:
         # Parse targets (right side: "... -> s4, s5")
         targets = [t.strip().lower() for t in targets_str.split(",") if t.strip()] if targets_str else []
 
+        if label in steps:
+            return StrategyPlan(
+                steps={
+                    "error": StrategyStep(
+                        label="error",
+                        commands=[],
+                        results=[
+                            CommandResult(
+                                ok=False,
+                                output=(
+                                    f"Invalid strategy: duplicate label `{label}`. "
+                                    "Emit exactly one executable strategy block with unique labels like `s1:`, `s2:`."
+                                ),
+                                command_type="error",
+                            )
+                        ],
+                    )
+                },
+                execution_order=[["error"]],
+            )
+
         steps[label] = StrategyStep(label=label, commands=commands, depends_on=deps, targets=targets)
         if targets:
             forward_targets[label] = targets
@@ -1503,6 +1524,9 @@ def execute_strategy(parser: TreeCommandParser, raw: str) -> Dict[str, List[Comm
     for tier in plan.execution_order:
         for label in tier:
             step = plan.steps[label]
+            if step.results and all(result.command_type == "error" for result in step.results):
+                all_results[label] = step.results
+                continue
 
             # Substitute upstream outputs into commands
             resolved_commands: List[str] = []

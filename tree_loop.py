@@ -262,6 +262,11 @@ FORMAT (every turn):
 >>pl: <what you plan to accomplish this turn>
 
 <commands, strategies, or annotations>
+
+Do not answer with a prose checklist, numbered plan, or "I will..." summary.
+After the required >>th:/>>pl: tags, emit executable tree commands directly.
+When using a strategy, the executable lines must be `s1:`, `s2:`, ... labels,
+not numbered bullets.
 """
 
 
@@ -325,7 +330,10 @@ def _build_user_prompt(
         sections.append("\n\n".join(history_parts))
 
     sections.append("═══ YOUR TURN ═══")
-    sections.append("Think, then act. Issue tree commands or a strategy block.")
+    sections.append(
+        "Think, then act. Start with >>th: and >>pl:, then issue executable tree commands or one `s1:` strategy block. "
+        "Do not return a numbered prose plan."
+    )
 
     return "\n\n".join(sections)
 
@@ -624,7 +632,12 @@ class TreeLoop:
                 output_excerpt = " ".join(str(raw_output or "").strip().split())
                 if len(output_excerpt) > 180:
                     output_excerpt = output_excerpt[:180] + "..."
-                guidance = "No executable tree commands extracted from model output. Respond with commands like `cat /repo/file` or `finish <summary>`."
+                guidance = (
+                    "No executable tree commands extracted from model output. "
+                    "Do not respond with numbered prose steps or an `I will...` plan. "
+                    "Start the next turn with `>>th:` and `>>pl:`, then emit executable commands such as "
+                    "`cat /repo/file`, `s1: cat /repo/file`, or `finish <summary>`."
+                )
                 if output_excerpt:
                     guidance += f" Output excerpt: {output_excerpt}"
                 commands_issued.append("model_output_invalid")
