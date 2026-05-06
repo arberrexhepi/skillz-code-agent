@@ -80,6 +80,22 @@ class PlannerWorker(Protocol):
     def reopen_issue(self, issue_id: str) -> Dict[str, Any]:
         ...
 
+    def activate_issue(self, issue_id: str) -> Dict[str, Any]:
+        ...
+
+    def create_issue(
+        self,
+        *,
+        request_summary: str,
+        plan_summary: str = "",
+        source: str = "",
+        parent_issue_id: str = "",
+        source_excerpt: str = "",
+        priority: int = 0,
+        activate: bool = True,
+    ) -> Dict[str, Any]:
+        ...
+
     def delete_session(self) -> str:
         ...
 
@@ -193,6 +209,59 @@ class DiscoveryResult:
     validation_summary: str = ""
 
 
+@dataclass
+class ProjectIntent:
+    path: str
+    content: str = ""
+    sha256: str = ""
+    present: bool = False
+
+
+@dataclass
+class ContinuousModeConfig:
+    enabled: bool = False
+    max_cycles: int = 1
+    max_consecutive_failures: int = 1
+    auto_approve: bool = True
+    review_required: bool = True
+
+
+@dataclass
+class ContinuousRunState:
+    enabled: bool = False
+    status: str = "idle"
+    cycle: int = 0
+    max_cycles: int = 0
+    active_issue_id: str = ""
+    run_prompt: str = ""
+    selected_discovery_mode: str = ""
+    latest_review_decision: str = ""
+    stop_reason: str = ""
+    latest_planning_failure: str = ""
+    created_followup_issue_ids: List[str] = field(default_factory=list)
+    created_followup_issues: List[Dict[str, Any]] = field(default_factory=list)
+    completed_issue_ids: List[str] = field(default_factory=list)
+    completed_issues: List[Dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass
+class PlanApprovalDecision:
+    approved: bool
+    reasons: List[str] = field(default_factory=list)
+    blocking_reasons: List[str] = field(default_factory=list)
+    revision_reasons: List[str] = field(default_factory=list)
+
+
+@dataclass
+class ReviewModeResult:
+    decision: str
+    evidence: List[str] = field(default_factory=list)
+    required_actions: List[str] = field(default_factory=list)
+    followup_issue_ids: List[str] = field(default_factory=list)
+    retryable: bool = False
+    retry_reason: str = ""
+
+
 def _discovery_findings_lines(result: Optional[DiscoveryResult], *, limit: int = 6) -> List[str]:
     if result is None:
         return []
@@ -238,6 +307,7 @@ class PlannerSession:
     executing_goal_title: str = ""
     executing_goal_count: int = 0
     active_issue_id: str = ""
+    defer_issue_close_for_review: bool = False
 
 
 class PlannerAgent:
@@ -258,6 +328,8 @@ class PlannerAgent:
         self.on_goal_callback: Optional[Callable[[str, int, str, str], None]] = None
         self.on_discovery_callback: Optional[Callable[[str, str], None]] = None
         self.on_plan_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None
+        self.continuous_config = ContinuousModeConfig()
+        self.continuous_state = ContinuousRunState()
 
     def reconfigure_runtime(
         self,
@@ -296,6 +368,32 @@ class PlannerAgent:
             return None
         ledger = IssueFactLedger.load(path)
         return ledger.planner_payload(path=str(path))
+
+    def _load_project_intent(self) -> ProjectIntent:
+        path = self.root / "INTENT.md"
+        if not path.exists() or not path.is_file():
+            return ProjectIntent(path=str(path), present=False)
+        try:
+            content = path.read_text(encoding="utf-8")
+        except Exception:
+            return ProjectIntent(path=str(path), present=False)
+        import hashlib
+        return ProjectIntent(
+            path=str(path),
+            content=content,
+            sha256=hashlib.sha256(content.encode("utf-8")).hexdigest(),
+            present=True,
+        )
+
+    def _load_project_intent_payload(self) -> Dict[str, Any]:
+        intent = self._load_project_intent()
+        return {
+            "path": intent.path,
+            "present": intent.present,
+            "sha256": intent.sha256,
+            "content": intent.content,
+            "immutable": True,
+        }
 
     def _available_repo_fact_keys(self) -> List[str]:
         payload = self._load_repo_facts_payload() or {}
@@ -369,6 +467,22 @@ class PlannerAgent:
             return "Planner session cleared."
         if lower in {"/delete-session", "delete-session"}:
             return self.delete_session()
+        if lower in {"/stop-continuous", "stop-continuous", "/stop-auto", "stop-auto"}:
+            return self.stop_continuous()
+        for prefix in ["/start-continuous", "start-continuous", "/start-auto", "start-auto"]:
+            if lower == prefix or lower.startswith(prefix + " "):
+                max_cycles = 1
+                run_prompt = ""
+                tail = stripped[len(prefix):].strip()
+                if tail:
+                    try:
+                        parts = tail.split(maxsplit=1)
+                        max_cycles = int(parts[0])
+                        run_prompt = parts[1].strip() if len(parts) > 1 else ""
+                    except Exception:
+                        max_cycles = 1
+                        run_prompt = tail
+                return self.start_continuous(max_cycles=max_cycles, prompt=run_prompt)
         if lower.startswith("reopen "):
             issue_id = stripped[len("reopen "):].strip()
             if issue_id:
@@ -377,6 +491,14 @@ class PlannerAgent:
             issue_id = stripped[len("/reopen "):].strip()
             if issue_id:
                 return self.reopen_issue(issue_id)
+        if lower.startswith("create-issue "):
+            summary = stripped[len("create-issue "):].strip()
+            if summary:
+                return self.create_manual_issue(summary)
+        if lower.startswith("/create-issue "):
+            summary = stripped[len("/create-issue "):].strip()
+            if summary:
+                return self.create_manual_issue(summary)
         if lower.startswith("close-issue "):
             issue_id = stripped[len("close-issue "):].strip()
             if issue_id:
@@ -412,6 +534,7 @@ class PlannerAgent:
         self.session.last_discovery = None
         self.session.completed_results = []
         self.session.planner_usage_totals = {}
+        self.session.defer_issue_close_for_review = False
         self._rehydrate_active_issue_context()
         return self._handle_intake_turn()
 
@@ -552,6 +675,31 @@ class PlannerAgent:
         if summary:
             return f"Reopened issue {self.session.active_issue_id}: {summary}. Send the follow-up request for this issue."
         return f"Reopened issue {self.session.active_issue_id}. Send the follow-up request for this issue."
+
+    def create_manual_issue(self, summary: str, *, activate: bool = True) -> str:
+        normalized = self._compact_failure_detail(summary, limit=500)
+        if not normalized:
+            return "Issue creation failed: missing issue details."
+        creator = getattr(self.worker, "create_issue", None)
+        if not callable(creator):
+            return "Worker does not support issue creation."
+        try:
+            issue = creator(
+                request_summary=normalized,
+                plan_summary=normalized,
+                source="manual",
+                source_excerpt=normalized,
+                priority=60,
+                activate=activate,
+            )
+        except Exception as exc:
+            return f"Issue creation failed: {exc}"
+        issue_id = str((issue or {}).get("issue_id", "") or "").strip()
+        if activate and issue_id:
+            self.session.active_issue_id = issue_id
+        if issue_id:
+            return f"Created issue {issue_id}: {normalized}"
+        return f"Created issue: {normalized}"
 
     def close_issue(self, issue_id: str) -> str:
         normalized_issue_id = str(issue_id or "").strip()
@@ -1006,10 +1154,11 @@ class PlannerAgent:
         self.session.last_completed_results = list(self.session.completed_results)
         self.session.last_execution_summary = final_summary
         if plan_completed:
-            closer = getattr(self.worker, "close_active_issue", None)
-            if callable(closer):
-                closer()
-            self.session.active_issue_id = ""
+            if not self.session.defer_issue_close_for_review:
+                closer = getattr(self.worker, "close_active_issue", None)
+                if callable(closer):
+                    closer()
+                self.session.active_issue_id = ""
             self.session.last_completed_plan = plan
             self.session.pending_plan = None
             self.session.last_presented_plan = None
@@ -1032,6 +1181,609 @@ class PlannerAgent:
         )
         self.session.completed_results = []
         return "\n\n".join(output + [final_summary])
+
+    def _intent_issue_summary(self) -> str:
+        intent = self._load_project_intent()
+        if not intent.present or not intent.content.strip():
+            return ""
+        fallback = ""
+        for line in intent.content.splitlines():
+            raw = line.strip()
+            stripped = raw.strip(" #\t")
+            if not stripped:
+                continue
+            if not fallback:
+                fallback = stripped[:180]
+            if raw.startswith("#"):
+                continue
+            return stripped[:180]
+        if fallback:
+            return fallback
+        return "Work from project intent"
+
+    def _continuous_request_for_issue(self, issue: Dict[str, Any]) -> str:
+        source = str(issue.get("source", "") or "").strip()
+        summary = str(issue.get("plan_summary") or issue.get("request_summary") or "").strip()
+        run_prompt = str(self.continuous_state.run_prompt or "").strip()
+        completed_context = self._continuous_completed_context()
+        if source != "intent":
+            if run_prompt:
+                parts = [
+                    f"Auto run prompt: {run_prompt}",
+                    f"Current issue: {summary}",
+                ]
+                if completed_context:
+                    parts.append("Already completed during this auto run:\n" + completed_context)
+                parts.append(
+                    "Plan only the current issue or a new remaining slice of the run prompt. "
+                    "Do not recreate work already completed in this auto run."
+                )
+                return "\n\n".join(parts)
+            return summary
+        intent_summary = self._intent_issue_summary()
+        candidate = intent_summary or summary
+        if not candidate:
+            return ""
+        request = (
+            "Auto run: choose and implement the next bounded project improvement "
+            f"from immutable project direction. Current candidate: {candidate}. "
+            "Use that source only as read-only guidance; do not edit it."
+        )
+        if run_prompt:
+            request = (
+                f"Auto run prompt: {run_prompt}\n\n"
+                + request
+                + "\nPrefer remaining work that advances the auto run prompt."
+            )
+        if completed_context:
+            request += "\n\nAlready completed during this auto run:\n" + completed_context
+            request += "\nDo not recreate those completed issues."
+        return request
+
+    def _continuous_completed_context(self) -> str:
+        lines: List[str] = []
+        for item in self.continuous_state.completed_issues:
+            if not isinstance(item, dict):
+                continue
+            issue_id = str(item.get("issue_id", "") or "").strip()
+            summary = str(item.get("plan_summary") or item.get("request_summary") or item.get("summary") or "").strip()
+            if issue_id or summary:
+                lines.append(f"- {issue_id}: {summary}" if issue_id and summary else f"- {issue_id or summary}")
+        return "\n".join(lines)
+
+    def _create_prompted_continuous_issue(self, prompt: str) -> Optional[Dict[str, Any]]:
+        summary = str(prompt or "").strip()
+        if not summary:
+            return None
+        creator = getattr(self.worker, "create_issue", None)
+        if not callable(creator):
+            return {
+                "issue_id": "",
+                "request_summary": summary,
+                "plan_summary": summary,
+                "source": "auto_prompt",
+                "source_excerpt": summary,
+            }
+        return creator(
+            request_summary=summary,
+            plan_summary=summary,
+            source="auto_prompt",
+            source_excerpt=summary,
+            priority=90,
+            activate=True,
+        )
+
+    def _activate_continuous_issue(self, issue: Dict[str, Any]) -> Dict[str, Any]:
+        issue_id = str(issue.get("issue_id", "") or "").strip()
+        if not issue_id:
+            return issue
+        activator = getattr(self.worker, "activate_issue", None)
+        if not callable(activator):
+            return issue
+        try:
+            activated = activator(issue_id)
+        except Exception:
+            return issue
+        if isinstance(activated, dict) and str(activated.get("issue_id", "") or "").strip():
+            return activated
+        return issue
+
+    def _create_or_select_continuous_issue(self) -> Optional[Dict[str, Any]]:
+        payload = self._load_repo_facts_payload() or {}
+        if isinstance(payload, dict):
+            active = payload.get("active_issue")
+            if (
+                isinstance(active, dict)
+                and active.get("issue_id")
+                and str(active.get("status", "") or "") == "open"
+            ):
+                return self._activate_continuous_issue(active)
+            issues = payload.get("issues")
+            if isinstance(issues, list):
+                open_issues = [
+                    issue for issue in issues
+                    if isinstance(issue, dict) and str(issue.get("status", "") or "") == "open"
+                ]
+                if open_issues:
+                    open_issues.sort(key=lambda issue: int(issue.get("priority", 0) or 0), reverse=True)
+                    return self._activate_continuous_issue(open_issues[0])
+
+        summary = self._intent_issue_summary()
+        if not summary:
+            return None
+        creator = getattr(self.worker, "create_issue", None)
+        if not callable(creator):
+            return {
+                "issue_id": "",
+                "request_summary": summary,
+                "plan_summary": summary,
+                "source": "intent",
+                "source_excerpt": summary,
+            }
+        return creator(
+            request_summary=summary,
+            plan_summary=summary,
+            source="intent",
+            source_excerpt=summary,
+            priority=50,
+            activate=True,
+        )
+
+    def _select_discovery_mode_for_issue(self, issue: Dict[str, Any]) -> str:
+        text = " ".join(
+            str(issue.get(key, "") or "")
+            for key in ["request_summary", "plan_summary", "source_excerpt", "blocked_reason", "last_review_decision"]
+        ).lower()
+        if any(token in text for token in ["architecture", "cross-module", "unknown", "unclear", "failed", "review"]):
+            return "deep"
+        if any(token in text for token in [".py", ".ts", ".tsx", "/", "file:", "path:"]):
+            return "quick"
+        return "moderate"
+
+    def _auto_approve_plan(self, plan: PlannerPlan) -> PlanApprovalDecision:
+        blockers: List[str] = []
+        revision_reasons: List[str] = []
+        reasons: List[str] = []
+        if not self.continuous_config.auto_approve:
+            blockers.append("auto approval is disabled")
+        if not 1 <= len(plan.goals) <= 5:
+            blockers.append("plan must contain 1 to 5 goals")
+        if not plan.not_in_scope:
+            blockers.append("plan must define concrete not_in_scope boundaries")
+        protected_text = " ".join(
+            [plan.summary]
+            + [goal.title + " " + goal.goal + " " + " ".join(goal.delegation_notes) for goal in plan.goals]
+        )
+        protected_edit_pattern = re.compile(
+            r"\b(?:edit|modify|update|rewrite|change|patch|delete|rename|mutate)\s+(?:the\s+)?(?:file\s+)?INTENT\.md\b"
+            r"|\bwrite\s+(?:changes\s+|edits\s+)?(?:to|into)\s+(?:the\s+)?(?:file\s+)?INTENT\.md\b"
+            r"|\b(?:make|apply)\s+(?:changes|edits|patches)\s+(?:to|in)\s+(?:the\s+)?(?:file\s+)?INTENT\.md\b"
+            r"|\bINTENT\.md\b.{0,40}\b(?:edit|mutation|write|patch|delete|rename|rewrite)\s+target\b",
+            re.IGNORECASE,
+        )
+        if protected_edit_pattern.search(protected_text):
+            revision_reasons.append("plan references INTENT.md as an edit target; regenerate with INTENT.md read-only")
+        for goal in plan.goals:
+            if goal.estimated_scope in {"write", "mixed"} and not goal.success_signals:
+                blockers.append(f"{goal.goal_id} is missing success_signals")
+        if not blockers and not revision_reasons:
+            reasons.append("plan passed continuous-mode approval gates")
+        return PlanApprovalDecision(
+            approved=not blockers and not revision_reasons,
+            reasons=reasons,
+            blocking_reasons=blockers,
+            revision_reasons=revision_reasons,
+        )
+
+    def _request_auto_plan_revision(self, plan: PlannerPlan, reasons: List[str]) -> None:
+        feedback = (
+            "Regenerate the plan for continuous-mode approval. "
+            "INTENT.md is immutable project direction and may be read for context only; "
+            "do not make it an edit, mutation, write, patch, delete, rename, or rewrite target. "
+            "Move any intended project-direction changes into editable implementation files or exclude them from scope. "
+            "Revision reasons: " + "; ".join(reason for reason in reasons if reason)
+        )
+        self.session.last_presented_plan = plan
+        self.session.pending_plan = None
+        self.session.awaiting_plan_revision = True
+        self.session.plan_revision_feedback.append(feedback)
+
+    def _review_completed_plan(self, plan: PlannerPlan) -> ReviewModeResult:
+        results = list(self.session.last_completed_results or [])
+        if not results:
+            return ReviewModeResult(decision="blocked", required_actions=["No completed goal results were available for review."])
+        failed = [result for result in results if result.status != "completed" or not result.task_satisfied]
+        if failed:
+            retryable = any(self._result_has_transient_failure(item) for item in failed)
+            return ReviewModeResult(
+                decision="rejected",
+                evidence=[f"{item.goal_id}: {item.final_message}" for item in failed],
+                required_actions=[
+                    "Retry the failed goal once before rejecting the issue."
+                    if retryable
+                    else "Retry or revise the failed goal before closing the issue."
+                ],
+                retryable=retryable,
+                retry_reason="Transient service failure during execution." if retryable else "",
+            )
+        invalid_validation = [
+            result for result in results
+            if result.validation_ran and not result.validation_passed
+        ]
+        if invalid_validation:
+            retryable = any(self._result_has_transient_failure(item) for item in invalid_validation)
+            return ReviewModeResult(
+                decision="rejected",
+                evidence=[f"{item.goal_id}: {item.validation_summary}" for item in invalid_validation],
+                required_actions=[
+                    "Retry validation once before rejecting the issue."
+                    if retryable
+                    else "Resolve validation failures before closing the issue."
+                ],
+                retryable=retryable,
+                retry_reason="Transient service failure during validation." if retryable else "",
+            )
+        return ReviewModeResult(
+            decision="accepted",
+            evidence=[f"{item.goal_id}: {item.final_message}" for item in results],
+        )
+
+    def _result_has_transient_failure(self, result: GoalExecutionResult) -> bool:
+        text = " ".join(
+            [
+                result.final_message,
+                result.validation_summary,
+                result.commentary_for_next_goal,
+                " ".join(
+                    str(item.get("summary", "") or "")
+                    for item in result.worker_history_summary
+                    if isinstance(item, dict)
+                ),
+            ]
+        ).lower()
+        transient_markers = [
+            "503",
+            "service unavailable",
+            "temporarily unavailable",
+            "temporary unavailable",
+            "upstream unavailable",
+            "server unavailable",
+            "overloaded",
+        ]
+        return any(marker in text for marker in transient_markers)
+
+    def _compact_failure_detail(self, value: Any, *, limit: int = 240) -> str:
+        compact = re.sub(r"\s+", " ", str(value or "")).strip()
+        if not compact:
+            return ""
+        try:
+            return textwrap.shorten(compact, width=limit, placeholder="...")
+        except Exception:
+            return compact[:limit].rstrip()
+
+    def _mark_continuous_planning_failed(self, detail: Any) -> None:
+        compact = self._compact_failure_detail(detail)
+        self.continuous_state.latest_planning_failure = compact
+        self.continuous_state.stop_reason = "planning_failed" + (f": {compact}" if compact else "")
+
+    def _continuous_discovery_for_planning_gap(self, plan_response: Any) -> Optional[DiscoveryRequest]:
+        compact = self._compact_failure_detail(plan_response)
+        if not compact:
+            return None
+        lowered = compact.lower()
+        clarification_like = (
+            "?" in compact
+            or lowered.startswith(("please clarify", "clarify ", "which ", "what ", "where ", "how ", "who "))
+        )
+        if not clarification_like:
+            return None
+        return DiscoveryRequest(
+            reason=f"Planner requested clarification during auto mode: {compact}",
+            prompt=(
+                "Auto mode cannot ask the operator this clarification. "
+                f"Use repository discovery to answer or reduce it, then return evidence for planning: {compact}"
+            ),
+            recommended_mode="moderate",
+        )
+
+    def _continue_auto_planning_after_discovery(self) -> str:
+        discovery = self.session.last_discovery
+        if discovery is None or not discovery.ok or self.session.pending_plan is not None:
+            return ""
+        run_prompt = str(self.continuous_state.run_prompt or "").strip()
+        completed_context = self._continuous_completed_context()
+        prompt = (
+            "Auto mode discovery is complete and the planner must continue without asking the operator. "
+            "Use last_discovery as evidence. If discovery shows the originally considered branch is already complete, "
+            "pivot to the next bounded project improvement from the active issue, project intent, repo facts, and discovered state. "
+            "Do not ask a clarification. Produce a concrete 1-5 goal plan with not_in_scope, or offer a new discovery pass only "
+            "if a different repository ambiguity blocks a safe plan."
+        )
+        if run_prompt:
+            prompt += (
+                f"\nThis auto run was started with operator prompt: {run_prompt}\n"
+                "Prefer remaining work that advances that prompt."
+            )
+        if completed_context:
+            prompt += "\nAlready completed during this auto run:\n" + completed_context
+            prompt += "\nDo not recreate those completed issues or their completed scope."
+        self.session.intake_messages.append({"role": "user", "content": prompt})
+        response = self._handle_intake_turn()
+        if self.session.pending_discovery is not None:
+            mode = self._normalize_discovery_mode(self.session.pending_discovery.recommended_mode)
+            response = "\n\n".join([response, self.execute_discovery(mode)])
+        return response
+
+    def _extract_next_steps_from_summary(self, summary: str) -> List[str]:
+        lines = str(summary or "").splitlines()
+        in_next_steps = False
+        steps: List[str] = []
+        for line in lines:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if stripped.lower().startswith("next steps"):
+                in_next_steps = True
+                continue
+            if in_next_steps and re.match(r"^[A-Z][A-Za-z ]+$", stripped) and not re.match(r"^[-*\d]", stripped):
+                break
+            if in_next_steps:
+                cleaned = re.sub(r"^(?:[-*]|\d+[.)])\s*", "", stripped).strip()
+                if cleaned and cleaned.lower() != "none." and cleaned.lower() != "none":
+                    steps.append(cleaned)
+        return self._filter_completed_next_steps(
+            self.session.last_completed_plan or PlannerPlan(original_request="", summary="", goals=[]),
+            self.session.last_completed_results,
+            steps,
+        )
+
+    def _continuous_completed_scope_texts(self) -> List[str]:
+        texts: List[str] = []
+        for item in self.continuous_state.completed_issues:
+            if not isinstance(item, dict):
+                continue
+            for key in ["request_summary", "plan_summary", "summary", "execution_summary"]:
+                value = str(item.get(key, "") or "").strip()
+                if value:
+                    texts.append(value)
+        return texts
+
+    def _create_followup_issues_from_next_steps(self, parent_issue_id: str) -> List[Dict[str, Any]]:
+        created: List[Dict[str, Any]] = []
+        creator = getattr(self.worker, "create_issue", None)
+        if not callable(creator):
+            return created
+        completed_scope = self._continuous_completed_scope_texts()
+        for step in self._extract_next_steps_from_summary(self.session.last_execution_summary):
+            if self._next_step_is_probably_completed(step, completed_scope):
+                continue
+            issue = creator(
+                request_summary=step,
+                plan_summary=step,
+                source="next_step",
+                parent_issue_id=parent_issue_id,
+                source_excerpt=step,
+                priority=40,
+                activate=False,
+            )
+            issue_id = str((issue or {}).get("issue_id", "") or "")
+            if issue_id and all(str(item.get("issue_id", "") or "") != issue_id for item in created):
+                created.append({
+                    "issue_id": issue_id,
+                    "request_summary": str((issue or {}).get("request_summary") or step),
+                    "plan_summary": str((issue or {}).get("plan_summary") or step),
+                    "source": str((issue or {}).get("source") or "next_step"),
+                    "parent_issue_id": str((issue or {}).get("parent_issue_id") or parent_issue_id),
+                })
+        return created
+
+    def start_continuous(self, *, max_cycles: int = 1, prompt: str = "") -> str:
+        run_prompt = str(prompt or "").strip()
+        self.continuous_config = ContinuousModeConfig(enabled=True, max_cycles=max(1, int(max_cycles or 1)))
+        self.continuous_state = ContinuousRunState(
+            enabled=True,
+            status="selecting_issue",
+            max_cycles=self.continuous_config.max_cycles,
+            run_prompt=run_prompt,
+        )
+        output: List[str] = ["Continuous mode started."]
+        if run_prompt:
+            output.append(f"Auto run prompt: {run_prompt}")
+        failures = 0
+        prompted_issue: Optional[Dict[str, Any]] = self._create_prompted_continuous_issue(run_prompt) if run_prompt else None
+        try:
+            for cycle in range(1, self.continuous_config.max_cycles + 1):
+                self.continuous_state.cycle = cycle
+                self.continuous_state.status = "selecting_issue"
+                issue = prompted_issue if prompted_issue is not None else self._create_or_select_continuous_issue()
+                prompted_issue = None
+                if not issue:
+                    self.continuous_state.stop_reason = "no_issue_candidate"
+                    break
+                issue_id = str(issue.get("issue_id", "") or "")
+                self.session.active_issue_id = issue_id
+                self.continuous_state.active_issue_id = issue_id
+                request = self._continuous_request_for_issue(issue)
+                if not request:
+                    self.continuous_state.stop_reason = "selected_issue_missing_summary"
+                    break
+
+                self.session.latest_request = request
+                self.session.intake_messages = [{"role": "user", "content": request}]
+                self.session.pending_plan = None
+                self.session.pending_discovery = None
+                self.session.last_completed_plan = None
+                self.session.last_completed_results = []
+                self.session.last_execution_summary = ""
+                self.session.defer_issue_close_for_review = True
+
+                self.continuous_state.status = "planning"
+                plan_response = self._handle_intake_turn()
+                if self.session.pending_discovery is not None:
+                    self.continuous_state.status = "discovering"
+                    mode = self._select_discovery_mode_for_issue(issue)
+                    self.continuous_state.selected_discovery_mode = mode
+                    output.append(f"Cycle {cycle}: selected {mode} discovery for {issue_id or 'intent issue'}.")
+                    plan_response = self.execute_discovery(mode)
+                    if self.session.pending_plan is None:
+                        continuation = self._continue_auto_planning_after_discovery()
+                        if continuation:
+                            output.append(f"Cycle {cycle}: continued planning after discovery.")
+                            plan_response = "\n\n".join([plan_response, continuation])
+                elif self.session.pending_plan is None:
+                    auto_discovery = self._continuous_discovery_for_planning_gap(plan_response)
+                    if auto_discovery is not None:
+                        self.session.pending_discovery = auto_discovery
+                        self.continuous_state.status = "discovering"
+                        mode = self._select_discovery_mode_for_issue(issue)
+                        self.continuous_state.selected_discovery_mode = mode
+                        output.append(
+                            f"Cycle {cycle}: converted planner clarification into {mode} discovery for {issue_id or 'intent issue'}."
+                        )
+                        plan_response = self.execute_discovery(mode)
+                        if self.session.pending_plan is None:
+                            continuation = self._continue_auto_planning_after_discovery()
+                            if continuation:
+                                output.append(f"Cycle {cycle}: continued planning after discovery.")
+                                plan_response = "\n\n".join([plan_response, continuation])
+                if self.session.pending_plan is None:
+                    failures += 1
+                    output.append(f"Cycle {cycle}: stopped before execution. {plan_response}")
+                    if failures >= self.continuous_config.max_consecutive_failures:
+                        self._mark_continuous_planning_failed(plan_response)
+                        break
+                    continue
+
+                revision_attempts = 0
+                decision = self._auto_approve_plan(self.session.pending_plan)
+                while (
+                    not decision.approved
+                    and decision.revision_reasons
+                    and not decision.blocking_reasons
+                    and revision_attempts < 2
+                    and self.session.pending_plan is not None
+                ):
+                    revision_attempts += 1
+                    output.append(
+                        f"Cycle {cycle}: requested plan revision. "
+                        + "; ".join(decision.revision_reasons)
+                    )
+                    self.continuous_state.status = "planning"
+                    self._request_auto_plan_revision(self.session.pending_plan, decision.revision_reasons)
+                    plan_response = self._handle_intake_turn()
+                    if self.session.pending_discovery is not None:
+                        mode = self._select_discovery_mode_for_issue(issue)
+                        self.continuous_state.selected_discovery_mode = mode
+                        output.append(f"Cycle {cycle}: selected {mode} discovery while revising {issue_id or 'intent issue'}.")
+                        plan_response = self.execute_discovery(mode)
+                        if self.session.pending_plan is None:
+                            continuation = self._continue_auto_planning_after_discovery()
+                            if continuation:
+                                output.append(f"Cycle {cycle}: continued planning after revision discovery.")
+                                plan_response = "\n\n".join([plan_response, continuation])
+                    elif self.session.pending_plan is None:
+                        auto_discovery = self._continuous_discovery_for_planning_gap(plan_response)
+                        if auto_discovery is not None:
+                            self.session.pending_discovery = auto_discovery
+                            mode = self._select_discovery_mode_for_issue(issue)
+                            self.continuous_state.selected_discovery_mode = mode
+                            output.append(
+                                f"Cycle {cycle}: converted revision clarification into {mode} discovery for {issue_id or 'intent issue'}."
+                            )
+                            plan_response = self.execute_discovery(mode)
+                            if self.session.pending_plan is None:
+                                continuation = self._continue_auto_planning_after_discovery()
+                                if continuation:
+                                    output.append(f"Cycle {cycle}: continued planning after revision discovery.")
+                                    plan_response = "\n\n".join([plan_response, continuation])
+                    if self.session.pending_plan is None:
+                        failures += 1
+                        output.append(f"Cycle {cycle}: stopped before execution after revision. {plan_response}")
+                        if failures >= self.continuous_config.max_consecutive_failures:
+                            self._mark_continuous_planning_failed(plan_response)
+                            break
+                        continue
+                    decision = self._auto_approve_plan(self.session.pending_plan)
+
+                if self.continuous_state.stop_reason:
+                    break
+                if not decision.approved:
+                    self.continuous_state.status = "stopped"
+                    reasons = decision.blocking_reasons or decision.revision_reasons
+                    self.continuous_state.stop_reason = "auto_approval_blocked: " + "; ".join(reasons)
+                    output.append(f"Cycle {cycle}: auto approval blocked. " + "; ".join(reasons))
+                    break
+
+                self.continuous_state.status = "executing"
+                output.append(f"Cycle {cycle}: auto-approved plan for {issue_id or 'intent issue'}.")
+                execution_message = self.execute_pending_plan()
+                output.append(execution_message)
+
+                self.continuous_state.status = "reviewing"
+                plan = self.session.last_completed_plan or self.session.last_presented_plan or self.session.pending_plan
+                if plan is None:
+                    self.continuous_state.stop_reason = "review_missing_plan"
+                    break
+                review = self._review_completed_plan(plan)
+                self.continuous_state.latest_review_decision = review.decision
+                if review.decision != "accepted" and review.retryable and self.session.pending_plan is not None:
+                    output.append(
+                        f"Cycle {cycle}: review {review.decision} due to transient failure; retrying once. "
+                        + (review.retry_reason or "; ".join(review.required_actions))
+                    )
+                    execution_message = self.execute_pending_plan()
+                    output.append(execution_message)
+                    plan = self.session.last_completed_plan or self.session.last_presented_plan or self.session.pending_plan
+                    if plan is None:
+                        self.continuous_state.stop_reason = "review_missing_plan_after_retry"
+                        break
+                    review = self._review_completed_plan(plan)
+                    self.continuous_state.latest_review_decision = review.decision
+                if review.decision != "accepted":
+                    failures += 1
+                    self.continuous_state.stop_reason = f"review_{review.decision}"
+                    output.append(f"Cycle {cycle}: review {review.decision}. " + "; ".join(review.required_actions))
+                    if failures >= self.continuous_config.max_consecutive_failures:
+                        break
+                    continue
+
+                self.continuous_state.status = "closing_issue"
+                completed_issue = {
+                    "issue_id": issue_id,
+                    "request_summary": str(issue.get("request_summary", "") or "").strip(),
+                    "plan_summary": str(issue.get("plan_summary", "") or "").strip(),
+                    "source": str(issue.get("source", "") or "").strip(),
+                    "execution_summary": self.session.last_execution_summary,
+                }
+                if issue_id:
+                    self.continuous_state.completed_issue_ids.append(issue_id)
+                self.continuous_state.completed_issues.append(completed_issue)
+                closer = getattr(self.worker, "close_active_issue", None)
+                if callable(closer):
+                    closer(note="Closed after continuous-mode review accepted completed work.")
+                self.session.active_issue_id = ""
+                followups = self._create_followup_issues_from_next_steps(issue_id)
+                followup_ids = [str(item.get("issue_id", "") or "") for item in followups if str(item.get("issue_id", "") or "")]
+                self.continuous_state.created_followup_issue_ids.extend(followup_ids)
+                self.continuous_state.created_followup_issues.extend(followups)
+                if followups:
+                    output.append(f"Cycle {cycle}: created follow-up issues: {', '.join(followup_ids)}.")
+        finally:
+            self.session.defer_issue_close_for_review = False
+            self.continuous_state.status = "stopped"
+            self.continuous_config.enabled = False
+            self.continuous_state.enabled = False
+        if not self.continuous_state.stop_reason:
+            self.continuous_state.stop_reason = "max_cycles_reached"
+        output.append(f"Continuous mode stopped: {self.continuous_state.stop_reason}.")
+        return "\n\n".join(output)
+
+    def stop_continuous(self, reason: str = "stopped_by_user") -> str:
+        self.continuous_config.enabled = False
+        self.continuous_state.enabled = False
+        self.continuous_state.status = "stopped"
+        self.continuous_state.stop_reason = str(reason or "stopped_by_user")
+        return f"Continuous mode stopped: {self.continuous_state.stop_reason}."
 
     def _handle_intake_turn(self) -> str:
         prompt = self._build_planner_prompt()
@@ -1136,9 +1888,12 @@ class PlannerAgent:
     def _load_final_summary_payload(self, raw: str) -> Dict[str, Any]:
         if self._use_tagged_planner_control():
             try:
-                return parse_final_summary_response(raw)
+                payload = parse_final_summary_response(raw)
+                if payload.get("summary") or payload.get("next_steps"):
+                    return payload
             except Exception:
-                return self.json_loader(raw)
+                pass
+            return self.json_loader(raw)
         return self.json_loader(raw)
 
     def _planner_system_prompt(self) -> str:
@@ -1167,6 +1922,8 @@ class PlannerAgent:
             - If a discovery offer was pending and the user replies with added detail instead of selecting 1/2/3 or skipping, treat that detail as new planning context and reassess whether discovery is still needed.
             - If last_discovery is present, treat it as evidence you must use, not background noise.
             - If repo_facts is present, treat it as durable repo memory from prior work and use it to avoid redundant rediscovery.
+            - Treat closed repo_facts issues as historical context only. In auto/continuous mode, do not reopen closed issues unless the active request explicitly requires continuing that exact closed issue and no open/new issue would preserve the user's intent.
+            - When auto/continuous mode needs follow-up work and no suitable open issue exists, prefer creating or selecting a new issue over reopening a closed issue.
             - When repo_facts materially help a goal, include a short relevant_fact_keys list naming the most relevant fact keys for that goal.
             - relevant_fact_keys should prioritize execution; they are not an exclusive allowlist.
             - After discovery, convert discovered files, flows, constraints, and risks into stronger goals and delegation notes.
@@ -1179,6 +1936,7 @@ class PlannerAgent:
             - Do not ignore revision feedback and do not simply re-emit the prior plan unless you explicitly explain that the requested change is already reflected.
             - If follow_up_context is present, the current request is a NEW user request that comes after a completed plan; use the prior plan and results as context, but plan for the new request.
             - Do not treat follow_up_context.prior_plan as the active request. The active request is always the top-level request field.
+            - If project_intent.present is true, treat project_intent.content as immutable project direction. Use it for scope and issue creation, but never propose edits to INTENT.md.
             - Do not start execution yourself.
             - Prefer 1 to 5 goals.
             - Each goal should be substantial, not a tiny task list.
@@ -1208,6 +1966,7 @@ class PlannerAgent:
         payload = {
             "root": str(self.root),
             "request": self.session.latest_request,
+            "project_intent": self._load_project_intent_payload(),
             "repo_facts": self._load_repo_facts_payload(),
             "conversation": self.session.intake_messages[-10:],
             "follow_up_context": self._follow_up_context_payload(),
@@ -1707,19 +2466,30 @@ class PlannerAgent:
                 "plan_summary": plan.summary,
                 "goals": [self._goal_payload(goal) for goal in plan.goals],
                 "results": [self._result_payload(result) for result in results],
+                "continuous_run_prompt": self.continuous_state.run_prompt,
+                "continuous_run_completed_issues": list(self.continuous_state.completed_issues),
             },
             indent=2,
+        )
+        run_completed = self._continuous_completed_context()
+        run_completed_block = (
+            "\n\nAUTO RUN ALREADY COMPLETED ISSUES (do NOT suggest these as next steps):\n"
+            + run_completed
+            if run_completed
+            else ""
         )
         raw = self._planner_complete(
                         final_summary_instructions(use_tags=self._use_tagged_planner_control())
                         + "\n\nALREADY COMPLETED (do NOT suggest any of this as next steps):"
             + "\n"
             + completed_block
+            + run_completed_block
             + "\n\n"
             + textwrap.dedent(
                 """
                 Requirements:
                 - next_steps must be NEW work not covered by any completed goal above
+                - when continuous_run_prompt is present, next_steps should be remaining slices of that prompt, not repeats of continuous_run_completed_issues
                 - a step is NOT new if any completed goal already implemented, integrated, or added what the step describes
                 - next_steps must be strictly remaining work, optional follow-up, or explicit validation that is not already completed
                 - avoid generic suggestions like add tests unless tied to the result
@@ -1981,6 +2751,8 @@ class PlannerAgent:
                 )
             actions.append({"type": "skip_discovery", "label": "Skip Discovery", "style": "secondary"})
         elif not self.session.executing:
+            actions.append({"type": "create_issue", "label": "Create Issue", "style": "primary"})
+            actions.append({"type": "start_continuous", "label": "Start Continuous", "style": "primary"})
             payload = self._load_repo_facts_payload() or {}
             for issue in payload.get("reopenable_issues", [])[:3] if isinstance(payload, dict) else []:
                 if not isinstance(issue, dict):
@@ -2004,6 +2776,8 @@ class PlannerAgent:
             has_issue_state = bool(payload.get("active_issue") or payload.get("reopenable_issues") or payload.get("issues"))
         if self.session.intake_messages or self.session.last_completed_plan is not None:
             actions.append({"type": "reset_session", "label": "Reset Session", "style": "ghost"})
+        if self.continuous_state.status not in {"idle", "stopped"}:
+            actions.append({"type": "stop_continuous", "label": "Stop Continuous", "style": "secondary"})
         actions.append(
             {
                 "type": "delete_session",
@@ -2040,6 +2814,23 @@ class PlannerAgent:
             },
             "status": self._session_status(),
             "latest_request": self.session.latest_request,
+            "project_intent": self._load_project_intent_payload(),
+            "continuous_mode": {
+                "enabled": self.continuous_state.enabled,
+                "status": self.continuous_state.status,
+                "cycle": self.continuous_state.cycle,
+                "max_cycles": self.continuous_state.max_cycles,
+                "active_issue_id": self.continuous_state.active_issue_id,
+                "run_prompt": self.continuous_state.run_prompt,
+                "selected_discovery_mode": self.continuous_state.selected_discovery_mode,
+                "latest_review_decision": self.continuous_state.latest_review_decision,
+                "stop_reason": self.continuous_state.stop_reason,
+                "latest_planning_failure": self.continuous_state.latest_planning_failure,
+                "created_followup_issue_ids": list(self.continuous_state.created_followup_issue_ids),
+                "created_followup_issues": list(self.continuous_state.created_followup_issues),
+                "completed_issue_ids": list(self.continuous_state.completed_issue_ids),
+                "completed_issues": list(self.continuous_state.completed_issues),
+            },
             "pending_plan": self._plan_payload(self.session.pending_plan),
             "last_presented_plan": self._plan_payload(self.session.last_presented_plan),
             "pending_discovery": self._discovery_request_payload(self.session.pending_discovery),

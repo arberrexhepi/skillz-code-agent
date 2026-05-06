@@ -8,7 +8,9 @@ import {
   buildPlannerActionMessage,
   buildReviewReport,
   combineSuggestedActions,
+  continuousModeOwnsLifecycle,
   groupLatestDiagnosticsByPath,
+  isContinuousModeActive,
   progressTimelineTarget,
   primaryPathForReview,
 } from './panelModel';
@@ -149,6 +151,23 @@ interface WorkerState extends JsonMap {
   latest_diagnostics?: LatestDiagnostics | null;
   latest_review?: LatestReview | null;
   suggested_next_actions?: WorkerSuggestedAction[];
+  protected_paths?: string[];
+}
+
+interface ContinuousModeState extends JsonMap {
+  enabled?: boolean;
+  status?: string;
+  cycle?: number;
+  max_cycles?: number;
+  active_issue_id?: string;
+  run_prompt?: string;
+  selected_discovery_mode?: string;
+  latest_review_decision?: string;
+  stop_reason?: string;
+  created_followup_issue_ids?: string[];
+  created_followup_issues?: JsonMap[];
+  completed_issue_ids?: string[];
+  completed_issues?: JsonMap[];
 }
 
 interface PlannerGoal extends JsonMap {
@@ -217,6 +236,7 @@ interface PlannerState extends JsonMap {
   executing_goal_count?: number;
   active_issue_id?: string;
   issue_state?: JsonMap;
+  continuous_mode?: ContinuousModeState;
   repo_facts_status_lines?: string[];
   planner_usage_summary?: string;
   suggested_next_actions?: PlannerSuggestedAction[];
@@ -900,6 +920,59 @@ class AgentPanel implements vscode.Disposable {
       return;
     }
 
+    if (type === 'createIssue') {
+      const summary = String(message.summary || message.request_summary || '').trim();
+      if (!summary) {
+        await this.panel?.webview.postMessage({ type: 'actionStatus', level: 'error', message: 'Enter issue details before creating an issue.' });
+        return;
+      }
+      const response = await this.bridge.plannerAction('create_issue', { summary });
+      if (!response.ok) {
+        throw new Error(String(response.message || 'Issue creation failed.'));
+      }
+      await this.panel?.webview.postMessage({ type: 'state', state: response.state });
+      return;
+    }
+
+    if (type === 'startContinuous' || type === 'start_continuous') {
+      const maxCycles = Math.max(1, Math.floor(Number(message.maxCycles || 1)));
+      const runPrompt = String(message.prompt || message.run_prompt || '').trim();
+      await this.panel?.webview.postMessage({
+        type: 'progress',
+        step: 0,
+        action_type: 'continuous_start_sent_ui',
+        path: '',
+        ok: true,
+        elapsed_s: 0,
+        thought: `Continuous mode start sent (${maxCycles} cycle${maxCycles === 1 ? '' : 's'}${runPrompt ? ' with prompt' : ''}).`,
+        summary: 'Extension host forwarding continuous mode start.',
+        diff: '',
+        replacements: 0,
+        added_lines: 0,
+        removed_lines: 0,
+        search_excerpt: '',
+        replace_excerpt: '',
+        inspected_file_count: 0,
+        inspected_files: [],
+        state: this.bridge.getState(),
+      });
+      const response = await this.bridge.plannerAction('start_continuous', { max_cycles: maxCycles, prompt: runPrompt });
+      if (!response.ok) {
+        throw new Error(String(response.message || 'Continuous mode failed to start.'));
+      }
+      await this.panel?.webview.postMessage({ type: 'state', state: response.state });
+      return;
+    }
+
+    if (type === 'stopContinuous' || type === 'stop_continuous') {
+      const response = await this.bridge.plannerAction('stop_continuous', {});
+      if (!response.ok) {
+        throw new Error(String(response.message || 'Continuous mode failed to stop.'));
+      }
+      await this.panel?.webview.postMessage({ type: 'state', state: response.state });
+      return;
+    }
+
     if (type === 'plannerAction') {
       const action = String(message.action || '').trim();
       const extras = typeof message.payload === 'object' && message.payload !== null ? { ...(message.payload as JsonMap) } : {};
@@ -1299,6 +1372,40 @@ class AgentPanel implements vscode.Disposable {
     .flow-meta { color: var(--muted); font-size: 12px; opacity: 0.8; }
     .flow-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
     .flow-actions button { font-size: 12px; padding: 5px 12px; font-weight: 500; }
+    .flow-actions input {
+      width: 58px;
+      min-width: 0;
+      padding: 4px 6px;
+      border-radius: var(--radius-sm);
+      border: 1px solid var(--divider);
+      background: var(--input-bg);
+      color: var(--text);
+      font-size: 12px;
+    }
+    .issue-create-form {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 6px;
+      align-items: center;
+      margin: 2px 0 10px;
+    }
+    .issue-create-form input {
+      min-width: 0;
+      padding: 6px 8px;
+      border-radius: var(--radius-sm);
+      border: 1px solid var(--divider);
+      background: var(--input-bg);
+      color: var(--text);
+      font-size: 12px;
+    }
+    .issue-create-form input:focus { border-color: var(--accent); outline: none; }
+    .auto-run-prompt {
+      width: 100%;
+      box-sizing: border-box;
+      min-height: 58px;
+      margin-top: 8px;
+      font-size: 12px;
+    }
     .compact-list { display: grid; gap: 3px; margin-top: 8px; }
     .compact-item {
       padding: 7px 10px;
@@ -1926,6 +2033,49 @@ class AgentPanel implements vscode.Disposable {
       const wa = (s.planner && s.planner.worker_state && s.planner.worker_state.suggested_next_actions) || [];
       return pa.map(a => ({ ...a, source: 'planner' })).concat(wa.map(a => ({ ...a, source: 'worker' })));
     }
+    function isContinuousModeActive(planner) {
+      const status = String(planner?.continuous_mode?.status || '').trim();
+      return !!(planner?.continuous_mode?.enabled || (status && !['idle', 'stopped'].includes(status)));
+    }
+    function continuousModeOwnsLifecycle(planner) {
+      const status = String(planner?.continuous_mode?.status || '').trim();
+      return ['selecting_issue', 'discovering', 'planning', 'approving', 'executing', 'reviewing', 'closing_issue', 'creating_followups'].includes(status);
+    }
+    function buildPlannerActionMessage(action) {
+      const payload = (typeof action.payload === 'object' && action.payload && !Array.isArray(action.payload)) ? { ...action.payload } : {};
+      if (typeof action.mode === 'string' && action.mode.trim()) { payload.mode = action.mode.trim(); }
+      if (typeof action.issue_id === 'string' && action.issue_id.trim()) { payload.issue_id = action.issue_id.trim(); }
+      if (typeof action.max_cycles === 'number' && Number.isFinite(action.max_cycles)) {
+        payload.max_cycles = Math.max(1, Math.floor(action.max_cycles));
+      }
+      return {
+        action: action.type,
+        mode: typeof action.mode === 'string' ? action.mode : undefined,
+        payload: Object.keys(payload).length ? payload : undefined,
+      };
+    }
+    function progressTimelineTarget(planner, pendingActionType) {
+      if (planner?.executing) { return 'plan'; }
+      if (planner?.pending_discovery || pendingActionType === 'select_discovery_mode') { return 'discovery'; }
+      if (isContinuousModeActive(planner)) { return 'plan'; }
+      return undefined;
+    }
+    function actionAllowedDuringContinuous(action) {
+      const type = String(action?.type || '').trim();
+      return [
+        'stop_continuous',
+        'create_issue',
+        'read_file',
+        'list_files',
+        'git_diff',
+        'show_diff',
+        'review_changes',
+        'list_issues',
+        'list_run_issues',
+        'show_issue',
+        'show_run_issue',
+      ].includes(type);
+    }
     function buildReviewReport(review) {
       if (!review || !review.action_type) { return null; }
       if (review.action_type === 'review_changes') {
@@ -2001,7 +2151,8 @@ class AgentPanel implements vscode.Disposable {
     }
 
     function buildLifecycleEntry(planner) {
-      const requestKey = String(planner.latest_request || '').trim();
+      const continuous = planner.continuous_mode || {};
+      const requestKey = String(planner.latest_request || continuous.active_issue_id || continuous.status || '').trim();
       if (!requestKey) {
         return null;
       }
@@ -2010,6 +2161,16 @@ class AgentPanel implements vscode.Disposable {
       const pendingDiscovery = planner.pending_discovery;
       const lastDiscovery = planner.last_discovery;
       const plan = planner.pending_plan || planner.last_presented_plan || planner.last_completed_plan;
+
+      if (isContinuousModeActive(planner) || continuous.stop_reason) {
+        rows.push({ label: 'Auto Mode', value: String(continuous.status || 'active') });
+        if (continuous.cycle || continuous.max_cycles) {
+          rows.push({ label: 'Cycle', value: String(continuous.cycle || 0) + '/' + String(continuous.max_cycles || '?') });
+        }
+        if (continuous.active_issue_id) { rows.push({ label: 'Issue', value: String(continuous.active_issue_id) }); }
+        if (continuous.selected_discovery_mode) { rows.push({ label: 'Discovery', value: String(continuous.selected_discovery_mode) }); }
+        if (continuous.latest_review_decision) { rows.push({ label: 'Review', value: String(continuous.latest_review_decision) }); }
+      }
 
       if (pendingDiscovery || lastDiscovery) {
         const discovery = lastDiscovery || pendingDiscovery || {};
@@ -2040,7 +2201,7 @@ class AgentPanel implements vscode.Disposable {
         }
       }
 
-      const outcome = planner.last_execution_summary || (lastDiscovery && lastDiscovery.final_message) || '';
+      const outcome = planner.last_execution_summary || (lastDiscovery && lastDiscovery.final_message) || (continuous.stop_reason ? 'Continuous mode stopped: ' + continuous.stop_reason : '');
       if (!rows.length && !outcome) {
         return null;
       }
@@ -2382,10 +2543,37 @@ class AgentPanel implements vscode.Disposable {
         : (Array.isArray(plannerIssueState.reopenable_issues) ? plannerIssueState.reopenable_issues : []);
       const totalFacts = Number(workerIssueState.total_fact_count || plannerIssueState.total_fact_count || 0);
       const hasDeleteSessionAction = actions.some(a => a.type === 'delete_session');
-      if (!activeIssue && !reopenableIssues.length && !hasDeleteSessionAction && totalFacts <= 0) { return null; }
+      const hasCreateIssueAction = actions.some(a => a.type === 'create_issue');
+      if (!activeIssue && !reopenableIssues.length && !hasDeleteSessionAction && !hasCreateIssueAction && totalFacts <= 0) { return null; }
 
       const card = el('div', 'flow-card lifecycle-card');
       card.appendChild(el('div', 'flow-title', 'Issues'));
+      if (hasCreateIssueAction) {
+        const form = el('form', 'issue-create-form');
+        const input = document.createElement('input');
+        input.type = 'text';
+        input.placeholder = 'Enter issue details';
+        input.setAttribute('aria-label', 'Issue details');
+        input.disabled = pendingAction;
+        const btn = el('button', 'primary', 'Create Issue');
+        btn.type = 'submit';
+        btn.disabled = pendingAction;
+        form.appendChild(input);
+        form.appendChild(btn);
+        form.addEventListener('submit', (event) => {
+          event.preventDefault();
+          if (pendingAction) { return; }
+          const summary = input.value.trim();
+          if (!summary) {
+            input.focus();
+            return;
+          }
+          lockButtons('create_issue');
+          render();
+          debugAndPost({ type: 'createIssue', summary });
+        });
+        card.appendChild(form);
+      }
       if (totalFacts > 0) {
         card.appendChild(el('div', 'flow-meta', totalFacts + ' durable fact' + (totalFacts === 1 ? '' : 's') + ' tracked across issues'));
       }
@@ -2399,6 +2587,10 @@ class AgentPanel implements vscode.Disposable {
         const closeRow = el('div', 'flow-actions');
         const closeButton = el('button', 'secondary', 'Close Active Issue');
         closeButton.type = 'button';
+        if (continuousModeOwnsLifecycle(planner)) {
+          closeButton.disabled = true;
+          closeButton.title = 'Continuous mode will close or keep issues after review.';
+        }
         closeButton.addEventListener('click', () => {
           unlockButtons();
           lockButtons('close_issue');
@@ -2439,6 +2631,10 @@ class AgentPanel implements vscode.Disposable {
           const issueId = String(action.issue_id || '').trim();
           if (!issueId) { continue; }
           const btn = el('button', action.style === 'primary' ? 'primary' : (action.style === 'ghost' ? 'ghost' : ''), action.label || action.type);
+          if (continuousModeOwnsLifecycle(planner)) {
+            btn.disabled = true;
+            btn.title = 'Continuous mode is selecting issues automatically.';
+          }
           btn.addEventListener('click', () => {
             submitPromptThroughChat('reopen ' + issueId);
           });
@@ -2451,6 +2647,10 @@ class AgentPanel implements vscode.Disposable {
       if (deleteSessionAction) {
         const row = el('div', 'flow-actions');
         const btn = el('button', deleteSessionAction.style === 'primary' ? 'primary' : (deleteSessionAction.style === 'ghost' ? 'ghost' : ''), deleteSessionAction.label || 'Delete Session');
+        if (continuousModeOwnsLifecycle(planner)) {
+          btn.disabled = true;
+          btn.title = 'Stop continuous mode before deleting session state.';
+        }
         btn.addEventListener('click', () => {
           postAction(deleteSessionAction);
         });
@@ -2565,6 +2765,9 @@ class AgentPanel implements vscode.Disposable {
 
     function postAction(action) {
       if (pendingAction) { return; }
+      if (continuousModeOwnsLifecycle(state.planner || {}) && !actionAllowedDuringContinuous(action)) {
+        return;
+      }
       if (action.requires_confirmation) {
         const confirmationPrompt = String(action.confirmation_prompt || action.confirmationPrompt || 'Proceed with this action?');
         const confirmed = window.confirm(confirmationPrompt);
@@ -2588,7 +2791,27 @@ class AgentPanel implements vscode.Disposable {
       const row = el('div', 'flow-actions');
       for (const action of actions) {
         const btn = el('button', action.style === 'primary' ? 'primary' : (action.style === 'ghost' ? 'ghost' : ''), action.label || action.type);
-        btn.addEventListener('click', () => postAction(action));
+        btn.type = 'button';
+        if (action.type === 'start_continuous') {
+          btn.dataset.continuousAction = 'start';
+          btn.dataset.maxCycles = String(action.max_cycles || (action.payload && action.payload.max_cycles) || 1);
+        } else if (action.type === 'stop_continuous') {
+          btn.dataset.continuousAction = 'stop';
+        }
+        if (continuousModeOwnsLifecycle(state.planner || {}) && !actionAllowedDuringContinuous(action)) {
+          btn.disabled = true;
+          btn.title = 'Continuous mode owns the lifecycle right now.';
+        }
+        if (action.type === 'start_continuous') {
+          btn.addEventListener('click', () => {
+            const cycles = Math.max(1, Math.min(25, Math.floor(Number(action.max_cycles || action.maxCycles || 1) || 1)));
+            debugAndPost({ type: 'startContinuous', maxCycles: cycles, prompt: '' });
+          });
+        } else if (action.type === 'stop_continuous') {
+          btn.addEventListener('click', () => submitPromptThroughChat('/stop-auto'));
+        } else {
+          btn.addEventListener('click', () => postAction(action));
+        }
         row.appendChild(btn);
       }
       return row;
@@ -2605,6 +2828,10 @@ class AgentPanel implements vscode.Disposable {
       for (const choice of choices) {
         const btn = el('button', choice.style === 'primary' ? 'primary' : (choice.style === 'ghost' ? 'ghost' : ''), choice.label);
         btn.type = 'button';
+        if (continuousModeOwnsLifecycle(state.planner || {})) {
+          btn.disabled = true;
+          btn.title = 'Continuous mode is choosing discovery automatically.';
+        }
         btn.addEventListener('click', () => {
           submitPromptThroughChat(choice.text);
         });
@@ -2623,6 +2850,10 @@ class AgentPanel implements vscode.Disposable {
       for (const choice of choices) {
         const btn = el('button', choice.style === 'primary' ? 'primary' : (choice.style === 'ghost' ? 'ghost' : ''), choice.label);
         btn.type = 'button';
+        if (continuousModeOwnsLifecycle(state.planner || {})) {
+          btn.disabled = true;
+          btn.title = 'Continuous mode auto-approves or stops on policy gates.';
+        }
         btn.addEventListener('click', () => {
           submitPromptThroughChat(choice.text);
         });
@@ -2651,6 +2882,153 @@ class AgentPanel implements vscode.Disposable {
     function scopeBadge(scope) {
       const colors = { write: '#4e9a06', read: '#3465a4', validation: '#c18616', mixed: '#75507b' };
       return '<span style="display:inline-block;padding:1px 6px;border-radius:4px;font-size:11px;font-weight:600;background:' + (colors[scope] || colors.mixed) + '22;color:' + (colors[scope] || colors.mixed) + ';">' + (scope || 'write') + '</span>';
+    }
+
+    function issueLookupById(planner) {
+      const lookup = {};
+      const states = [
+        planner.issue_state || {},
+        (planner.worker_state || {}).issue_state || {},
+      ];
+      for (const issueState of states) {
+        const activeIssue = issueState.active_issue;
+        if (activeIssue && activeIssue.issue_id) {
+          lookup[String(activeIssue.issue_id)] = activeIssue;
+        }
+        for (const key of ['issues', 'reopenable_issues']) {
+          const issues = Array.isArray(issueState[key]) ? issueState[key] : [];
+          for (const issue of issues) {
+            if (issue && issue.issue_id) {
+              lookup[String(issue.issue_id)] = issue;
+            }
+          }
+        }
+      }
+      return lookup;
+    }
+
+    function followupIssueItems(planner) {
+      const continuous = planner.continuous_mode || {};
+      const lookup = issueLookupById(planner);
+      const byId = {};
+      const items = [];
+      const richFollowups = Array.isArray(continuous.created_followup_issues) ? continuous.created_followup_issues : [];
+      for (const item of richFollowups) {
+        if (!item || !item.issue_id) { continue; }
+        const issueId = String(item.issue_id);
+        const merged = { ...(lookup[issueId] || {}), ...item };
+        byId[issueId] = merged;
+        items.push(merged);
+      }
+      const ids = Array.isArray(continuous.created_followup_issue_ids) ? continuous.created_followup_issue_ids.filter(Boolean) : [];
+      for (const issueIdRaw of ids) {
+        const issueId = String(issueIdRaw);
+        if (byId[issueId]) { continue; }
+        const issue = lookup[issueId] || { issue_id: issueId };
+        items.push(issue);
+      }
+      return items;
+    }
+
+    function buildContinuousModeCard(planner, actions) {
+      const continuous = planner.continuous_mode || {};
+      const worker = planner.worker_state || {};
+      const active = isContinuousModeActive(planner);
+      const hasStartAction = actions.some(a => a.type === 'start_continuous');
+      const hasStopAction = actions.some(a => a.type === 'stop_continuous');
+      if (!active && !hasStartAction && !hasStopAction && !continuous.stop_reason) { return null; }
+
+      const card = el('div', 'flow-card lifecycle-card');
+      card.appendChild(el('div', 'flow-title', 'Continuous Mode'));
+
+      const status = String(continuous.status || (active ? 'running' : 'stopped'));
+      const statusRow = el('div', 'phase-row');
+      statusRow.appendChild(el('span', 'phase-label ' + (active ? 'active' : 'muted-phase'), active ? 'Active' : 'Stopped'));
+      const cycle = Number(continuous.cycle || 0);
+      const maxCycles = Number(continuous.max_cycles || 0);
+      const cycleText = maxCycles > 0 ? ' cycle ' + cycle + '/' + maxCycles : '';
+      statusRow.appendChild(el('span', 'phase-body', status + cycleText));
+      card.appendChild(statusRow);
+
+      const rows = [
+        ['Prompt', continuous.run_prompt],
+        ['Issue', continuous.active_issue_id],
+        ['Discovery', continuous.selected_discovery_mode],
+        ['Review', continuous.latest_review_decision],
+        ['Stop Reason', continuous.stop_reason],
+      ];
+      for (const [label, value] of rows) {
+        if (!value) { continue; }
+        const row = el('div', 'phase-row');
+        row.appendChild(el('span', 'phase-label muted-phase', label));
+        row.appendChild(el('span', 'phase-body', String(value)));
+        card.appendChild(row);
+      }
+
+      const protectedPaths = Array.isArray(worker.protected_paths) ? worker.protected_paths : [];
+      if (protectedPaths.length) {
+        card.appendChild(el('div', 'flow-meta', 'Protected: ' + protectedPaths.join(', ')));
+      }
+
+      const followups = followupIssueItems(planner);
+      if (followups.length) {
+        card.appendChild(el('div', 'flow-meta', 'Follow-up Issues'));
+        const list = el('div', 'compact-list');
+        for (const issue of followups.slice(0, 6)) {
+          const issueId = String(issue.issue_id || '').trim();
+          const summary = String(issue.plan_summary || issue.request_summary || issue.source_excerpt || '').trim();
+          list.appendChild(el('div', 'compact-item', issueId + (summary ? ': ' + summary : '')));
+        }
+        card.appendChild(list);
+      }
+
+      const completed = Array.isArray(continuous.completed_issues) ? continuous.completed_issues : [];
+      if (completed.length) {
+        card.appendChild(el('div', 'flow-meta', 'Completed This Run'));
+        const list = el('div', 'compact-list');
+        for (const issue of completed.slice(0, 6)) {
+          const issueId = String(issue.issue_id || '').trim();
+          const summary = String(issue.plan_summary || issue.request_summary || '').trim();
+          list.appendChild(el('div', 'compact-item', issueId + (summary ? ': ' + summary : '')));
+        }
+        card.appendChild(list);
+      }
+
+      const row = el('div', 'flow-actions');
+      if (active || hasStopAction) {
+        const stopAction = actions.find(a => a.type === 'stop_continuous') || { type: 'stop_continuous', label: 'Stop Continuous', source: 'planner' };
+        const stop = el('button', 'secondary', stopAction.label || 'Stop Continuous');
+        stop.type = 'button';
+        stop.addEventListener('click', () => {
+          submitPromptThroughChat('/stop-auto');
+        });
+        row.appendChild(stop);
+      } else {
+        const prompt = document.createElement('textarea');
+        prompt.className = 'issue-create-input auto-run-prompt';
+        prompt.rows = 3;
+        prompt.placeholder = 'Optional: describe what this auto run should build or fix';
+        prompt.value = String(continuous.run_prompt || '');
+        const label = el('span', 'flow-meta', 'Cycles');
+        const input = document.createElement('input');
+        input.type = 'number';
+        input.min = '1';
+        input.max = '25';
+        input.step = '1';
+        input.value = String(Math.max(1, Number(continuous.max_cycles || 1)));
+        const start = el('button', 'primary', 'Start Continuous');
+        start.type = 'button';
+        start.addEventListener('click', () => {
+          const cycles = Math.max(1, Math.min(25, Math.floor(Number(input.value) || 1)));
+          debugAndPost({ type: 'startContinuous', maxCycles: cycles, prompt: prompt.value || '' });
+        });
+        card.appendChild(prompt);
+        row.appendChild(label);
+        row.appendChild(input);
+        row.appendChild(start);
+      }
+      card.appendChild(row);
+      return card;
     }
 
     function buildUnifiedDiscoveryCard(planner, actions) {
@@ -2888,6 +3266,7 @@ class AgentPanel implements vscode.Disposable {
       const workerIssueState = (planner.worker_state || {}).issue_state || {};
       const hasIssueState = !!((workerIssueState.active_issue || plannerIssueState.active_issue) || ((workerIssueState.reopenable_issues || plannerIssueState.reopenable_issues || []).length));
       const discoveryActive = !!(planner.pending_discovery && !planner.last_discovery);
+      if (isContinuousModeActive(planner)) { return 'continuous'; }
       if (discoveryActive) { return 'discovery'; }
       if (planner.pending_plan || planner.executing || planner.last_execution_summary || planner.last_completed_plan || planner.last_presented_plan) { return 'plan'; }
       if (planner.last_discovery) { return 'discovery'; }
@@ -2897,11 +3276,13 @@ class AgentPanel implements vscode.Disposable {
 
     function buildLifecycleDock(planner, actions) {
       const tabs = [];
+      const continuousCard = buildContinuousModeCard(planner, actions);
       const discoveryCard = buildUnifiedDiscoveryCard(planner, actions);
       const planCard = buildUnifiedPlanCard(planner, actions);
       const issuesCard = buildIssuesCard(planner, actions);
       const factsCard = buildFactsCard(planner);
       const runtimeCard = buildRuntimeCard();
+      if (continuousCard) { tabs.push({ id: 'continuous', label: 'Auto', node: continuousCard }); }
       if (discoveryCard) { tabs.push({ id: 'discovery', label: 'Discovery', node: discoveryCard }); }
       if (planCard) { tabs.push({ id: 'plan', label: 'Plan', node: planCard }); }
       if (issuesCard) { tabs.push({ id: 'issues', label: 'Issues', node: issuesCard }); }
@@ -3075,7 +3456,7 @@ class AgentPanel implements vscode.Disposable {
       }
 
       /* Fallback: actions with no other state — suppress when dock handles actions */
-      const lifecycleActions = new Set(['approve_plan', 'reject_plan', 'reset', 'discovery_quick', 'discovery_moderate', 'discovery_deep', 'skip_discovery', 'reopen_issue']);
+      const lifecycleActions = new Set(['approve_plan', 'reject_plan', 'reset', 'discovery_quick', 'discovery_moderate', 'discovery_deep', 'skip_discovery', 'create_issue', 'reopen_issue', 'start_continuous', 'stop_continuous']);
       const nonLifecycleActions = actions.filter(a => !lifecycleActions.has(a.type));
       if (!cards.length && nonLifecycleActions.length && state.last_message && !hasDockVisible) {
         cards.push(flowCard({
@@ -3128,7 +3509,7 @@ class AgentPanel implements vscode.Disposable {
 
       /* Filter transcript: when lifecycle cards are visible, keep the transcript up to the last user turn only. */
       const planner = state.planner || {};
-      const hasLifecycleCard = !!(planner.pending_discovery || planner.last_discovery || planner.pending_plan || planner.executing || planner.last_execution_summary);
+      const hasLifecycleCard = !!(isContinuousModeActive(planner) || planner.pending_discovery || planner.last_discovery || planner.pending_plan || planner.executing || planner.last_execution_summary);
       let items = transcript;
       if (hasLifecycleCard && transcript.length) {
         let lastUserIndex = -1;

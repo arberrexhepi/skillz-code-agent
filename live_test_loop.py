@@ -21,7 +21,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 # Load .env without overriding existing variables.
 env_path = Path(__file__).parent / ".env"
@@ -43,7 +43,16 @@ from main import (  # noqa: E402
     extract_first_json_object,
     refresh_runtime_provider_catalog_once,
 )
-from issue_facts import FACT_TYPE_ARCHITECTURE, FACT_TYPE_GOAL, IssueFactLedger, IssueFactRecord  # noqa: E402
+from issue_facts import (  # noqa: E402
+    FACT_TYPE_ARCHITECTURE,
+    FACT_TYPE_GOAL,
+    IssueFactLedger,
+    IssueFactRecord,
+    format_issue_not_found,
+    format_issue_record_detail,
+    format_issue_summary_list,
+    issue_summaries_from_payload,
+)
 from planner import PlannerAgent, interactive_planner_loop  # noqa: E402
 from runtime_catalog import runtime_options_payload  # noqa: E402
 from skill_loader import load_markdown_skills_from_dir  # noqa: E402
@@ -202,6 +211,7 @@ class TreeLoopPlannerWorker:
         self._pending_verification: Optional[Dict[str, Any]] = None
         self._patch_resolution: Optional[Dict[str, Any]] = None
         self._discovery_remediation: Optional[Dict[str, Any]] = None
+        self._stale_issue_ids: Set[str] = set()
         self._pending_npm_command: Optional[Dict[str, Any]] = None
         self._edit_batch_mode = False
         self._edit_batch_pending: Dict[str, Dict[str, Any]] = {}
@@ -225,6 +235,17 @@ class TreeLoopPlannerWorker:
         }
         self.loop = self._build_loop(model)
         self.history = self.loop.history
+        self._sync_fact_map()
+
+    def _reload_repo_facts(self) -> None:
+        try:
+            ledger = IssueFactLedger.load(self._repo_facts_path())
+        except Exception:
+            return
+        self.issue_ledger = ledger
+        self._repo_facts_loaded_count = self.issue_ledger.total_fact_count()
+        active_issue = self.issue_ledger.active_issue()
+        self.active_issue_id = active_issue.issue_id if active_issue is not None else ""
         self._sync_fact_map()
 
     def _build_loop(self, model: Any) -> TreeLoop:
@@ -436,6 +457,18 @@ class TreeLoopPlannerWorker:
     def discovery_remediation_state(self) -> Optional[Dict[str, Any]]:
         return dict(self._discovery_remediation) if isinstance(self._discovery_remediation, dict) else None
 
+    def _mark_stale_issue_id(self, issue_id: str) -> None:
+        normalized = str(issue_id or "").strip()
+        if not normalized:
+            return
+        self._stale_issue_ids.add(normalized)
+        if isinstance(self._discovery_remediation, dict):
+            remediation_issue_id = str(self._discovery_remediation.get("issue_id", "") or "").strip()
+            diagnostic_issue_id = str(self._discovery_remediation.get("diagnostic_issue_id", "") or "").strip()
+            if normalized in {remediation_issue_id, diagnostic_issue_id}:
+                self._discovery_remediation = None
+        self._refresh_loop_steering()
+
     def edit_batch_state(self) -> Dict[str, Any]:
         queued_paths = sorted(self._edit_batch_pending.keys())
         return {
@@ -486,9 +519,9 @@ class TreeLoopPlannerWorker:
             if issue_id:
                 focused_block.append(f"s{len(focused_block) + 1}: show-issue {issue_id}")
             if not focused_block:
-                focused_block.append("s1: list-issues")
+                focused_block.append("s1: list-run-issues")
             issue_block: List[str] = ["s1: list-issues"]
-            if issue_id:
+            if issue_id and issue_id not in self._stale_issue_ids:
                 issue_block.append(f"s2: show-issue {issue_id}")
             return {
                 "mode": "discovery_remediation",
@@ -564,10 +597,12 @@ class TreeLoopPlannerWorker:
             "finish",
             "git_diff",
             "list_issues",
+            "list_run_issues",
             "read_file",
             "reject_npm_command",
             "review_changes",
             "show_issue",
+            "show_run_issue",
             "show_diff",
         }
 
@@ -611,6 +646,7 @@ class TreeLoopPlannerWorker:
         }
 
     def execute_operator_action(self, action: Dict[str, Any], *, thought: str = "Operator action from extension UI.") -> ActionResult:
+        self._reload_repo_facts()
         if not isinstance(action, dict):
             return ActionResult(ok=False, name="operator_action", payload={"error": "Action must be an object."})
 
@@ -647,35 +683,70 @@ class TreeLoopPlannerWorker:
                 },
             )
 
-        if action_type == "list_issues":
+        if action_type in {"list_issues", "list_run_issues"}:
             issues = self.loop.bridge.tree.list_log_issues()
-            summary = self.loop.bridge.tree.format_log_issue_list(issues)
+            durable_state = self.issue_ledger.planner_payload(path=str(self._repo_facts_path()))
+            self._maybe_resolve_discovery_remediation(action_type)
+            summary_parts: List[str] = []
+            if issues:
+                summary_parts.append(self.loop.bridge.tree.format_log_issue_list(issues))
+            if action_type == "list_issues" and issue_summaries_from_payload(durable_state):
+                summary_parts.append(format_issue_summary_list(durable_state))
+            if not summary_parts:
+                summary_parts.append("(no run issues)" if action_type == "list_run_issues" else "(no run issues and no durable repo_facts issues)")
+            summary = "\n\n".join(summary_parts)
             return ActionResult(
                 ok=True,
                 name=action_type,
                 payload={
-                    "message": f"Listed {len(issues)} issue(s).",
+                    "message": f"Listed {len(issues)} run issue(s) and {len(issue_summaries_from_payload(durable_state))} durable issue(s).",
                     "summary": summary,
                     "issues": issues,
+                    "durable_issues": issue_summaries_from_payload(durable_state),
                 },
             )
 
-        if action_type == "show_issue":
+        if action_type in {"show_issue", "show_run_issue"}:
             issue_id = str(action.get("issue_id", "") or action.get("id", "") or "").strip()
             if not issue_id:
                 return ActionResult(ok=False, name=action_type, payload={"error": "show_issue requires issue_id"})
             issue = self.loop.bridge.tree.show_log_issue(issue_id)
-            self._maybe_resolve_discovery_remediation(action_type, issue_id=issue_id)
-            summary = self.loop.bridge.tree.format_log_issue_detail(issue) if issue else f"Issue not found: {issue_id}"
+            durable_issue = None if action_type == "show_run_issue" else self.issue_ledger.get_issue(issue_id)
+            durable_state = self.issue_ledger.planner_payload(path=str(self._repo_facts_path()))
+            found = issue is not None or durable_issue is not None
+            if found:
+                self._maybe_resolve_discovery_remediation(action_type, issue_id=issue_id)
+            else:
+                remediation_issue_id = str((self._discovery_remediation or {}).get("issue_id", "") or "").strip()
+                remediation_diagnostic_issue_id = str((self._discovery_remediation or {}).get("diagnostic_issue_id", "") or "").strip()
+                if (
+                    (remediation_issue_id and remediation_issue_id == issue_id)
+                    or (remediation_diagnostic_issue_id and remediation_diagnostic_issue_id == issue_id)
+                ):
+                    self._discovery_remediation = None
+                    self._refresh_loop_steering()
+            if issue is not None:
+                summary = self.loop.bridge.tree.format_log_issue_detail(issue)
+            elif durable_issue is not None:
+                summary = format_issue_record_detail(durable_issue)
+            else:
+                summary = format_issue_not_found(issue_id, durable_state)
+                self._mark_stale_issue_id(issue_id)
             return ActionResult(
-                ok=bool(issue),
+                ok=True,
                 name=action_type,
                 payload={
-                    "message": f"Loaded {issue_id}." if issue else f"Issue not found: {issue_id}",
+                    "message": f"Loaded {issue_id}." if found else f"Issue not found: {issue_id}; returned available durable issues for recovery.",
                     "summary": summary,
                     "issue": issue,
+                    "durable_issue": durable_issue.summary() if durable_issue is not None else None,
                     "next_reads": self.loop.bridge.tree.log_issue_read_commands(issue) if issue else [],
                     "issue_id": issue_id,
+                    "available_issue_ids": [
+                        str(item.get("issue_id", "") or "")
+                        for item in issue_summaries_from_payload(durable_state)
+                        if str(item.get("issue_id", "") or "").strip()
+                    ][:20],
                 },
             )
 
@@ -771,6 +842,40 @@ class TreeLoopPlannerWorker:
         self._sync_fact_map()
         return issue.summary()
 
+    def create_issue(
+        self,
+        *,
+        request_summary: str,
+        plan_summary: str = "",
+        source: str = "",
+        parent_issue_id: str = "",
+        source_excerpt: str = "",
+        priority: int = 0,
+        activate: bool = True,
+    ) -> Dict[str, Any]:
+        duplicate = self.issue_ledger.find_duplicate_issue(
+            request_summary=request_summary,
+            source=source,
+            parent_issue_id=parent_issue_id,
+        )
+        issue = duplicate or self.issue_ledger.create_issue(
+            request_summary=request_summary,
+            plan_summary=plan_summary,
+            source=source,
+            parent_issue_id=parent_issue_id,
+            source_excerpt=source_excerpt,
+            priority=priority,
+            activate=activate,
+        )
+        if activate:
+            issue.status = "open"
+            issue.closed_at = ""
+            self.issue_ledger.active_issue_id = issue.issue_id
+            self.active_issue_id = issue.issue_id
+        self._persist_repo_facts()
+        self._sync_fact_map()
+        return issue.summary()
+
     def close_active_issue(self, *, note: str = "") -> Optional[Dict[str, Any]]:
         issue = self.issue_ledger.close_active_issue(note=note)
         self.active_issue_id = ""
@@ -801,7 +906,15 @@ class TreeLoopPlannerWorker:
         self._edit_batch_last_failure = None
         return issue.summary()
 
+    def activate_issue(self, issue_id: str) -> Dict[str, Any]:
+        issue = self.issue_ledger.activate_issue(str(issue_id or "").strip())
+        self.active_issue_id = issue.issue_id
+        self._persist_repo_facts()
+        self._sync_fact_map()
+        return issue.summary()
+
     def run_task(self, task: str) -> WorkerRunResult:
+        self._reload_repo_facts()
         self._current_task = str(task or "").strip()
         self._reset_guard_state(clear_budget_usage=False)
         self._run_sequence += 1
@@ -978,6 +1091,17 @@ class TreeLoopPlannerWorker:
             )
         if self.goal_fact_keys:
             parts.append("Prioritize these repo fact keys when relevant: " + ", ".join(self.goal_fact_keys))
+        parts.append(
+            "Issue lifecycle: treat closed durable repo_facts issues as historical context only. "
+            "Do not reopen a closed issue unless the task explicitly requires that exact issue; prefer continuing an open issue or creating a new follow-up issue."
+        )
+        if self._stale_issue_ids:
+            stale = ", ".join(sorted(self._stale_issue_ids)[:8])
+            parts.append(
+                "Stale issue ids forbidden this run: "
+                + stale
+                + ". Do not call show-issue or show-run-issue for these ids again. Use list-issues, list-run-issues, an available durable issue id, or a focused file read instead."
+            )
         if self.discovery_budget is not None:
             parts.append(
                 "\n".join(
@@ -1150,6 +1274,7 @@ class TreeLoopPlannerWorker:
         self._write_observability_snapshot(final_message=final_message, finished=True)
 
     def _status_payload(self) -> Dict[str, Any]:
+        self._reload_repo_facts()
         payload: Dict[str, Any] = {
             "task_satisfied": self._task_satisfied,
             "completion_check_pending": self._completion_check_pending,
@@ -1357,16 +1482,26 @@ class TreeLoopPlannerWorker:
             return
         focus = issues[0]
         path = str(focus.get("file", "") or "").strip().removeprefix("/repo/").removeprefix("repo/")
-        issue_id = str(focus.get("id", "") or "").strip()
+        diagnostic_issue_id = str(focus.get("id", "") or "").strip()
+        active_issue = self.issue_ledger.active_issue()
+        current_issue_id = (
+            active_issue.issue_id
+            if active_issue is not None
+            else str(self.active_issue_id or "").strip()
+        )
+        issue_id = current_issue_id
         next_required_action: Dict[str, Any]
         if path:
             next_required_action = {"type": "read_file", "path": path}
-        else:
+        elif issue_id:
             next_required_action = {"type": "show_issue", "issue_id": issue_id}
+        else:
+            next_required_action = {"type": "list_issues"}
         self._discovery_remediation = {
             "task": self._current_task,
             "source_action_type": str(source_action or "").strip(),
             "issue_id": issue_id,
+            "diagnostic_issue_id": diagnostic_issue_id,
             "path": path,
             "classification": str(focus.get("classification", "") or "").strip(),
             "summary": str(focus.get("summary", "") or focus.get("message", "") or "").strip(),
@@ -1384,8 +1519,10 @@ class TreeLoopPlannerWorker:
         if action_type in {"drop_context", "git_diff", "show_diff", "review_changes", "run_check", "run_route_check"}:
             return None
         target = str((self._discovery_remediation or {}).get("path", "") or (self._discovery_remediation or {}).get("issue_id", "") or "the surfaced issue")
+        if action_type == "list_issues" and target == "the surfaced issue":
+            return None
         return (
-            f"discovery remediation active: inspect {target} with read_file or show_issue before mutating or finishing"
+            f"discovery remediation active: inspect {target} with read_file, show_issue, or show_run_issue before mutating or finishing"
         )
 
     def _maybe_resolve_discovery_remediation(self, action_type: str, path: str = "", issue_id: str = "") -> bool:
@@ -1394,12 +1531,21 @@ class TreeLoopPlannerWorker:
 
         resolution_path = str((self._discovery_remediation or {}).get("path", "") or "").strip()
         resolution_issue_id = str((self._discovery_remediation or {}).get("issue_id", "") or "").strip()
+        diagnostic_issue_id = str((self._discovery_remediation or {}).get("diagnostic_issue_id", "") or "").strip()
         normalized_path = str(path or "").strip().removeprefix("/repo/").removeprefix("repo/")
         resolved = False
         if action_type == "read_file":
             resolved = bool(normalized_path and resolution_path and normalized_path == resolution_path)
         elif action_type == "show_issue":
-            resolved = bool(issue_id and resolution_issue_id and issue_id == resolution_issue_id)
+            resolved = bool(
+                issue_id
+                and (
+                    (resolution_issue_id and issue_id == resolution_issue_id)
+                    or (diagnostic_issue_id and issue_id == diagnostic_issue_id)
+                )
+            )
+        elif action_type == "list_issues":
+            resolved = not resolution_path and not resolution_issue_id
 
         if not resolved:
             return False
@@ -1630,15 +1776,22 @@ class TreeLoopPlannerWorker:
             return
 
         if result.command_type == "read":
+            normalized_command = str(command or "").strip()
+            if normalized_command.startswith("[") and "] " in normalized_command:
+                normalized_command = normalized_command.split("] ", 1)[1].strip()
             read_path = self._extract_read_path(command)
             shown_issue_id = self._extract_shown_issue_id(command)
             pending_path = str((self._pending_verification or {}).get("path", "") or "")
             if read_path and pending_path and read_path == pending_path:
                 self._mark_path_validated(read_path)
+            if shown_issue_id and "Issue not found:" in str(result.output or ""):
+                self._mark_stale_issue_id(shown_issue_id)
             self._maybe_resolve_patch_resolution("read_file", read_path)
             self._maybe_resolve_discovery_remediation("read_file", read_path)
             if shown_issue_id:
                 self._maybe_resolve_discovery_remediation("show_issue", issue_id=shown_issue_id)
+            elif normalized_command in {"list-issues", "list-run-issues"}:
+                self._maybe_resolve_discovery_remediation("list_issues")
             self._emit_step_progress(command, result)
             return
 
@@ -1819,7 +1972,7 @@ class TreeLoopPlannerWorker:
         normalized = str(command or "").strip()
         if normalized.startswith("[") and "] " in normalized:
             normalized = normalized.split("] ", 1)[1].strip()
-        if normalized.startswith("show-issue "):
+        if normalized.startswith("show-issue ") or normalized.startswith("show-run-issue "):
             parts = normalized.split()
             if len(parts) >= 2:
                 return str(parts[1] or "").strip()
@@ -1884,10 +2037,15 @@ class TreeLoopPlannerWorker:
         if action_type == "show_issue":
             issue_id = str(action.get("issue_id", "") or action.get("id", "") or "").strip()
             return f"Show Issue {issue_id}" if issue_id else "Show Issue"
+        if action_type == "show_run_issue":
+            issue_id = str(action.get("issue_id", "") or action.get("id", "") or "").strip()
+            return f"Show Run Issue {issue_id}" if issue_id else "Show Run Issue"
         if action_type == "close_active_issue":
             return "Close Active Issue"
         if action_type == "list_issues":
             return "List Issues"
+        if action_type == "list_run_issues":
+            return "List Run Issues"
         if action_type == "approve_npm_command":
             return "Approve NPM Command"
         if action_type == "reject_npm_command":
@@ -1955,9 +2113,10 @@ class TreeLoopPlannerWorker:
             suggestions.append({"type": "read_file", "path": path})
             suggestions.append({"type": "show_diff", "path": path})
             suggestions.append({"type": "review_changes", "path": path, "limit": 20})
-        if issue_id:
+        if issue_id and issue_id not in self._stale_issue_ids:
             suggestions.append({"type": "show_issue", "issue_id": issue_id})
         suggestions.append({"type": "list_issues"})
+        suggestions.append({"type": "list_run_issues"})
         suggestions.append({"type": "drop_context", "reason": "Reset discovery remediation"})
 
         unique: List[Dict[str, Any]] = []

@@ -5,7 +5,9 @@ import {
   buildPlannerActionMessage,
   buildReviewReport,
   combineSuggestedActions,
+  continuousModeOwnsLifecycle,
   groupLatestDiagnosticsByPath,
+  isContinuousModeActive,
   progressTimelineTarget,
   primaryPathForReview,
   type BridgeState,
@@ -107,6 +109,37 @@ test('buildPlannerActionMessage preserves discovery mode payloads', () => {
   assert.equal(message.action, 'select_discovery_mode');
   assert.equal(message.mode, 'moderate');
   assert.deepEqual(message.payload, { mode: 'moderate' });
+});
+
+test('buildPlannerActionMessage forwards bounded continuous mode cycles', () => {
+  const message = buildPlannerActionMessage({
+    type: 'start_continuous',
+    max_cycles: 3,
+    label: 'Start Auto',
+    source: 'planner',
+  });
+
+  assert.equal(message.action, 'start_continuous');
+  assert.deepEqual(message.payload, { max_cycles: 3 });
+});
+
+test('buildPlannerActionMessage preserves existing payload fields', () => {
+  const message = buildPlannerActionMessage({
+    type: 'start_continuous',
+    payload: { max_cycles: 2, origin: 'continuous-card' },
+    label: 'Start Auto',
+    source: 'planner',
+  });
+
+  assert.equal(message.action, 'start_continuous');
+  assert.deepEqual(message.payload, { max_cycles: 2, origin: 'continuous-card' });
+});
+
+test('continuous mode helpers distinguish active ownership from stopped state', () => {
+  assert.equal(isContinuousModeActive({ continuous_mode: { status: 'stopped', enabled: false } }), false);
+  assert.equal(isContinuousModeActive({ continuous_mode: { status: 'reviewing', enabled: false } }), true);
+  assert.equal(continuousModeOwnsLifecycle({ continuous_mode: { status: 'reviewing' } }), true);
+  assert.equal(continuousModeOwnsLifecycle({ continuous_mode: { status: 'stopped' } }), false);
 });
 
 test('progressTimelineTarget preserves discovery routing while action remains pending', () => {

@@ -176,6 +176,7 @@ FILESYSTEM_MUTATION_ACTION_TYPES = {
     "fill_template",
 }
 MUTATION_ACTION_TYPES = TEXT_MUTATION_ACTION_TYPES | STRUCTURAL_MUTATION_ACTION_TYPES | FILESYSTEM_MUTATION_ACTION_TYPES
+PROTECTED_REPO_PATHS = {"INTENT.md"}
 DISCOVERY_ACTION_TYPES = {
     "list_files",
     "read_file",
@@ -1900,6 +1901,7 @@ class WorkingFolderAgent:
             "available_skills": self._available_skills_payload(),
             "suggested_next_actions": self._runtime_suggested_next_actions(),
             "backoff": self.get_backoff_state(),
+            "protected_paths": sorted(PROTECTED_REPO_PATHS),
         }
 
     def _issue_state_payload(self) -> Dict[str, Any]:
@@ -1917,6 +1919,39 @@ class WorkingFolderAgent:
             plan_summary=str(plan_summary or "").strip(),
             reuse_issue_id=str(reuse_issue_id or "").strip(),
         )
+        self._persist_repo_facts()
+        self._clear_facts()
+        return issue.summary()
+
+    def create_issue(
+        self,
+        *,
+        request_summary: str,
+        plan_summary: str = "",
+        source: str = "",
+        parent_issue_id: str = "",
+        source_excerpt: str = "",
+        priority: int = 0,
+        activate: bool = True,
+    ) -> Dict[str, Any]:
+        duplicate = self.issue_ledger.find_duplicate_issue(
+            request_summary=request_summary,
+            source=source,
+            parent_issue_id=parent_issue_id,
+        )
+        issue = duplicate or self.issue_ledger.create_issue(
+            request_summary=request_summary,
+            plan_summary=plan_summary,
+            source=source,
+            parent_issue_id=parent_issue_id,
+            source_excerpt=source_excerpt,
+            priority=priority,
+            activate=activate,
+        )
+        if activate:
+            issue.status = "open"
+            issue.closed_at = ""
+            self.issue_ledger.active_issue_id = issue.issue_id
         self._persist_repo_facts()
         self._clear_facts()
         return issue.summary()
@@ -1939,6 +1974,12 @@ class WorkingFolderAgent:
         self._clear_facts()
         self._reset_task_satisfaction()
         self._clear_edit_batch_state()
+        return issue.summary()
+
+    def activate_issue(self, issue_id: str) -> Dict[str, Any]:
+        issue = self.issue_ledger.activate_issue(str(issue_id or "").strip())
+        self._persist_repo_facts()
+        self._clear_facts()
         return issue.summary()
 
     def _latest_diagnostics_state(self) -> Optional[Dict[str, Any]]:
@@ -5767,6 +5808,7 @@ class WorkingFolderAgent:
                 7a. Prefer the narrowest implementation that directly satisfies the user's request.
                 7b. Do not expand admin/editor constraints into public runtime behavior unless the request or concrete code dependency requires it.
                 7c. Do not claim performance gains or WCAG compliance unless you measured them, computed them, or implemented an actual validation mechanism.
+                7e. Treat closed durable repo_facts issues as historical context only. Do not reopen closed issues unless the task explicitly requires that exact issue; prefer creating or continuing an open/new issue for follow-up work.
 
                 8. RELEVANT MEMORY contains compact prior tool results selected for the current task.
                 9. Prefer using paths, entities, and tags from RELEVANT MEMORY when choosing your next action.
@@ -6528,6 +6570,65 @@ class WorkingFolderAgent:
         if resolution_block is None:
             return None
         return self._error_action_result(action_type, resolution_block)
+
+    def _normalize_repo_action_path(self, value: Any) -> str:
+        normalized = str(value or "").strip().replace("\\", "/")
+        if normalized:
+            candidate = Path(normalized).expanduser()
+            if candidate.is_absolute():
+                try:
+                    normalized = str(candidate.resolve().relative_to(self.root.resolve())).replace("\\", "/")
+                except Exception:
+                    pass
+        normalized = normalized.removeprefix("/repo/").removeprefix("repo/").removeprefix("./")
+        parts: List[str] = []
+        for part in normalized.split("/"):
+            if not part or part == ".":
+                continue
+            if part == "..":
+                if parts:
+                    parts.pop()
+                continue
+            parts.append(part)
+        return "/".join(parts)
+
+    def _action_candidate_paths(self, action: Dict[str, Any]) -> List[str]:
+        paths: List[str] = []
+        for key in ["path", "old_path", "new_path", "source_path", "destination_path", "target_path"]:
+            value = action.get(key)
+            if isinstance(value, str) and value.strip():
+                paths.append(value)
+        operations = action.get("operations")
+        if isinstance(operations, list):
+            for operation in operations:
+                if isinstance(operation, dict):
+                    paths.extend(self._action_candidate_paths(operation))
+        return paths
+
+    def _protected_path_block_result(self, action: Dict[str, Any], action_type: str) -> Optional[ActionResult]:
+        is_mutation = action_type in MUTATION_ACTION_TYPES or action_type == "batch_mutate"
+        is_shell_touch = action_type == "run_shell" and any(path in str(action.get("command", "")) for path in PROTECTED_REPO_PATHS)
+        if not is_mutation and not is_shell_touch:
+            return None
+        touched = {
+            self._normalize_repo_action_path(path)
+            for path in self._action_candidate_paths(action)
+            if str(path or "").strip()
+        }
+        if is_shell_touch:
+            touched.add("INTENT.md")
+        protected = sorted(path for path in touched if path in PROTECTED_REPO_PATHS)
+        if not protected:
+            return None
+        return self._error_action_result(
+            action_type,
+            {
+                "code": "PROTECTED_PATH",
+                "message": f"Protected project intent file cannot be mutated: {', '.join(protected)}.",
+                "protected_paths": protected,
+                "next_hint": "Read INTENT.md for project direction, then choose a different editable target.",
+            },
+        )
 
     def _set_output_format_recovery(self, *, error_type: str, message: str, raw: str = "") -> None:
         self.output_format_recovery = {
@@ -8188,6 +8289,10 @@ class WorkingFolderAgent:
             if blocked_result is not None:
                 return blocked_result
 
+            blocked_result = self._protected_path_block_result(action, action_type)
+            if blocked_result is not None:
+                return blocked_result
+
             blocked_result = self._enforce_budget_and_mode(action_type)
             if blocked_result is not None:
                 return blocked_result
@@ -8649,6 +8754,36 @@ def _handle_bridge_planner_action(
         message = planner.execute_pending_plan()
         add_exchange("assistant", message)
         return message
+    if action_name == "start_continuous":
+        max_cycles = 1
+        run_prompt = ""
+        payload = request.get("payload")
+        if isinstance(payload, dict):
+            try:
+                max_cycles = int(payload.get("max_cycles", max_cycles) or max_cycles)
+            except Exception:
+                max_cycles = 1
+            run_prompt = str(payload.get("prompt") or payload.get("run_prompt") or payload.get("summary") or "").strip()
+        elif request.get("max_cycles") is not None:
+            try:
+                max_cycles = int(request.get("max_cycles") or max_cycles)
+            except Exception:
+                max_cycles = 1
+        if not run_prompt:
+            run_prompt = str(request.get("prompt") or request.get("run_prompt") or "").strip()
+        starter = getattr(planner, "start_continuous", None)
+        if not callable(starter):
+            raise ValueError("Planner does not support continuous mode")
+        message = starter(max_cycles=max_cycles, prompt=run_prompt)
+        add_exchange("assistant", message)
+        return message
+    if action_name == "stop_continuous":
+        stopper = getattr(planner, "stop_continuous", None)
+        if not callable(stopper):
+            raise ValueError("Planner does not support continuous mode")
+        message = stopper()
+        add_exchange("assistant", message)
+        return message
     if action_name == "reject_plan":
         add_exchange("user", "reject")
         message = planner.continue_conversation("reject")
@@ -8706,6 +8841,19 @@ def _handle_bridge_planner_action(
         if not issue_id:
             raise ValueError("reopen_issue requires issue_id")
         message = planner.reopen_issue(issue_id)
+        add_exchange("assistant", message)
+        return message
+    if action_name == "create_issue":
+        summary = str(request.get("summary", "") or request.get("request_summary", "") or "").strip()
+        payload = request.get("payload")
+        if isinstance(payload, dict):
+            summary = summary or str(payload.get("summary", "") or payload.get("request_summary", "") or "").strip()
+        if not summary:
+            raise ValueError("create_issue requires issue details")
+        creator = getattr(planner, "create_manual_issue", None)
+        if not callable(creator):
+            raise ValueError("Planner does not support issue creation")
+        message = creator(summary)
         add_exchange("assistant", message)
         return message
     if action_name == "close_issue":

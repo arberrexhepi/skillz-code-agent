@@ -58,10 +58,25 @@ export interface WorkerState extends JsonMap {
   latest_diagnostics?: LatestDiagnostics | null;
   latest_review?: LatestReview | null;
   suggested_next_actions?: WorkerSuggestedAction[];
+  protected_paths?: string[];
+}
+
+export interface ContinuousModeState extends JsonMap {
+  enabled?: boolean;
+  status?: string;
+  cycle?: number;
+  max_cycles?: number;
+  active_issue_id?: string;
+  selected_discovery_mode?: string;
+  latest_review_decision?: string;
+  stop_reason?: string;
+  created_followup_issue_ids?: string[];
+  created_followup_issues?: JsonMap[];
 }
 
 export interface PlannerState extends JsonMap {
   issue_state?: JsonMap;
+  continuous_mode?: ContinuousModeState;
   suggested_next_actions?: PlannerSuggestedAction[];
   worker_state?: WorkerState | null;
 }
@@ -78,8 +93,28 @@ export interface CombinedSuggestedAction extends JsonMap {
   style?: string;
   mode?: string;
   issue_id?: string;
+  max_cycles?: number;
   requires_confirmation?: boolean;
   source: 'planner' | 'worker';
+}
+
+export function isContinuousModeActive(planner?: PlannerState): boolean {
+  const status = String(planner?.continuous_mode?.status || '').trim();
+  return Boolean(planner?.continuous_mode?.enabled || (status && !['idle', 'stopped'].includes(status)));
+}
+
+export function continuousModeOwnsLifecycle(planner?: PlannerState): boolean {
+  const status = String(planner?.continuous_mode?.status || '').trim();
+  return [
+    'selecting_issue',
+    'discovering',
+    'planning',
+    'approving',
+    'executing',
+    'reviewing',
+    'closing_issue',
+    'creating_followups',
+  ].includes(status);
 }
 
 export function combineSuggestedActions(state: BridgeState): CombinedSuggestedAction[] {
@@ -164,12 +199,17 @@ export function progressTimelineTarget(
 }
 
 export function buildPlannerActionMessage(action: CombinedSuggestedAction): { action: string; mode?: string; payload?: JsonMap } {
-  const payload: JsonMap = {};
+  const payload: JsonMap = typeof action.payload === 'object' && action.payload !== null && !Array.isArray(action.payload)
+    ? { ...(action.payload as JsonMap) }
+    : {};
   if (typeof action.mode === 'string' && action.mode.trim()) {
     payload.mode = action.mode.trim();
   }
   if (typeof action.issue_id === 'string' && action.issue_id.trim()) {
     payload.issue_id = action.issue_id.trim();
+  }
+  if (typeof action.max_cycles === 'number' && Number.isFinite(action.max_cycles)) {
+    payload.max_cycles = Math.max(1, Math.floor(action.max_cycles));
   }
   return {
     action: action.type,
