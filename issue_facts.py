@@ -122,6 +122,12 @@ class IssueRecord:
     opened_at: str = ""
     closed_at: str = ""
     reopen_count: int = 0
+    source: str = ""
+    parent_issue_id: str = ""
+    source_excerpt: str = ""
+    priority: int = 0
+    blocked_reason: str = ""
+    last_review_decision: str = ""
     lifecycle_notes: List[str] = field(default_factory=list)
     facts: List[IssueFactRecord] = field(default_factory=list)
 
@@ -134,6 +140,12 @@ class IssueRecord:
             "opened_at": self.opened_at,
             "closed_at": self.closed_at,
             "reopen_count": self.reopen_count,
+            "source": self.source,
+            "parent_issue_id": self.parent_issue_id,
+            "source_excerpt": self.source_excerpt,
+            "priority": self.priority,
+            "blocked_reason": self.blocked_reason,
+            "last_review_decision": self.last_review_decision,
             "lifecycle_notes": list(self.lifecycle_notes),
             "facts": [record.to_persisted_dict() for record in sorted(self.facts, key=lambda item: (item.fact_type, item.key))],
         }
@@ -149,6 +161,12 @@ class IssueRecord:
             "opened_at": self.opened_at,
             "closed_at": self.closed_at,
             "reopen_count": self.reopen_count,
+            "source": self.source,
+            "parent_issue_id": self.parent_issue_id,
+            "source_excerpt": self.source_excerpt,
+            "priority": self.priority,
+            "blocked_reason": self.blocked_reason,
+            "last_review_decision": self.last_review_decision,
             "lifecycle_notes": list(self.lifecycle_notes),
             "fact_count": len(self.facts),
             "architecture_fact_count": architecture_count,
@@ -176,6 +194,12 @@ class IssueRecord:
             opened_at=str(item.get("opened_at", "") or ""),
             closed_at=str(item.get("closed_at", "") or ""),
             reopen_count=int(item.get("reopen_count", 0) or 0),
+            source=str(item.get("source", "") or ""),
+            parent_issue_id=str(item.get("parent_issue_id", "") or ""),
+            source_excerpt=str(item.get("source_excerpt", "") or ""),
+            priority=int(item.get("priority", 0) or 0),
+            blocked_reason=str(item.get("blocked_reason", "") or ""),
+            last_review_decision=str(item.get("last_review_decision", "") or ""),
             lifecycle_notes=[str(note) for note in item.get("lifecycle_notes", []) or [] if str(note).strip()],
             facts=facts,
         )
@@ -415,6 +439,10 @@ class IssueFactLedger:
         request_summary: str = "",
         plan_summary: str = "",
         reuse_issue_id: str = "",
+        source: str = "",
+        parent_issue_id: str = "",
+        source_excerpt: str = "",
+        priority: int = 0,
     ) -> IssueRecord:
         if reuse_issue_id:
             issue = self.get_issue(reuse_issue_id)
@@ -425,6 +453,14 @@ class IssueFactLedger:
                     issue.request_summary = request_summary
                 if plan_summary:
                     issue.plan_summary = plan_summary
+                if source:
+                    issue.source = source
+                if parent_issue_id:
+                    issue.parent_issue_id = parent_issue_id
+                if source_excerpt:
+                    issue.source_excerpt = source_excerpt
+                if priority:
+                    issue.priority = int(priority)
                 self.active_issue_id = issue.issue_id
                 return issue
         active_issue = self.active_issue()
@@ -440,10 +476,56 @@ class IssueFactLedger:
             plan_summary=plan_summary,
             status=ISSUE_STATUS_OPEN,
             opened_at=_utc_timestamp(),
+            source=source,
+            parent_issue_id=parent_issue_id,
+            source_excerpt=source_excerpt,
+            priority=int(priority or 0),
         )
         self.issues.append(issue)
         self.active_issue_id = issue.issue_id
         return issue
+
+    def create_issue(
+        self,
+        *,
+        request_summary: str,
+        plan_summary: str = "",
+        source: str = "",
+        parent_issue_id: str = "",
+        source_excerpt: str = "",
+        priority: int = 0,
+        activate: bool = True,
+    ) -> IssueRecord:
+        issue = IssueRecord(
+            issue_id=self._next_issue_id(),
+            request_summary=str(request_summary or "").strip(),
+            plan_summary=str(plan_summary or request_summary or "").strip(),
+            status=ISSUE_STATUS_OPEN,
+            opened_at=_utc_timestamp(),
+            source=str(source or "").strip(),
+            parent_issue_id=str(parent_issue_id or "").strip(),
+            source_excerpt=str(source_excerpt or "").strip(),
+            priority=int(priority or 0),
+        )
+        self.issues.append(issue)
+        if activate:
+            self.active_issue_id = issue.issue_id
+        return issue
+
+    def find_duplicate_issue(self, *, request_summary: str, source: str = "", parent_issue_id: str = "") -> Optional[IssueRecord]:
+        normalized = re.sub(r"\s+", " ", str(request_summary or "").strip().lower())
+        if not normalized:
+            return None
+        for issue in self.issues:
+            candidate = re.sub(r"\s+", " ", str(issue.request_summary or issue.plan_summary or "").strip().lower())
+            if candidate != normalized:
+                continue
+            if source and issue.source and issue.source != source:
+                continue
+            if parent_issue_id and issue.parent_issue_id and issue.parent_issue_id != parent_issue_id:
+                continue
+            return issue
+        return None
 
     def ensure_goal_issue(self, *, task_summary: str = "") -> IssueRecord:
         active_issue = self.active_issue()

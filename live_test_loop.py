@@ -771,6 +771,40 @@ class TreeLoopPlannerWorker:
         self._sync_fact_map()
         return issue.summary()
 
+    def create_issue(
+        self,
+        *,
+        request_summary: str,
+        plan_summary: str = "",
+        source: str = "",
+        parent_issue_id: str = "",
+        source_excerpt: str = "",
+        priority: int = 0,
+        activate: bool = True,
+    ) -> Dict[str, Any]:
+        duplicate = self.issue_ledger.find_duplicate_issue(
+            request_summary=request_summary,
+            source=source,
+            parent_issue_id=parent_issue_id,
+        )
+        issue = duplicate or self.issue_ledger.create_issue(
+            request_summary=request_summary,
+            plan_summary=plan_summary,
+            source=source,
+            parent_issue_id=parent_issue_id,
+            source_excerpt=source_excerpt,
+            priority=priority,
+            activate=activate,
+        )
+        if activate:
+            issue.status = "open"
+            issue.closed_at = ""
+            self.issue_ledger.active_issue_id = issue.issue_id
+            self.active_issue_id = issue.issue_id
+        self._persist_repo_facts()
+        self._sync_fact_map()
+        return issue.summary()
+
     def close_active_issue(self, *, note: str = "") -> Optional[Dict[str, Any]]:
         issue = self.issue_ledger.close_active_issue(note=note)
         self.active_issue_id = ""
