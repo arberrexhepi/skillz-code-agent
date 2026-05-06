@@ -18,7 +18,7 @@ import textwrap
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, cast
+from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Tuple, cast
 from issue_facts import FACT_TYPE_ARCHITECTURE, FACT_TYPE_GOAL, IssueFactLedger, IssueFactRecord
 from memory_manager import MemoryManager, MemoryQuery
 from project_diagnostics import run_backend_diagnostics
@@ -5053,13 +5053,15 @@ class WorkingFolderAgent:
         self,
         *,
         action_type: str,
-        result_payload: Dict[str, Any],
+        result_payload: Mapping[str, Any],
         success_summary: str,
         failure_summary: str,
         context_label: str,
     ) -> ActionResult:
-        diagnostics = result_payload.get("diagnostics") if isinstance(result_payload.get("diagnostics"), list) else []
-        summary = result_payload.get("summary") if isinstance(result_payload.get("summary"), dict) else {}
+        raw_diagnostics = result_payload.get("diagnostics")
+        diagnostics: List[Any] = raw_diagnostics if isinstance(raw_diagnostics, list) else []
+        raw_summary = result_payload.get("summary")
+        summary: Dict[str, Any] = raw_summary if isinstance(raw_summary, dict) else {}
         error_count = int(summary.get("error", 0)) if isinstance(summary, dict) else 0
         warning_count = int(summary.get("warning", 0)) if isinstance(summary, dict) else 0
         payload: Dict[str, Any] = {
