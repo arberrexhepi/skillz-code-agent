@@ -43,7 +43,16 @@ from main import (  # noqa: E402
     extract_first_json_object,
     refresh_runtime_provider_catalog_once,
 )
-from issue_facts import FACT_TYPE_ARCHITECTURE, FACT_TYPE_GOAL, IssueFactLedger, IssueFactRecord  # noqa: E402
+from issue_facts import (  # noqa: E402
+    FACT_TYPE_ARCHITECTURE,
+    FACT_TYPE_GOAL,
+    IssueFactLedger,
+    IssueFactRecord,
+    format_issue_not_found,
+    format_issue_record_detail,
+    format_issue_summary_list,
+    issue_summaries_from_payload,
+)
 from planner import PlannerAgent, interactive_planner_loop  # noqa: E402
 from runtime_catalog import runtime_options_payload  # noqa: E402
 from skill_loader import load_markdown_skills_from_dir  # noqa: E402
@@ -649,14 +658,23 @@ class TreeLoopPlannerWorker:
 
         if action_type == "list_issues":
             issues = self.loop.bridge.tree.list_log_issues()
-            summary = self.loop.bridge.tree.format_log_issue_list(issues)
+            durable_state = self.issue_ledger.planner_payload(path=str(self._repo_facts_path()))
+            summary_parts: List[str] = []
+            if issues:
+                summary_parts.append(self.loop.bridge.tree.format_log_issue_list(issues))
+            if issue_summaries_from_payload(durable_state):
+                summary_parts.append(format_issue_summary_list(durable_state))
+            if not summary_parts:
+                summary_parts.append("(no parsed log issues and no durable repo_facts issues)")
+            summary = "\n\n".join(summary_parts)
             return ActionResult(
                 ok=True,
                 name=action_type,
                 payload={
-                    "message": f"Listed {len(issues)} issue(s).",
+                    "message": f"Listed {len(issues)} parsed issue(s) and {len(issue_summaries_from_payload(durable_state))} durable issue(s).",
                     "summary": summary,
                     "issues": issues,
+                    "durable_issues": issue_summaries_from_payload(durable_state),
                 },
             )
 
@@ -665,17 +683,37 @@ class TreeLoopPlannerWorker:
             if not issue_id:
                 return ActionResult(ok=False, name=action_type, payload={"error": "show_issue requires issue_id"})
             issue = self.loop.bridge.tree.show_log_issue(issue_id)
-            self._maybe_resolve_discovery_remediation(action_type, issue_id=issue_id)
-            summary = self.loop.bridge.tree.format_log_issue_detail(issue) if issue else f"Issue not found: {issue_id}"
+            durable_issue = self.issue_ledger.get_issue(issue_id)
+            durable_state = self.issue_ledger.planner_payload(path=str(self._repo_facts_path()))
+            found = issue is not None or durable_issue is not None
+            if found:
+                self._maybe_resolve_discovery_remediation(action_type, issue_id=issue_id)
+            else:
+                remediation_issue_id = str((self._discovery_remediation or {}).get("issue_id", "") or "").strip()
+                if remediation_issue_id and remediation_issue_id == issue_id:
+                    self._discovery_remediation = None
+                    self._refresh_loop_steering()
+            if issue is not None:
+                summary = self.loop.bridge.tree.format_log_issue_detail(issue)
+            elif durable_issue is not None:
+                summary = format_issue_record_detail(durable_issue)
+            else:
+                summary = format_issue_not_found(issue_id, durable_state)
             return ActionResult(
-                ok=bool(issue),
+                ok=True,
                 name=action_type,
                 payload={
-                    "message": f"Loaded {issue_id}." if issue else f"Issue not found: {issue_id}",
+                    "message": f"Loaded {issue_id}." if found else f"Issue not found: {issue_id}; returned available durable issues for recovery.",
                     "summary": summary,
                     "issue": issue,
+                    "durable_issue": durable_issue.summary() if durable_issue is not None else None,
                     "next_reads": self.loop.bridge.tree.log_issue_read_commands(issue) if issue else [],
                     "issue_id": issue_id,
+                    "available_issue_ids": [
+                        str(item.get("issue_id", "") or "")
+                        for item in issue_summaries_from_payload(durable_state)
+                        if str(item.get("issue_id", "") or "").strip()
+                    ][:20],
                 },
             )
 

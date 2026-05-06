@@ -71,6 +71,7 @@ export interface ContinuousModeState extends JsonMap {
   latest_review_decision?: string;
   stop_reason?: string;
   created_followup_issue_ids?: string[];
+  created_followup_issues?: JsonMap[];
 }
 
 export interface PlannerState extends JsonMap {

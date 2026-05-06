@@ -164,6 +164,7 @@ interface ContinuousModeState extends JsonMap {
   latest_review_decision?: string;
   stop_reason?: string;
   created_followup_issue_ids?: string[];
+  created_followup_issues?: JsonMap[];
 }
 
 interface PlannerGoal extends JsonMap {
@@ -1211,20 +1212,7 @@ class AgentPanel implements vscode.Disposable {
     /* ── Lifecycle Dock ── */
     .lifecycle-dock { display: none; gap: 10px; grid-template-rows: auto minmax(248px, 248px); }
     .lifecycle-dock.visible { display: grid; }
-    .dock-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; min-width: 0; }
     .dock-tabs { display: flex; gap: 2px; flex-wrap: wrap; }
-    .dock-actions { display: flex; align-items: center; gap: 6px; margin-left: auto; }
-    .dock-actions input {
-      width: 54px;
-      min-width: 0;
-      padding: 4px 6px;
-      border-radius: var(--radius-sm);
-      border: 1px solid var(--divider);
-      background: var(--input-bg);
-      color: var(--text);
-      font-size: 12px;
-    }
-    .dock-actions button { font-size: 12px; padding: 5px 10px; }
     .dock-tab {
       border-radius: var(--radius-sm);
       padding: 5px 12px;
@@ -1643,10 +1631,7 @@ class AgentPanel implements vscode.Disposable {
   <div id="feed" class="feed"></div>
   <div class="input-area">
     <div id="lifecycleDock" class="lifecycle-dock">
-      <div class="dock-head">
-        <div id="dockTabs" class="dock-tabs"></div>
-        <div id="dockActions" class="dock-actions"></div>
-      </div>
+      <div id="dockTabs" class="dock-tabs"></div>
       <div id="dockPanels" class="dock-panels"></div>
     </div>
     <form id="promptForm">
@@ -1681,7 +1666,6 @@ class AgentPanel implements vscode.Disposable {
     const backoffWindow = document.getElementById('backoffWindow');
     const lifecycleDockEl = document.getElementById('lifecycleDock');
     const dockTabsEl = document.getElementById('dockTabs');
-    const dockActionsEl = document.getElementById('dockActions');
     const dockPanelsEl = document.getElementById('dockPanels');
     const promptForm = document.getElementById('promptForm');
     const promptInput = document.getElementById('promptInput');
@@ -2730,24 +2714,6 @@ class AgentPanel implements vscode.Disposable {
       debugAndPost({ type: 'plannerAction', action: message.action, mode: message.mode || '', payload: message.payload || {} });
     }
 
-    function postContinuousStart(maxCycles) {
-      if (pendingAction) { return; }
-      const cycles = Math.max(1, Math.min(25, Math.floor(Number(maxCycles) || 1)));
-      if (cycles > 1 && !window.confirm('Start continuous mode for ' + cycles + ' cycles?')) {
-        return;
-      }
-      debugAndPost({ type: 'startContinuous', maxCycles: cycles });
-      lockButtons('start_continuous');
-      render();
-    }
-
-    function postContinuousStop() {
-      if (pendingAction) { return; }
-      debugAndPost({ type: 'stopContinuous' });
-      lockButtons('stop_continuous');
-      render();
-    }
-
     function actionRow(actions) {
       if (!actions.length) { return null; }
       const row = el('div', 'flow-actions');
@@ -2764,17 +2730,16 @@ class AgentPanel implements vscode.Disposable {
           btn.disabled = true;
           btn.title = 'Continuous mode owns the lifecycle right now.';
         }
-        btn.addEventListener('click', () => {
-          if (action.type === 'start_continuous') {
-            postContinuousStart(btn.dataset.maxCycles || 1);
-            return;
-          }
-          if (action.type === 'stop_continuous') {
-            postContinuousStop();
-            return;
-          }
-          postAction(action);
-        });
+        if (action.type === 'start_continuous') {
+          btn.addEventListener('click', () => {
+            const cycles = Math.max(1, Math.min(25, Math.floor(Number(action.max_cycles || action.maxCycles || 1) || 1)));
+            submitPromptThroughChat('/start-auto ' + cycles);
+          });
+        } else if (action.type === 'stop_continuous') {
+          btn.addEventListener('click', () => submitPromptThroughChat('/stop-auto'));
+        } else {
+          btn.addEventListener('click', () => postAction(action));
+        }
         row.appendChild(btn);
       }
       return row;
@@ -2847,6 +2812,52 @@ class AgentPanel implements vscode.Disposable {
       return '<span style="display:inline-block;padding:1px 6px;border-radius:4px;font-size:11px;font-weight:600;background:' + (colors[scope] || colors.mixed) + '22;color:' + (colors[scope] || colors.mixed) + ';">' + (scope || 'write') + '</span>';
     }
 
+    function issueLookupById(planner) {
+      const lookup = {};
+      const states = [
+        planner.issue_state || {},
+        (planner.worker_state || {}).issue_state || {},
+      ];
+      for (const issueState of states) {
+        const activeIssue = issueState.active_issue;
+        if (activeIssue && activeIssue.issue_id) {
+          lookup[String(activeIssue.issue_id)] = activeIssue;
+        }
+        for (const key of ['issues', 'reopenable_issues']) {
+          const issues = Array.isArray(issueState[key]) ? issueState[key] : [];
+          for (const issue of issues) {
+            if (issue && issue.issue_id) {
+              lookup[String(issue.issue_id)] = issue;
+            }
+          }
+        }
+      }
+      return lookup;
+    }
+
+    function followupIssueItems(planner) {
+      const continuous = planner.continuous_mode || {};
+      const lookup = issueLookupById(planner);
+      const byId = {};
+      const items = [];
+      const richFollowups = Array.isArray(continuous.created_followup_issues) ? continuous.created_followup_issues : [];
+      for (const item of richFollowups) {
+        if (!item || !item.issue_id) { continue; }
+        const issueId = String(item.issue_id);
+        const merged = { ...(lookup[issueId] || {}), ...item };
+        byId[issueId] = merged;
+        items.push(merged);
+      }
+      const ids = Array.isArray(continuous.created_followup_issue_ids) ? continuous.created_followup_issue_ids.filter(Boolean) : [];
+      for (const issueIdRaw of ids) {
+        const issueId = String(issueIdRaw);
+        if (byId[issueId]) { continue; }
+        const issue = lookup[issueId] || { issue_id: issueId };
+        items.push(issue);
+      }
+      return items;
+    }
+
     function buildContinuousModeCard(planner, actions) {
       const continuous = planner.continuous_mode || {};
       const worker = planner.worker_state || {};
@@ -2886,12 +2897,14 @@ class AgentPanel implements vscode.Disposable {
         card.appendChild(el('div', 'flow-meta', 'Protected: ' + protectedPaths.join(', ')));
       }
 
-      const followups = Array.isArray(continuous.created_followup_issue_ids) ? continuous.created_followup_issue_ids.filter(Boolean) : [];
+      const followups = followupIssueItems(planner);
       if (followups.length) {
         card.appendChild(el('div', 'flow-meta', 'Follow-up Issues'));
         const list = el('div', 'compact-list');
-        for (const issueId of followups.slice(0, 6)) {
-          list.appendChild(el('div', 'compact-item', String(issueId)));
+        for (const issue of followups.slice(0, 6)) {
+          const issueId = String(issue.issue_id || '').trim();
+          const summary = String(issue.plan_summary || issue.request_summary || issue.source_excerpt || '').trim();
+          list.appendChild(el('div', 'compact-item', issueId + (summary ? ': ' + summary : '')));
         }
         card.appendChild(list);
       }
@@ -2901,8 +2914,9 @@ class AgentPanel implements vscode.Disposable {
         const stopAction = actions.find(a => a.type === 'stop_continuous') || { type: 'stop_continuous', label: 'Stop Continuous', source: 'planner' };
         const stop = el('button', 'secondary', stopAction.label || 'Stop Continuous');
         stop.type = 'button';
-        stop.dataset.continuousAction = 'stop';
-        stop.addEventListener('click', () => postContinuousStop());
+        stop.addEventListener('click', () => {
+          submitPromptThroughChat('/stop-auto');
+        });
         row.appendChild(stop);
       } else {
         const label = el('span', 'flow-meta', 'Cycles');
@@ -2914,9 +2928,10 @@ class AgentPanel implements vscode.Disposable {
         input.value = String(Math.max(1, Number(continuous.max_cycles || 1)));
         const start = el('button', 'primary', 'Start Continuous');
         start.type = 'button';
-        start.dataset.continuousAction = 'start';
-        start.dataset.maxCyclesInput = 'true';
-        start.addEventListener('click', () => postContinuousStart(input.value));
+        start.addEventListener('click', () => {
+          const cycles = Math.max(1, Math.min(25, Math.floor(Number(input.value) || 1)));
+          submitPromptThroughChat('/start-auto ' + cycles);
+        });
         row.appendChild(label);
         row.appendChild(input);
         row.appendChild(start);
@@ -3190,34 +3205,6 @@ class AgentPanel implements vscode.Disposable {
       return tabs;
     }
 
-    function renderDockActions(planner, actions) {
-      dockActionsEl.innerHTML = '';
-      const active = isContinuousModeActive(planner);
-      const hasStartAction = actions.some(a => a.type === 'start_continuous');
-      const hasStopAction = actions.some(a => a.type === 'stop_continuous');
-      if (active || hasStopAction) {
-        const stop = el('button', 'secondary', 'Stop Auto');
-        stop.type = 'button';
-        stop.dataset.continuousAction = 'stop';
-        dockActionsEl.appendChild(stop);
-        return;
-      }
-      if (!hasStartAction) {
-        return;
-      }
-      const input = document.createElement('input');
-      input.type = 'number';
-      input.min = '1';
-      input.max = '25';
-      input.step = '1';
-      input.value = '1';
-      const start = el('button', 'primary', 'Start Auto');
-      start.type = 'button';
-      start.dataset.continuousAction = 'start';
-      dockActionsEl.appendChild(input);
-      dockActionsEl.appendChild(start);
-    }
-
     function renderLifecycleDock() {
       const planner = state.planner || {};
       const actions = combineSuggestedActions(state).map(a => ({ ...a, _source: a.source }));
@@ -3230,7 +3217,6 @@ class AgentPanel implements vscode.Disposable {
       }
 
       dockTabsEl.innerHTML = '';
-      dockActionsEl.innerHTML = '';
       dockPanelsEl.innerHTML = '';
 
       if (!tabs.length) {
@@ -3239,7 +3225,6 @@ class AgentPanel implements vscode.Disposable {
       }
 
       lifecycleDockEl.classList.add('visible');
-      renderDockActions(planner, actions);
       const wantedTab = desiredDockTab(planner);
       if (!tabs.some(tab => tab.id === activeDockTab)) {
         activeDockTab = tabs[0].id;
@@ -3530,25 +3515,6 @@ class AgentPanel implements vscode.Disposable {
         vscode.postMessage({ type: 'configureBackoff', enabled: true, tokenLimitK: k });
       }
     });
-
-    document.addEventListener('click', (event) => {
-      const target = event.target;
-      if (!(target instanceof Element)) { return; }
-      const button = target.closest('[data-continuous-action]');
-      if (!(button instanceof HTMLElement)) { return; }
-      const action = String(button.dataset.continuousAction || '').trim();
-      if (!action) { return; }
-      event.preventDefault();
-      event.stopPropagation();
-      if (action === 'start') {
-        const row = button.closest('.flow-actions');
-        const input = row ? row.querySelector('input[type="number"]') : null;
-        const cycles = input instanceof HTMLInputElement ? input.value : (button.dataset.maxCycles || 1);
-        postContinuousStart(cycles);
-      } else if (action === 'stop') {
-        postContinuousStop();
-      }
-    }, true);
 
     window.addEventListener('message', (event) => {
       const message = event.data;

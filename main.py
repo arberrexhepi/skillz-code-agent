@@ -6566,6 +6566,13 @@ class WorkingFolderAgent:
 
     def _normalize_repo_action_path(self, value: Any) -> str:
         normalized = str(value or "").strip().replace("\\", "/")
+        if normalized:
+            candidate = Path(normalized).expanduser()
+            if candidate.is_absolute():
+                try:
+                    normalized = str(candidate.resolve().relative_to(self.root.resolve())).replace("\\", "/")
+                except Exception:
+                    pass
         normalized = normalized.removeprefix("/repo/").removeprefix("repo/").removeprefix("./")
         parts: List[str] = []
         for part in normalized.split("/"):

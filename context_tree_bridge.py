@@ -50,14 +50,24 @@ class ContextTreeBridge:
         hot_file_selector: Optional[Callable[[str], List[str]]] = None,
     ) -> None:
         self.tree = ContextTree(workspace_root)
-        self.parser = TreeCommandParser(self.tree)
         self._get_fact_records = get_fact_records
         self._get_memory_items = get_memory_items
         self._get_status = get_status
         self._hot_file_selector = hot_file_selector
+        self.parser = TreeCommandParser(self.tree, get_issue_state=self._issue_state_for_commands)
         self._indexed = False
         self._last_sync_ts = 0.0
         self._sync_interval = 2.0  # seconds between syncs
+
+    def _issue_state_for_commands(self) -> Dict[str, Any]:
+        try:
+            status = self._get_status()
+        except Exception:
+            return {}
+        if not isinstance(status, dict):
+            return {}
+        issue_state = status.get("issue_state")
+        return issue_state if isinstance(issue_state, dict) else {}
 
     # ------------------------------------------------------------------
     # Setup

@@ -517,6 +517,8 @@ class IssueFactLedger:
         if not normalized:
             return None
         for issue in self.issues:
+            if issue.status == ISSUE_STATUS_CLOSED:
+                continue
             candidate = re.sub(r"\s+", " ", str(issue.request_summary or issue.plan_summary or "").strip().lower())
             if candidate != normalized:
                 continue
@@ -677,3 +679,161 @@ class IssueFactLedger:
             else:
                 previous_run_records.append(record)
         return previous_run_records, current_run_records
+
+
+def issue_display_summary(issue: Dict[str, Any]) -> str:
+    """Return a compact, model-actionable issue summary."""
+    return str(
+        issue.get("plan_summary")
+        or issue.get("request_summary")
+        or issue.get("source_excerpt")
+        or issue.get("issue_id")
+        or ""
+    ).strip()
+
+
+def issue_summaries_from_payload(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Collect unique issue summaries from a repo_facts/planner issue payload."""
+    items: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+
+    active = payload.get("active_issue")
+    if isinstance(active, dict):
+        issue_id = str(active.get("issue_id", "") or "").strip()
+        if issue_id:
+            seen.add(issue_id)
+            items.append(active)
+
+    for key in ["issues", "reopenable_issues"]:
+        raw_items = payload.get(key, [])
+        if not isinstance(raw_items, list):
+            continue
+        for item in raw_items:
+            if not isinstance(item, dict):
+                continue
+            issue_id = str(item.get("issue_id", "") or "").strip()
+            if not issue_id or issue_id in seen:
+                continue
+            seen.add(issue_id)
+            items.append(item)
+
+    return items
+
+
+def format_issue_summary_list(payload: Dict[str, Any], *, limit: int = 40) -> str:
+    """Render durable repo_facts issues as a checklist for the model."""
+    issues = issue_summaries_from_payload(payload)
+    if not issues:
+        return "(no durable issues in repo_facts)"
+
+    open_items = [item for item in issues if str(item.get("status", "") or "").strip() == ISSUE_STATUS_OPEN]
+    closed_items = [item for item in issues if str(item.get("status", "") or "").strip() != ISSUE_STATUS_OPEN]
+    ordered = open_items + closed_items
+    limited = ordered[: max(1, int(limit))]
+
+    lines = [f"Durable issues from repo_facts: {len(issues)}"]
+    for issue in limited:
+        issue_id = str(issue.get("issue_id", "") or "").strip()
+        status = str(issue.get("status", "") or ISSUE_STATUS_CLOSED).strip()
+        summary = issue_display_summary(issue)
+        source = str(issue.get("source", "") or "").strip()
+        parent = str(issue.get("parent_issue_id", "") or "").strip()
+        facts = int(issue.get("fact_count", 0) or 0)
+        bits = [f"- {issue_id} [{status}]"]
+        if source:
+            bits.append(f"source={source}")
+        if parent:
+            bits.append(f"parent={parent}")
+        if facts:
+            bits.append(f"facts={facts}")
+        lines.append(" ".join(bits))
+        if summary:
+            lines.append(f"  summary: {summary}")
+        lines.append(f"  next: show-issue {issue_id}")
+
+    remaining = len(ordered) - len(limited)
+    if remaining > 0:
+        lines.append(f"... {remaining} more issue(s) omitted; use show-issue with one of the listed ids or reopen a recent issue.")
+    return "\n".join(lines)
+
+
+def format_issue_record_detail(issue: IssueRecord) -> str:
+    """Render one durable issue with enough detail to recover work."""
+    summary = issue.summary()
+    lines = [
+        f"Issue {issue.issue_id} [{issue.status}]",
+        f"summary: {issue_display_summary(summary)}",
+    ]
+    fields = [
+        ("request_summary", issue.request_summary),
+        ("plan_summary", issue.plan_summary),
+        ("source", issue.source),
+        ("parent_issue_id", issue.parent_issue_id),
+        ("source_excerpt", issue.source_excerpt),
+        ("opened_at", issue.opened_at),
+        ("closed_at", issue.closed_at),
+        ("last_review_decision", issue.last_review_decision),
+        ("blocked_reason", issue.blocked_reason),
+    ]
+    for key, value in fields:
+        text = str(value or "").strip()
+        if text:
+            lines.append(f"{key}: {text}")
+    if issue.lifecycle_notes:
+        lines.append("lifecycle_notes:")
+        lines.extend(f"- {note}" for note in issue.lifecycle_notes if str(note).strip())
+    if issue.facts:
+        lines.append("facts:")
+        for record in sorted(issue.facts, key=lambda item: (item.fact_type, item.key)):
+            lines.append(f"- [{record.fact_type}] {record.key}: {record.value}")
+    return "\n".join(lines)
+
+
+def format_issue_summary_detail(issue: Dict[str, Any]) -> str:
+    """Render a durable issue summary payload as detail when full facts are unavailable."""
+    issue_id = str(issue.get("issue_id", "") or "").strip()
+    status = str(issue.get("status", "") or ISSUE_STATUS_CLOSED).strip()
+    lines = [
+        f"Issue {issue_id} [{status}]",
+        f"summary: {issue_display_summary(issue)}",
+    ]
+    fields = [
+        "request_summary",
+        "plan_summary",
+        "source",
+        "parent_issue_id",
+        "source_excerpt",
+        "opened_at",
+        "closed_at",
+        "reopen_count",
+        "priority",
+        "blocked_reason",
+        "last_review_decision",
+        "fact_count",
+        "architecture_fact_count",
+        "goal_fact_count",
+    ]
+    for key in fields:
+        value = issue.get(key)
+        text = str(value or "").strip()
+        if text:
+            lines.append(f"{key}: {text}")
+    notes = issue.get("lifecycle_notes")
+    if isinstance(notes, list) and notes:
+        lines.append("lifecycle_notes:")
+        lines.extend(f"- {note}" for note in notes if str(note).strip())
+    return "\n".join(lines)
+
+
+def format_issue_not_found(issue_id: str, payload: Dict[str, Any], *, limit: int = 12) -> str:
+    """Return a recovery-oriented message for a missing issue id."""
+    requested = str(issue_id or "").strip()
+    lines = [
+        f"Issue not found: {requested}",
+        "Recovery: do not retry this id unless it appears below. Use list-issues or show one of the available durable issue ids.",
+    ]
+    if issue_summaries_from_payload(payload):
+        lines.append(format_issue_summary_list(payload, limit=limit))
+    else:
+        lines.append("(no durable issues available)")
+    return "\n".join(lines)

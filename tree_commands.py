@@ -60,9 +60,15 @@ import json
 import re
 import shlex
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from context_tree import ContextTree
+from issue_facts import (
+    format_issue_not_found,
+    format_issue_summary_detail,
+    format_issue_summary_list,
+    issue_summaries_from_payload,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -153,8 +159,16 @@ _RANGE_ONLY_RE = re.compile(r"^(\d+)-(\d+)$")
 class TreeCommandParser:
     """Parse and execute compact tree commands."""
 
-    def __init__(self, tree: ContextTree) -> None:
+    def __init__(self, tree: ContextTree, get_issue_state: Optional[Callable[[], Dict[str, Any]]] = None) -> None:
         self.tree = tree
+        self._get_issue_state = get_issue_state or (lambda: {})
+
+    def _durable_issue_state(self) -> Dict[str, Any]:
+        try:
+            payload = self._get_issue_state()
+        except Exception:
+            return {}
+        return payload if isinstance(payload, dict) else {}
 
     def parse_and_execute(self, raw: str) -> CommandResult:
         """Parse a command string and execute it.
@@ -368,7 +382,15 @@ class TreeCommandParser:
 
     def _cmd_list_issues(self, rest: str) -> CommandResult:
         issues = self.tree.list_log_issues()
-        return CommandResult(ok=True, output=self.tree.format_log_issue_list(issues), command_type="read")
+        durable_state = self._durable_issue_state()
+        parts: List[str] = []
+        if issues:
+            parts.append(self.tree.format_log_issue_list(issues))
+        if issue_summaries_from_payload(durable_state):
+            parts.append(format_issue_summary_list(durable_state))
+        if not parts:
+            parts.append("(no parsed log issues and no durable repo_facts issues)")
+        return CommandResult(ok=True, output="\n\n".join(parts), command_type="read")
 
     def _cmd_show_issue(self, rest: str) -> CommandResult:
         issue_id = rest.strip()
@@ -376,7 +398,11 @@ class TreeCommandParser:
             return CommandResult(ok=False, output="Usage: show-issue <id>", command_type="error")
         issue = self.tree.show_log_issue(issue_id)
         if issue is None:
-            return CommandResult(ok=False, output=f"Issue not found: {issue_id}", command_type="error")
+            durable_state = self._durable_issue_state()
+            for durable_issue in issue_summaries_from_payload(durable_state):
+                if str(durable_issue.get("issue_id", "") or "").strip() == issue_id:
+                    return CommandResult(ok=True, output=format_issue_summary_detail(durable_issue), command_type="read")
+            return CommandResult(ok=True, output=format_issue_not_found(issue_id, durable_state), command_type="read")
         return CommandResult(ok=True, output=self.tree.format_log_issue_detail(issue), command_type="read")
 
     def _cmd_read_diagnostics(self, rest: str) -> CommandResult:
@@ -1309,7 +1335,30 @@ def _consume_chained_call(tail: str, name: str) -> Optional[Tuple[str, str]]:
     if not tail.startswith(prefix):
         return None
     depth = 0
+    quote = ""
+    in_regex = False
+    escaped = False
     for index, char in enumerate(tail[len(prefix):], start=len(prefix)):
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\":
+            escaped = True
+            continue
+        if quote:
+            if char == quote:
+                quote = ""
+            continue
+        if in_regex:
+            if char == "/":
+                in_regex = False
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            continue
+        if char == "/" and name == "match":
+            in_regex = True
+            continue
         if char == "(":
             depth += 1
         elif char == ")":
