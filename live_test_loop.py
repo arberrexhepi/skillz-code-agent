@@ -649,11 +649,13 @@ class TreeLoopPlannerWorker:
 
         if action_type == "list_issues":
             issues = self.loop.bridge.tree.list_log_issues()
+            summary = self.loop.bridge.tree.format_log_issue_list(issues)
             return ActionResult(
                 ok=True,
                 name=action_type,
                 payload={
                     "message": f"Listed {len(issues)} issue(s).",
+                    "summary": summary,
                     "issues": issues,
                 },
             )
@@ -664,12 +666,15 @@ class TreeLoopPlannerWorker:
                 return ActionResult(ok=False, name=action_type, payload={"error": "show_issue requires issue_id"})
             issue = self.loop.bridge.tree.show_log_issue(issue_id)
             self._maybe_resolve_discovery_remediation(action_type, issue_id=issue_id)
+            summary = self.loop.bridge.tree.format_log_issue_detail(issue) if issue else f"Issue not found: {issue_id}"
             return ActionResult(
                 ok=bool(issue),
                 name=action_type,
                 payload={
                     "message": f"Loaded {issue_id}." if issue else f"Issue not found: {issue_id}",
+                    "summary": summary,
                     "issue": issue,
+                    "next_reads": self.loop.bridge.tree.log_issue_read_commands(issue) if issue else [],
                     "issue_id": issue_id,
                 },
             )
@@ -2376,7 +2381,8 @@ def _run_extension_bridge(args: argparse.Namespace) -> int:
                 return f"{prefix}: {action_type}. {detail}"
         if isinstance(error, str) and error.strip():
             return f"{prefix}: {action_type}. {error.strip()}"
-        for key in ["message", "summary"]:
+        detail_keys = ["summary", "message"] if action_type in {"list_issues", "show_issue"} else ["message", "summary"]
+        for key in detail_keys:
             detail = str(payload.get(key, "") or "").strip()
             if detail:
                 return f"{prefix}: {action_type}. {detail}"

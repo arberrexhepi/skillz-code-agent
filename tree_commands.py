@@ -368,15 +368,7 @@ class TreeCommandParser:
 
     def _cmd_list_issues(self, rest: str) -> CommandResult:
         issues = self.tree.list_log_issues()
-        if not issues:
-            return CommandResult(ok=True, output="(no parsed issues)", command_type="read")
-        lines = []
-        for issue in issues:
-            status = str(issue.get("status", "open"))
-            count = str(issue.get("count", "1"))
-            summary = str(issue.get("summary", issue.get("message", issue.get("id", ""))))
-            lines.append(f"[{status}] {issue.get('id')} x{count} — {summary}")
-        return CommandResult(ok=True, output="\n".join(lines), command_type="read")
+        return CommandResult(ok=True, output=self.tree.format_log_issue_list(issues), command_type="read")
 
     def _cmd_show_issue(self, rest: str) -> CommandResult:
         issue_id = rest.strip()
@@ -385,7 +377,7 @@ class TreeCommandParser:
         issue = self.tree.show_log_issue(issue_id)
         if issue is None:
             return CommandResult(ok=False, output=f"Issue not found: {issue_id}", command_type="error")
-        return CommandResult(ok=True, output=json.dumps(issue, indent=2), command_type="read")
+        return CommandResult(ok=True, output=self.tree.format_log_issue_detail(issue), command_type="read")
 
     def _cmd_read_diagnostics(self, rest: str) -> CommandResult:
         path = rest.strip()

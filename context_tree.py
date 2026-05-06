@@ -716,6 +716,98 @@ class ContextTree:
                 return issue
         return None
 
+    def log_issue_read_commands(self, issue: Dict[str, Any], *, radius: int = 20) -> List[str]:
+        """Return focused read commands that help the model inspect an issue."""
+        file_path = str(issue.get("file", "") or "").strip()
+        if not file_path:
+            return []
+        repo_path = file_path if file_path.startswith("/repo/") else f"/repo/{file_path.removeprefix('repo/')}"
+        line_text = str(issue.get("line", "") or "").strip()
+        try:
+            line_no = int(line_text)
+        except Exception:
+            line_no = 0
+        if line_no > 0:
+            start = max(1, line_no - radius)
+            end = line_no + radius
+            return [
+                f"read-line-range {repo_path} {start}-{end}",
+                f"cat {repo_path}:{start}-{end}",
+            ]
+        return [f"cat {repo_path}"]
+
+    def format_log_issue_list(self, issues: Optional[List[Dict[str, Any]]] = None) -> str:
+        """Render parsed issues as a model-actionable checklist."""
+        issue_items = self.list_log_issues() if issues is None else issues
+        if not issue_items:
+            return "(no parsed issues)"
+
+        lines = [f"Parsed issues: {len(issue_items)}"]
+        for issue in issue_items:
+            issue_id = str(issue.get("id", "") or "")
+            status = str(issue.get("status", "open") or "open")
+            count = str(issue.get("count", "1") or "1")
+            severity = str(issue.get("severity", "") or "").strip()
+            kind = str(issue.get("kind", "") or "").strip()
+            code = str(issue.get("code", "") or "").strip()
+            file_path = str(issue.get("file", "") or "").strip()
+            line_no = str(issue.get("line", "") or "").strip()
+            column = str(issue.get("column", "") or "").strip()
+            location = file_path
+            if line_no:
+                location += f":{line_no}"
+                if column:
+                    location += f":{column}"
+            summary = str(issue.get("summary", issue.get("message", issue_id)) or "").strip()
+            metadata = [part for part in [f"severity={severity}" if severity else "", kind, code] if part]
+            header_bits = [f"- {issue_id} [{status}] x{count}"]
+            if metadata:
+                header_bits.append(" ".join(metadata))
+            if location:
+                header_bits.append(f"at {location}")
+            lines.append(" ".join(header_bits))
+            if summary:
+                lines.append(f"  summary: {summary}")
+            next_reads = self.log_issue_read_commands(issue)
+            next_steps = [f"show-issue {issue_id}", *next_reads]
+            lines.append(f"  next: {'; '.join(next_steps)}")
+        return "\n".join(lines)
+
+    def format_log_issue_detail(self, issue: Dict[str, Any]) -> str:
+        """Render one issue with the high-value fields before verbose evidence."""
+        issue_id = str(issue.get("id", "") or "")
+        status = str(issue.get("status", "open") or "open")
+        fields = [
+            ("summary", issue.get("summary") or issue.get("message") or ""),
+            ("message", issue.get("message") or ""),
+            ("kind", issue.get("kind") or ""),
+            ("classification", issue.get("classification") or ""),
+            ("tool", issue.get("tool") or ""),
+            ("code", issue.get("code") or ""),
+            ("severity", issue.get("severity") or ""),
+            ("file", issue.get("file") or ""),
+            ("line", issue.get("line") or ""),
+            ("column", issue.get("column") or ""),
+            ("count", issue.get("count") or ""),
+            ("source", issue.get("source") or ""),
+        ]
+        lines = [f"Issue {issue_id} [{status}]"]
+        for key, value in fields:
+            text = str(value or "").strip()
+            if text:
+                lines.append(f"{key}: {text}")
+
+        next_reads = self.log_issue_read_commands(issue)
+        if next_reads:
+            lines.append("next_reads:")
+            lines.extend(f"- {command}" for command in next_reads)
+
+        example = str(issue.get("example", "") or "").strip()
+        if example:
+            lines.append("evidence:")
+            lines.append(example)
+        return "\n".join(lines)
+
     def resolve_log_issue(self, issue_id: str) -> bool:
         issue = self.show_log_issue(issue_id)
         if issue is None:
