@@ -1610,6 +1610,7 @@ class WorkingFolderAgent:
         self.edit_batch_started_thought = ""
         self.pending_fact_resolution = None
         self.active_error = None
+        self.output_format_recovery: Optional[Dict[str, Any]] = None
         self.fact_map = {}
         self.issue_ledger = IssueFactLedger.empty()
         self._run_sequence = 0
@@ -1805,6 +1806,7 @@ class WorkingFolderAgent:
         self._clear_pending_verification()
         self._clear_pending_fact_resolution()
         self._clear_active_error()
+        self._clear_output_format_recovery()
         self.clear_goal_fact_keys()
         self.clear_discovery_budget()
         if not preserve_context:
@@ -1857,6 +1859,9 @@ class WorkingFolderAgent:
         pending_patch_recovery = None
         if isinstance(self.pending_patch_recovery, dict):
             pending_patch_recovery = dict(self.pending_patch_recovery)
+        output_format_recovery = None
+        if isinstance(self.output_format_recovery, dict):
+            output_format_recovery = dict(self.output_format_recovery)
         return {
             "runtime_config": {
                 "provider": self.config.provider,
@@ -1870,6 +1875,7 @@ class WorkingFolderAgent:
             "completion_check_pending": self.completion_check_pending,
             "completion_check_reason": self.completion_check_reason,
             "active_error": active_error,
+            "output_format_recovery": output_format_recovery,
             "active_mode_strategy": self._active_mode_strategy(),
             "pending_patch_recovery": pending_patch_recovery,
             "pending_verification": pending_verification,
@@ -5473,6 +5479,11 @@ class WorkingFolderAgent:
                 try:
                     obj = extract_first_json_object(raw)
                 except Exception as exc:
+                    self._set_output_format_recovery(
+                        error_type="parse_error",
+                        message=f"Could not parse JSON: {exc}",
+                        raw=raw,
+                    )
                     result = ActionResult(
                         ok=False,
                         name="parse_error",
@@ -5481,7 +5492,7 @@ class WorkingFolderAgent:
                     error_step = AgentStep(
                         step=len(self.history) + 1,
                         thought="Model returned invalid JSON.",
-                        action={"action": "error"},
+                        action={"type": "output_format_error", "error_type": "parse_error"},
                         result=result,
                         elapsed_s=time.time() - started,
                         run_id=self._active_run_id,
@@ -5499,10 +5510,15 @@ class WorkingFolderAgent:
                         name="schema_error",
                         payload={"error": "Invalid action payload", "object": obj},
                     )
+                    self._set_output_format_recovery(
+                        error_type="schema_error",
+                        message=str(result.payload.get("error", "Invalid action payload")) if isinstance(result.payload, dict) else "Invalid action payload",
+                        raw=raw,
+                    )
                     error_step = AgentStep(
                         step=len(self.history) + 1,
                         thought=thought,
-                        action={"action": "error"},
+                        action={"type": "output_format_error", "error_type": "schema_error"},
                         result=result,
                         elapsed_s=time.time() - started,
                         run_id=self._active_run_id,
@@ -5521,6 +5537,8 @@ class WorkingFolderAgent:
 
                     self._current_thought = thought
                     result = self._execute_action(action)
+                    if result.ok:
+                        self._clear_output_format_recovery()
                     error_cleared = self._maybe_clear_active_error(action, result)
                     if not result.ok:
                         self._set_active_error(action, result)
@@ -5743,6 +5761,7 @@ class WorkingFolderAgent:
                 5. {shell_rule}
                 6. Never ask for tools; choose the next action yourself. Use a short ordered batch only when the steps are tightly coupled and clearly higher-yield than waiting for another turn.
                 7. Return EXACTLY one JSON object and nothing else.
+                7d. Do not answer with prose-only plans, numbered checklists, markdown, or "I will..." summaries. Put any plan in `thought`, then emit an executable `action` or `actions`.
                 7a. Prefer the narrowest implementation that directly satisfies the user's request.
                 7b. Do not expand admin/editor constraints into public runtime behavior unless the request or concrete code dependency requires it.
                 7c. Do not claim performance gains or WCAG compliance unless you measured them, computed them, or implemented an actual validation mechanism.
@@ -6175,6 +6194,22 @@ class WorkingFolderAgent:
             - Once a matching follow-up succeeds, the host will clear this error state.
             """).strip()
 
+        output_format_note = ""
+        if isinstance(self.output_format_recovery, dict):
+            output_format_note = textwrap.dedent(f"""
+            OUTPUT FORMAT RECOVERY:
+            {json.dumps(self.output_format_recovery, indent=2)}
+
+            IMPORTANT:
+            - The previous model turn was ignored because it was not a valid action object.
+            - Do not repeat the prose plan or numbered checklist from that turn.
+            - Return exactly one JSON object and nothing else.
+            - Put brief reasoning in `thought`, then emit an executable `action` or `actions`.
+            - Valid immediate examples:
+              {{"thought":"Apply the Dashboard and sidebar integration UI updates.","action":{{"type":"patch_file","path":"src/pages/Dashboard.tsx","search":"old exact text","replace":"new exact text"}}}}
+              {{"thought":"Batch the Dashboard and sidebar updates, then verify.","actions":[{{"type":"begin_edit_batch"}},{{"type":"patch_file","path":"src/pages/Dashboard.tsx","search":"old exact text","replace":"new exact text"}},{{"type":"patch_file","path":"src/components/SmartSidebar.tsx","search":"old exact text","replace":"new exact text"}},{{"type":"end_edit_batch"}}]}}
+            """).strip()
+
         fact_discipline_note = ""
         recent_exploration = self._recent_exploration_actions(window=6)
         if recent_exploration:
@@ -6295,6 +6330,8 @@ class WorkingFolderAgent:
         {edit_batch_note}
 
         {active_error_note}
+
+        {output_format_note}
 
         {fact_discipline_note}
 
@@ -6489,6 +6526,17 @@ class WorkingFolderAgent:
         if resolution_block is None:
             return None
         return self._error_action_result(action_type, resolution_block)
+
+    def _set_output_format_recovery(self, *, error_type: str, message: str, raw: str = "") -> None:
+        self.output_format_recovery = {
+            "error_type": str(error_type or "output_format").strip() or "output_format",
+            "message": str(message or "").strip(),
+            "raw_excerpt": shorten(str(raw or "").strip(), 1000),
+            "step": len(self.history) + 1,
+        }
+
+    def _clear_output_format_recovery(self) -> None:
+        self.output_format_recovery = None
 
     def _recent_exploration_burst(self, window: int = 10) -> List[AgentStep]:
         burst: List[AgentStep] = []
@@ -7928,14 +7976,29 @@ class WorkingFolderAgent:
         value = str(action.get("value", "") or "").strip()
         fact_type = str(action.get("fact_type", "") or "").strip().lower()
         if fact_type not in {FACT_TYPE_GOAL, FACT_TYPE_ARCHITECTURE}:
-            return self._error_action_result(action_type, {"error": 'set_fact requires fact_type as "goal" or "architecture".'})
+            return self._error_action_result(
+                action_type,
+                {
+                    "error": 'set_fact requires fact_type as "goal" or "architecture".',
+                    "next_hint": 'Retry set_fact with fact_type "goal" for task-local findings or "architecture" for reusable repo knowledge.',
+                },
+            )
         if not key or not value:
-            return self._error_action_result(action_type, {"error": "set_fact requires non-empty key and value"})
+            return self._error_action_result(
+                action_type,
+                {
+                    "error": "set_fact requires non-empty key and value.",
+                    "next_hint": "Retry with a concise durable finding, for example {\"type\":\"set_fact\",\"key\":\"goal/findings/<short_key>\",\"value\":\"<specific finding>\",\"fact_type\":\"goal\"}.",
+                },
+            )
         existing = self.issue_ledger.find_fact(key)
         if existing is not None:
             return self._error_action_result(
                 action_type,
-                {"error": f"Fact already exists: {key}. Use update_fact to change an existing fact."},
+                {
+                    "error": f"Fact already exists: {key}.",
+                    "next_hint": "Use update_fact with the same key to revise an existing fact, or choose a different key for a distinct finding.",
+                },
             )
         quality_error = self._validate_fact_quality(action_type, key, value, fact_type)
         if quality_error is not None:
@@ -7957,10 +8020,22 @@ class WorkingFolderAgent:
         action_type = str(action.get("type"))
         key = str(action.get("key", "") or "").strip()
         if not key:
-            return self._error_action_result(action_type, {"error": "update_fact requires a non-empty key"})
+            return self._error_action_result(
+                action_type,
+                {
+                    "error": "update_fact requires a non-empty key.",
+                    "next_hint": "Retry update_fact with the exact existing fact key, or use set_fact with a non-empty key for a new finding.",
+                },
+            )
         existing = self.issue_ledger.find_fact(key)
         if existing is None:
-            return self._error_action_result(action_type, {"error": f"Fact not found: {key}"})
+            return self._error_action_result(
+                action_type,
+                {
+                    "error": f"Fact not found: {key}",
+                    "next_hint": "Use set_fact to create a new finding, or retry update_fact with an existing key from the fact context.",
+                },
+            )
 
         next_value = str(
             action.get("value", action.get("resolution", "")) or existing.value

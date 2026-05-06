@@ -2166,6 +2166,8 @@ class AgentPanel implements vscode.Disposable {
         label = 'model call failed';
       } else if (p.action_type === 'model_call_interrupted') {
         label = 'model call interrupted';
+      } else if (p.action_type === 'output_format_error') {
+        label = 'output format';
       }
       if (p.action_type === 'skill') {
         if (p.skill_name) {

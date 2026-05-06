@@ -986,6 +986,8 @@ class TreeLoopPlannerWorker:
                         f"Discovery mode: {self.discovery_budget.mode_label}.",
                         f"Discovery budget: at most {self.discovery_budget.max_tool_calls} tool-backed actions.",
                         "Do not modify files during discovery. Finish with a concise discovery summary.",
+                        "Record useful findings with executable fact commands, for example: `fact demo/goal/entrypoint planner.py owns discovery mode`.",
+                        "Fact commands are allowed after the tool-call budget is exhausted, but they must include a non-empty key and value.",
                     ]
                 )
             )
@@ -2082,7 +2084,7 @@ class TreeLoopPlannerWorker:
         key = str(action.get("key", "") or "").strip()
         value = str(action.get("value", "") or "").strip()
         if not key or not value:
-            return "set_fact: missing key or value"
+            return "set_fact: missing key or value; emit `fact demo/goal/<key> <value>` with a concise non-empty finding"
         fact_type = str(action.get("fact_type", FACT_TYPE_ARCHITECTURE) or FACT_TYPE_ARCHITECTURE).strip().lower()
         issue_id = str(action.get("issue_id", "") or "").strip()
         record = self._set_fact_record(
