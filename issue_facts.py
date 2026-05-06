@@ -565,6 +565,15 @@ class IssueFactLedger:
         self.active_issue_id = issue.issue_id
         return issue
 
+    def activate_issue(self, issue_id: str) -> IssueRecord:
+        issue = self.get_issue(issue_id)
+        if issue is None:
+            raise KeyError(issue_id)
+        if issue.status != ISSUE_STATUS_OPEN:
+            raise ValueError(f"Issue {issue_id} is not open")
+        self.active_issue_id = issue.issue_id
+        return issue
+
     def _find_fact_index(self, issue: IssueRecord, *, key: str, fact_type: str) -> int:
         for index, record in enumerate(issue.facts):
             if record.key == key and record.fact_type == fact_type:
@@ -753,7 +762,7 @@ def format_issue_summary_list(payload: Dict[str, Any], *, limit: int = 40) -> st
 
     remaining = len(ordered) - len(limited)
     if remaining > 0:
-        lines.append(f"... {remaining} more issue(s) omitted; use show-issue with one of the listed ids or reopen a recent issue.")
+        lines.append(f"... {remaining} more issue(s) omitted; use show-issue with one of the listed ids; prefer a new follow-up issue over reopening a closed one.")
     return "\n".join(lines)
 
 
@@ -830,7 +839,7 @@ def format_issue_not_found(issue_id: str, payload: Dict[str, Any], *, limit: int
     requested = str(issue_id or "").strip()
     lines = [
         f"Issue not found: {requested}",
-        "Recovery: do not retry this id unless it appears below. Use list-issues or show one of the available durable issue ids.",
+        "Recovery: do not retry this durable issue id unless it appears below. Use list-issues or show one of the available durable issue ids. For current-run diagnostics, use list-run-issues/show-run-issue.",
     ]
     if issue_summaries_from_payload(payload):
         lines.append(format_issue_summary_list(payload, limit=limit))

@@ -164,9 +164,11 @@ READ (free, no tool call — use these instead of tool actions for exploration):
   read-diagnostics [path]           Ingest a local diagnostics snapshot
     diagnose <path> [limit=N]         Run backend diagnostics for one file and ingest issues
   run-route-check <route-or-url> [base=<url>]  Visit a route and ingest browser/runtime errors
-  list-issues                       List parsed log issues
-  show-issue <id>                   Show one parsed issue
-  reopen-issue <id>                 Mark one parsed issue open again
+  list-run-issues                   List parsed run diagnostic issues
+  show-run-issue <id>               Show one parsed run diagnostic issue
+  list-issues                       Compatibility alias: list run + durable issues
+  show-issue <id>                   Compatibility alias: show run or durable issue
+  reopen-run-issue <id>             Mark one parsed run issue open again
 
 WRITE (dispatches to real tools):
   write <path> <content>            Write file (single line content)
@@ -200,7 +202,7 @@ HEREDOC (<<< ... >>> works on ANY command or strategy step):
 
 CONTEXT:
   fact <issue>/<type>/<key> <value> Set/update a durable fact
-  ingest-log <path>                 Parse a log file into /facts/log-issues
+  ingest-log <path>                 Parse a log file into run issues under /facts/log-issues
   run-check <build|lint|typecheck|test>  Run a finite project check and ingest issues
   run-route-check <route-or-url> [base=<url>]  Visit a route with Playwright and ingest browser/runtime issues
   expand <step_number>              Expand a history step
@@ -208,8 +210,8 @@ CONTEXT:
   drop                              Clear active context
   batch start                       Begin edit batch mode
   batch end                         End edit batch mode
-  resolve-issue <id>                Mark a parsed issue resolved
-  reopen-issue <id>                 Mark a parsed issue open again
+  resolve-run-issue <id>            Mark a parsed run issue resolved
+  reopen-run-issue <id>             Mark a parsed run issue open again
   finish [message]                  Signal task completion
 
 SKILLS:
@@ -277,7 +279,7 @@ STRATEGIES (multi-step DAG pipelines):
         first_word = stripped.split(None, 1)[0].lower()
         return first_word in {
             "ls", "cat", "read-line-range", "read_line_range", "symbols", "find-symbol", "find_symbol", "stat", "find", "grep",
-            "read-diagnostics", "run-route-check", "run_route_check", "ingest-log", "list-issues", "show-issue", "resolve-issue", "reopen-issue", "run-check",
+            "read-diagnostics", "run-route-check", "run_route_check", "ingest-log", "list-run-issues", "list_run_issues", "list-issues", "show-run-issue", "show_run_issue", "show-issue", "resolve-run-issue", "resolve_run_issue", "resolve-issue", "reopen-run-issue", "reopen_run_issue", "reopen-issue", "run-check",
             "write", "replace-lines", "replace_lines", "patch", "show-diff", "show_diff", "review-changes", "review_changes", "shell", "git",
             "fact", "expand", "drop", "batch", "finish",
             "skill", "#",

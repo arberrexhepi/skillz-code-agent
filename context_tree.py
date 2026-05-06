@@ -737,12 +737,12 @@ class ContextTree:
         return [f"cat {repo_path}"]
 
     def format_log_issue_list(self, issues: Optional[List[Dict[str, Any]]] = None) -> str:
-        """Render parsed issues as a model-actionable checklist."""
+        """Render current-run diagnostic issues as a model-actionable checklist."""
         issue_items = self.list_log_issues() if issues is None else issues
         if not issue_items:
-            return "(no parsed issues)"
+            return "(no run issues)"
 
-        lines = [f"Parsed issues: {len(issue_items)}"]
+        lines = [f"Run issues: {len(issue_items)}"]
         for issue in issue_items:
             issue_id = str(issue.get("id", "") or "")
             status = str(issue.get("status", "open") or "open")
@@ -769,7 +769,7 @@ class ContextTree:
             if summary:
                 lines.append(f"  summary: {summary}")
             next_reads = self.log_issue_read_commands(issue)
-            next_steps = [f"show-issue {issue_id}", *next_reads]
+            next_steps = [f"show-run-issue {issue_id}", *next_reads]
             lines.append(f"  next: {'; '.join(next_steps)}")
         return "\n".join(lines)
 
@@ -791,7 +791,7 @@ class ContextTree:
             ("count", issue.get("count") or ""),
             ("source", issue.get("source") or ""),
         ]
-        lines = [f"Issue {issue_id} [{status}]"]
+        lines = [f"Run Issue {issue_id} [{status}]"]
         for key, value in fields:
             text = str(value or "").strip()
             if text:

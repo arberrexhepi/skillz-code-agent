@@ -2,6 +2,18 @@
 
 Planner-first coding agent for real repositories. The planner handles clarification, discovery, goal sequencing, and final next steps. The worker executes concrete repository actions.
 
+## TLDR: Ways To Use The Agent
+
+| Interface | Best for | How to start | How to use |
+| --- | --- | --- | --- |
+| Planner CLI | Normal repo work where you want discovery, a reviewable plan, then execution. | `python main.py --provider openai --model gpt-5.4 --root /your/project` | Type the request, choose discovery depth if offered, then `approve` to run the plan. |
+| Auto CLI | Letting the planner run one or more issue cycles without pausing for plan approval. | `start-auto 3 Build the feature described in PROPOSAL.md` from the planner prompt | The optional text becomes the auto-run prompt; cycles create/close issues and use completed issue context to avoid repeats. |
+| Direct Worker CLI | Small, concrete edits when you do not need planner decomposition. | `python main.py --provider openai --model gpt-5.4 --root /your/project --worker-mode` | Give a focused task; the worker reads, edits, validates, and finishes directly. |
+| Beta TreeLoop Worker | Fast command-grammar workflow and current-run diagnostics. | `python main_v2.py --provider gemini --model gemini-3-flash-preview --root /your/project --worker-mode` | Use tree commands like `cat`, `replace-lines`, `run-check`, `list-run-issues`, and `show-run-issue`. |
+| VS Code Extension | Desktop UI for planner state, Auto mode, issues, diagnostics, diffs, and suggested actions. | Open `vscode-extension/` in VS Code and run `Run Python Agent Extension` | Use the panel to submit prompts, create issues, start Auto cycles, approve plans, inspect diagnostics, and open files/diffs. |
+
+Common planner commands: `/reset`, `/start-auto 3 optional prompt`, `/stop-auto`, `/create-issue details`, `reopen issue-123`, `approve`, `reject`.
+
 ## Setup
 
 Install dependencies:

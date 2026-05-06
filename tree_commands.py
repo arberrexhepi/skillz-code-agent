@@ -19,8 +19,10 @@ READ (free, in-context — no tool call):
   read-diagnostics [path]          Ingest a local diagnostics snapshot
     diagnose <path> [limit=N]        Run backend diagnostics for one file and ingest issues
   run-route-check <route-or-url> [base=<url>]  Visit a route with Playwright and ingest runtime errors
-  list-issues                      List parsed log issues
-  show-issue <id>                  Show one parsed issue
+  list-run-issues                  List parsed run diagnostic issues
+  show-run-issue <id>              Show one parsed run diagnostic issue
+  list-issues                      Compatibility alias: list run + durable issues
+  show-issue <id>                  Compatibility alias: show run or durable issue
 
 WRITE (real tool dispatch):
   write <path> <content>           Write full file
@@ -45,8 +47,8 @@ TREE MUTATIONS (in-process):
   batch end                        End edit batch
     approve-npm                      Approve the pending npm command
     reject-npm                       Reject the pending npm command
-  resolve-issue <id>               Mark a parsed issue resolved
-  reopen-issue <id>                Mark a parsed issue open again
+  resolve-run-issue <id>           Mark a parsed run issue resolved
+  reopen-run-issue <id>            Mark a parsed run issue open again
   finish [message]                 Signal completion
 
 SKILLS (preloaded cache or handler):
@@ -200,9 +202,17 @@ class TreeCommandParser:
             "run-route-check": self._cmd_run_route_check,
             "run_route_check": self._cmd_run_route_check,
             "ingest-log": self._cmd_ingest_log,
+            "list-run-issues": self._cmd_list_issues,
+            "list_run_issues": self._cmd_list_issues,
             "list-issues": self._cmd_list_issues,
+            "show-run-issue": self._cmd_show_issue,
+            "show_run_issue": self._cmd_show_issue,
             "show-issue": self._cmd_show_issue,
+            "resolve-run-issue": self._cmd_resolve_issue,
+            "resolve_run_issue": self._cmd_resolve_issue,
             "resolve-issue": self._cmd_resolve_issue,
+            "reopen-run-issue": self._cmd_reopen_issue,
+            "reopen_run_issue": self._cmd_reopen_issue,
             "reopen-issue": self._cmd_reopen_issue,
             "run-check": self._cmd_run_check,
             "write": self._cmd_write,
@@ -389,13 +399,13 @@ class TreeCommandParser:
         if issue_summaries_from_payload(durable_state):
             parts.append(format_issue_summary_list(durable_state))
         if not parts:
-            parts.append("(no parsed log issues and no durable repo_facts issues)")
+            parts.append("(no run issues and no durable repo_facts issues)")
         return CommandResult(ok=True, output="\n\n".join(parts), command_type="read")
 
     def _cmd_show_issue(self, rest: str) -> CommandResult:
         issue_id = rest.strip()
         if not issue_id:
-            return CommandResult(ok=False, output="Usage: show-issue <id>", command_type="error")
+            return CommandResult(ok=False, output="Usage: show-run-issue <id>", command_type="error")
         issue = self.tree.show_log_issue(issue_id)
         if issue is None:
             durable_state = self._durable_issue_state()
@@ -905,7 +915,7 @@ class TreeCommandParser:
     def _cmd_resolve_issue(self, rest: str) -> CommandResult:
         issue_id = rest.strip()
         if not issue_id:
-            return CommandResult(ok=False, output="Usage: resolve-issue <id>", command_type="error")
+            return CommandResult(ok=False, output="Usage: resolve-run-issue <id>", command_type="error")
         resolved = self.tree.resolve_log_issue(issue_id)
         if not resolved:
             return CommandResult(ok=False, output=f"Issue not found: {issue_id}", command_type="error")
@@ -914,7 +924,7 @@ class TreeCommandParser:
     def _cmd_reopen_issue(self, rest: str) -> CommandResult:
         issue_id = rest.strip()
         if not issue_id:
-            return CommandResult(ok=False, output="Usage: reopen-issue <id>", command_type="error")
+            return CommandResult(ok=False, output="Usage: reopen-run-issue <id>", command_type="error")
         reopened = self.tree.reopen_log_issue(issue_id)
         if not reopened:
             return CommandResult(ok=False, output=f"Issue not found: {issue_id}", command_type="error")
@@ -1059,7 +1069,7 @@ def _starts_new_command_boundary(line: str) -> bool:
     first = line.split(None, 1)[0].lower() if line else ""
     return first in {
         "ls", "cat", "read-line-range", "read_line_range", "symbols", "find-symbol", "find_symbol", "stat", "find", "grep",
-        "read-diagnostics", "diagnose", "run-route-check", "run_route_check", "ingest-log", "list-issues", "show-issue", "resolve-issue", "reopen-issue", "run-check",
+        "read-diagnostics", "diagnose", "run-route-check", "run_route_check", "ingest-log", "list-run-issues", "list_run_issues", "list-issues", "show-run-issue", "show_run_issue", "show-issue", "resolve-run-issue", "resolve_run_issue", "resolve-issue", "reopen-run-issue", "reopen_run_issue", "reopen-issue", "run-check",
         "write", "replace-lines", "replace_lines", "patch", "discover", "mutate", "show-diff", "show_diff", "review-changes", "review_changes", "shell", "git",
         "fact", "expand", "drop", "batch", "finish", "skill",
     }

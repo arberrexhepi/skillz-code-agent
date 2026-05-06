@@ -176,6 +176,112 @@ class ContinuousAutoApprovalTests(unittest.TestCase):
         self.assertNotEqual(created.issue_id, closed.issue_id)
         self.assertEqual(ledger.get_issue(closed.issue_id).status, "closed")
 
+    def test_manual_issue_creation_activates_new_issue(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            config = SimpleNamespace(root=str(root), provider="openai", model="test", max_parallel_workers=1)
+            planner = ContinuousPlannerForTest(FakeModel([]), config, lambda: FakeWorker(root), json.loads)
+
+            message = planner.create_manual_issue("Investigate route health checks")
+
+        self.assertIn("Created issue ISSUE-1: Investigate route health checks", message)
+        self.assertEqual(planner.session.active_issue_id, "ISSUE-1")
+
+    def test_auto_mode_activates_open_issue_before_initial_planning(self):
+        class ActivatingWorker(FakeWorker):
+            def __init__(self, root: Path, ledger: IssueFactLedger):
+                super().__init__(root)
+                self.ledger = ledger
+                self.activated = []
+
+            def activate_issue(self, issue_id: str):
+                issue = self.ledger.activate_issue(issue_id)
+                self.activated.append(issue.issue_id)
+                (self.root / "repo_facts.md").write_text(self.ledger.to_markdown(), encoding="utf-8")
+                return issue.summary()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            ledger = IssueFactLedger.empty()
+            ledger.create_issue(
+                request_summary="Lower priority open issue",
+                plan_summary="Lower priority open issue",
+                priority=10,
+                activate=False,
+            )
+            selected = ledger.create_issue(
+                request_summary="Follow up reviewer 503 retry",
+                plan_summary="Follow up reviewer 503 retry",
+                priority=80,
+                activate=False,
+            )
+            ledger.active_issue_id = ""
+            ledger.upsert_fact(
+                key="reviewer_retry",
+                value="Reviewer 503 failures should get one automatic retry.",
+                fact_type="goal",
+                source_action="test",
+                updated_step=1,
+                updated_run_id=1,
+                issue_id=selected.issue_id,
+            )
+            (root / "repo_facts.md").write_text(ledger.to_markdown(), encoding="utf-8")
+            worker = ActivatingWorker(root, ledger)
+            model = FakeModel([
+                present_plan(
+                    "Implement reviewer retry follow-up.",
+                    "Use the selected issue context to implement the reviewer retry follow-up.",
+                    ["Use repo_facts active issue context."],
+                )
+            ])
+            config = SimpleNamespace(root=str(root), provider="openai", model="test", max_parallel_workers=1)
+            planner = ContinuousPlannerForTest(model, config, lambda: worker, json.loads)
+
+            planner.start_continuous(max_cycles=1)
+
+        self.assertEqual(worker.activated, [selected.issue_id])
+        self.assertIn(f'"issue_id": "{selected.issue_id}"', model.prompts[0])
+        self.assertIn("Follow up reviewer 503 retry", model.prompts[0])
+        self.assertIn("reviewer_retry", model.prompts[0])
+
+    def test_prompted_auto_mode_creates_initial_issue_from_prompt(self):
+        class PromptIssueWorker(FakeWorker):
+            def __init__(self, root: Path):
+                super().__init__(root)
+                self.created = []
+
+            def create_issue(self, **kwargs):
+                issue = {
+                    "issue_id": f"issue-{len(self.created) + 1:03d}",
+                    "request_summary": kwargs.get("request_summary", ""),
+                    "plan_summary": kwargs.get("plan_summary", ""),
+                    "source": kwargs.get("source", ""),
+                    "source_excerpt": kwargs.get("source_excerpt", ""),
+                }
+                self.created.append(issue)
+                return issue
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            worker = PromptIssueWorker(root)
+            model = FakeModel([
+                present_plan(
+                    "Add manual auto-run prompt support.",
+                    "Implement support for starting auto mode from an operator prompt.",
+                    ["Use the operator prompt as run-level context."],
+                )
+            ])
+            config = SimpleNamespace(root=str(root), provider="openai", model="test", max_parallel_workers=1)
+            planner = ContinuousPlannerForTest(model, config, lambda: worker, json.loads)
+
+            message = planner.start_continuous(max_cycles=1, prompt="Build manual auto-run prompt support")
+
+        self.assertIn("Auto run prompt: Build manual auto-run prompt support", message)
+        self.assertEqual(worker.created[0]["source"], "auto_prompt")
+        self.assertEqual(worker.created[0]["request_summary"], "Build manual auto-run prompt support")
+        self.assertIn("Auto run prompt: Build manual auto-run prompt support", model.prompts[0])
+        self.assertEqual(planner.continuous_state.completed_issue_ids, ["issue-001"])
+
     def test_intent_guidance_reference_passes_auto_approval(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

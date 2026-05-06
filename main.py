@@ -1976,6 +1976,12 @@ class WorkingFolderAgent:
         self._clear_edit_batch_state()
         return issue.summary()
 
+    def activate_issue(self, issue_id: str) -> Dict[str, Any]:
+        issue = self.issue_ledger.activate_issue(str(issue_id or "").strip())
+        self._persist_repo_facts()
+        self._clear_facts()
+        return issue.summary()
+
     def _latest_diagnostics_state(self) -> Optional[Dict[str, Any]]:
         if self.active_error is not None and self.active_error.diagnostics:
             return {
@@ -5802,6 +5808,7 @@ class WorkingFolderAgent:
                 7a. Prefer the narrowest implementation that directly satisfies the user's request.
                 7b. Do not expand admin/editor constraints into public runtime behavior unless the request or concrete code dependency requires it.
                 7c. Do not claim performance gains or WCAG compliance unless you measured them, computed them, or implemented an actual validation mechanism.
+                7e. Treat closed durable repo_facts issues as historical context only. Do not reopen closed issues unless the task explicitly requires that exact issue; prefer creating or continuing an open/new issue for follow-up work.
 
                 8. RELEVANT MEMORY contains compact prior tool results selected for the current task.
                 9. Prefer using paths, entities, and tags from RELEVANT MEMORY when choosing your next action.
@@ -8749,21 +8756,25 @@ def _handle_bridge_planner_action(
         return message
     if action_name == "start_continuous":
         max_cycles = 1
+        run_prompt = ""
         payload = request.get("payload")
         if isinstance(payload, dict):
             try:
                 max_cycles = int(payload.get("max_cycles", max_cycles) or max_cycles)
             except Exception:
                 max_cycles = 1
+            run_prompt = str(payload.get("prompt") or payload.get("run_prompt") or payload.get("summary") or "").strip()
         elif request.get("max_cycles") is not None:
             try:
                 max_cycles = int(request.get("max_cycles") or max_cycles)
             except Exception:
                 max_cycles = 1
+        if not run_prompt:
+            run_prompt = str(request.get("prompt") or request.get("run_prompt") or "").strip()
         starter = getattr(planner, "start_continuous", None)
         if not callable(starter):
             raise ValueError("Planner does not support continuous mode")
-        message = starter(max_cycles=max_cycles)
+        message = starter(max_cycles=max_cycles, prompt=run_prompt)
         add_exchange("assistant", message)
         return message
     if action_name == "stop_continuous":
@@ -8830,6 +8841,19 @@ def _handle_bridge_planner_action(
         if not issue_id:
             raise ValueError("reopen_issue requires issue_id")
         message = planner.reopen_issue(issue_id)
+        add_exchange("assistant", message)
+        return message
+    if action_name == "create_issue":
+        summary = str(request.get("summary", "") or request.get("request_summary", "") or "").strip()
+        payload = request.get("payload")
+        if isinstance(payload, dict):
+            summary = summary or str(payload.get("summary", "") or payload.get("request_summary", "") or "").strip()
+        if not summary:
+            raise ValueError("create_issue requires issue details")
+        creator = getattr(planner, "create_manual_issue", None)
+        if not callable(creator):
+            raise ValueError("Planner does not support issue creation")
+        message = creator(summary)
         add_exchange("assistant", message)
         return message
     if action_name == "close_issue":
