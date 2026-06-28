@@ -512,7 +512,10 @@ class ContextTree:
     def sync_facts(self, records: Sequence[Any]) -> None:
         """Rebuild /facts from IssueFactRecord-like objects.
         Structure: /facts/<issue_id>/<fact_type>/<key>"""
+        log_issues = self._facts.children.get(self.LOG_ISSUES_ROOT)
         self._facts.children.clear()
+        if log_issues is not None:
+            self._facts.children[self.LOG_ISSUES_ROOT] = log_issues
         for rec in records:
             issue_id = str(getattr(rec, "issue_id", "default"))
             fact_type = str(getattr(rec, "fact_type", "architecture"))

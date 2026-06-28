@@ -8843,6 +8843,35 @@ def _handle_bridge_planner_action(
         message = planner.reopen_issue(issue_id)
         add_exchange("assistant", message)
         return message
+    if action_name == "activate_issue":
+        issue_id = str(request.get("issue_id", "") or "").strip()
+        if not issue_id:
+            payload = request.get("payload")
+            if isinstance(payload, dict):
+                issue_id = str(payload.get("issue_id", "") or "").strip()
+        if not issue_id:
+            raise ValueError("activate_issue requires issue_id")
+        activator = getattr(planner, "activate_issue", None)
+        if not callable(activator):
+            raise ValueError("Planner does not support issue activation")
+        message = activator(issue_id)
+        add_exchange("assistant", message)
+        return message
+    if action_name == "continue_issue":
+        issue_id = str(request.get("issue_id", "") or "").strip()
+        prompt = str(request.get("prompt", "") or "").strip()
+        payload = request.get("payload")
+        if isinstance(payload, dict):
+            issue_id = issue_id or str(payload.get("issue_id", "") or "").strip()
+            prompt = prompt or str(payload.get("prompt", "") or payload.get("run_prompt", "") or "").strip()
+        if not issue_id:
+            raise ValueError("continue_issue requires issue_id")
+        continuer = getattr(planner, "continue_issue", None)
+        if not callable(continuer):
+            raise ValueError("Planner does not support issue continuation")
+        message = continuer(issue_id, prompt)
+        add_exchange("assistant", message)
+        return message
     if action_name == "create_issue":
         summary = str(request.get("summary", "") or request.get("request_summary", "") or "").strip()
         payload = request.get("payload")

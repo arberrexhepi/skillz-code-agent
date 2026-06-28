@@ -154,8 +154,8 @@ def _looks_like_command(line: str) -> bool:
     """Quick check if a line looks like a tree command, strategy label, or annotation."""
     if not line:
         return False
-    # Annotations: >>tag: content
-    if line.startswith(">>"):
+    # Annotations: >>tag: content. A bare heredoc terminator (>>>) is not a command.
+    if is_annotation(line):
         return True
     if is_strategy(line):
         return True
@@ -1112,7 +1112,8 @@ class TreeLoop:
         if action_type == "run_shell":
             return lowered.startswith("run_shell: timed out") or lowered.startswith("run_shell: error executing")
         if action_type == "diagnose":
-            return lowered.startswith("diagnose:")
+            match = re.search(r"\bissues=(\d+)\b", str(message or ""), re.IGNORECASE)
+            return lowered.startswith("diagnose:") or bool(match and int(match.group(1)) > 0)
         if action_type == "run_check":
             return lowered.startswith("run_check:")
         return lowered.startswith(f"{action_type}:")

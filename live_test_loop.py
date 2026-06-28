@@ -62,6 +62,7 @@ from tree_loop import TreeLoop, Turn  # noqa: E402
 
 REPO_FACTS_FILENAME = "repo_facts.md"
 OBSERVABILITY_TRACE_BLOCK_LIMIT = 24
+DISCOVERY_REMEDIATION_READ_SATISFIERS = {"read_file", "read_line_range", "read-line-range", "grep"}
 
 
 def _normalize_cli_argv(argv: Sequence[str]) -> List[str]:
@@ -1301,6 +1302,7 @@ class TreeLoopPlannerWorker:
             "repo_facts_status_lines": self.repo_facts_status_lines(),
             "available_skills": self._available_skills_payload(),
             "suggested_next_actions": self.runtime_suggested_next_actions(),
+            "issue_state": self.issue_ledger.planner_payload(path=str(self._repo_facts_path())),
         }
         if self._latest_review is not None:
             payload["latest_review"] = dict(self._latest_review)
@@ -1516,13 +1518,17 @@ class TreeLoopPlannerWorker:
     def _discovery_remediation_blocks_action(self, action_type: str) -> Optional[str]:
         if not self._is_discovery_remediation_active():
             return None
-        if action_type in {"drop_context", "git_diff", "show_diff", "review_changes", "run_check", "run_route_check"}:
+        if action_type in (
+            DISCOVERY_REMEDIATION_READ_SATISFIERS
+            | {"drop_context", "git_diff", "show_diff", "review_changes", "run_check", "run_route_check"}
+        ):
             return None
         target = str((self._discovery_remediation or {}).get("path", "") or (self._discovery_remediation or {}).get("issue_id", "") or "the surfaced issue")
         if action_type == "list_issues" and target == "the surfaced issue":
             return None
         return (
-            f"discovery remediation active: inspect {target} with read_file, show_issue, or show_run_issue before mutating or finishing"
+            f"discovery remediation active: inspect {target} with read_file, read_line_range, grep, "
+            "show_issue, or show_run_issue before mutating or finishing"
         )
 
     def _maybe_resolve_discovery_remediation(self, action_type: str, path: str = "", issue_id: str = "") -> bool:
@@ -1534,7 +1540,7 @@ class TreeLoopPlannerWorker:
         diagnostic_issue_id = str((self._discovery_remediation or {}).get("diagnostic_issue_id", "") or "").strip()
         normalized_path = str(path or "").strip().removeprefix("/repo/").removeprefix("repo/")
         resolved = False
-        if action_type == "read_file":
+        if action_type in DISCOVERY_REMEDIATION_READ_SATISFIERS:
             resolved = bool(normalized_path and resolution_path and normalized_path == resolution_path)
         elif action_type == "show_issue":
             resolved = bool(
@@ -1736,6 +1742,27 @@ class TreeLoopPlannerWorker:
                 path = str(action.get("path", "") or "").strip()
                 self._enter_patch_resolution(action_type=action_type, path=path, reason=str(result.output or "").strip())
                 self._request_same_turn_halt(str(result.output or "patch resolution required"))
+            if action_type in {"diagnose", "run_check", "run_route_check"} and self._command_reported_issue_count(result) > 0:
+                self._enter_discovery_remediation(source_action=action_type)
+                focus = str((self._discovery_remediation or {}).get("path", "") or (self._discovery_remediation or {}).get("issue_id", "") or "the surfaced issue")
+                self._request_same_turn_halt(f"discovery remediation active for {focus}")
+            if action_type in {"diagnose", "run_check", "run_route_check", "run_shell"} and self._has_mutation:
+                path = str(action.get("path", "") or "").strip()
+                self._validation_after_mutation = False
+                self._pending_verification = {
+                    "path": path,
+                    "mode": "validation",
+                    "source": action_type,
+                    "reason": str(result.output or "").strip()[:1000],
+                }
+                self._completion_check_pending = True
+                self._completion_check_reason = (
+                    f"{action_type} failed after mutation"
+                    + (f" for {path}" if path else "")
+                    + ". Fix the failure or run a passing concrete validation before finish."
+                )
+                self._refresh_loop_steering()
+                self._request_same_turn_halt(f"validation failed after mutation via {action_type}")
             self._emit_step_progress(command, result)
             return
 
@@ -1769,6 +1796,10 @@ class TreeLoopPlannerWorker:
             else:
                 self._pending_verification = {"path": "", "mode": "validation", "source": action_type}
             self._refresh_loop_steering()
+            if self._command_reported_issue_count(result) > 0:
+                self._enter_discovery_remediation(source_action=action_type)
+                focus = str((self._discovery_remediation or {}).get("path", "") or (self._discovery_remediation or {}).get("issue_id", "") or "the surfaced issue")
+                self._request_same_turn_halt(f"discovery remediation active for {focus}")
             if not self._edit_batch_mode:
                 focus_path = pending_path or "the latest mutation"
                 self._request_same_turn_halt(f"pending verification active after mutation on {focus_path}")
@@ -1966,6 +1997,10 @@ class TreeLoopPlannerWorker:
             parts = normalized.split()
             if len(parts) >= 2:
                 return parts[1].removeprefix("/repo/").removeprefix("repo/").strip()
+        if normalized.startswith("grep /repo/"):
+            parts = normalized.split()
+            if len(parts) >= 2:
+                return parts[1].removeprefix("/repo/").removeprefix("repo/").strip()
         return ""
 
     def _extract_shown_issue_id(self, command: str) -> str:
@@ -1986,9 +2021,15 @@ class TreeLoopPlannerWorker:
             return lowered.startswith("run_shell: timed out") or lowered.startswith("run_shell: error executing")
         if action_type == "run_check":
             return lowered.startswith("run_check:")
+        if action_type == "diagnose":
+            return lowered.startswith("diagnose:") or self._diagnostic_message_has_issues(message)
         if action_type.startswith("git_"):
             return lowered.startswith("git ") and "failed" in lowered
         return lowered.startswith(f"{action_type}:")
+
+    def _diagnostic_message_has_issues(self, message: str) -> bool:
+        match = re.search(r"\bissues=(\d+)\b", str(message or ""), re.IGNORECASE)
+        return bool(match and int(match.group(1)) > 0)
 
     def _resolve_repo_path(self, path: str) -> Path:
         normalized = str(path or "").strip().removeprefix("/repo/").removeprefix("repo/")

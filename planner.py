@@ -298,6 +298,7 @@ class PlannerSession:
     plan_revision_feedback: List[str] = field(default_factory=list)
     pending_discovery: Optional[DiscoveryRequest] = None
     last_discovery: Optional[DiscoveryResult] = None
+    discovery_phase: str = "idle"
     completed_results: List[GoalExecutionResult] = field(default_factory=list)
     latest_request: str = ""
     planner_usage_totals: Dict[str, int] = field(default_factory=dict)
@@ -455,6 +456,148 @@ class PlannerAgent:
         active_issue_id = self._active_issue_id_from_repo_facts()
         self.session.active_issue_id = active_issue_id
 
+    def _open_issues_from_repo_facts(self) -> List[Dict[str, Any]]:
+        payload = self._load_repo_facts_payload() or {}
+        if not isinstance(payload, dict):
+            return []
+        seen: set[str] = set()
+        open_issues: List[Dict[str, Any]] = []
+        active = payload.get("active_issue")
+        if isinstance(active, dict) and str(active.get("status", "") or "") == "open":
+            issue_id = str(active.get("issue_id", "") or "").strip()
+            if issue_id:
+                seen.add(issue_id)
+                open_issues.append(active)
+        issues = payload.get("issues")
+        if isinstance(issues, list):
+            for issue in issues:
+                if not isinstance(issue, dict) or str(issue.get("status", "") or "") != "open":
+                    continue
+                issue_id = str(issue.get("issue_id", "") or "").strip()
+                if not issue_id or issue_id in seen:
+                    continue
+                seen.add(issue_id)
+                open_issues.append(issue)
+        open_issues.sort(
+            key=lambda issue: (
+                int(issue.get("priority", 0) or 0),
+                str(issue.get("opened_at", "") or ""),
+                str(issue.get("issue_id", "") or ""),
+            ),
+            reverse=True,
+        )
+        return open_issues
+
+    def _active_open_issue_from_repo_facts(self) -> Optional[Dict[str, Any]]:
+        payload = self._load_repo_facts_payload() or {}
+        if not isinstance(payload, dict):
+            return None
+        active = payload.get("active_issue")
+        if (
+            isinstance(active, dict)
+            and str(active.get("issue_id", "") or "").strip()
+            and str(active.get("status", "") or "") == "open"
+        ):
+            return active
+        return None
+
+    def _select_open_issue_for_auto(self) -> Optional[Dict[str, Any]]:
+        active = self._active_open_issue_from_repo_facts()
+        if active is not None:
+            return active
+        open_issues = self._open_issues_from_repo_facts()
+        return open_issues[0] if open_issues else None
+
+    def _activate_issue_summary(self, issue: Dict[str, Any]) -> Dict[str, Any]:
+        issue_id = str(issue.get("issue_id", "") or "").strip()
+        if not issue_id:
+            return issue
+        activator = getattr(self.worker, "activate_issue", None)
+        if callable(activator):
+            try:
+                activated = activator(issue_id)
+            except Exception:
+                activated = None
+            if isinstance(activated, dict) and str(activated.get("issue_id", "") or "").strip():
+                self.session.active_issue_id = str(activated.get("issue_id", "") or "").strip()
+                return activated
+        self.session.active_issue_id = issue_id
+        return issue
+
+    def _prepare_open_issue_for_prompt(self) -> Optional[str]:
+        open_issues = self._open_issues_from_repo_facts()
+        if not open_issues:
+            return None
+        if self.session.active_issue_id:
+            return None
+        if len(open_issues) == 1:
+            self._activate_issue_summary(open_issues[0])
+            return None
+        lines = ["Multiple open issues exist. Choose one before starting a new prompt:"]
+        example_issue_id = ""
+        for issue in open_issues[:10]:
+            issue_id = str(issue.get("issue_id", "") or "").strip()
+            if issue_id and not example_issue_id:
+                example_issue_id = issue_id
+            summary = str(issue.get("plan_summary") or issue.get("request_summary") or "").strip()
+            lines.append(f"- {issue_id}: {summary}" if summary else f"- {issue_id}")
+        example_issue_id = example_issue_id or "issue-001"
+        lines.append(
+            f"Use /{example_issue_id} <prompt>, /{example_issue_id}, or the Continue button in the Issues panel to choose the issue to continue."
+        )
+        return "\n".join(lines)
+
+    def _activate_issue_record(self, issue_id: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        normalized = str(issue_id or "").strip()
+        if not normalized:
+            return None, "activate_issue requires issue_id"
+        activator = getattr(self.worker, "activate_issue", None)
+        if not callable(activator):
+            return None, "Planner worker does not support issue activation."
+        try:
+            issue = activator(normalized)
+        except Exception as exc:
+            return None, f"Issue activation failed: {exc}"
+        if not isinstance(issue, dict):
+            issue = {"issue_id": normalized}
+        activated_id = str(issue.get("issue_id", "") or normalized).strip()
+        self.session.active_issue_id = activated_id
+        self.session.pending_plan = None
+        self.session.pending_discovery = None
+        self.session.awaiting_plan_revision = False
+        return issue, None
+
+    def activate_issue(self, issue_id: str) -> str:
+        issue, error = self._activate_issue_record(issue_id)
+        if error:
+            return error
+        assert issue is not None
+        activated_id = str(issue.get("issue_id", "") or issue_id).strip()
+        summary = str(issue.get("plan_summary") or issue.get("request_summary") or "").strip()
+        if summary:
+            return f"Activated {activated_id}: {summary}"
+        return f"Activated {activated_id}."
+
+    def _default_issue_continuation_prompt(self, issue: Dict[str, Any]) -> str:
+        issue_id = str(issue.get("issue_id", "") or self.session.active_issue_id or "").strip()
+        summary = str(issue.get("plan_summary") or issue.get("request_summary") or "").strip()
+        if summary and issue_id:
+            return f"User has requested resolution of {issue_id}: {summary}"
+        if issue_id:
+            return f"User has requested resolution of {issue_id}."
+        return "User has requested resolution of the selected open issue."
+
+    def continue_issue(self, issue_id: str, prompt: str = "") -> str:
+        issue, error = self._activate_issue_record(issue_id)
+        if error:
+            return error
+        assert issue is not None
+        continuation_prompt = prompt.strip() or self._default_issue_continuation_prompt(issue)
+        return self.start_request(continuation_prompt)
+
+    def _activate_issue_and_optionally_start(self, issue_id: str, prompt: str) -> str:
+        return self.continue_issue(issue_id, prompt)
+
     def try_builtin_command(self, text: str) -> Optional[str]:
         """Recognise built-in slash-commands (``/reset``, ``/reopen <id>``,
         ``reopen <id>``) that can come from either the CLI or the extension
@@ -469,6 +612,17 @@ class PlannerAgent:
             return self.delete_session()
         if lower in {"/stop-continuous", "stop-continuous", "/stop-auto", "stop-auto"}:
             return self.stop_continuous()
+        issue_prompt_match = re.match(r"^/(issue-\d+)(?:\s+(.*))?$", stripped, flags=re.IGNORECASE | re.DOTALL)
+        if issue_prompt_match:
+            return self._activate_issue_and_optionally_start(
+                issue_prompt_match.group(1),
+                issue_prompt_match.group(2) or "",
+            )
+        for prefix in ["/activate-issue", "activate-issue"]:
+            if lower == prefix or lower.startswith(prefix + " "):
+                issue_id = stripped[len(prefix):].strip()
+                if issue_id:
+                    return self.activate_issue(issue_id)
         for prefix in ["/start-continuous", "start-continuous", "/start-auto", "start-auto"]:
             if lower == prefix or lower.startswith(prefix + " "):
                 max_cycles = 1
@@ -532,10 +686,14 @@ class PlannerAgent:
         self.session.plan_revision_feedback = []
         self.session.pending_discovery = None
         self.session.last_discovery = None
+        self.session.discovery_phase = "idle"
         self.session.completed_results = []
         self.session.planner_usage_totals = {}
         self.session.defer_issue_close_for_review = False
         self._rehydrate_active_issue_context()
+        open_issue_message = self._prepare_open_issue_for_prompt()
+        if open_issue_message:
+            return open_issue_message
         return self._handle_intake_turn()
 
     def continue_conversation(self, user_message: str) -> str:
@@ -595,9 +753,11 @@ class PlannerAgent:
             if self._is_rejection(text):
                 self.session.intake_messages.append({"role": "user", "content": text})
                 self.session.pending_discovery = None
+                self.session.discovery_phase = "skipped"
                 return "Discovery skipped. Add more detail or let me know what should be assumed instead."
             self.session.intake_messages.append({"role": "user", "content": text})
             self.session.pending_discovery = None
+            self.session.discovery_phase = "skipped"
             return self._handle_intake_turn()
 
         if self.session.awaiting_plan_revision and self.session.last_presented_plan is not None:
@@ -660,6 +820,7 @@ class PlannerAgent:
         self.session.plan_revision_feedback = []
         self.session.pending_discovery = None
         self.session.last_discovery = None
+        self.session.discovery_phase = "idle"
         self.session.executing = False
         self.session.executing_goal_index = -1
         self.session.executing_goal_id = ""
@@ -728,6 +889,7 @@ class PlannerAgent:
         self.session.plan_revision_feedback = []
         self.session.pending_discovery = None
         self.session.last_discovery = None
+        self.session.discovery_phase = "idle"
         self.session.executing = False
         self.session.executing_goal_index = -1
         self.session.executing_goal_id = ""
@@ -753,6 +915,7 @@ class PlannerAgent:
         self.session.plan_revision_feedback = []
         self.session.pending_discovery = None
         self.session.last_discovery = None
+        self.session.discovery_phase = "idle"
         self.session.completed_results = []
         self.session.planner_usage_totals = {}
         self._rehydrate_active_issue_context()
@@ -992,6 +1155,7 @@ class PlannerAgent:
 
         steering = self._build_discovery_steering(request, mode)
         task = self._build_discovery_task(request, mode)
+        self.session.discovery_phase = "running"
         self._fire_discovery_callback("discovery_start", mode.key)
         try:
             execution = self._run_worker_task(
@@ -1036,17 +1200,20 @@ class PlannerAgent:
                 ok=False,
             )
             self.session.pending_discovery = None
+            self.session.discovery_phase = "complete"
             self._fire_discovery_callback("discovery_finish", mode_key)
             return f"Discovery failed before planning could continue: {exc}"
 
         if not result.ok:
             self.session.last_discovery = result
             self.session.pending_discovery = None
+            self.session.discovery_phase = "complete"
             self._fire_discovery_callback("discovery_finish", result.mode)
             return self._render_discovery_result(result)
 
         self.session.last_discovery = result
         self.session.pending_discovery = None
+        self.session.discovery_phase = "complete"
         self._fire_discovery_callback("discovery_finish", result.mode)
         self._rehydrate_active_issue_context()
 
@@ -1054,11 +1221,16 @@ class PlannerAgent:
         discovery_summary = self._render_discovery_result(result)
         return "\n\n".join([discovery_summary, plan_response])
 
+    def _mark_discovery_complete_for_plan_approval(self) -> None:
+        self.session.pending_discovery = None
+        self.session.discovery_phase = "complete"
+
     def execute_pending_plan(self) -> str:
         plan = self.session.pending_plan
         if plan is None:
             return "No pending plan to execute."
 
+        self._mark_discovery_complete_for_plan_approval()
         self._fire_plan_callback(
             "plan_execution_start",
             {
@@ -1255,6 +1427,9 @@ class PlannerAgent:
         summary = str(prompt or "").strip()
         if not summary:
             return None
+        open_issue = self._select_open_issue_for_auto()
+        if open_issue is not None:
+            return self._activate_issue_summary(open_issue)
         creator = getattr(self.worker, "create_issue", None)
         if not callable(creator):
             return {
@@ -1274,39 +1449,12 @@ class PlannerAgent:
         )
 
     def _activate_continuous_issue(self, issue: Dict[str, Any]) -> Dict[str, Any]:
-        issue_id = str(issue.get("issue_id", "") or "").strip()
-        if not issue_id:
-            return issue
-        activator = getattr(self.worker, "activate_issue", None)
-        if not callable(activator):
-            return issue
-        try:
-            activated = activator(issue_id)
-        except Exception:
-            return issue
-        if isinstance(activated, dict) and str(activated.get("issue_id", "") or "").strip():
-            return activated
-        return issue
+        return self._activate_issue_summary(issue)
 
     def _create_or_select_continuous_issue(self) -> Optional[Dict[str, Any]]:
-        payload = self._load_repo_facts_payload() or {}
-        if isinstance(payload, dict):
-            active = payload.get("active_issue")
-            if (
-                isinstance(active, dict)
-                and active.get("issue_id")
-                and str(active.get("status", "") or "") == "open"
-            ):
-                return self._activate_continuous_issue(active)
-            issues = payload.get("issues")
-            if isinstance(issues, list):
-                open_issues = [
-                    issue for issue in issues
-                    if isinstance(issue, dict) and str(issue.get("status", "") or "") == "open"
-                ]
-                if open_issues:
-                    open_issues.sort(key=lambda issue: int(issue.get("priority", 0) or 0), reverse=True)
-                    return self._activate_continuous_issue(open_issues[0])
+        open_issue = self._select_open_issue_for_auto()
+        if open_issue is not None:
+            return self._activate_continuous_issue(open_issue)
 
         summary = self._intent_issue_summary()
         if not summary:
@@ -1612,6 +1760,7 @@ class PlannerAgent:
                 self.session.intake_messages = [{"role": "user", "content": request}]
                 self.session.pending_plan = None
                 self.session.pending_discovery = None
+                self.session.discovery_phase = "idle"
                 self.session.last_completed_plan = None
                 self.session.last_completed_results = []
                 self.session.last_execution_summary = ""
@@ -1634,6 +1783,7 @@ class PlannerAgent:
                     auto_discovery = self._continuous_discovery_for_planning_gap(plan_response)
                     if auto_discovery is not None:
                         self.session.pending_discovery = auto_discovery
+                        self.session.discovery_phase = "pending"
                         self.continuous_state.status = "discovering"
                         mode = self._select_discovery_mode_for_issue(issue)
                         self.continuous_state.selected_discovery_mode = mode
@@ -1685,6 +1835,7 @@ class PlannerAgent:
                         auto_discovery = self._continuous_discovery_for_planning_gap(plan_response)
                         if auto_discovery is not None:
                             self.session.pending_discovery = auto_discovery
+                            self.session.discovery_phase = "pending"
                             mode = self._select_discovery_mode_for_issue(issue)
                             self.continuous_state.selected_discovery_mode = mode
                             output.append(
@@ -1838,6 +1989,7 @@ class PlannerAgent:
                 recommended_mode=self._normalize_discovery_mode(str(action.get("recommended_mode") or "moderate")),
             )
             self.session.pending_discovery = request
+            self.session.discovery_phase = "pending"
             return self._render_discovery_offer(request)
 
         if action_type == "present_plan":
@@ -1848,6 +2000,7 @@ class PlannerAgent:
             self.session.awaiting_plan_revision = False
             self.session.plan_revision_feedback = []
             self.session.pending_discovery = None
+            self.session.discovery_phase = "complete"
             self._fire_plan_callback(
                 "plan_presented",
                 {
@@ -2754,6 +2907,25 @@ class PlannerAgent:
             actions.append({"type": "create_issue", "label": "Create Issue", "style": "primary"})
             actions.append({"type": "start_continuous", "label": "Start Continuous", "style": "primary"})
             payload = self._load_repo_facts_payload() or {}
+            active_issue_id = ""
+            active_issue = payload.get("active_issue") if isinstance(payload, dict) else None
+            if isinstance(active_issue, dict):
+                active_issue_id = str(active_issue.get("issue_id", "") or "").strip()
+            for issue in payload.get("issues", [])[:5] if isinstance(payload, dict) else []:
+                if not isinstance(issue, dict) or str(issue.get("status", "") or "") != "open":
+                    continue
+                issue_id = str(issue.get("issue_id", "") or "").strip()
+                if not issue_id or issue_id == active_issue_id:
+                    continue
+                label = str(issue.get("plan_summary", "") or issue.get("request_summary", "") or issue_id).strip()
+                actions.append(
+                    {
+                        "type": "continue_issue",
+                        "issue_id": issue_id,
+                        "label": f"Continue {issue_id}: {label[:36]}",
+                        "style": "secondary",
+                    }
+                )
             for issue in payload.get("reopenable_issues", [])[:3] if isinstance(payload, dict) else []:
                 if not isinstance(issue, dict):
                     continue
@@ -2814,6 +2986,7 @@ class PlannerAgent:
             },
             "status": self._session_status(),
             "latest_request": self.session.latest_request,
+            "discovery_phase": self.session.discovery_phase,
             "project_intent": self._load_project_intent_payload(),
             "continuous_mode": {
                 "enabled": self.continuous_state.enabled,

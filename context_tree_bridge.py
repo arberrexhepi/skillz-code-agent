@@ -92,8 +92,7 @@ class ContextTreeBridge:
             return
         try:
             records = self._get_fact_records()
-            if records:
-                self.tree.sync_facts(records)
+            self.tree.sync_facts(records or [])
         except Exception:
             pass
         try:

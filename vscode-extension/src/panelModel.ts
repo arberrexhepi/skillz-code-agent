@@ -76,6 +76,7 @@ export interface ContinuousModeState extends JsonMap {
 
 export interface PlannerState extends JsonMap {
   issue_state?: JsonMap;
+  discovery_phase?: string;
   continuous_mode?: ContinuousModeState;
   suggested_next_actions?: PlannerSuggestedAction[];
   worker_state?: WorkerState | null;
