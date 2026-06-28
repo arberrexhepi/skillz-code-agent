@@ -205,8 +205,8 @@ class TreeCommandParser:
             "list-run-issues": self._cmd_list_issues,
             "list_run_issues": self._cmd_list_issues,
             "list-issues": self._cmd_list_issues,
-            "show-run-issue": self._cmd_show_issue,
-            "show_run_issue": self._cmd_show_issue,
+            "show-run-issue": self._cmd_show_run_issue,
+            "show_run_issue": self._cmd_show_run_issue,
             "show-issue": self._cmd_show_issue,
             "resolve-run-issue": self._cmd_resolve_issue,
             "resolve_run_issue": self._cmd_resolve_issue,
@@ -402,16 +402,32 @@ class TreeCommandParser:
             parts.append("(no run issues and no durable repo_facts issues)")
         return CommandResult(ok=True, output="\n\n".join(parts), command_type="read")
 
-    def _cmd_show_issue(self, rest: str) -> CommandResult:
+    def _show_durable_issue(self, issue_id: str) -> Optional[CommandResult]:
+        durable_state = self._durable_issue_state()
+        for durable_issue in issue_summaries_from_payload(durable_state):
+            if str(durable_issue.get("issue_id", "") or "").strip() == issue_id:
+                return CommandResult(ok=True, output=format_issue_summary_detail(durable_issue), command_type="read")
+        return None
+
+    def _cmd_show_run_issue(self, rest: str) -> CommandResult:
         issue_id = rest.strip()
         if not issue_id:
             return CommandResult(ok=False, output="Usage: show-run-issue <id>", command_type="error")
         issue = self.tree.show_log_issue(issue_id)
         if issue is None:
+            return CommandResult(ok=True, output=format_issue_not_found(issue_id, self._durable_issue_state()), command_type="read")
+        return CommandResult(ok=True, output=self.tree.format_log_issue_detail(issue), command_type="read")
+
+    def _cmd_show_issue(self, rest: str) -> CommandResult:
+        issue_id = rest.strip()
+        if not issue_id:
+            return CommandResult(ok=False, output="Usage: show-issue <id>", command_type="error")
+        durable = self._show_durable_issue(issue_id)
+        if durable is not None:
+            return durable
+        issue = self.tree.show_log_issue(issue_id)
+        if issue is None:
             durable_state = self._durable_issue_state()
-            for durable_issue in issue_summaries_from_payload(durable_state):
-                if str(durable_issue.get("issue_id", "") or "").strip() == issue_id:
-                    return CommandResult(ok=True, output=format_issue_summary_detail(durable_issue), command_type="read")
             return CommandResult(ok=True, output=format_issue_not_found(issue_id, durable_state), command_type="read")
         return CommandResult(ok=True, output=self.tree.format_log_issue_detail(issue), command_type="read")
 
@@ -1030,7 +1046,7 @@ def parse_multi_command(raw: str) -> List[str]:
     while i < len(logical_lines):
         line = logical_lines[i]
         stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
+        if not stripped or stripped.startswith("#") or stripped == ">>>":
             i += 1
             continue
         if _starts_inline_multiline_command(stripped):

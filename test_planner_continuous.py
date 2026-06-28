@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from planner import DiscoveryResult, GoalExecutionResult, PlannerAgent, PlannerPlan
+from planner import DiscoveryRequest, DiscoveryResult, GoalExecutionResult, PlannerAgent, PlannerPlan
 from planner import PlannerGoal
 from issue_facts import IssueFactLedger
 
@@ -99,6 +99,21 @@ class ContinuousPlannerForTest(PlannerAgent):
         return "Discovery complete.\n\n" + self._handle_intake_turn()
 
 
+class ImmediateExecutionPlannerForTest(PlannerAgent):
+    def _execute_goal_with_worker(self, worker, plan, goal, index):
+        return GoalExecutionResult(
+            goal_id=goal.goal_id,
+            title=goal.title,
+            delegated_task=goal.goal,
+            final_message="goal done",
+            status="completed",
+            task_satisfied=True,
+            validation_ran=True,
+            validation_passed=True,
+            validation_summary="validated",
+        )
+
+
 def present_plan(summary: str, goal: str, notes):
     return {
         "action": {
@@ -122,6 +137,47 @@ def present_plan(summary: str, goal: str, notes):
 
 
 class ContinuousAutoApprovalTests(unittest.TestCase):
+    def test_plan_execution_marks_discovery_phase_complete(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            model = FakeModel([{"summary": "Plan done.", "next_steps": []}])
+            config = SimpleNamespace(
+                root=str(root),
+                provider="openai",
+                model="test",
+                thinking_mode="low",
+                verbosity="medium",
+                max_parallel_workers=1,
+            )
+            planner = ImmediateExecutionPlannerForTest(model, config, lambda: FakeWorker(root), json.loads)
+            planner.session.pending_discovery = DiscoveryRequest(
+                reason="stale discovery",
+                prompt="Inspect before planning.",
+                recommended_mode="quick",
+            )
+            planner.session.discovery_phase = "pending"
+            planner.session.pending_plan = PlannerPlan(
+                original_request="Fix the issue",
+                summary="Fix the issue",
+                goals=[
+                    PlannerGoal(
+                        goal_id="goal-1",
+                        title="Fix",
+                        goal="Make the fix.",
+                        reason="Needed.",
+                        estimated_scope="write",
+                        success_signals=["validated"],
+                    )
+                ],
+                not_in_scope=["Unrelated changes."],
+            )
+
+            planner.execute_pending_plan()
+
+        self.assertIsNone(planner.session.pending_discovery)
+        self.assertEqual(planner.session.discovery_phase, "complete")
+        self.assertEqual(planner.export_state()["discovery_phase"], "complete")
+
     def test_intent_mutation_plan_is_regenerated_instead_of_stopping(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -186,6 +242,123 @@ class ContinuousAutoApprovalTests(unittest.TestCase):
 
         self.assertIn("Created issue ISSUE-1: Investigate route health checks", message)
         self.assertEqual(planner.session.active_issue_id, "ISSUE-1")
+
+    def test_start_request_lists_multiple_open_issues_instead_of_creating_context(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            ledger = IssueFactLedger.empty()
+            first = ledger.create_issue(
+                request_summary="First open issue",
+                plan_summary="First open issue",
+                priority=10,
+                activate=False,
+            )
+            second = ledger.create_issue(
+                request_summary="Second open issue",
+                plan_summary="Second open issue",
+                priority=20,
+                activate=False,
+            )
+            ledger.active_issue_id = ""
+            (root / "repo_facts.md").write_text(ledger.to_markdown(), encoding="utf-8")
+            config = SimpleNamespace(root=str(root), provider="openai", model="test", max_parallel_workers=1)
+            planner = ContinuousPlannerForTest(FakeModel([]), config, lambda: FakeWorker(root), json.loads)
+
+            message = planner.start_request("Continue work")
+
+        self.assertIn("Multiple open issues exist", message)
+        self.assertIn(first.issue_id, message)
+        self.assertIn(second.issue_id, message)
+        self.assertIn("Continue button in the Issues panel", message)
+        self.assertEqual(planner.session.pending_plan, None)
+        self.assertEqual(len(planner.model.prompts), 0)
+
+    def test_issue_slash_command_activates_issue_and_starts_prompt(self):
+        class ActivatingWorker(FakeWorker):
+            def __init__(self, root: Path, ledger: IssueFactLedger):
+                super().__init__(root)
+                self.ledger = ledger
+                self.activated = []
+
+            def activate_issue(self, issue_id: str):
+                issue = self.ledger.activate_issue(issue_id)
+                self.activated.append(issue.issue_id)
+                (self.root / "repo_facts.md").write_text(self.ledger.to_markdown(), encoding="utf-8")
+                return issue.summary()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            ledger = IssueFactLedger.empty()
+            ledger.create_issue(
+                request_summary="Other open issue",
+                plan_summary="Other open issue",
+                priority=50,
+                activate=False,
+            )
+            selected = ledger.create_issue(
+                request_summary="Selected open issue",
+                plan_summary="Selected open issue",
+                priority=10,
+                activate=False,
+            )
+            ledger.active_issue_id = ""
+            (root / "repo_facts.md").write_text(ledger.to_markdown(), encoding="utf-8")
+            worker = ActivatingWorker(root, ledger)
+            model = FakeModel([
+                present_plan(
+                    "Continue selected issue.",
+                    "Continue the selected open issue.",
+                    ["Use the selected issue context."],
+                )
+            ])
+            config = SimpleNamespace(root=str(root), provider="openai", model="test", max_parallel_workers=1)
+            planner = ContinuousPlannerForTest(model, config, lambda: worker, json.loads)
+
+            message = planner.start_request(f"/{selected.issue_id} continue with this issue")
+
+        self.assertEqual(worker.activated, [selected.issue_id])
+        self.assertIn("Plan Summary", message)
+        self.assertIn("continue with this issue", model.prompts[0])
+        self.assertIn(f'"issue_id": "{selected.issue_id}"', model.prompts[0])
+
+    def test_issue_slash_command_without_prompt_starts_default_resolution_prompt(self):
+        class ActivatingWorker(FakeWorker):
+            def __init__(self, root: Path, ledger: IssueFactLedger):
+                super().__init__(root)
+                self.ledger = ledger
+
+            def activate_issue(self, issue_id: str):
+                issue = self.ledger.activate_issue(issue_id)
+                (self.root / "repo_facts.md").write_text(self.ledger.to_markdown(), encoding="utf-8")
+                return issue.summary()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            ledger = IssueFactLedger.empty()
+            selected = ledger.create_issue(
+                request_summary="Improve transfer errors",
+                plan_summary="Improve transfer errors",
+                priority=10,
+                activate=False,
+            )
+            ledger.active_issue_id = ""
+            (root / "repo_facts.md").write_text(ledger.to_markdown(), encoding="utf-8")
+            worker = ActivatingWorker(root, ledger)
+            model = FakeModel([
+                present_plan(
+                    "Improve transfer errors.",
+                    "Improve the selected issue.",
+                    ["Use the generated issue continuation prompt."],
+                )
+            ])
+            config = SimpleNamespace(root=str(root), provider="openai", model="test", max_parallel_workers=1)
+            planner = ContinuousPlannerForTest(model, config, lambda: worker, json.loads)
+
+            message = planner.start_request(f"/{selected.issue_id}")
+
+        self.assertIn("Plan Summary", message)
+        self.assertIn(f"User has requested resolution of {selected.issue_id}: Improve transfer errors", model.prompts[0])
+        self.assertIn(f'"issue_id": "{selected.issue_id}"', model.prompts[0])
 
     def test_auto_mode_activates_open_issue_before_initial_planning(self):
         class ActivatingWorker(FakeWorker):
@@ -281,6 +454,59 @@ class ContinuousAutoApprovalTests(unittest.TestCase):
         self.assertEqual(worker.created[0]["request_summary"], "Build manual auto-run prompt support")
         self.assertIn("Auto run prompt: Build manual auto-run prompt support", model.prompts[0])
         self.assertEqual(planner.continuous_state.completed_issue_ids, ["issue-001"])
+
+    def test_prompted_auto_mode_reuses_active_open_issue(self):
+        class PromptIssueWorker(FakeWorker):
+            def __init__(self, root: Path, ledger: IssueFactLedger):
+                super().__init__(root)
+                self.ledger = ledger
+                self.created = []
+                self.activated = []
+
+            def create_issue(self, **kwargs):
+                self.created.append(kwargs)
+                return super().create_issue(**kwargs)
+
+            def activate_issue(self, issue_id: str):
+                issue = self.ledger.activate_issue(issue_id)
+                self.activated.append(issue.issue_id)
+                (self.root / "repo_facts.md").write_text(self.ledger.to_markdown(), encoding="utf-8")
+                return issue.summary()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            ledger = IssueFactLedger.empty()
+            active = ledger.create_issue(
+                request_summary="Continue existing cleanup work",
+                plan_summary="Continue existing cleanup work",
+                priority=10,
+                activate=True,
+            )
+            ledger.create_issue(
+                request_summary="Higher priority but inactive",
+                plan_summary="Higher priority but inactive",
+                priority=90,
+                activate=False,
+            )
+            ledger.active_issue_id = active.issue_id
+            (root / "repo_facts.md").write_text(ledger.to_markdown(), encoding="utf-8")
+            worker = PromptIssueWorker(root, ledger)
+            model = FakeModel([
+                present_plan(
+                    "Continue cleanup work.",
+                    "Continue the active cleanup issue.",
+                    ["Use the active open issue."],
+                )
+            ])
+            config = SimpleNamespace(root=str(root), provider="openai", model="test", max_parallel_workers=1)
+            planner = ContinuousPlannerForTest(model, config, lambda: worker, json.loads)
+
+            message = planner.start_continuous(max_cycles=1, prompt="Do the next thing")
+
+        self.assertIn("Current issue: Continue existing cleanup work", model.prompts[0])
+        self.assertEqual(worker.created, [])
+        self.assertEqual(worker.activated, [active.issue_id])
+        self.assertIn(f"auto-approved plan for {active.issue_id}", message)
 
     def test_intent_guidance_reference_passes_auto_approval(self):
         with tempfile.TemporaryDirectory() as tmpdir:
