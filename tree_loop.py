@@ -161,7 +161,7 @@ def _looks_like_command(line: str) -> bool:
         return True
     first = line.split(None, 1)[0].lower() if line else ""
     return first in {
-        "ls", "cat", "read-line-range", "read_line_range", "symbols", "find-symbol", "find_symbol", "stat", "find", "grep",
+        "ls", "cat", "read-line-range", "read_line_range", "symbols", "find-symbol", "find_symbol", "repo-map", "repo_map", "stat", "find", "grep",
         "read-diagnostics", "diagnose", "run-route-check", "run_route_check", "ingest-log", "list-issues", "show-issue", "resolve-issue", "reopen-issue", "run-check",
         "write", "replace-lines", "replace_lines", "patch", "show-diff", "show_diff", "review-changes", "review_changes", "shell", "git",
         "fact", "expand", "drop", "batch", "finish",
@@ -207,8 +207,11 @@ ANNOTATIONS (>> feed-forward metadata — free, no tool call):
   - Do not use >>dg: as a generic note. Use it only for a real if/then branch.
 
 RULES:
-1. READ commands (ls, cat, read-line-range, symbols, find-symbol, stat, find, grep, read-diagnostics) are FREE — they resolve instantly
+1. READ commands (ls, cat, read-line-range, repo-map, symbols, find-symbol, stat, find, grep, read-diagnostics) are FREE — they resolve instantly
     from the in-context tree. Use them liberally. They do NOT count as tool calls.
+1c. For broad or unfamiliar codebase work, start with `repo-map /repo topic="<task topic>" limit=20` before line-by-line reads.
+    Treat it as the structural layer of a retrieval funnel: use the ranked files, symbols, imports, and drill-down suggestions to
+    choose targeted `symbols`, `find-symbol`, `grep`, `cat`, or `read-line-range` commands.
 1a. Skills are part of your capability surface. Use `skill` with no arguments to discover what skills are available, and use
     `skill <name>` to load a skill payload into the run when it would improve task quality, style consistency, testing approach,
     or repair strategy. When skill choice is uncertain or the user asks for skills broadly, prefer an explicit `skill` discovery
@@ -247,7 +250,7 @@ RULES:
     b) `replace-lines /repo/path/file.ts:52-68 <<< ... >>>`
     c) `read-line-range /repo/path/file.ts 48-72`
     This keeps edits anchored and reduces accidental duplication.
-11a. When line ranges feel unstable or a file has many nearby definitions, use `symbols` or `find-symbol` first to anchor on the right function, class, or variable before editing.
+11a. When line ranges feel unstable or a file has many nearby definitions, use `repo-map`, `symbols`, or `find-symbol` first to anchor on the right function, class, or variable before editing.
 12. Prefer `replace-lines` for bounded edits. Prefer `write` when replacing most of a file or rebuilding a corrupted region wholesale.
 12a. Use inline `replace-lines` only for short single-line replacements. If the replacement spans multiple lines or is longer than a short import/function call, use heredoc.
 13. Avoid rereading an entire large file after a localized edit unless you need whole-file structure. Verify the edited range first.

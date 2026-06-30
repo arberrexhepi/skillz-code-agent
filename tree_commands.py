@@ -12,6 +12,7 @@ READ (free, in-context — no tool call):
   read-line-range /repo/src/main.py 100-200  Read line range with numbering
   symbols /repo/src/main.py        List functions/classes/variables in a file
   find-symbol /repo/src useTodo    Find a symbol by name in a file or directory
+  repo-map /repo/src topic="billing"  Structural map ranked before line reads
   stat /repo/src/main.py           File metadata
   find /repo *.py                  Glob search
   grep /facts "pattern"            Search content
@@ -65,6 +66,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from context_tree import ContextTree
+from discovery import repo_map
 from issue_facts import (
     format_issue_not_found,
     format_issue_summary_detail,
@@ -194,6 +196,8 @@ class TreeCommandParser:
             "symbols": self._cmd_symbols,
             "find-symbol": self._cmd_find_symbol,
             "find_symbol": self._cmd_find_symbol,
+            "repo-map": self._cmd_repo_map,
+            "repo_map": self._cmd_repo_map,
             "stat": self._cmd_stat,
             "find": self._cmd_find,
             "grep": self._cmd_grep,
@@ -332,6 +336,54 @@ class TreeCommandParser:
         if not matches:
             return CommandResult(ok=True, output="(no symbol matches)", command_type="read")
         return CommandResult(ok=True, output=json.dumps(matches, indent=2), command_type="read")
+
+    def _cmd_repo_map(self, rest: str) -> CommandResult:
+        try:
+            parts = shlex.split(rest)
+        except ValueError as exc:
+            return CommandResult(ok=False, output=f"repo-map parse error: {exc}", command_type="error")
+
+        path = "."
+        topic = ""
+        limit = 30
+        symbols_per_file = 12
+        include_hidden = False
+        if parts and not _is_key_value_arg(parts[0]):
+            path = parts[0]
+            parts = parts[1:]
+
+        for part in parts:
+            key, sep, value = part.partition("=")
+            if not sep:
+                if not topic:
+                    topic = part
+                continue
+            normalized_key = key.replace("_", "-").lower()
+            if normalized_key == "topic":
+                topic = value
+            elif normalized_key == "limit":
+                try:
+                    limit = int(value)
+                except ValueError:
+                    return CommandResult(ok=False, output="repo-map limit must be an integer", command_type="error")
+            elif normalized_key in {"symbols", "symbols-per-file"}:
+                try:
+                    symbols_per_file = int(value)
+                except ValueError:
+                    return CommandResult(ok=False, output="repo-map symbols-per-file must be an integer", command_type="error")
+            elif normalized_key in {"hidden", "include-hidden"}:
+                include_hidden = value.lower() in {"1", "true", "yes", "on"}
+
+        rel_path = _repo_tree_path_to_rel(path)
+        payload = repo_map(
+            path=rel_path,
+            topic=topic or None,
+            limit=max(1, limit),
+            symbols_per_file=max(1, symbols_per_file),
+            include_hidden=include_hidden,
+            root=self.tree.workspace_root,
+        )
+        return CommandResult(ok=True, output=json.dumps(payload, indent=2), command_type="read")
 
     def _cmd_stat(self, rest: str) -> CommandResult:
         path = rest.strip() or "/"
@@ -1084,11 +1136,22 @@ def _starts_new_command_boundary(line: str) -> bool:
         return True
     first = line.split(None, 1)[0].lower() if line else ""
     return first in {
-        "ls", "cat", "read-line-range", "read_line_range", "symbols", "find-symbol", "find_symbol", "stat", "find", "grep",
+        "ls", "cat", "read-line-range", "read_line_range", "symbols", "find-symbol", "find_symbol", "repo-map", "repo_map", "stat", "find", "grep",
         "read-diagnostics", "diagnose", "run-route-check", "run_route_check", "ingest-log", "list-run-issues", "list_run_issues", "list-issues", "show-run-issue", "show_run_issue", "show-issue", "resolve-run-issue", "resolve_run_issue", "resolve-issue", "reopen-run-issue", "reopen_run_issue", "reopen-issue", "run-check",
         "write", "replace-lines", "replace_lines", "patch", "discover", "mutate", "show-diff", "show_diff", "review-changes", "review_changes", "shell", "git",
         "fact", "expand", "drop", "batch", "finish", "skill",
     }
+
+
+def _is_key_value_arg(value: str) -> bool:
+    return bool(re.match(r"^[A-Za-z_][A-Za-z0-9_-]*=", value or ""))
+
+
+def _repo_tree_path_to_rel(path: str) -> str:
+    normalized = str(path or ".").strip()
+    if normalized in {"", ".", "/", "/repo", "/repo/"}:
+        return "."
+    return normalized.removeprefix("/repo/").removeprefix("repo/").strip() or "."
 
 
 def execute_multi(parser: TreeCommandParser, raw: str) -> Tuple[List[CommandResult], List[Annotation]]:

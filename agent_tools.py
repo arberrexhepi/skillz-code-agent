@@ -49,6 +49,7 @@ from discovery import (
     outline_file,
     read_symbol,
     recent_changes,
+    repo_map,
     search_in_files,
     semantic_search,
     trace_dependencies,
@@ -1851,6 +1852,21 @@ def cmd_semantic_search(args: argparse.Namespace) -> None:
     )
 
 
+def cmd_repo_map(args: argparse.Namespace) -> None:
+    root = resolve_root(args.root)
+    _emit_discovery_ok(
+        "repo_map",
+        repo_map(
+            path=str(args.path),
+            topic=str(args.topic) if args.topic else None,
+            limit=int(args.limit),
+            symbols_per_file=int(args.symbols_per_file),
+            include_hidden=bool(args.hidden),
+            root=root,
+        ),
+    )
+
+
 def cmd_investigate(args: argparse.Namespace) -> None:
     root = resolve_root(args.root)
     _emit_discovery_ok(
@@ -2189,6 +2205,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--path", default=".")
     p.add_argument("--limit", type=int, default=20)
     p.set_defaults(func=cmd_semantic_search)
+
+    p = sub.add_parser("repo-map")
+    p.add_argument("--root", required=True)
+    p.add_argument("--path", default=".")
+    p.add_argument("--topic")
+    p.add_argument("--limit", type=int, default=30)
+    p.add_argument("--symbols-per-file", type=int, default=12)
+    p.add_argument("--hidden", action="store_true")
+    p.set_defaults(func=cmd_repo_map)
 
     p = sub.add_parser("investigate")
     p.add_argument("--root", required=True)

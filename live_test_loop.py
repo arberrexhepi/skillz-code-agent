@@ -62,7 +62,7 @@ from tree_loop import TreeLoop, Turn  # noqa: E402
 
 REPO_FACTS_FILENAME = "repo_facts.md"
 OBSERVABILITY_TRACE_BLOCK_LIMIT = 24
-DISCOVERY_REMEDIATION_READ_SATISFIERS = {"read_file", "read_line_range", "read-line-range", "grep"}
+DISCOVERY_REMEDIATION_READ_SATISFIERS = {"read_file", "read_line_range", "read-line-range", "grep", "repo-map", "repo_map"}
 
 
 def _normalize_cli_argv(argv: Sequence[str]) -> List[str]:
@@ -1111,6 +1111,7 @@ class TreeLoopPlannerWorker:
                         f"Discovery mode: {self.discovery_budget.mode_label}.",
                         f"Discovery budget: at most {self.discovery_budget.max_tool_calls} tool-backed actions.",
                         "Do not modify files during discovery. Finish with a concise discovery summary.",
+                        "Start broad discovery with `repo-map /repo topic=\"<task topic>\" limit=20`, then drill down with symbols, find-symbol, grep, cat, or read-line-range.",
                         "Record useful findings with executable fact commands, for example: `fact demo/goal/entrypoint planner.py owns discovery mode`.",
                         "Fact commands are allowed after the tool-call budget is exhausted, but they must include a non-empty key and value.",
                     ]
@@ -1528,7 +1529,7 @@ class TreeLoopPlannerWorker:
             return None
         return (
             f"discovery remediation active: inspect {target} with read_file, read_line_range, grep, "
-            "show_issue, or show_run_issue before mutating or finishing"
+            "repo_map, show_issue, or show_run_issue before mutating or finishing"
         )
 
     def _maybe_resolve_discovery_remediation(self, action_type: str, path: str = "", issue_id: str = "") -> bool:
@@ -1998,6 +1999,10 @@ class TreeLoopPlannerWorker:
             if len(parts) >= 2:
                 return parts[1].removeprefix("/repo/").removeprefix("repo/").strip()
         if normalized.startswith("grep /repo/"):
+            parts = normalized.split()
+            if len(parts) >= 2:
+                return parts[1].removeprefix("/repo/").removeprefix("repo/").strip()
+        if normalized.startswith("repo-map /repo/") or normalized.startswith("repo_map /repo/"):
             parts = normalized.split()
             if len(parts) >= 2:
                 return parts[1].removeprefix("/repo/").removeprefix("repo/").strip()
