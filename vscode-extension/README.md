@@ -16,7 +16,7 @@ Local desktop VS Code extension shell for the Python planner/worker runtime in t
 - Node.js and `npm`
 - Python 3.13 recommended
 - `git` on `PATH`
-- provider credentials in the environment seen by VS Code, such as `OPENAI_API_KEY` or `GEMINI_API_KEY`
+- provider credentials in the parent repository `.env`, such as `OPENAI_API_KEY`, `META_AI_API_KEY`, or `GEMINI_API_KEY`
 
 For this repository, a practical Python interpreter setting is:
 
@@ -53,8 +53,8 @@ The extension settings are defined in [package.json](package.json):
 
 Recommended local values for this repo:
 
-- `skillzAgent.provider = gemini` or `openai`
-- `skillzAgent.model = gemini-3-flash-preview` or your OpenAI model
+- `skillzAgent.provider = gemini`, `openai`, or `meta`
+- `skillzAgent.model = gemini-3-flash-preview`, `muse-spark-1.2`, or another model supported by the selected provider
 - `skillzAgent.pythonPath = /.venv/bin/python`
 
 ## Use The Extension

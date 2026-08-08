@@ -11,6 +11,7 @@ import {
   continuousModeOwnsLifecycle,
   groupLatestDiagnosticsByPath,
   isContinuousModeActive,
+  preferredRuntimeModel,
   progressTimelineTarget,
   primaryPathForReview,
 } from './panelModel';
@@ -101,6 +102,31 @@ interface LatestReview extends JsonMap {
 }
 
 interface WorkerState extends JsonMap {
+  issue_context?: {
+    active_durable_issue?: JsonMap | null;
+    focused_run_diagnostic_id?: string;
+    run_diagnostics?: Array<{
+      issue_id?: string;
+      namespace?: string;
+      status?: string;
+      summary?: string;
+      file?: string;
+      line?: string;
+      code?: string;
+    }>;
+  };
+  llm_activity?: {
+    in_flight?: boolean;
+    turn?: number;
+    last_event?: string;
+    elapsed_s?: number;
+    output_chars?: number;
+    error?: string;
+    status_code?: number | null;
+    request_id?: string;
+    repair_attempt?: number;
+    output_valid?: boolean;
+  };
   issue_state?: {
     active_issue_id?: string;
     active_issue?: {
@@ -143,6 +169,7 @@ interface WorkerState extends JsonMap {
   };
   current_run_facts?: Array<{ key?: string; value?: string }>;
   available_skills?: SkillSummary[];
+  usage_accounting?: JsonMap;
   last_run_result?: {
     final_message?: string;
     validation_passed?: boolean;
@@ -211,6 +238,39 @@ interface PlannerState extends JsonMap {
     clarification_summary?: string;
     next_steps_preview?: string[];
     confirmation_prompt?: string;
+    dependency_repairs?: string[];
+    dependency_errors?: string[];
+  } | null;
+  pending_checkpoint_results?: Array<{ title?: string; final_message?: string; status?: string; goal_id?: string }>;
+  execution_paused?: boolean;
+  paused_plan?: {
+    summary?: string;
+    goals?: PlannerGoal[];
+    assumptions?: string[];
+    clarification_summary?: string;
+    next_steps_preview?: string[];
+  } | null;
+  paused_completed_results?: Array<{ title?: string; final_message?: string; status?: string; goal_id?: string }>;
+  paused_failed_goal_id?: string;
+  paused_failed_goal_title?: string;
+  paused_failed_goal_index?: number;
+  paused_failure_reason?: string;
+  paused_failure_retryable?: boolean;
+  paused_failure_status_code?: number | null;
+  paused_failure_request_id?: string;
+  resume_checkpoint?: {
+    mode?: 'retry_failed_goal' | 'resume_remaining' | 'durable_continuation' | 'issue_continuation';
+    total_goal_count?: number;
+    completed_goal_count?: number;
+    completed_goal_ids?: string[];
+    next_goal_index?: number;
+    next_goal?: PlannerGoal | null;
+    remaining_goals?: Array<{ goal_id?: string; title?: string; index?: number }>;
+    completed_goals_will_rerun?: boolean;
+    prior_issue_completed_goal_count?: number;
+    prior_issue_completed_goals?: JsonMap[];
+    dependency_repairs?: string[];
+    dependency_errors?: string[];
   } | null;
   pending_discovery?: {
     reason?: string;
@@ -228,7 +288,7 @@ interface PlannerState extends JsonMap {
     summary?: string;
     goals?: PlannerGoal[];
   } | null;
-  last_completed_results?: Array<{ title?: string; final_message?: string; status?: string }>;
+  last_completed_results?: Array<{ title?: string; final_message?: string; status?: string; goal_id?: string }>;
   completed_results?: Array<{ title?: string; final_message?: string; status?: string; goal_id?: string }>;
   executing?: boolean;
   executing_goal_index?: number;
@@ -264,6 +324,7 @@ interface RuntimeProviderOption extends JsonMap {
   package?: string | null;
   env_var?: string | null;
   default_model?: string;
+  selection_model?: string;
   suggested_models?: string[];
   notes?: string;
   active?: boolean;
@@ -285,6 +346,7 @@ interface RuntimeOptionsResponse extends BridgeResponse {
 
 const DEFAULT_MODEL_BY_PROVIDER: Record<string, string> = {
   openai: 'gpt-5.4',
+  meta: 'muse-spark-1.2',
   anthropic: 'claude-sonnet-4-6',
   gemini: 'gemini-3-flash-preview',
   local: 'gemma4',
@@ -298,6 +360,14 @@ function defaultModelForProvider(provider: string): string {
   return DEFAULT_MODEL_BY_PROVIDER[normalized] || DEFAULT_MODEL_BY_PROVIDER.gemini;
 }
 
+function configuredModelForProvider(config: vscode.WorkspaceConfiguration, provider: string): string {
+  const inspected = config.inspect<string>('model');
+  const explicitModel = inspected?.workspaceFolderValue
+    ?? inspected?.workspaceValue
+    ?? inspected?.globalValue;
+  return String(explicitModel || '').trim() || defaultModelForProvider(provider);
+}
+
 interface ProgressMessage extends JsonMap {
   type: 'progress' | 'goal_start' | 'goal_finish';
   domain?: string;
@@ -307,6 +377,9 @@ interface ProgressMessage extends JsonMap {
   skill_mode?: string;
   skill_count?: number;
   path?: string;
+  command?: string;
+  issue_namespace?: string;
+  issue_id?: string;
   ok?: boolean;
   elapsed_s?: number;
   thought?: string;
@@ -478,7 +551,7 @@ class skillzAgentBridge implements vscode.Disposable {
     const mainScript = backendScript.resolvedPath;
     const toolScript = path.join(repoRoot, 'agent_tools.py');
     const provider = String(config.get<string>('provider') || 'gemini').trim();
-    const model = String(config.get<string>('model') || defaultModelForProvider(provider)).trim() || defaultModelForProvider(provider);
+    const model = configuredModelForProvider(config, provider);
     this.launchedBackendInfo = {
       launched_script_path: backendScript.resolvedPath,
       launched_script_name: backendScript.scriptName,
@@ -554,7 +627,24 @@ class skillzAgentBridge implements vscode.Disposable {
   public async getRuntimeOptions(): Promise<RuntimeOptionsPayload | undefined> {
     await this.ensureStarted();
     const response = await this.request('runtime_options', {}) as RuntimeOptionsResponse;
-    return response.runtime_options;
+    const options = response.runtime_options;
+    if (!options) {
+      return undefined;
+    }
+    const currentProvider = String(options.current_provider || '').trim();
+    const currentModel = String(options.current_model || '').trim();
+    return {
+      ...options,
+      providers: (options.providers || []).map((provider) => ({
+        ...provider,
+        selection_model: preferredRuntimeModel(
+          String(provider.key || ''),
+          currentProvider,
+          currentModel,
+          String(provider.default_model || ''),
+        ),
+      })),
+    };
   }
 
   public async workerAction(action: JsonMap): Promise<BridgeResponse> {
@@ -1664,6 +1754,10 @@ class AgentPanel implements vscode.Disposable {
       <button id="switchBackendBtn" class="secondary small" style="margin-top:6px">Switch to Beta</button>
     </div>
     <div>
+      <div class="flow-title">Token Accounting</div>
+      <div id="usageSummary" class="compact-list"></div>
+    </div>
+    <div>
       <div class="flow-title">Loaded Skills</div>
       <div id="skillsSummary" class="compact-list"></div>
     </div>
@@ -1704,6 +1798,7 @@ class AgentPanel implements vscode.Disposable {
     const customModelInput = document.getElementById('customModelInput');
     const runtimeStatusEl = document.getElementById('runtimeStatus');
     const backendSummaryEl = document.getElementById('backendSummary');
+    const usageSummaryEl = document.getElementById('usageSummary');
     const skillsSummaryEl = document.getElementById('skillsSummary');
     const runtimeDebugMetaEl = document.getElementById('runtimeDebugMeta');
     const runtimeDebugListEl = document.getElementById('runtimeDebugList');
@@ -1807,6 +1902,92 @@ class AgentPanel implements vscode.Disposable {
       return count + ' skill' + (count === 1 ? '' : 's');
     }
 
+    function numberValue(value) {
+      const parsed = Number(value || 0);
+      if (!Number.isFinite(parsed) || parsed < 0) {
+        return 0;
+      }
+      return parsed;
+    }
+
+    function formatNumber(value) {
+      return Math.round(numberValue(value)).toLocaleString();
+    }
+
+    function usageAccounting() {
+      const worker = state.planner?.worker_state || {};
+      return worker.usage_accounting || {};
+    }
+
+    function usageTotals(entry) {
+      if (!entry) {
+        return {};
+      }
+      if (entry.totals) {
+        return entry.totals || {};
+      }
+      return entry;
+    }
+
+    function cachePercent(totals) {
+      const input = numberValue(totals?.input_tokens);
+      if (!input) {
+        return '0%';
+      }
+      const cached = numberValue(totals?.cached_tokens);
+      return Math.round(Math.min(100, (cached / input) * 100)) + '%';
+    }
+
+    function usageLine(label, entry, detail) {
+      const totals = usageTotals(entry);
+      const calls = numberValue(totals.model_calls);
+      const pieces = [
+        'calls ' + formatNumber(calls),
+        'in ' + formatNumber(totals.input_tokens),
+        'out ' + formatNumber(totals.output_tokens),
+        'cached ' + formatNumber(totals.cached_tokens),
+        'hit ' + cachePercent(totals),
+      ];
+      const suffix = detail ? ' · ' + detail : '';
+      return el('div', 'compact-item', label + ': ' + pieces.join(' · ') + suffix);
+    }
+
+    function renderUsageSummary() {
+      if (!usageSummaryEl) {
+        return;
+      }
+      usageSummaryEl.innerHTML = '';
+      const accounting = usageAccounting();
+      const currentIssue = accounting.current_issue || {};
+      const currentRun = accounting.current_run || {};
+      const session = accounting.session || {};
+      const recentTurns = Array.isArray(accounting.recent_turns) ? accounting.recent_turns : [];
+      const issues = Array.isArray(accounting.issues) ? accounting.issues : [];
+      const hasUsage = numberValue(usageTotals(session).model_calls) > 0
+        || numberValue(usageTotals(currentRun).model_calls) > 0
+        || numberValue(usageTotals(currentIssue).model_calls) > 0;
+      if (!hasUsage) {
+        usageSummaryEl.appendChild(el('div', 'compact-item muted', 'No completed model turns reported yet.'));
+        return;
+      }
+      const issueLabel = truncate(currentIssue.label || currentIssue.issue_id || 'Active issue', 80);
+      usageSummaryEl.appendChild(usageLine('Current issue', currentIssue, issueLabel));
+      const currentIssueId = String(currentIssue.issue_id || '').trim();
+      for (const issue of issues.filter((item) => String(item?.issue_id || '').trim() !== currentIssueId).slice(0, 3)) {
+        const label = truncate(issue.label || issue.issue_id || 'Issue', 72);
+        usageSummaryEl.appendChild(usageLine('Issue ' + String(issue.issue_id || '').trim(), issue, label));
+      }
+      usageSummaryEl.appendChild(usageLine('Current run', currentRun));
+      usageSummaryEl.appendChild(usageLine('Session', session));
+      const latest = recentTurns.length ? recentTurns[recentTurns.length - 1] : null;
+      if (latest) {
+        const latestUsage = latest.usage || {};
+        const turn = numberValue(latest.turn);
+        const runtime = [latest.provider, latest.model].filter(Boolean).join(' / ');
+        usageSummaryEl.appendChild(usageLine('Last turn ' + (turn || ''), latestUsage, runtime));
+      }
+    }
+
     function renderRuntimeSummary() {
       if (!backendSummaryEl || !skillsSummaryEl) {
         return;
@@ -1842,6 +2023,8 @@ class AgentPanel implements vscode.Disposable {
           switchBackendBtn.removeAttribute('disabled');
         }
       }
+
+      renderUsageSummary();
 
       skillsSummaryEl.innerHTML = '';
       const skills = currentSkillCatalog();
@@ -1969,7 +2152,9 @@ class AgentPanel implements vscode.Disposable {
         providerSelect.appendChild(option);
       }
       providerSelect.value = existingValue && findProviderOption(existingValue) ? existingValue : currentProvider;
-      syncModelOptionsForProvider(providerSelect.value, current.model || runtimeOptions.current_model);
+      const selectedProviderOption = findProviderOption(providerSelect.value);
+      const preferredModel = String(selectedProviderOption?.selection_model || selectedProviderOption?.default_model || '');
+      syncModelOptionsForProvider(providerSelect.value, preferredModel);
       setRuntimeControlsDisabled(providers.length === 0);
       // sync backoff from state if present
       const workerState = ((state || {}).planner || {}).worker_state || state || {};
@@ -2168,7 +2353,7 @@ class AgentPanel implements vscode.Disposable {
       const rows = [];
       const pendingDiscovery = planner.pending_discovery;
       const lastDiscovery = planner.last_discovery;
-      const plan = planner.pending_plan || planner.last_presented_plan || planner.last_completed_plan;
+      const plan = (planner.execution_paused && planner.paused_plan) || planner.pending_plan || planner.last_presented_plan || planner.last_completed_plan;
 
       if (isContinuousModeActive(planner) || continuous.stop_reason) {
         rows.push({ label: 'Auto Mode', value: String(continuous.status || 'active') });
@@ -2200,7 +2385,11 @@ class AgentPanel implements vscode.Disposable {
         if (plan.summary) { rows.push({ label: 'Plan', value: plan.summary }); }
         const goalsText = goalListText(plan.goals || []);
         if (goalsText) { rows.push({ label: 'Goals', value: goalsText }); }
-        if (planner.last_execution_summary) {
+        if (planner.execution_paused) {
+          const checkpoint = planner.resume_checkpoint || {};
+          const nextIndex = Number(checkpoint.next_goal_index || planner.paused_failed_goal_index || 0);
+          rows.push({ label: 'Status', value: 'Paused → resumes at ' + (nextIndex > 0 ? 'Goal ' + nextIndex : 'next incomplete goal') });
+        } else if (planner.last_execution_summary) {
           rows.push({ label: 'Status', value: 'Approved → Executed' });
         } else if (planner.executing) {
           rows.push({ label: 'Status', value: 'Approved → Execution started' });
@@ -2286,9 +2475,23 @@ class AgentPanel implements vscode.Disposable {
           value: 'Waiting on ' + (runtime || 'configured model') + (turn > 0 ? ' (turn ' + turn + ')' : ''),
         });
       } else if (String(llmActivity.last_event || '') === 'model_call_error') {
+        const turn = Number(llmActivity.turn || 0);
+        const status = llmActivity.status_code ? 'HTTP ' + llmActivity.status_code + ' ' : '';
+        const requestId = String(llmActivity.request_id || '').trim();
         items.push({
           label: 'Model',
-          value: 'Last call failed' + (llmActivity.error ? ': ' + llmActivity.error : ''),
+          value: 'Last call failed' + (turn > 0 ? ' on turn ' + turn : '') + ': ' + status
+            + (llmActivity.error || 'unknown error') + (requestId ? ' (request ' + requestId + ')' : ''),
+        });
+      } else if (
+        String(llmActivity.last_event || '') === 'model_call_finish'
+        && Number(llmActivity.repair_attempt || 0) > 0
+        && llmActivity.output_valid !== false
+      ) {
+        items.push({
+          label: 'Model',
+          value: 'Recovered a non-executable response on turn ' + Number(llmActivity.turn || 0)
+            + ' before command execution.',
         });
       }
 
@@ -2337,6 +2540,14 @@ class AgentPanel implements vscode.Disposable {
         label = 'model call interrupted';
       } else if (p.action_type === 'output_format_error') {
         label = 'output format';
+      } else if (p.action_type === 'show_run_issue') {
+        label = 'run diagnostic ' + String(p.issue_id || '').trim();
+      } else if (p.action_type === 'show_issue') {
+        label = 'durable issue ' + String(p.issue_id || '').trim();
+      } else if (p.action_type === 'list_run_issues') {
+        label = 'list run diagnostics';
+      } else if (p.action_type === 'list_issues') {
+        label = 'list durable + run issues';
       }
       if (p.action_type === 'skill') {
         if (p.skill_name) {
@@ -2510,7 +2721,7 @@ class AgentPanel implements vscode.Disposable {
       if (planner.pending_discovery && !planner.last_discovery) {
         items.push(renderInlineStatus('Awaiting action', 'Discovery needs your confirmation.', true));
       }
-      if (planner.pending_plan && !planner.executing && !planner.last_execution_summary) {
+      if (planner.pending_plan && !planner.execution_paused && !planner.executing && !planner.last_execution_summary) {
         items.push(renderInlineStatus('Awaiting action', 'Plan is ready for approval.', true));
       } else if (planner.executing) {
         items.push(renderInlineStatus('Plan approved', 'Execution in progress.', true));
@@ -2558,9 +2769,12 @@ class AgentPanel implements vscode.Disposable {
         ? workerIssueState.reopenable_issues
         : (Array.isArray(plannerIssueState.reopenable_issues) ? plannerIssueState.reopenable_issues : []);
       const totalFacts = Number(workerIssueState.total_fact_count || plannerIssueState.total_fact_count || 0);
+      const issueContext = (planner.worker_state || {}).issue_context || {};
+      const runDiagnostics = Array.isArray(issueContext.run_diagnostics) ? issueContext.run_diagnostics : [];
+      const focusedRunDiagnosticId = String(issueContext.focused_run_diagnostic_id || '').trim();
       const hasDeleteSessionAction = actions.some(a => a.type === 'delete_session');
       const hasCreateIssueAction = actions.some(a => a.type === 'create_issue');
-      if (!activeIssue && !openIssues.length && !reopenableIssues.length && !hasDeleteSessionAction && !hasCreateIssueAction && totalFacts <= 0) { return null; }
+      if (!activeIssue && !openIssues.length && !reopenableIssues.length && !runDiagnostics.length && !hasDeleteSessionAction && !hasCreateIssueAction && totalFacts <= 0) { return null; }
 
       const card = el('div', 'flow-card lifecycle-card');
       card.appendChild(el('div', 'flow-title', 'Issues'));
@@ -2595,12 +2809,20 @@ class AgentPanel implements vscode.Disposable {
       }
 
       if (activeIssue && activeIssue.issue_id) {
-        card.appendChild(el('div', 'flow-meta', 'Active Issue'));
+        card.appendChild(el('div', 'flow-meta', 'Active Durable Issue'));
         const summary = activeIssue.plan_summary || activeIssue.request_summary || 'Active issue';
         const status = String(activeIssue.status || 'open').toUpperCase();
         card.appendChild(el('div', 'flow-body', activeIssue.issue_id + ' [' + status + ']: ' + summary));
         card.appendChild(el('div', 'flow-meta', 'Use manual close if the app or agent stopped before the issue was closed automatically.'));
         const closeRow = el('div', 'flow-actions');
+        if (planner.execution_paused) {
+          const continueButton = el('button', 'primary', 'Continue Active Issue');
+          continueButton.type = 'button';
+          continueButton.addEventListener('click', () => {
+            postAction({ type: 'continue_issue', issue_id: activeIssue.issue_id, label: 'Continue ' + activeIssue.issue_id, style: 'primary' });
+          });
+          closeRow.appendChild(continueButton);
+        }
         const closeButton = el('button', 'secondary', 'Close Active Issue');
         closeButton.type = 'button';
         if (continuousModeOwnsLifecycle(planner)) {
@@ -2615,6 +2837,33 @@ class AgentPanel implements vscode.Disposable {
         });
         closeRow.appendChild(closeButton);
         card.appendChild(closeRow);
+      }
+
+      if (runDiagnostics.length) {
+        card.appendChild(el('div', 'flow-meta', 'Run Diagnostics (Transient)'));
+        card.appendChild(el('div', 'muted', 'Validation findings inside the active durable issue; these are not planner issues.'));
+        const list = el('div', 'compact-list');
+        for (const diagnostic of runDiagnostics.slice(0, 8)) {
+          const diagnosticId = String(diagnostic.issue_id || '').trim();
+          if (!diagnosticId) { continue; }
+          const item = el('div', 'compact-item issue-row');
+          const location = diagnostic.file
+            ? ' · ' + diagnostic.file + (diagnostic.line ? ':' + diagnostic.line : '')
+            : '';
+          const focus = diagnosticId === focusedRunDiagnosticId ? ' [FOCUS]' : '';
+          item.appendChild(el('span', '', diagnosticId + focus + ': ' + String(diagnostic.summary || diagnostic.code || 'Diagnostic') + location));
+          const inspectBtn = el('button', 'secondary', 'Inspect');
+          inspectBtn.type = 'button';
+          inspectBtn.addEventListener('click', () => {
+            unlockButtons();
+            lockButtons('show_run_issue');
+            render();
+            debugAndPost({ type: 'workerAction', action: { type: 'show_run_issue', issue_id: diagnosticId } });
+          });
+          item.appendChild(inspectBtn);
+          list.appendChild(item);
+        }
+        card.appendChild(list);
       }
 
       if (openIssues.length) {
@@ -2895,8 +3144,10 @@ class AgentPanel implements vscode.Disposable {
 
     function planChoiceRow() {
       const row = el('div', 'flow-actions');
+      const checkpoint = (state.planner || {}).resume_checkpoint || {};
+      const resumeIndex = Number(checkpoint.next_goal_index || 0);
       const choices = [
-        { label: 'Approve Plan', text: 'approve', style: 'primary' },
+        { label: resumeIndex > 0 ? 'Resume from Goal ' + resumeIndex : 'Approve Plan', text: 'approve', style: 'primary' },
         { label: 'Reject Plan', text: 'reject', style: 'secondary' },
         { label: 'Reset Session', text: '/reset', style: 'ghost' },
       ];
@@ -3203,14 +3454,18 @@ class AgentPanel implements vscode.Disposable {
     function buildUnifiedPlanCard(planner, actions) {
       const pending = planner.pending_plan;
       const executing = planner.executing;
+      const paused = !!planner.execution_paused;
       const completed = planner.last_completed_plan;
       const executionSummary = planner.last_execution_summary;
-      const plan = pending || planner.last_presented_plan || completed;
+      const plan = (paused && planner.paused_plan) || pending || planner.last_presented_plan || completed;
+      const checkpoint = planner.resume_checkpoint || {};
+      const continuationPlan = !!(pending && ['durable_continuation', 'issue_continuation'].includes(String(checkpoint.mode || '')));
+      const durableContinuation = !!(continuationPlan && Number(checkpoint.completed_goal_count || 0) > 0);
       const hasDiscoveryLifecycle = !!(planner.pending_discovery || planner.last_discovery);
       if (!plan && !executing && !executionSummary && !hasDiscoveryLifecycle) { return null; }
 
       const card = el('div', 'flow-card lifecycle-card');
-      card.appendChild(el('div', 'flow-title', 'Plan'));
+      card.appendChild(el('div', 'flow-title', (paused || continuationPlan) ? 'Resume Plan' : 'Plan'));
 
       const plannerTraceEntry = currentLifecycleEntry(planner);
       if (plannerTraceEntry) {
@@ -3234,12 +3489,65 @@ class AgentPanel implements vscode.Disposable {
         }
       }
 
+      if ((paused || continuationPlan) && plan) {
+        const rawNextIndex = Number(checkpoint.next_goal_index || planner.paused_failed_goal_index || 0);
+        const nextIndex = rawNextIndex > 0 ? rawNextIndex : 0;
+        const nextGoal = checkpoint.next_goal || {};
+        const nextTitle = String(nextGoal.title || planner.paused_failed_goal_title || planner.paused_failed_goal_id || '').trim();
+        const totalGoals = Number(checkpoint.total_goal_count || ((plan.goals || []).length));
+        const recoveredResults = durableContinuation ? (planner.pending_checkpoint_results || []) : (planner.paused_completed_results || []);
+        const completedCount = Number(checkpoint.completed_goal_count || recoveredResults.filter(r => r.status === 'completed').length);
+        const priorIssueCompletedCount = Number(checkpoint.prior_issue_completed_goal_count || 0);
+
+        const resumePhase = el('div', 'phase-row');
+        resumePhase.appendChild(el('span', 'phase-label active', 'Resume point'));
+        resumePhase.appendChild(el('span', 'phase-body', (nextIndex ? 'Goal ' + nextIndex + (totalGoals ? '/' + totalGoals : '') : 'Next incomplete goal') + (nextTitle ? ' — ' + nextTitle : '')));
+        card.appendChild(resumePhase);
+
+        const checkpointPhase = el('div', 'phase-row');
+        checkpointPhase.appendChild(el('span', 'phase-label done', 'Checkpoint'));
+        const checkpointText = priorIssueCompletedCount > 0
+          ? priorIssueCompletedCount + ' earlier issue goal' + (priorIssueCompletedCount === 1 ? ' is' : 's are') + ' preserved; this plan contains ' + totalGoals + ' remaining goal' + (totalGoals === 1 ? '' : 's') + '.'
+          : completedCount + ' goal' + (completedCount === 1 ? ' is' : 's are') + ' complete in this plan and will be skipped.';
+        checkpointPhase.appendChild(el('span', 'phase-body', checkpointText));
+        card.appendChild(checkpointPhase);
+
+        const dependencyRepairs = Array.isArray(checkpoint.dependency_repairs) ? checkpoint.dependency_repairs : [];
+        if (dependencyRepairs.length) {
+          const repairPhase = el('div', 'phase-row');
+          repairPhase.appendChild(el('span', 'phase-label done', 'Dependencies'));
+          repairPhase.appendChild(el('span', 'phase-body', dependencyRepairs.join(' ')));
+          card.appendChild(repairPhase);
+        }
+        const dependencyErrors = Array.isArray(checkpoint.dependency_errors) ? checkpoint.dependency_errors : [];
+        if (dependencyErrors.length) {
+          const errorPhase = el('div', 'phase-row');
+          errorPhase.appendChild(el('span', 'phase-label', 'Invalid plan'));
+          errorPhase.appendChild(el('span', 'phase-body', dependencyErrors.join(' ')));
+          card.appendChild(errorPhase);
+        }
+      } else if (pending && planner.active_issue_id) {
+        const activeIssue = ((planner.issue_state || {}).active_issue || {});
+        const priorGoalFacts = Number(activeIssue.goal_fact_count || 0);
+        if (priorGoalFacts > 0) {
+          const continuationPhase = el('div', 'phase-row');
+          continuationPhase.appendChild(el('span', 'phase-label active', 'Continuation'));
+          continuationPhase.appendChild(el('span', 'phase-body', 'This is a new continuation plan for ' + planner.active_issue_id + ', but no executable completed-goal checkpoint was recovered. Every goal shown below is pending.'));
+          card.appendChild(continuationPhase);
+        }
+      }
+
       /* Goals list */
       const goals = (plan && plan.goals) || [];
       const completedResults = planner.completed_results || [];
+      const pausedCompletedResults = planner.paused_completed_results || [];
+      const pendingCheckpointResults = planner.pending_checkpoint_results || [];
       const lastCompletedResults = planner.last_completed_results || [];
-      const doneResults = executing ? completedResults : lastCompletedResults;
-      const doneIds = new Set(doneResults.map(r => r.goal_id).filter(Boolean));
+      const doneResults = executing ? completedResults : (paused ? pausedCompletedResults : (durableContinuation ? pendingCheckpointResults : lastCompletedResults));
+      const doneIds = new Set(doneResults.filter(r => r.status === 'completed').map(r => r.goal_id).filter(Boolean));
+      const checkpointDoneIds = new Set(Array.isArray(checkpoint.completed_goal_ids) ? checkpoint.completed_goal_ids : []);
+      for (const goalId of checkpointDoneIds) { doneIds.add(goalId); }
+      const resumeGoalId = String((checkpoint.next_goal || {}).goal_id || planner.paused_failed_goal_id || '').trim();
 
       if (goals.length) {
         const list = el('div', 'compact-list');
@@ -3247,12 +3555,16 @@ class AgentPanel implements vscode.Disposable {
           const g = goals[i];
           const isDone = doneIds.has(g.goal_id);
           const isCurrent = executing && planner.executing_goal_index === (i + 1);
+          const isResumeNext = (paused || continuationPlan) && !isDone && ((resumeGoalId && g.goal_id === resumeGoalId) || (!resumeGoalId && Number(checkpoint.next_goal_index || 0) === (i + 1)));
           const result = doneResults.find(r => r.goal_id === g.goal_id);
-          const item = el('div', 'compact-item' + (isDone ? ' goal-item-done' : '') + (isCurrent ? ' goal-item-active' : ''));
+          const item = el('div', 'compact-item' + (isDone ? ' goal-item-done' : '') + ((isCurrent || isResumeNext) ? ' goal-item-active' : ''));
           const header = document.createElement('div');
-          const prefix = isDone ? '\u2713 ' : (isCurrent ? '\u25b6 ' : '');
-          const statusSuffix = result ? ' \u2014 ' + (result.status || '') : '';
-          header.innerHTML = prefix + '<strong>' + (g.title || g.goal_id || 'Goal') + '</strong> ' + scopeBadge(g.estimated_scope) + (statusSuffix ? '<span class="muted">' + statusSuffix + '</span>' : '');
+          const prefix = isDone ? '\u2713 ' : ((isCurrent || isResumeNext) ? '\u25b6 ' : '');
+          const resumeStatus = isDone && (paused || continuationPlan)
+            ? 'Completed · skipped on resume'
+            : (isResumeNext ? (planner.paused_failed_goal_id ? 'Retry starts here' : 'Resume starts here') : ((paused || continuationPlan) && !isDone ? 'Queued after resume point' : ''));
+          const statusSuffix = resumeStatus || (result ? (result.status || '') : '');
+          header.innerHTML = prefix + '<strong>' + (g.title || g.goal_id || 'Goal') + '</strong> ' + scopeBadge(g.estimated_scope) + (statusSuffix ? '<span class="muted"> \u2014 ' + statusSuffix + '</span>' : '');
           item.appendChild(header);
           if (!isDone && g.goal) { item.appendChild(el('div', 'muted', g.goal)); }
           if (!isDone && g.success_signals && g.success_signals.length) {
@@ -3274,11 +3586,28 @@ class AgentPanel implements vscode.Disposable {
       }
 
       /* Pending approval — action buttons */
-      if (pending && !executing) {
+      if (pending && !executing && !paused) {
         if (plan && plan.next_steps_preview && plan.next_steps_preview.length) {
           card.appendChild(el('div', 'flow-meta', 'Then: ' + plan.next_steps_preview.join(', ')));
         }
-        const row = planChoiceRow();
+        const dependencyErrors = Array.isArray(plan && plan.dependency_errors) ? plan.dependency_errors : [];
+        const row = dependencyErrors.length
+          ? actionRow(actions.filter(a => a.type === 'reject_plan'))
+          : planChoiceRow();
+        if (row) { card.appendChild(row); }
+      }
+
+      if (paused && !executing) {
+        const phase = el('div', 'phase-row');
+        phase.appendChild(el('span', 'phase-label', 'Paused'));
+        const failedGoal = String(planner.paused_failed_goal_title || planner.paused_failed_goal_id || '').trim();
+        const reason = String(planner.paused_failure_reason || 'Execution stopped after a failed goal.').trim();
+        const requestId = String(planner.paused_failure_request_id || '').trim();
+        const status = planner.paused_failure_status_code ? 'HTTP ' + planner.paused_failure_status_code + ' · ' : '';
+        phase.appendChild(el('span', 'phase-body', (failedGoal ? failedGoal + ': ' : '') + status + reason + (requestId ? ' (request ' + requestId + ')' : '')));
+        card.appendChild(phase);
+        const recoveryActions = actions.filter(a => a.type === 'retry_failed_goal' || a.type === 'reject_plan');
+        const row = actionRow(recoveryActions);
         if (row) { card.appendChild(row); }
       }
 
@@ -3306,7 +3635,7 @@ class AgentPanel implements vscode.Disposable {
       }
 
       /* Execution complete — summary */
-      if (executionSummary && !executing && !pending) {
+      if (executionSummary && !executing && !pending && !paused) {
         const phase = el('div', 'phase-row');
         phase.appendChild(el('span', 'phase-label done', '\u2713 Complete'));
         phase.appendChild(el('span', 'phase-body', executionSummary));
@@ -3323,7 +3652,7 @@ class AgentPanel implements vscode.Disposable {
       const discoveryActive = !!(planner.pending_discovery && !planner.last_discovery);
       if (isContinuousModeActive(planner)) { return 'continuous'; }
       if (discoveryActive) { return 'discovery'; }
-      if (planner.pending_plan || planner.executing || planner.last_execution_summary || planner.last_completed_plan || planner.last_presented_plan) { return 'plan'; }
+      if (planner.pending_plan || planner.execution_paused || planner.paused_plan || planner.executing || planner.last_execution_summary || planner.last_completed_plan || planner.last_presented_plan) { return 'plan'; }
       if (planner.last_discovery) { return 'discovery'; }
       if (hasIssueState) { return 'issues'; }
       return activeDockTab;
@@ -3511,7 +3840,7 @@ class AgentPanel implements vscode.Disposable {
       }
 
       /* Fallback: actions with no other state — suppress when dock handles actions */
-      const lifecycleActions = new Set(['approve_plan', 'reject_plan', 'reset', 'discovery_quick', 'discovery_moderate', 'discovery_deep', 'skip_discovery', 'create_issue', 'activate_issue', 'continue_issue', 'close_issue', 'reopen_issue', 'start_continuous', 'stop_continuous']);
+      const lifecycleActions = new Set(['approve_plan', 'reject_plan', 'retry_failed_goal', 'resume_execution', 'reset', 'discovery_quick', 'discovery_moderate', 'discovery_deep', 'skip_discovery', 'create_issue', 'activate_issue', 'continue_issue', 'close_issue', 'reopen_issue', 'start_continuous', 'stop_continuous']);
       const nonLifecycleActions = actions.filter(a => !lifecycleActions.has(a.type));
       if (!cards.length && nonLifecycleActions.length && state.last_message && !hasDockVisible) {
         cards.push(flowCard({
@@ -3844,7 +4173,7 @@ export function activate(context: vscode.ExtensionContext): void {
       }
       const config = skillzAgentConfig(primaryWorkspaceFolder()?.uri);
       const provider = String(config.get<string>('provider') || 'gemini').trim();
-      const model = String(config.get<string>('model') || defaultModelForProvider(provider)).trim() || defaultModelForProvider(provider);
+      const model = configuredModelForProvider(config, provider);
       try {
         const response = await bridge.reconfigureRuntime(provider, model);
         if (!response.ok) {

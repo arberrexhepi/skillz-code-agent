@@ -61,6 +61,22 @@ class DiscoveryRemediationSatisfierTests(unittest.TestCase):
             "src/app.py",
         )
 
+    def test_strategy_run_issue_progress_preserves_namespace_without_fake_path(self):
+        worker = self._worker_with_remediation()
+        worker._bridge_step_counter = 0
+
+        payload = worker._command_progress_payload(
+            "[s2] show-run-issue run-ts1005-deadbeef01",
+            CommandResult(ok=True, output="Run Diagnostic", command_type="read"),
+        )
+
+        self.assertIsNotNone(payload)
+        assert payload is not None
+        self.assertEqual(payload["action_type"], "show_run_issue")
+        self.assertEqual(payload["issue_namespace"], "run")
+        self.assertEqual(payload["issue_id"], "run-ts1005-deadbeef01")
+        self.assertEqual(payload["path"], "")
+
     def test_read_line_range_does_not_resolve_other_paths(self):
         worker = self._worker_with_remediation()
 

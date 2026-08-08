@@ -19,6 +19,7 @@ Design goals:
 from __future__ import annotations
 
 import fnmatch
+import hashlib
 import json
 import os
 import re
@@ -32,6 +33,67 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tupl
 _CAT_MAX_FULL_LINES = 200
 _CAT_MAX_FULL_CHARS = 20000
 _CAT_PREVIEW_LINES = 80
+
+
+def _stable_run_issue_id(issue: Dict[str, Any]) -> str:
+    """Build a stable, explicitly transient diagnostic id from issue identity."""
+    identity = {
+        key: str(issue.get(key, "") or "").strip().lower()
+        for key in (
+            "code",
+            "message",
+            "file",
+            "line",
+            "column",
+            "route",
+            "url",
+        )
+    }
+    digest = hashlib.sha256(
+        json.dumps(identity, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    ).hexdigest()[:10]
+    descriptor = (
+        identity["code"]
+        or str(issue.get("classification", "") or "").strip().lower()
+        or str(issue.get("tool", "") or "").strip().lower()
+        or "diagnostic"
+    )
+    slug = re.sub(r"[^a-z0-9]+", "-", descriptor).strip("-")[:24] or "diagnostic"
+    return f"run-{slug}-{digest}"
+
+
+def _assign_stable_run_issue_ids(issues: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    by_id: Dict[str, Dict[str, Any]] = {}
+    for raw_issue in issues:
+        issue = dict(raw_issue)
+        issue_id = _stable_run_issue_id(issue)
+        issue["id"] = issue_id
+        issue["namespace"] = "run"
+        existing = by_id.get(issue_id)
+        if existing is None:
+            by_id[issue_id] = issue
+            continue
+        existing["count"] = int(existing.get("count", 1) or 1) + int(issue.get("count", 1) or 1)
+    return list(by_id.values())
+
+
+def _run_issue_sort_key(issue: Dict[str, Any]) -> Tuple[int, int, str, int, str]:
+    status_rank = 1 if str(issue.get("status", "open") or "open") == "resolved" else 0
+    try:
+        severity_rank = -int(issue.get("severity", 0) or 0)
+    except (TypeError, ValueError):
+        severity_rank = 0
+    try:
+        line = int(issue.get("line", 0) or 0)
+    except (TypeError, ValueError):
+        line = 0
+    return (
+        status_rank,
+        severity_rank,
+        str(issue.get("file", "") or ""),
+        line,
+        str(issue.get("id", "") or ""),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -582,7 +644,6 @@ class ContextTree:
         final_url = str(payload.get("finalUrl", payload.get("url", "")) or "")
 
         def _append(issue: Dict[str, Any]) -> None:
-            issue["id"] = f"issue-{len(issues) + 1:03d}"
             issues.append(issue)
 
         for entry in payload.get("consoleMessages", []) or []:
@@ -689,6 +750,7 @@ class ContextTree:
                 "example": json.dumps(entry, indent=2),
             })
 
+        issues = _assign_stable_run_issue_ids(issues)
         self.clear_fact_scope(self.LOG_ISSUES_ROOT)
         for issue in issues:
             issue_id = str(issue["id"])
@@ -711,7 +773,7 @@ class ContextTree:
                 if isinstance(entry, FileNode):
                     issue[entry.name] = entry.content
             issues.append(issue)
-        return issues
+        return sorted(issues, key=_run_issue_sort_key)
 
     def show_log_issue(self, issue_id: str) -> Optional[Dict[str, Any]]:
         for issue in self.list_log_issues():
@@ -745,7 +807,10 @@ class ContextTree:
         if not issue_items:
             return "(no run issues)"
 
-        lines = [f"Run issues: {len(issue_items)}"]
+        lines = [
+            f"Run diagnostic issues: {len(issue_items)}",
+            "Namespace: run (transient validation diagnostics, separate from durable planner issues).",
+        ]
         for issue in issue_items:
             issue_id = str(issue.get("id", "") or "")
             status = str(issue.get("status", "open") or "open")
@@ -772,7 +837,7 @@ class ContextTree:
             if summary:
                 lines.append(f"  summary: {summary}")
             next_reads = self.log_issue_read_commands(issue)
-            next_steps = [f"show-run-issue {issue_id}", *next_reads]
+            next_steps = next_reads or [f"show-run-issue {issue_id}"]
             lines.append(f"  next: {'; '.join(next_steps)}")
         return "\n".join(lines)
 
@@ -794,7 +859,10 @@ class ContextTree:
             ("count", issue.get("count") or ""),
             ("source", issue.get("source") or ""),
         ]
-        lines = [f"Run Issue {issue_id} [{status}]"]
+        lines = [
+            f"Run Diagnostic {issue_id} [{status}]",
+            "namespace: run (transient; not the active durable planner issue)",
+        ]
         for key, value in fields:
             text = str(value or "").strip()
             if text:
@@ -1038,9 +1106,7 @@ class ContextTree:
             issues_by_fingerprint.values(),
             key=lambda issue: (str(issue.get("file", "")), str(issue.get("message", ""))),
         )
-        for index, issue in enumerate(issues, start=1):
-            issue["id"] = f"issue-{index:03d}"
-        return issues
+        return _assign_stable_run_issue_ids(issues)
 
     def _extract_embedded_diagnostics(self, content: str) -> List[Dict[str, Any]]:
         decoder = JSONDecoder()

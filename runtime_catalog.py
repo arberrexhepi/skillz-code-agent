@@ -23,6 +23,21 @@ BASE_RUNTIME_PROVIDER_CATALOG: Dict[str, Dict[str, Any]] = {
         ],
         "notes": "Uses the Responses API. Any compatible OpenAI model string is allowed.",
     },
+    "meta": {
+        "label": "Meta Model API",
+        "package": "openai",
+        "env_var": "META_AI_API_KEY",
+        "default_model": "muse-spark-1.2",
+        "models": [
+            "muse-spark-1.2",
+            "muse-spark-1.2-contributor",
+            "muse-spark-1.1",
+        ],
+        "notes": (
+            "Uses Meta's OpenAI-compatible Responses API at https://api.meta.ai/v1. "
+            "The contributor model permits Meta to use prompts and completions for training."
+        ),
+    },
     "anthropic": {
         "label": "Anthropic",
         "package": "anthropic",
@@ -156,6 +171,8 @@ def _looks_like_supported_runtime_model(provider: str, model_name: str) -> bool:
         allowed_prefix = normalized.startswith(("gpt-", "o1", "o3", "o4", "chatgpt-"))
         blocked_terms = ("image", "realtime", "tts", "transcribe", "embedding", "moderation")
         return allowed_prefix and not any(term in normalized for term in blocked_terms)
+    if provider == "meta":
+        return normalized.startswith("muse-")
     if provider == "anthropic":
         return normalized.startswith("claude-")
     if provider == "gemini":
@@ -188,6 +205,14 @@ def _refresh_openai_models() -> List[str]:
         for item in client.models.list()
         if _looks_like_supported_runtime_model("openai", _extract_model_name(item))
     )
+
+
+def _refresh_meta_models() -> List[str]:
+    api_key = str(os.environ.get("META_AI_API_KEY", "")).strip()
+    if not api_key:
+        return []
+    base_url = str(os.environ.get("META_MODEL_API_BASE_URL") or "https://api.meta.ai/v1").strip()
+    return _refresh_openai_compatible_models(base_url, api_key, "meta")
 
 
 def _refresh_anthropic_models() -> List[str]:
@@ -255,6 +280,7 @@ def refresh_runtime_provider_catalog_once() -> Dict[str, Any]:
             RUNTIME_PROVIDER_CATALOG[key] = deepcopy(BASE_RUNTIME_PROVIDER_CATALOG[key])
         refreshers = {
             "openai": _refresh_openai_models,
+            "meta": _refresh_meta_models,
             "anthropic": _refresh_anthropic_models,
             "gemini": _refresh_gemini_models,
             "ollama": _refresh_ollama_local_models,
@@ -301,6 +327,7 @@ def validate_provider_model_selection(provider: Optional[str], model: Optional[s
     provider_named_model = normalized_model in RUNTIME_PROVIDER_CATALOG
     known_provider_prefixes = {
         "openai": ("gpt-", "o1", "o3", "o4", "chatgpt-"),
+        "meta": ("muse-",),
         "anthropic": ("claude-",),
         "gemini": ("gemini-",),
         "local": tuple(),

@@ -25,6 +25,7 @@
           "type": "string",
           "enum": [
             "openai",
+            "meta",
             "anthropic",
             "gemini",
             "local",
@@ -32,7 +33,7 @@
             "ollama-runpod"
           ],
           "default": "gemini",
-          "description": "Provider passed to the skillz agent runtime. Use local for the localhost OpenAI-compatible bridge on port 5051, ollama-local for the localhost Ollama endpoint on port 11434, or ollama-runpod for the configured Runpod Ollama endpoint."
+          "description": "Provider passed to the skillz agent runtime. Use meta for Muse Spark through Meta Model API, local for the localhost OpenAI-compatible bridge on port 5051, ollama-local for the localhost Ollama endpoint on port 11434, or ollama-runpod for the configured Runpod Ollama endpoint."
         },
         "skillzAgent.model": {
           "type": "string",

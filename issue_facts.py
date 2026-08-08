@@ -48,6 +48,12 @@ def _record_sort_key(record: "IssueFactRecord") -> tuple[int, int, str, str, str
     )
 
 
+def _legacy_checkpoint_key(checkpoint: "CompletedGoalCheckpoint") -> tuple[str, str]:
+    message = re.sub(r"\s+", " ", str(checkpoint.final_message or "").strip().lower())
+    fallback = re.sub(r"\s+", " ", str(checkpoint.plan_summary or "").strip().lower())
+    return (str(checkpoint.goal_id or "").strip(), message or fallback)
+
+
 @dataclass
 class IssueFactRecord:
     key: str
@@ -114,6 +120,54 @@ class IssueFactRecord:
 
 
 @dataclass
+class CompletedGoalCheckpoint:
+    goal_id: str
+    title: str = ""
+    goal_signature: str = ""
+    plan_summary: str = ""
+    final_message: str = ""
+    validation_summary: str = ""
+    completed_at: str = ""
+    original_index: int = 0
+    total_goal_count: int = 0
+    source: str = "execution"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "goal_id": self.goal_id,
+            "title": self.title,
+            "goal_signature": self.goal_signature,
+            "plan_summary": self.plan_summary,
+            "final_message": self.final_message,
+            "validation_summary": self.validation_summary,
+            "completed_at": self.completed_at,
+            "original_index": self.original_index,
+            "total_goal_count": self.total_goal_count,
+            "source": self.source,
+        }
+
+    @classmethod
+    def from_dict(cls, item: Dict[str, Any]) -> Optional["CompletedGoalCheckpoint"]:
+        goal_id = str(item.get("goal_id", "") or "").strip()
+        title = str(item.get("title", "") or "").strip()
+        signature = str(item.get("goal_signature", "") or "").strip()
+        if not goal_id and not title and not signature:
+            return None
+        return cls(
+            goal_id=goal_id,
+            title=title,
+            goal_signature=signature,
+            plan_summary=str(item.get("plan_summary", "") or "").strip(),
+            final_message=str(item.get("final_message", "") or "").strip(),
+            validation_summary=str(item.get("validation_summary", "") or "").strip(),
+            completed_at=str(item.get("completed_at", "") or "").strip(),
+            original_index=int(item.get("original_index", 0) or 0),
+            total_goal_count=int(item.get("total_goal_count", 0) or 0),
+            source=str(item.get("source", "execution") or "execution").strip(),
+        )
+
+
+@dataclass
 class IssueRecord:
     issue_id: str
     request_summary: str = ""
@@ -130,6 +184,7 @@ class IssueRecord:
     last_review_decision: str = ""
     lifecycle_notes: List[str] = field(default_factory=list)
     facts: List[IssueFactRecord] = field(default_factory=list)
+    completed_goals: List[CompletedGoalCheckpoint] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -148,6 +203,7 @@ class IssueRecord:
             "last_review_decision": self.last_review_decision,
             "lifecycle_notes": list(self.lifecycle_notes),
             "facts": [record.to_persisted_dict() for record in sorted(self.facts, key=lambda item: (item.fact_type, item.key))],
+            "completed_goals": [checkpoint.to_dict() for checkpoint in self.completed_goals],
         }
 
     def summary(self) -> Dict[str, Any]:
@@ -171,6 +227,7 @@ class IssueRecord:
             "fact_count": len(self.facts),
             "architecture_fact_count": architecture_count,
             "goal_fact_count": goal_count,
+            "completed_goal_count": len(self.completed_goals),
         }
 
     @classmethod
@@ -186,6 +243,13 @@ class IssueRecord:
             fact = IssueFactRecord.from_dict(fact_item, issue_id=issue_id, issue_status=status)
             if fact is not None:
                 facts.append(fact)
+        completed_goals: List[CompletedGoalCheckpoint] = []
+        for checkpoint_item in item.get("completed_goals", []) or []:
+            if not isinstance(checkpoint_item, dict):
+                continue
+            checkpoint = CompletedGoalCheckpoint.from_dict(checkpoint_item)
+            if checkpoint is not None:
+                completed_goals.append(checkpoint)
         return cls(
             issue_id=issue_id,
             request_summary=str(item.get("request_summary", "") or ""),
@@ -202,6 +266,7 @@ class IssueRecord:
             last_review_decision=str(item.get("last_review_decision", "") or ""),
             lifecycle_notes=[str(note) for note in item.get("lifecycle_notes", []) or [] if str(note).strip()],
             facts=facts,
+            completed_goals=completed_goals,
         )
 
 
@@ -392,10 +457,15 @@ class IssueFactLedger:
                 for record in sorted(active_issue.facts, key=lambda item: (item.fact_type, item.key))
                 if record.fact_type == FACT_TYPE_GOAL
             ]
+        active_issue_payload = active_issue.summary() if active_issue is not None else None
+        if active_issue_payload is not None:
+            active_issue_payload["completed_goals"] = [
+                checkpoint.to_dict() for checkpoint in active_issue.completed_goals
+            ]
         return {
             "path": path,
             "schema_version": self.schema_version,
-            "active_issue": active_issue.summary() if active_issue is not None else None,
+            "active_issue": active_issue_payload,
             "context_facts": context_facts,
             "active_issue_goal_facts": active_issue_goal_facts,
             "reopenable_issues": self.reopenable_issues(),
@@ -540,6 +610,61 @@ class IssueFactLedger:
         if issue is None:
             return None
         return self.close_issue(issue.issue_id, note=note)
+
+    def record_completed_goal(
+        self,
+        *,
+        issue_id: str,
+        checkpoint: CompletedGoalCheckpoint,
+    ) -> CompletedGoalCheckpoint:
+        issue = self.get_issue(issue_id) if issue_id else self.active_issue()
+        if issue is None:
+            raise KeyError(issue_id or self.active_issue_id)
+        checkpoint.completed_at = checkpoint.completed_at or _utc_timestamp()
+        match_index = -1
+        for index, existing in enumerate(issue.completed_goals):
+            if (
+                checkpoint.source == "legacy_observability"
+                and existing.source == "legacy_observability"
+                and _legacy_checkpoint_key(existing) == _legacy_checkpoint_key(checkpoint)
+            ):
+                return existing
+            if checkpoint.goal_signature and existing.goal_signature == checkpoint.goal_signature:
+                match_index = index
+                break
+            if (
+                checkpoint.plan_summary
+                and existing.plan_summary == checkpoint.plan_summary
+                and checkpoint.goal_id
+                and existing.goal_id == checkpoint.goal_id
+            ):
+                match_index = index
+                break
+        if match_index >= 0:
+            issue.completed_goals[match_index] = checkpoint
+        else:
+            issue.completed_goals.append(checkpoint)
+        return checkpoint
+
+    def deduplicate_legacy_completed_goals(self, issue_id: str) -> int:
+        issue = self.get_issue(issue_id)
+        if issue is None:
+            raise KeyError(issue_id)
+        seen: set[tuple[str, str]] = set()
+        retained: List[CompletedGoalCheckpoint] = []
+        removed = 0
+        for checkpoint in issue.completed_goals:
+            if checkpoint.source != "legacy_observability":
+                retained.append(checkpoint)
+                continue
+            key = _legacy_checkpoint_key(checkpoint)
+            if key in seen:
+                removed += 1
+                continue
+            seen.add(key)
+            retained.append(checkpoint)
+        issue.completed_goals = retained
+        return removed
 
     def close_issue(self, issue_id: str, *, note: str = "") -> IssueRecord:
         issue = self.get_issue(issue_id)

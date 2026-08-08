@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import hashlib
 import json
 import os
 import re
@@ -74,6 +75,18 @@ class PlannerWorker(Protocol):
     def close_active_issue(self, *, note: str = "") -> Optional[Dict[str, Any]]:
         ...
 
+    def record_completed_goal(
+        self,
+        *,
+        issue_id: str,
+        plan_summary: str,
+        goal: Dict[str, Any],
+        result: Dict[str, Any],
+        original_index: int,
+        total_goal_count: int,
+    ) -> Dict[str, Any]:
+        ...
+
     def close_issue(self, issue_id: str, *, note: str = "") -> Dict[str, Any]:
         ...
 
@@ -136,6 +149,78 @@ REPO_FACTS_FILENAME = "repo_facts.md"
 REPO_FACTS_JSON_BLOCK_RE = re.compile(r"```json\s*(.*?)\s*```", re.DOTALL)
 
 
+def _execution_error_status(exc: Exception) -> Optional[int]:
+    for value in (
+        getattr(exc, "status_code", None),
+        getattr(exc, "status", None),
+        getattr(exc, "code", None),
+    ):
+        try:
+            status = int(value)
+        except (TypeError, ValueError):
+            continue
+        if 100 <= status <= 599:
+            return status
+    match = re.search(r"(?:error code|status(?: code)?|http)\s*[:=]?\s*(\d{3})\b", str(exc), re.IGNORECASE)
+    return int(match.group(1)) if match else None
+
+
+def _execution_error_request_id(exc: Exception) -> str:
+    request_id = str(getattr(exc, "request_id", "") or "").strip()
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None)
+    if request_id or headers is None:
+        return request_id
+    for name in ("x-request-id", "request-id", "x-meta-request-id"):
+        try:
+            request_id = str(headers.get(name, "") or "").strip()
+        except Exception:
+            request_id = ""
+        if request_id:
+            return request_id
+    return ""
+
+
+def _execution_error_is_retryable(exc: Exception) -> bool:
+    status = _execution_error_status(exc)
+    if status is not None:
+        return status in {408, 409, 425, 429} or 500 <= status <= 599
+    text = str(exc).lower()
+    return any(
+        marker in text
+        for marker in (
+            "internal server error",
+            "server_error",
+            "service unavailable",
+            "temporarily unavailable",
+            "gateway timeout",
+            "connection reset",
+            "connection aborted",
+            "timed out",
+            "timeout",
+        )
+    )
+
+
+def _execution_error_retry_summary(exc: Exception) -> str:
+    attempts = int(getattr(exc, "retry_attempts", 0) or 0)
+    if attempts <= 1:
+        return ""
+    details = [f"attempts={attempts}"]
+    delays = list(getattr(exc, "retry_delays_s", []) or [])
+    if delays:
+        details.append("delays=" + ",".join(f"{float(delay):g}s" for delay in delays))
+    retry_after = str(getattr(exc, "retry_after", "") or "").strip()
+    if retry_after:
+        details.append(f"Retry-After={retry_after}s")
+    request_ids = list(getattr(exc, "retry_request_ids", []) or [])
+    if request_ids:
+        details.append("requests=" + ",".join(str(item) for item in request_ids))
+    if bool(getattr(exc, "fresh_context_retry", False)):
+        details.append("fresh_context=true")
+    return " [retry: " + "; ".join(details) + "]"
+
+
 @dataclass
 class PlannerGoal:
     goal_id: str
@@ -161,6 +246,8 @@ class PlannerPlan:
     not_in_scope: List[str] = field(default_factory=list)
     next_steps_preview: List[str] = field(default_factory=list)
     confirmation_prompt: str = "Approve this plan to start execution."
+    dependency_repairs: List[str] = field(default_factory=list)
+    dependency_errors: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -180,6 +267,9 @@ class GoalExecutionResult:
     validation_ran: bool = False
     validation_passed: bool = False
     validation_summary: str = ""
+    failure_retryable: bool = False
+    failure_status_code: Optional[int] = None
+    failure_request_id: str = ""
 
 
 @dataclass
@@ -290,6 +380,7 @@ def _discovery_findings_lines(result: Optional[DiscoveryResult], *, limit: int =
 class PlannerSession:
     intake_messages: List[Dict[str, str]] = field(default_factory=list)
     pending_plan: Optional[PlannerPlan] = None
+    pending_checkpoint_results: List[GoalExecutionResult] = field(default_factory=list)
     last_presented_plan: Optional[PlannerPlan] = None
     last_completed_plan: Optional[PlannerPlan] = None
     last_completed_results: List[GoalExecutionResult] = field(default_factory=list)
@@ -309,6 +400,16 @@ class PlannerSession:
     executing_goal_count: int = 0
     active_issue_id: str = ""
     defer_issue_close_for_review: bool = False
+    execution_paused: bool = False
+    paused_plan: Optional[PlannerPlan] = None
+    paused_completed_results: List[GoalExecutionResult] = field(default_factory=list)
+    paused_failed_goal_id: str = ""
+    paused_failed_goal_title: str = ""
+    paused_failed_goal_index: int = -1
+    paused_failure_reason: str = ""
+    paused_failure_retryable: bool = False
+    paused_failure_status_code: Optional[int] = None
+    paused_failure_request_id: str = ""
 
 
 class PlannerAgent:
@@ -331,6 +432,21 @@ class PlannerAgent:
         self.on_plan_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None
         self.continuous_config = ContinuousModeConfig()
         self.continuous_state = ContinuousRunState()
+
+    def _clear_paused_execution(self) -> None:
+        self.session.execution_paused = False
+        self.session.paused_plan = None
+        self.session.paused_completed_results = []
+        self.session.paused_failed_goal_id = ""
+        self.session.paused_failed_goal_title = ""
+        self.session.paused_failed_goal_index = -1
+        self.session.paused_failure_reason = ""
+        self.session.paused_failure_retryable = False
+        self.session.paused_failure_status_code = None
+        self.session.paused_failure_request_id = ""
+
+    def _clear_pending_checkpoint(self) -> None:
+        self.session.pending_checkpoint_results = []
 
     def reconfigure_runtime(
         self,
@@ -563,8 +679,10 @@ class PlannerAgent:
         activated_id = str(issue.get("issue_id", "") or normalized).strip()
         self.session.active_issue_id = activated_id
         self.session.pending_plan = None
+        self._clear_pending_checkpoint()
         self.session.pending_discovery = None
         self.session.awaiting_plan_revision = False
+        self._clear_paused_execution()
         return issue, None
 
     def activate_issue(self, issue_id: str) -> str:
@@ -588,6 +706,15 @@ class PlannerAgent:
         return "User has requested resolution of the selected open issue."
 
     def continue_issue(self, issue_id: str, prompt: str = "") -> str:
+        normalized = str(issue_id or "").strip()
+        if (
+            self.session.execution_paused
+            and self.session.paused_plan is not None
+            and normalized
+            and normalized == str(self.session.active_issue_id or "").strip()
+            and not prompt.strip()
+        ):
+            return self.resume_paused_execution()
         issue, error = self._activate_issue_record(issue_id)
         if error:
             return error
@@ -678,6 +805,7 @@ class PlannerAgent:
         self.session.latest_request = user_request.strip()
         self.session.intake_messages = [{"role": "user", "content": user_request.strip()}]
         self.session.pending_plan = None
+        self._clear_pending_checkpoint()
         self.session.last_presented_plan = None
         self.session.last_completed_plan = None
         self.session.last_completed_results = []
@@ -690,6 +818,7 @@ class PlannerAgent:
         self.session.completed_results = []
         self.session.planner_usage_totals = {}
         self.session.defer_issue_close_for_review = False
+        self._clear_paused_execution()
         self._rehydrate_active_issue_context()
         open_issue_message = self._prepare_open_issue_for_prompt()
         if open_issue_message:
@@ -704,6 +833,19 @@ class PlannerAgent:
         builtin = self.try_builtin_command(text)
         if builtin is not None:
             return builtin
+
+        if self.session.execution_paused and self.session.paused_plan is not None:
+            if text.lower() in {"retry", "/retry", "resume", "/resume", "continue", "/continue"}:
+                return self.resume_paused_execution()
+            paused_plan = self.session.paused_plan
+            self.session.intake_messages.append({"role": "user", "content": text})
+            self.session.last_presented_plan = paused_plan
+            self._clear_paused_execution()
+            self.session.awaiting_plan_revision = True
+            self.session.plan_revision_feedback.append(text)
+            if self._is_rejection(text):
+                return "Paused execution rejected. Describe what should change and I will revise the plan."
+            return self._handle_intake_turn()
 
         if self.session.pending_plan is not None:
             if self._is_approval(text):
@@ -721,6 +863,7 @@ class PlannerAgent:
                 pending = self.session.pending_plan
                 self.session.last_presented_plan = self.session.pending_plan
                 self.session.pending_plan = None
+                self._clear_pending_checkpoint()
                 self.session.awaiting_plan_revision = True
                 self._fire_plan_callback(
                     "plan_rejected",
@@ -734,6 +877,7 @@ class PlannerAgent:
             pending = self.session.pending_plan
             self.session.last_presented_plan = self.session.pending_plan
             self.session.pending_plan = None
+            self._clear_pending_checkpoint()
             self.session.awaiting_plan_revision = True
             self.session.plan_revision_feedback.append(text)
             self._fire_plan_callback(
@@ -815,6 +959,7 @@ class PlannerAgent:
         self.session.intake_messages = []
         self.session.latest_request = ""
         self.session.pending_plan = None
+        self._clear_pending_checkpoint()
         self.session.last_presented_plan = None
         self.session.awaiting_plan_revision = False
         self.session.plan_revision_feedback = []
@@ -831,6 +976,7 @@ class PlannerAgent:
         self.session.last_completed_results = []
         self.session.completed_results = []
         self.session.planner_usage_totals = {}
+        self._clear_paused_execution()
         self.session.active_issue_id = str((issue or {}).get("issue_id", normalized_issue_id) or normalized_issue_id)
         summary = str((issue or {}).get("plan_summary", "") or "").strip()
         if summary:
@@ -884,6 +1030,7 @@ class PlannerAgent:
         self.session.intake_messages = []
         self.session.latest_request = ""
         self.session.pending_plan = None
+        self._clear_pending_checkpoint()
         self.session.last_presented_plan = None
         self.session.awaiting_plan_revision = False
         self.session.plan_revision_feedback = []
@@ -900,6 +1047,7 @@ class PlannerAgent:
         self.session.last_completed_results = []
         self.session.completed_results = []
         self.session.planner_usage_totals = {}
+        self._clear_paused_execution()
         self.session.active_issue_id = ""
         return f"Closed issue {issue_id_closed}. It will stay out of active context until reopened."
 
@@ -907,6 +1055,7 @@ class PlannerAgent:
         self.session.latest_request = user_request.strip()
         self.session.intake_messages = [{"role": "user", "content": user_request.strip()}]
         self.session.pending_plan = None
+        self._clear_pending_checkpoint()
         self.session.last_presented_plan = None
         self.session.last_completed_plan = None
         self.session.last_completed_results = []
@@ -918,6 +1067,7 @@ class PlannerAgent:
         self.session.discovery_phase = "idle"
         self.session.completed_results = []
         self.session.planner_usage_totals = {}
+        self._clear_paused_execution()
         self._rehydrate_active_issue_context()
 
     def _planner_complete(self, system: str, prompt: str) -> str:
@@ -1111,6 +1261,8 @@ class PlannerAgent:
     ) -> GoalExecutionResult:
         steering = self._build_goal_steering(plan, goal, index)
         task = self._build_goal_task(plan, goal, index)
+        started = time.time()
+        history_start = len(getattr(worker, "history", []))
         try:
             execution = self._run_worker_task(
                 worker=worker,
@@ -1137,14 +1289,30 @@ class PlannerAgent:
                 validation_summary=str(worker_result["validation_summary"]),
             )
         except Exception as exc:
+            history_slice = list(getattr(worker, "history", [])[history_start:])
+            touched_paths = self._collect_touched_paths(history_slice)
+            validation_summary = (
+                "Execution was interrupted after partial repository changes; inspect and repair the current diff before continuing."
+                if touched_paths
+                else "Execution was interrupted before a validated completion."
+            )
             return GoalExecutionResult(
                 goal_id=goal.goal_id,
                 title=goal.title,
                 delegated_task=task,
-                final_message=f"Worker execution failed: {exc}",
+                final_message=f"Worker execution failed: {exc}{_execution_error_retry_summary(exc)}",
                 usage_summary=str(worker.render_last_usage_summary() or "").strip(),
+                worker_history_summary=self._summarize_worker_history(history_slice),
+                touched_paths=touched_paths,
                 preserve_context_used=goal.preserve_context,
+                duration_s=round(time.time() - started, 3),
                 status="failed",
+                validation_ran=False,
+                validation_passed=False,
+                validation_summary=validation_summary,
+                failure_retryable=_execution_error_is_retryable(exc),
+                failure_status_code=_execution_error_status(exc),
+                failure_request_id=_execution_error_request_id(exc),
             )
 
     def execute_discovery(self, mode_key: str) -> str:
@@ -1230,19 +1398,70 @@ class PlannerAgent:
         if plan is None:
             return "No pending plan to execute."
 
+        self._normalize_plan_dependencies(plan)
+        dependency_error = self._dependency_error_message(plan)
+        if dependency_error:
+            return dependency_error + " Revise the plan before approval."
+        recovered_results = self._checkpoint_results_for_plan(plan)
+        checkpoint_by_goal = {
+            result.goal_id: result
+            for result in [*self.session.pending_checkpoint_results, *recovered_results]
+            if result.status == "completed" and result.goal_id
+        }
+        checkpoint_results = list(checkpoint_by_goal.values())
+        self.session.pending_plan = None
+        self._clear_pending_checkpoint()
+        self._clear_paused_execution()
+        return self._execute_plan(
+            plan,
+            checkpoint_results=checkpoint_results,
+            resumed=bool(checkpoint_results),
+        )
+
+    def resume_paused_execution(self) -> str:
+        plan = self.session.paused_plan
+        if not self.session.execution_paused or plan is None:
+            return "No paused execution to resume."
+
+        self._normalize_plan_dependencies(plan)
+        dependency_error = self._dependency_error_message(plan)
+        if dependency_error:
+            self.session.paused_failure_reason = dependency_error
+            return dependency_error + " Revise the plan before resuming."
+        checkpoint_results = [
+            result
+            for result in self.session.paused_completed_results
+            if result.status == "completed"
+        ]
+        self._clear_paused_execution()
+        return self._execute_plan(plan, checkpoint_results=checkpoint_results, resumed=True)
+
+    def _execute_plan(
+        self,
+        plan: PlannerPlan,
+        *,
+        checkpoint_results: List[GoalExecutionResult],
+        resumed: bool,
+    ) -> str:
+
         self._mark_discovery_complete_for_plan_approval()
         self._fire_plan_callback(
             "plan_execution_start",
             {
                 "summary": plan.summary,
                 "goal_count": len(plan.goals),
+                "resumed": resumed,
             },
         )
-        self.session.completed_results = []
+        self.session.completed_results = list(checkpoint_results)
         self.session.executing = True
         self.session.executing_goal_count = len(plan.goals)
-        output: List[str] = ["Executing confirmed plan."]
-        completed_ids: set[str] = set()
+        output: List[str] = ["Resuming checkpointed plan from its next incomplete goal." if resumed else "Executing confirmed plan."]
+        completed_ids: set[str] = {
+            result.goal_id
+            for result in checkpoint_results
+            if result.status == "completed" and result.goal_id
+        }
         failed = False
 
         opener = getattr(self.worker, "ensure_issue_for_plan", None)
@@ -1255,7 +1474,11 @@ class PlannerAgent:
             issue_id = str((issue or {}).get("issue_id", "") or "").strip()
             if issue_id:
                 self.session.active_issue_id = issue_id
-                output[0] = f"Executing confirmed plan under {issue_id}."
+                output[0] = (
+                    f"Resuming checkpointed plan under {issue_id} from its next incomplete goal."
+                    if resumed
+                    else f"Executing confirmed plan under {issue_id}."
+                )
 
         try:
             while len(completed_ids) < len(plan.goals) and not failed:
@@ -1273,20 +1496,23 @@ class PlannerAgent:
                     self._fire_goal_callback("goal_start", index, goal.goal_id, goal.title)
                     # On the main worker, preserve facts from earlier goals in
                     # the same plan so context accumulates across the sequence.
-                    effective_preserve = goal.preserve_context or bool(completed_ids)
+                    effective_preserve = goal.preserve_context or bool(completed_ids) or resumed
                     result = self._execute_goal_with_worker(
                         self.worker, plan,
                         _dataclass_replace(goal, preserve_context=effective_preserve),
                         index,
                     )
                     self._fire_goal_callback("goal_finish", index, goal.goal_id, goal.title)
+                    if result.status == "completed":
+                        self._record_completed_goal_checkpoint(plan, goal, result, index)
                     if result.status == "completed" and index < len(plan.goals):
                         result.commentary_for_next_goal = self._plan_next_goal_guidance(plan, goal, result)
                         self._apply_guidance_to_next_goal(plan, index, result.commentary_for_next_goal)
                     self.session.completed_results.append(result)
-                    completed_ids.add(goal.goal_id)
                     output.append(self._render_goal_result(index, len(plan.goals), result))
-                    if result.status != "completed":
+                    if result.status == "completed":
+                        completed_ids.add(goal.goal_id)
+                    else:
                         failed = True
                     continue
 
@@ -1308,9 +1534,11 @@ class PlannerAgent:
                 for index, goal in batch:
                     result = results_by_goal[goal.goal_id]
                     self.session.completed_results.append(result)
-                    completed_ids.add(goal.goal_id)
                     output.append(self._render_goal_result(index, len(plan.goals), result))
-                    if result.status != "completed":
+                    if result.status == "completed":
+                        completed_ids.add(goal.goal_id)
+                        self._record_completed_goal_checkpoint(plan, goal, result, index)
+                    else:
                         failed = True
         finally:
             self.session.executing = False
@@ -1336,19 +1564,70 @@ class PlannerAgent:
             self.session.last_presented_plan = None
             self.session.awaiting_plan_revision = False
             self.session.plan_revision_feedback = []
+            self._clear_paused_execution()
         else:
+            failed_results = [result for result in self.session.completed_results if result.status != "completed"]
+            failed_result = failed_results[0] if failed_results else None
+            if failed_result is not None and failed_result.touched_paths:
+                failed_goal = next(
+                    (goal for goal in plan.goals if goal.goal_id == failed_result.goal_id),
+                    None,
+                )
+                if failed_goal is not None:
+                    recovery_note = (
+                        "Recovery: the previous attempt was interrupted after partial writes to "
+                        + ", ".join(failed_result.touched_paths[:8])
+                        + ". Inspect the current diff and diagnostics first, repair the partial implementation, and do not restart this goal from scratch."
+                    )
+                    if recovery_note not in failed_goal.delegation_notes:
+                        failed_goal.delegation_notes.append(recovery_note)
+            failed_goal_index = -1
+            if failed_result is not None:
+                failed_goal_index = next(
+                    (
+                        index
+                        for index, goal in enumerate(plan.goals, start=1)
+                        if goal.goal_id == failed_result.goal_id
+                    ),
+                    -1,
+                )
             self.session.last_completed_plan = None
-            self.session.pending_plan = plan
+            self.session.pending_plan = None
             self.session.last_presented_plan = plan
             self.session.awaiting_plan_revision = False
             self.session.plan_revision_feedback = []
+            self.session.execution_paused = True
+            self.session.paused_plan = plan
+            self.session.paused_completed_results = [
+                result for result in self.session.completed_results if result.status == "completed"
+            ]
+            self.session.paused_failed_goal_id = failed_result.goal_id if failed_result is not None else ""
+            self.session.paused_failed_goal_title = failed_result.title if failed_result is not None else ""
+            self.session.paused_failed_goal_index = failed_goal_index
+            self.session.paused_failure_reason = (
+                failed_result.final_message
+                if failed_result is not None
+                else "No dependency-ready goals were available."
+            )
+            self.session.paused_failure_retryable = bool(
+                failed_result is not None
+                and (failed_result.failure_retryable or self._result_has_transient_failure(failed_result))
+            )
+            self.session.paused_failure_status_code = (
+                failed_result.failure_status_code if failed_result is not None else None
+            )
+            self.session.paused_failure_request_id = (
+                failed_result.failure_request_id if failed_result is not None else ""
+            )
         self._fire_plan_callback(
             "plan_execution_finish",
             {
                 "summary": plan.summary,
                 "goal_count": len(plan.goals),
-                "status": "completed" if plan_completed else "failed",
+                "status": "completed" if plan_completed else "paused",
                 "execution_summary": final_summary,
+                "failed_goal_id": self.session.paused_failed_goal_id if not plan_completed else "",
+                "retryable": self.session.paused_failure_retryable if not plan_completed else False,
             },
         )
         self.session.completed_results = []
@@ -1533,6 +1812,7 @@ class PlannerAgent:
         )
         self.session.last_presented_plan = plan
         self.session.pending_plan = None
+        self._clear_pending_checkpoint()
         self.session.awaiting_plan_revision = True
         self.session.plan_revision_feedback.append(feedback)
 
@@ -1577,6 +1857,10 @@ class PlannerAgent:
         )
 
     def _result_has_transient_failure(self, result: GoalExecutionResult) -> bool:
+        if result.failure_retryable:
+            return True
+        if result.failure_status_code is not None:
+            return result.failure_status_code in {408, 409, 425, 429} or 500 <= result.failure_status_code <= 599
         text = " ".join(
             [
                 result.final_message,
@@ -1590,13 +1874,22 @@ class PlannerAgent:
             ]
         ).lower()
         transient_markers = [
+            "500",
+            "502",
             "503",
+            "504",
+            "internal server error",
+            "server_error",
             "service unavailable",
             "temporarily unavailable",
             "temporary unavailable",
             "upstream unavailable",
             "server unavailable",
             "overloaded",
+            "gateway timeout",
+            "connection reset",
+            "timed out",
+            "timeout",
         ]
         return any(marker in text for marker in transient_markers)
 
@@ -1871,20 +2164,36 @@ class PlannerAgent:
                 output.append(execution_message)
 
                 self.continuous_state.status = "reviewing"
-                plan = self.session.last_completed_plan or self.session.last_presented_plan or self.session.pending_plan
+                plan = (
+                    self.session.last_completed_plan
+                    or self.session.paused_plan
+                    or self.session.last_presented_plan
+                    or self.session.pending_plan
+                )
                 if plan is None:
                     self.continuous_state.stop_reason = "review_missing_plan"
                     break
                 review = self._review_completed_plan(plan)
                 self.continuous_state.latest_review_decision = review.decision
-                if review.decision != "accepted" and review.retryable and self.session.pending_plan is not None:
+                if review.decision != "accepted" and review.retryable and (
+                    self.session.execution_paused or self.session.pending_plan is not None
+                ):
                     output.append(
                         f"Cycle {cycle}: review {review.decision} due to transient failure; retrying once. "
                         + (review.retry_reason or "; ".join(review.required_actions))
                     )
-                    execution_message = self.execute_pending_plan()
+                    execution_message = (
+                        self.resume_paused_execution()
+                        if self.session.execution_paused
+                        else self.execute_pending_plan()
+                    )
                     output.append(execution_message)
-                    plan = self.session.last_completed_plan or self.session.last_presented_plan or self.session.pending_plan
+                    plan = (
+                        self.session.last_completed_plan
+                        or self.session.paused_plan
+                        or self.session.last_presented_plan
+                        or self.session.pending_plan
+                    )
                     if plan is None:
                         self.continuous_state.stop_reason = "review_missing_plan_after_retry"
                         break
@@ -1995,6 +2304,8 @@ class PlannerAgent:
         if action_type == "present_plan":
             plan = self._plan_from_action(action)
             self._apply_discovery_findings_to_plan(plan)
+            self._normalize_plan_dependencies(plan)
+            self.session.pending_checkpoint_results = self._checkpoint_results_for_plan(plan)
             self.session.pending_plan = plan
             self.session.last_presented_plan = plan
             self.session.awaiting_plan_revision = False
@@ -2006,6 +2317,7 @@ class PlannerAgent:
                 {
                     "summary": plan.summary,
                     "goal_count": len(plan.goals),
+                    "checkpointed_goal_count": len(self.session.pending_checkpoint_results),
                     "confirmation_prompt": plan.confirmation_prompt,
                 },
             )
@@ -2227,6 +2539,12 @@ class PlannerAgent:
         if plan.next_steps_preview:
             lines.extend(["", "Expected Follow-Through"])
             lines.extend(f"- {item}" for item in plan.next_steps_preview)
+        if plan.dependency_repairs:
+            lines.extend(["", "Continuation Reconciliation"])
+            lines.extend(f"- {item}" for item in plan.dependency_repairs)
+        if plan.dependency_errors:
+            lines.extend(["", "Dependency Errors"])
+            lines.extend(f"- {item}" for item in plan.dependency_errors)
         lines.extend([
             "",
             "Approval",
@@ -2585,29 +2903,39 @@ class PlannerAgent:
         plan: PlannerPlan,
         results: List[GoalExecutionResult],
     ) -> str:
+        failed_results = [result for result in results if result.status != "completed"]
+        if failed_results:
+            failed_result = failed_results[0]
+            partial_changes = bool(failed_result.touched_paths)
+            lines = [
+                "Execution Summary",
+                f"- Plan execution stopped after a failed goal: {failed_result.title}.",
+                (
+                    "- The failed attempt left partial repository changes; retry continues by inspecting and repairing the current diff."
+                    if partial_changes
+                    else "- Execution is paused; completed goals will not be rerun."
+                ),
+                "",
+                "Next Steps",
+                (
+                    f"1. Inspect the current diff and validation failure for {failed_result.title}, then repair the partial implementation."
+                    if partial_changes
+                    else f"1. Inspect the failed goal output and validation summary for {failed_result.title}."
+                ),
+                "2. Retry the failed goal from its preserved context; do not restart completed issue work.",
+            ]
+            return "\n".join(lines)
+
         if len(results) < len(plan.goals):
             remaining = [goal.title for goal in plan.goals if goal.goal_id not in {result.goal_id for result in results}]
             lines = [
                 "Execution Summary",
                 "- Plan execution stopped before all goals became dependency-ready.",
-                "- The current plan remains pending so it can be revised or retried after dependency fixes.",
+                "- Execution is paused with completed goals checkpointed.",
                 "",
                 "Next Steps",
-                "1. Inspect goal dependencies and revise any goals that form an unresolved chain.",
+                "1. Inspect goal dependencies, then resume execution without re-approving the plan.",
                 f"2. Remaining goals: {', '.join(remaining[:5]) or '(none)'}.",
-            ]
-            return "\n".join(lines)
-
-        failed_results = [result for result in results if result.status != "completed"]
-        if failed_results:
-            lines = [
-                "Execution Summary",
-                f"- Plan execution stopped after a failed goal: {failed_results[0].title}.",
-                "- The current plan remains pending so it can be retried or revised.",
-                "",
-                "Next Steps",
-                f"1. Inspect the failed goal output and validation summary for {failed_results[0].title}.",
-                "2. Revise the plan or retry it once the blocking issue is resolved.",
             ]
             return "\n".join(lines)
 
@@ -2756,6 +3084,165 @@ class PlannerAgent:
             "relevant_fact_keys": goal.relevant_fact_keys,
         }
 
+    def _goal_signature(self, goal: PlannerGoal) -> str:
+        normalized = "\n".join(
+            re.sub(r"\s+", " ", value.strip().lower())
+            for value in (goal.title, goal.goal)
+        )
+        return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+    def _normalized_checkpoint_text(self, value: Any) -> str:
+        return re.sub(r"\s+", " ", str(value or "").strip().lower())
+
+    def _checkpoint_results_for_plan(self, plan: PlannerPlan) -> List[GoalExecutionResult]:
+        checkpoints = self._issue_completed_goal_checkpoints()
+
+        normalized_plan = self._normalized_checkpoint_text(plan.summary)
+        matched_results: List[GoalExecutionResult] = []
+        used_checkpoint_indexes: set[int] = set()
+        for goal in plan.goals:
+            goal_signature = self._goal_signature(goal)
+            normalized_title = self._normalized_checkpoint_text(goal.title)
+            matched: Optional[Dict[str, Any]] = None
+            for checkpoint_index, item in enumerate(checkpoints):
+                if checkpoint_index in used_checkpoint_indexes or not isinstance(item, dict):
+                    continue
+                checkpoint_plan = self._normalized_checkpoint_text(item.get("plan_summary"))
+                checkpoint_plan_matches = bool(checkpoint_plan and checkpoint_plan == normalized_plan)
+                signature_matches = bool(
+                    str(item.get("goal_signature", "") or "").strip() == goal_signature
+                )
+                title_matches = bool(
+                    normalized_title
+                    and self._normalized_checkpoint_text(item.get("title")) == normalized_title
+                )
+                legacy_id_matches = bool(
+                    str(item.get("source", "") or "") == "legacy_observability"
+                    and checkpoint_plan_matches
+                    and str(item.get("goal_id", "") or "") == goal.goal_id
+                )
+                if not (signature_matches or title_matches or legacy_id_matches):
+                    continue
+                matched = item
+                used_checkpoint_indexes.add(checkpoint_index)
+                break
+            if matched is None:
+                continue
+            matched_results.append(
+                GoalExecutionResult(
+                    goal_id=goal.goal_id,
+                    title=goal.title,
+                    delegated_task=goal.goal,
+                    final_message=str(matched.get("final_message", "") or "Completed in an earlier run."),
+                    status="completed",
+                    task_satisfied=True,
+                    validation_ran=bool(str(matched.get("validation_summary", "") or "").strip()),
+                    validation_passed=True,
+                    validation_summary=str(matched.get("validation_summary", "") or ""),
+                    preserve_context_used=True,
+                )
+            )
+        return matched_results
+
+    def _issue_completed_goal_checkpoints(self) -> List[Dict[str, Any]]:
+        payload = self._load_repo_facts_payload() or {}
+        active_issue = payload.get("active_issue") if isinstance(payload, dict) else None
+        if not isinstance(active_issue, dict):
+            return []
+        checkpoints = active_issue.get("completed_goals")
+        if not isinstance(checkpoints, list):
+            return []
+        return [item for item in checkpoints if isinstance(item, dict)]
+
+    def _normalize_plan_dependencies(self, plan: PlannerPlan) -> None:
+        """Resolve stale continuation edges and reject unsafe dependency graphs.
+
+        Planner goals are ordered for execution. Dependencies may point only to
+        earlier goals in the current plan. A dependency on an omitted durable
+        checkpoint is already satisfied and can be removed. This also handles
+        regenerated plans that reuse old goal IDs for a smaller remaining slice.
+        """
+        plan.dependency_repairs = list(dict.fromkeys(plan.dependency_repairs))
+        plan.dependency_errors = []
+        recorded_repairs = set(plan.dependency_repairs)
+
+        def record_repair(message: str) -> None:
+            if message not in recorded_repairs:
+                plan.dependency_repairs.append(message)
+                recorded_repairs.add(message)
+        positions: Dict[str, int] = {}
+        for index, goal in enumerate(plan.goals):
+            if goal.goal_id in positions:
+                plan.dependency_errors.append(f"Duplicate goal id: {goal.goal_id}.")
+            else:
+                positions[goal.goal_id] = index
+        durable_ids = {
+            str(item.get("goal_id", "") or "").strip()
+            for item in self._issue_completed_goal_checkpoints()
+            if str(item.get("goal_id", "") or "").strip()
+        }
+        for index, goal in enumerate(plan.goals):
+            normalized: List[str] = []
+            seen: set[str] = set()
+            for raw_dependency in goal.depends_on:
+                dependency = str(raw_dependency or "").strip()
+                if not dependency or dependency in seen:
+                    continue
+                seen.add(dependency)
+                dependency_index = positions.get(dependency)
+                if dependency_index is None:
+                    if dependency in durable_ids:
+                        record_repair(f"{goal.goal_id}: satisfied omitted dependency {dependency} from the issue checkpoint.")
+                        continue
+                    plan.dependency_errors.append(
+                        f"{goal.goal_id} depends on unknown goal {dependency}."
+                    )
+                    normalized.append(dependency)
+                    continue
+                if dependency_index >= index:
+                    if dependency in durable_ids:
+                        record_repair(
+                            f"{goal.goal_id}: removed stale dependency {dependency}; that id belongs to completed issue work."
+                        )
+                        continue
+                    plan.dependency_errors.append(
+                        f"{goal.goal_id} depends on {dependency}, which is not earlier in execution order."
+                    )
+                    normalized.append(dependency)
+                    continue
+                normalized.append(dependency)
+            goal.depends_on = normalized
+
+    def _dependency_error_message(self, plan: PlannerPlan) -> str:
+        if not plan.dependency_errors:
+            return ""
+        return "Plan dependency validation failed before execution: " + "; ".join(plan.dependency_errors)
+
+    def _record_completed_goal_checkpoint(
+        self,
+        plan: PlannerPlan,
+        goal: PlannerGoal,
+        result: GoalExecutionResult,
+        original_index: int,
+    ) -> None:
+        recorder = getattr(self.worker, "record_completed_goal", None)
+        if not callable(recorder):
+            return
+        try:
+            recorder(
+                issue_id=str(self.session.active_issue_id or "").strip(),
+                plan_summary=plan.summary,
+                goal={**self._goal_payload(goal), "goal_signature": self._goal_signature(goal)},
+                result=self._result_payload(result),
+                original_index=original_index,
+                total_goal_count=len(plan.goals),
+            )
+        except Exception:
+            # Checkpoint persistence must never turn successful implementation
+            # work into a failed goal. The in-memory checkpoint still protects
+            # the current process and the next successful goal retries storage.
+            return
+
     def _discovery_request_payload(self, request: Optional[DiscoveryRequest]) -> Optional[Dict[str, Any]]:
         if request is None:
             return None
@@ -2797,8 +3284,11 @@ class PlannerAgent:
             "assumptions": plan.assumptions,
             "clarification_summary": plan.clarification_summary,
             "goals": [self._goal_payload(goal) for goal in plan.goals],
+            "not_in_scope": plan.not_in_scope,
             "next_steps_preview": plan.next_steps_preview,
             "confirmation_prompt": plan.confirmation_prompt,
+            "dependency_repairs": plan.dependency_repairs,
+            "dependency_errors": plan.dependency_errors,
         }
 
     def _result_payload(self, result: GoalExecutionResult) -> Dict[str, Any]:
@@ -2817,6 +3307,9 @@ class PlannerAgent:
             "commentary_for_next_goal": result.commentary_for_next_goal,
             "status": result.status,
             "usage_summary": result.usage_summary,
+            "failure_retryable": result.failure_retryable,
+            "failure_status_code": result.failure_status_code,
+            "failure_request_id": result.failure_request_id,
         }
 
     def _revision_context_payload(self) -> Optional[Dict[str, Any]]:
@@ -2870,6 +3363,8 @@ class PlannerAgent:
     def _session_status(self) -> str:
         if self.session.executing:
             return "executing"
+        if self.session.execution_paused:
+            return "execution_paused"
         if self.session.pending_plan is not None:
             return "awaiting_plan_approval"
         if self.session.pending_discovery is not None:
@@ -2884,10 +3379,49 @@ class PlannerAgent:
 
     def _suggested_next_actions_payload(self) -> List[Dict[str, Any]]:
         actions: List[Dict[str, Any]] = []
-        if self.session.pending_plan is not None:
+        if self.session.execution_paused and self.session.paused_plan is not None:
+            checkpoint = self._resume_checkpoint_payload()
+            if self.session.paused_plan.dependency_errors:
+                actions.append(
+                    {
+                        "type": "reject_plan",
+                        "label": "Revise Invalid Dependencies",
+                        "style": "primary",
+                    }
+                )
+                return actions
+            next_index = int((checkpoint or {}).get("next_goal_index", 0) or 0)
+            if self.session.paused_failed_goal_id and next_index:
+                retry_label = f"Retry Goal {next_index}, Then Continue"
+            elif next_index:
+                retry_label = f"Resume from Goal {next_index}"
+            else:
+                retry_label = "Resume Execution"
+            actions.append(
+                {
+                    "type": "retry_failed_goal",
+                    "label": retry_label,
+                    "style": "primary",
+                    "goal_id": self.session.paused_failed_goal_id,
+                    "retryable": self.session.paused_failure_retryable,
+                }
+            )
+        elif self.session.pending_plan is not None:
+            checkpoint = self._resume_checkpoint_payload()
+            if self.session.pending_plan.dependency_errors:
+                actions.append(
+                    {
+                        "type": "reject_plan",
+                        "label": "Revise Invalid Dependencies",
+                        "style": "primary",
+                    }
+                )
+                return actions
+            next_index = int((checkpoint or {}).get("next_goal_index", 0) or 0)
+            approve_label = f"Resume from Goal {next_index}" if next_index else "Approve Plan"
             actions.extend(
                 [
-                    {"type": "approve_plan", "label": "Approve Plan", "style": "primary"},
+                    {"type": "approve_plan", "label": approve_label, "style": "primary"},
                     {"type": "reject_plan", "label": "Reject Plan", "style": "secondary"},
                 ]
             )
@@ -2961,6 +3495,69 @@ class PlannerAgent:
         )
         return actions
 
+    def _resume_checkpoint_payload(self) -> Optional[Dict[str, Any]]:
+        paused = bool(self.session.execution_paused and self.session.paused_plan is not None)
+        plan = self.session.paused_plan if paused else self.session.pending_plan
+        checkpoint_results = (
+            self.session.paused_completed_results
+            if paused
+            else self.session.pending_checkpoint_results
+        )
+        issue_checkpoints = self._issue_completed_goal_checkpoints()
+        if plan is None:
+            return None
+        self._normalize_plan_dependencies(plan)
+        if not paused and not checkpoint_results and not issue_checkpoints:
+            return None
+        completed_ids = {
+            result.goal_id
+            for result in checkpoint_results
+            if result.status == "completed" and result.goal_id
+        }
+        next_index = 0
+        next_goal: Optional[PlannerGoal] = None
+        failed_id = str(self.session.paused_failed_goal_id or "").strip() if paused else ""
+        if failed_id:
+            for index, goal in enumerate(plan.goals, start=1):
+                if goal.goal_id == failed_id and goal.goal_id not in completed_ids:
+                    next_index = index
+                    next_goal = goal
+                    break
+        if next_goal is None:
+            for index, goal in enumerate(plan.goals, start=1):
+                if goal.goal_id not in completed_ids:
+                    next_index = index
+                    next_goal = goal
+                    break
+        remaining = [
+            {"goal_id": goal.goal_id, "title": goal.title, "index": index}
+            for index, goal in enumerate(plan.goals, start=1)
+            if goal.goal_id not in completed_ids
+        ]
+        prior_issue_completed_count = max(0, len(issue_checkpoints) - len(completed_ids))
+        if failed_id:
+            mode = "retry_failed_goal"
+        elif paused:
+            mode = "resume_remaining"
+        elif completed_ids:
+            mode = "durable_continuation"
+        else:
+            mode = "issue_continuation"
+        return {
+            "mode": mode,
+            "total_goal_count": len(plan.goals),
+            "completed_goal_count": len(completed_ids),
+            "completed_goal_ids": sorted(completed_ids),
+            "prior_issue_completed_goal_count": prior_issue_completed_count,
+            "prior_issue_completed_goals": issue_checkpoints,
+            "next_goal_index": next_index,
+            "next_goal": self._goal_payload(next_goal) if next_goal is not None else None,
+            "remaining_goals": remaining,
+            "completed_goals_will_rerun": False,
+            "dependency_repairs": list(plan.dependency_repairs),
+            "dependency_errors": list(plan.dependency_errors),
+        }
+
     def export_state(self) -> Dict[str, Any]:
         worker_state_getter = getattr(self.worker, "export_runtime_state", None)
         worker_state = None
@@ -3005,6 +3602,22 @@ class PlannerAgent:
                 "completed_issues": list(self.continuous_state.completed_issues),
             },
             "pending_plan": self._plan_payload(self.session.pending_plan),
+            "pending_checkpoint_results": [
+                self._result_payload(result) for result in self.session.pending_checkpoint_results
+            ],
+            "execution_paused": self.session.execution_paused,
+            "paused_plan": self._plan_payload(self.session.paused_plan),
+            "paused_completed_results": [
+                self._result_payload(result) for result in self.session.paused_completed_results[-5:]
+            ],
+            "paused_failed_goal_id": self.session.paused_failed_goal_id,
+            "paused_failed_goal_title": self.session.paused_failed_goal_title,
+            "paused_failed_goal_index": self.session.paused_failed_goal_index,
+            "paused_failure_reason": self.session.paused_failure_reason,
+            "paused_failure_retryable": self.session.paused_failure_retryable,
+            "paused_failure_status_code": self.session.paused_failure_status_code,
+            "paused_failure_request_id": self.session.paused_failure_request_id,
+            "resume_checkpoint": self._resume_checkpoint_payload(),
             "last_presented_plan": self._plan_payload(self.session.last_presented_plan),
             "pending_discovery": self._discovery_request_payload(self.session.pending_discovery),
             "last_discovery": self._discovery_result_payload(self.session.last_discovery),

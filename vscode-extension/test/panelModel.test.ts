@@ -8,6 +8,7 @@ import {
   continuousModeOwnsLifecycle,
   groupLatestDiagnosticsByPath,
   isContinuousModeActive,
+  preferredRuntimeModel,
   progressTimelineTarget,
   primaryPathForReview,
   type BridgeState,
@@ -98,6 +99,17 @@ test('buildPlannerActionMessage forwards issue_id for close actions', () => {
   assert.deepEqual(message.payload, { issue_id: 'issue-003' });
 });
 
+test('buildPlannerActionMessage preserves paused execution recovery actions', () => {
+  const message = buildPlannerActionMessage({
+    type: 'retry_failed_goal',
+    label: 'Retry Failed Goal',
+    source: 'planner',
+  });
+
+  assert.equal(message.action, 'retry_failed_goal');
+  assert.equal(message.payload, undefined);
+});
+
 test('buildPlannerActionMessage preserves discovery mode payloads', () => {
   const message = buildPlannerActionMessage({
     type: 'select_discovery_mode',
@@ -159,4 +171,12 @@ test('progressTimelineTarget still routes discovery when a prior discovery resul
     progressTimelineTarget({ pending_discovery: { reason: 'Need repo scan' }, last_discovery: { final_message: 'Earlier discovery' } }, ''),
     'discovery',
   );
+});
+
+test('preferredRuntimeModel keeps the active model for the current provider', () => {
+  assert.equal(preferredRuntimeModel('gemini', 'gemini', 'gemini-3-flash-preview', 'gemini-3.1-pro-preview'), 'gemini-3-flash-preview');
+});
+
+test('preferredRuntimeModel selects the provider default when switching to Meta', () => {
+  assert.equal(preferredRuntimeModel('meta', 'gemini', 'gemini-3-flash-preview', 'muse-spark-1.2'), 'muse-spark-1.2');
 });

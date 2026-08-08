@@ -14,6 +14,21 @@ Planner-first coding agent for real repositories. The planner handles clarificat
 
 Common planner commands: `/reset`, `/start-auto 3 optional prompt`, `/stop-auto`, `/create-issue details`, `reopen issue-123`, `approve`, `reject`.
 
+## Latest Development Update
+
+The current development work tightens the full planner/worker loop, from provider selection through recovery and continuation:
+
+- **Smaller model turns:** stable and beta workers now keep provider-native message transcripts after the first turn instead of rebuilding the full prompt every time. OpenAI prompt-cache keys, cached-token accounting, explicit context drops, and compact fresh-context final retries reduce repeated context without losing current repository state.
+- **Resilient provider calls:** transient 408/409/425/429 and 5xx failures receive bounded retries, `Retry-After` is honored, repeated 500s receive a longer cooldown, and request IDs plus retry timing are retained for observability. Terminal provider failures pause execution with partial edits preserved so retry starts by inspecting and repairing the current diff.
+- **Reliable plan continuation:** completed goals are persisted as issue checkpoints, continuation plans reconcile dependencies on completed or omitted goals, and unsafe dependency graphs are rejected before execution. Resuming skips completed goals and starts at the failed or next incomplete goal without another approval cycle.
+- **Clear issue identity:** durable planner issues use `issue-*` identifiers, while transient validation findings use stable `run-*` identifiers and dedicated list/show commands. This prevents a worker from mistaking an editor diagnostic for the active issue it is implementing.
+- **Preemptive output recovery:** annotation-only, prose-only, and malformed command turns are repaired into the beta command grammar before they become terminal `model_output_invalid` failures.
+- **Expanded guarded Git support:** the beta worker now supports bounded status, diff, revision-range log, branch, remote, rev-parse, show, blame, add, restore, move, remove, commit, and push operations. Mutating or remote operations remain authorization-gated, paths are explicit, and broad or unsafe revision expressions are rejected.
+- **Meta Muse Spark support:** `muse-spark-1.2` is available through Meta's OpenAI-compatible API using `META_AI_API_KEY`, including provider/model selection in the extension. The standard model remains distinct from the opt-in contributor tier whose prompts and completions may be used for Meta training.
+- **Better extension state:** the panel shows provider-specific model choices, per-session and per-issue usage, transient recovery details, durable-versus-run issue context, completed checkpoints, and the exact goal where a paused plan will resume.
+
+These changes are covered by targeted provider, prompt-cache, transcript, recovery, continuation, usage-accounting, beta Git, command-repair, and extension panel tests.
+
 ## Setup
 
 Install dependencies:
@@ -26,6 +41,7 @@ Set an API key with environment variables or a local `.env` file:
 
 ```bash
 export OPENAI_API_KEY=...
+export META_AI_API_KEY=...
 export GEMINI_API_KEY=...
 export ANTHROPIC_API_KEY=...
 ```
@@ -36,6 +52,7 @@ Planner-first mode:
 
 ```bash
 python main.py --provider openai --model gpt-5.4 --root /your/project
+python main.py --provider meta --model muse-spark-1.2 --root /your/project
 python main.py --provider anthropic --model claude-sonnet-4-6 --root /your/project
 python main.py --provider local --model gemma4 --root /your/project
 ```
@@ -44,6 +61,7 @@ Direct worker mode:
 
 ```bash
 python main.py --provider openai --model gpt-5.4 --root /your/project --worker-mode
+python main.py --provider meta --model muse-spark-1.2 --root /your/project --worker-mode
 python main.py --provider anthropic --model claude-sonnet-4-6 --root /your/project --worker-mode
 python main_v2.py --provider gemini --model gemini-3-flash-preview --root /your/project --worker-mode
 python main.py --provider local --model gemma4 --root /your/project --worker-mode
@@ -66,7 +84,9 @@ Live runtime switching in the CLI:
 /models gemini
 ```
 
-`/providers` lists supported runtimes. `/models [provider]` shows the current provider by default and prints suggested model names for any supported provider. On startup, the backend now does one best-effort live model refresh for providers with installed SDKs and credentials, then falls back to the built-in April 2026 catalog if a provider cannot be queried. Custom model strings are still allowed.
+`/providers` lists supported runtimes. `/models [provider]` shows the current provider by default and prints suggested model names for any supported provider. On startup, the backend does one best-effort live model refresh for providers with installed SDKs and credentials, then falls back to the built-in catalog if a provider cannot be queried. Custom model strings are still allowed.
+
+Muse Spark uses Meta's OpenAI-compatible Responses API. Add `META_AI_API_KEY=...` to the repository `.env`, then select `--provider meta --model muse-spark-1.2`. The shared startup loader reads `.env` before constructing any provider client, including when the VS Code extension launches the backend. The base URL defaults to `https://api.meta.ai/v1` and can be overridden with `META_MODEL_API_BASE_URL`. Meta does not support `--thinking-mode none`; use `minimal` or higher. The discounted `muse-spark-1.2-contributor` model is also listed, but its prompts and completions may be used by Meta for training, unlike the standard tier.
 
 ## VS Code Extension
 
@@ -107,7 +127,7 @@ Backend requirements:
 
 - Python 3.13 is the current development target; the extension will also work with a compatible Python interpreter that can run `main.py` and `agent_tools.py`.
 - Install Python dependencies for the selected provider before launching the extension: `openai` for OpenAI mode, `anthropic` for Anthropic mode, `google-genai` for Gemini mode.
-- Set provider credentials in the environment seen by VS Code, such as `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or `GEMINI_API_KEY`.
+- Set provider credentials in the repository `.env` or the environment seen by VS Code, such as `OPENAI_API_KEY`, `META_AI_API_KEY`, `ANTHROPIC_API_KEY`, or `GEMINI_API_KEY`.
 - Keep `git` available on `PATH`; review, diff, and file comparison flows rely on repository commands.
 - `skillzAgent.pythonPath` should point at the interpreter or virtual environment you want the extension backend to use.
 - The `local` provider targets the existing localhost OpenAI-compatible endpoint at `http://127.0.0.1:5051/v1`, which can be used for models such as Gemma 4.
@@ -127,6 +147,8 @@ The extension currently targets desktop VS Code APIs and uses the Python runtime
 - After discovery, pushes discovered files, constraints, and risks into delegation so goals are concrete rather than vague.
 - Ends with specific next steps tied to the executed work.
 - Opens an issue-scoped execution context when an approved plan starts, closes it on full success, and can explicitly reopen recent issues for follow-up work.
+- Pauses on retryable model failures while preserving completed-goal checkpoints and partial repository changes.
+- Resumes from the failed or next incomplete goal without rerunning completed goals or requiring plan re-approval.
 
 Planner commands:
 
@@ -213,6 +235,8 @@ Change and git actions:
 - `git_diff` with staged, stat, and name-only modes.
 - `review_changes` with risk and validation summaries.
 - `git_add`, `git_restore`, `git_commit`, `git_log`, and `git_branch`.
+
+The beta TreeLoop worker exposes a guarded Git command library for `status`, `diff`, revision-range `log`, read-only branch and remote inspection, `rev-parse`, `show`, `blame`, explicit-path staging/restoration/moves/removals, commits, and authorized pushes. Remote writes require explicit task authorization, and repository paths and revisions are validated before execution.
 
 Execution and context actions:
 
