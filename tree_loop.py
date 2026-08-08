@@ -30,7 +30,7 @@ import json
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Protocol, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Protocol, Sequence, Tuple, TypedDict
 
 from context_tree_bridge import ContextTreeBridge
 from mutations import (
@@ -65,6 +65,54 @@ from tree_commands import (
 )
 
 
+def _model_error_metadata(exc: Exception) -> Dict[str, Any]:
+    status_code: Optional[int] = None
+    for value in (
+        getattr(exc, "status_code", None),
+        getattr(exc, "status", None),
+        getattr(exc, "code", None),
+    ):
+        try:
+            candidate = int(value)
+        except (TypeError, ValueError):
+            continue
+        if 100 <= candidate <= 599:
+            status_code = candidate
+            break
+    if status_code is None:
+        match = re.search(r"(?:error code|status(?: code)?|http)\s*[:=]?\s*(\d{3})\b", str(exc), re.IGNORECASE)
+        if match:
+            status_code = int(match.group(1))
+
+    request_id = str(getattr(exc, "request_id", "") or "").strip()
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None)
+    if not request_id and headers is not None:
+        for name in ("x-request-id", "request-id", "x-meta-request-id"):
+            try:
+                request_id = str(headers.get(name, "") or "").strip()
+            except Exception:
+                request_id = ""
+            if request_id:
+                break
+    retry_attempts = int(getattr(exc, "retry_attempts", 0) or 0)
+    retry_request_ids = list(getattr(exc, "retry_request_ids", []) or [])
+    retry_delays_s = list(getattr(exc, "retry_delays_s", []) or [])
+    rate_limit_headers = dict(getattr(exc, "rate_limit_headers", {}) or {})
+    retry_after = str(getattr(exc, "retry_after", "") or "").strip()
+    fresh_context_retry = bool(getattr(exc, "fresh_context_retry", False))
+    return {
+        "status_code": status_code,
+        "request_id": request_id,
+        "retry_attempts": retry_attempts,
+        "retry_request_ids": retry_request_ids,
+        "retry_delays_s": retry_delays_s,
+        "rate_limit_headers": rate_limit_headers,
+        "retry_after": retry_after,
+        "fresh_context_retry": fresh_context_retry,
+    }
+
+
 def _env_flag_enabled(name: str, default: bool = True) -> bool:
     raw = os.getenv(name)
     if raw is None:
@@ -80,6 +128,11 @@ def _env_flag_enabled(name: str, default: bool = True) -> bool:
 # ---------------------------------------------------------------------------
 # Protocol — any object with .complete(system, prompt) -> str works
 # ---------------------------------------------------------------------------
+
+class ChatMessage(TypedDict):
+    role: str
+    content: str
+
 
 class ModelClient(Protocol):
     def complete(self, system: str, prompt: str) -> str: ...
@@ -161,12 +214,77 @@ def _looks_like_command(line: str) -> bool:
         return True
     first = line.split(None, 1)[0].lower() if line else ""
     return first in {
-        "ls", "cat", "read-line-range", "read_line_range", "symbols", "find-symbol", "find_symbol", "stat", "find", "grep",
+        "ls", "cat", "read-line-range", "read_line_range", "symbols", "find-symbol", "find_symbol", "repo-map", "repo_map", "stat", "find", "grep",
         "read-diagnostics", "diagnose", "run-route-check", "run_route_check", "ingest-log", "list-issues", "show-issue", "resolve-issue", "reopen-issue", "run-check",
         "write", "replace-lines", "replace_lines", "patch", "show-diff", "show_diff", "review-changes", "review_changes", "shell", "git",
         "fact", "expand", "drop", "batch", "finish",
         "skill",
     }
+
+
+_MARKDOWN_COMMAND_PREFIX_RE = re.compile(r"^(?:[-*+]\s+|\d{1,3}[.)]\s+|\[[ xX]\]\s+)")
+_INLINE_ANNOTATION_RE = re.compile(r">>\w+:\s*")
+
+
+def _strip_leading_control_preamble(raw: str) -> str:
+    """Drop prose attached directly before the first annotation marker.
+
+    Some compatible models prefix an otherwise valid response with a short
+    sentence and omit the newline before ``>>th:``. Only text before the first
+    annotation is removed; command-like prefixes and heredoc content are left
+    untouched so normalization cannot broaden execution authority.
+    """
+    text = str(raw or "")
+    match = _INLINE_ANNOTATION_RE.search(text)
+    if match is None or match.start() == 0:
+        return text
+    preamble = text[:match.start()]
+    if "<<<" in preamble:
+        return text
+    if any(_looks_like_command(_normalize_command_candidate(line)) for line in preamble.splitlines()):
+        return text
+    return text[match.start():]
+
+
+def _normalize_command_candidate(line: str) -> str:
+    """Recover executable command lines wrapped in common Markdown prose syntax."""
+    candidate = str(line or "").strip()
+    if candidate.startswith("> "):
+        candidate = candidate[2:].lstrip()
+    candidate = _MARKDOWN_COMMAND_PREFIX_RE.sub("", candidate, count=1).strip()
+    if len(candidate) >= 2 and candidate.startswith("`") and candidate.endswith("`"):
+        candidate = candidate[1:-1].strip()
+    command_label = re.match(r"^(?:command|action)\s*:\s*(.+)$", candidate, re.IGNORECASE)
+    if command_label:
+        candidate = command_label.group(1).strip()
+    return candidate
+
+
+def _has_executable_command(command_block: str) -> bool:
+    if not str(command_block or "").strip():
+        return False
+    return any(
+        not is_annotation(command.strip())
+        for command in parse_multi_command(command_block)
+        if command.strip()
+    )
+
+
+def _build_output_repair_instruction() -> str:
+    return "\n".join(
+        [
+            "FORMAT REPAIR REQUIRED: your previous response contained no executable Playground OS command.",
+            "Rewrite it as an executable turn using the same intent and current context.",
+            "Return only this shape:",
+            ">>th: <brief reasoning>",
+            ">>pl: <one concrete action>",
+            "<at least one executable command>",
+            "Put each annotation and each executable command on its own line; never attach prose before `>>th:`.",
+            "Valid commands include `repo-map /repo topic=\"...\" limit=20`, `cat /repo/path`, "
+            "`read-line-range /repo/path 1-120`, `s1: cat /repo/path`, and `finish <summary>`.",
+            "Do not return bullets, a numbered plan, a promise to act later, JSON, or a fenced code block.",
+        ]
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -175,6 +293,8 @@ def _looks_like_command(line: str) -> bool:
 
 _SYSTEM_PROMPT_TEMPLATE = """\
 You are a precise coding agent operating inside a playground OS.
+NON-NEGOTIABLE EXECUTION CONTRACT: every response must contain at least one executable Playground OS command.
+`>>th:` and `>>pl:` annotations do not count as executable commands. Never return prose-only planning.
 Your workspace is mounted as a virtual filesystem with 5 mounts:
   /repo    — source files (lazy-loaded)
   /facts   — durable facts you record (persist across turns)
@@ -202,13 +322,17 @@ ANNOTATIONS (>> feed-forward metadata — free, no tool call):
 
   Tag discipline:
   - Start every turn with >>th: and >>pl:
+  - The command parser is line-oriented: put each annotation and each executable command on its own line, with no prose before >>th:.
   - Keep >>pl: operational, not vague. Good: "Read lines 30-60 of DemoTodoContext.tsx, replace addTodo, then verify lines 30-60."
   - Use >>err: after a failed edit so the next turn can avoid repeating the same mistake.
   - Do not use >>dg: as a generic note. Use it only for a real if/then branch.
 
 RULES:
-1. READ commands (ls, cat, read-line-range, symbols, find-symbol, stat, find, grep, read-diagnostics) are FREE — they resolve instantly
+1. READ commands (ls, cat, read-line-range, repo-map, symbols, find-symbol, stat, find, grep, read-diagnostics) are FREE — they resolve instantly
     from the in-context tree. Use them liberally. They do NOT count as tool calls.
+1c. For broad or unfamiliar codebase work, start with `repo-map /repo topic="<task topic>" limit=20` before line-by-line reads.
+    Treat it as the structural layer of a retrieval funnel: use the ranked files, symbols, imports, and drill-down suggestions to
+    choose targeted `symbols`, `find-symbol`, `grep`, `cat`, or `read-line-range` commands.
 1a. Skills are part of your capability surface. Use `skill` with no arguments to discover what skills are available, and use
     `skill <name>` to load a skill payload into the run when it would improve task quality, style consistency, testing approach,
     or repair strategy. When skill choice is uncertain or the user asks for skills broadly, prefer an explicit `skill` discovery
@@ -247,7 +371,7 @@ RULES:
     b) `replace-lines /repo/path/file.ts:52-68 <<< ... >>>`
     c) `read-line-range /repo/path/file.ts 48-72`
     This keeps edits anchored and reduces accidental duplication.
-11a. When line ranges feel unstable or a file has many nearby definitions, use `symbols` or `find-symbol` first to anchor on the right function, class, or variable before editing.
+11a. When line ranges feel unstable or a file has many nearby definitions, use `repo-map`, `symbols`, or `find-symbol` first to anchor on the right function, class, or variable before editing.
 12. Prefer `replace-lines` for bounded edits. Prefer `write` when replacing most of a file or rebuilding a corrupted region wholesale.
 12a. Use inline `replace-lines` only for short single-line replacements. If the replacement spans multiple lines or is longer than a short import/function call, use heredoc.
 13. Avoid rereading an entire large file after a localized edit unless you need whole-file structure. Verify the edited range first.
@@ -271,7 +395,7 @@ not numbered bullets.
 
 
 # ---------------------------------------------------------------------------
-# User prompt (rebuilt each turn)
+# User prompt (rebuilt each turn, used as a compatibility fallback)
 # ---------------------------------------------------------------------------
 
 def _build_user_prompt(
@@ -338,6 +462,90 @@ def _build_user_prompt(
     return "\n\n".join(sections)
 
 
+def _build_initial_context_message(task: str, os_state: str, *, steering: str = "") -> str:
+    sections = [
+        "═══ TASK ═══",
+        task,
+        "═══ PLAYGROUND OS STATE ═══",
+        os_state,
+    ]
+    if steering:
+        sections.extend(["═══ OPERATOR STEERING ═══", steering])
+    sections.extend([
+        "═══ YOUR TURN ═══",
+        "Think, then act. Start with >>th: and >>pl:, then issue executable tree commands or one `s1:` strategy block. "
+        "Do not return a numbered prose plan.",
+    ])
+    return "\n\n".join(sections)
+
+
+def _build_turn_result_message(turn: Turn) -> str:
+    return "\n\n".join([
+        "═══ LATEST PLAYGROUND OS RESULT ═══",
+        turn.compact(),
+        "═══ YOUR TURN ═══",
+        "Continue from the latest result. Start with brief >>th: and >>pl:, then emit executable tree commands or `finish <summary>`.",
+    ])
+
+
+def _build_current_steering_message(steering: str) -> str:
+    return "\n\n".join([
+        "═══ CURRENT STEERING ═══",
+        steering,
+        "Apply this steering on the next executable command.",
+    ])
+
+
+def _message_chars(messages: Sequence[ChatMessage]) -> int:
+    return sum(len(str(item.get("role", ""))) + len(str(item.get("content", ""))) for item in messages)
+
+
+def _merge_adjacent_messages(messages: Sequence[ChatMessage]) -> List[ChatMessage]:
+    merged: List[ChatMessage] = []
+    for item in messages:
+        role = str(item.get("role", "user") or "user")
+        content = str(item.get("content", "") or "")
+        if not content:
+            continue
+        if merged and merged[-1]["role"] == role:
+            merged[-1]["content"] = merged[-1]["content"] + "\n\n" + content
+        else:
+            merged.append({"role": role, "content": content})
+    return merged
+
+
+def _build_context_summary_message(task: str, history: Sequence[Turn], os_state: str, *, steering: str = "", max_chars: int = 50000) -> str:
+    parts: List[str] = [
+        "═══ COMPACTED WORK SUMMARY ═══",
+        "Older transcript messages were compacted to keep the stable system prompt cacheable.",
+        "",
+        "Current task:",
+        task,
+    ]
+    if history:
+        parts.extend(["", "Prior turns:"])
+        budget = max_chars
+        compact_parts: List[str] = []
+        for turn in reversed(history):
+            compact = turn.compact(max_result_chars=1200)
+            if len(compact) > budget:
+                compact = compact[:budget] + "\n… (older compacted work omitted)"
+                compact_parts.insert(0, compact)
+                break
+            compact_parts.insert(0, compact)
+            budget -= len(compact)
+        parts.append("\n\n".join(compact_parts))
+    parts.extend(["", "═══ PLAYGROUND OS STATE REFRESH ═══", os_state])
+    if steering:
+        parts.extend(["", "═══ OPERATOR STEERING ═══", steering])
+    parts.extend([
+        "",
+        "═══ YOUR TURN ═══",
+        "Continue from the compacted summary and current OS state. Start with brief >>th: and >>pl:, then emit executable tree commands or `finish <summary>`.",
+    ])
+    return "\n".join(parts)
+
+
 # ---------------------------------------------------------------------------
 # Command extraction from LLM output
 # ---------------------------------------------------------------------------
@@ -353,7 +561,7 @@ def extract_commands(raw: str) -> str:
 
     Free-form prose is ignored rather than being sent to the command parser.
     """
-    lines = raw.strip().splitlines()
+    lines = _strip_leading_control_preamble(raw).strip().splitlines()
     extracted: List[str] = []
     pending_annotations: List[str] = []
     collecting_heredoc = False
@@ -373,16 +581,18 @@ def extract_commands(raw: str) -> str:
         if not stripped:
             continue
 
-        if is_annotation(stripped):
-            pending_annotations.append(stripped)
+        candidate = _normalize_command_candidate(stripped)
+
+        if is_annotation(candidate):
+            pending_annotations.append(candidate)
             continue
 
-        if _looks_like_command(stripped):
+        if _looks_like_command(candidate):
             if pending_annotations:
                 extracted.extend(pending_annotations)
                 pending_annotations = []
-            extracted.append(stripped)
-            if stripped.endswith("<<<"):
+            extracted.append(candidate)
+            if candidate.endswith("<<<"):
                 collecting_heredoc = True
             continue
 
@@ -424,6 +634,7 @@ class RecentRead:
 
 MAX_MUTATION_COMMANDS_PER_TURN = 4
 MAX_CONSECUTIVE_COMMANDLESS_TURNS = 2
+MAX_MODEL_OUTPUT_REPAIR_ATTEMPTS = 1
 
 
 class TreeLoop:
@@ -461,12 +672,14 @@ class TreeLoop:
         self._external_status_provider = get_status or (lambda: {})
         self._base_steering = steering
         self._checkpoint_steering = ""
+        self._recovery_steering = ""
         self._signal_steering = ""
         self._signal_state: Dict[str, Any] = {
             "active_signal": "",
             "meta_signal": "",
             "signal_version": 0,
             "current_focus_issue_id": "",
+            "current_focus_issue_namespace": "",
             "unresolved_issue_count": 0,
             "resolved_issue_count": 0,
             "issue_status_map": {},
@@ -482,9 +695,17 @@ class TreeLoop:
         )
         self.history: List[Turn] = []
         self._recent_reads: List[RecentRead] = []
+        self._conversation_messages: List[ChatMessage] = []
+        self._conversation_task = ""
+        self._conversation_compaction_count = 0
+        self._conversation_char_budget = int(os.getenv("TREELOOP_MESSAGE_CONTEXT_CHARS", "120000") or "120000")
         self._total_reads = 0
         self._total_writes = 0
         self._same_turn_halt_reason = ""
+        self._inspected_run_issue_ids: set[str] = set()
+        compactor_setter = getattr(self.model, "set_final_retry_message_compactor", None)
+        if callable(compactor_setter):
+            compactor_setter(self._compact_messages_for_final_retry)
 
     def setup(self, *, max_files: int = 5000) -> Dict[str, Any]:
         """Index workspace and initial sync."""
@@ -521,19 +742,79 @@ class TreeLoop:
                 recent_reads=self._recent_reads,
                 steering=prompt_steering,
             )
+            self._ensure_conversation_task(task, os_state, steering=prompt_steering)
+            self._compact_conversation_if_needed(task, os_state, steering=prompt_steering)
+            call_messages: List[ChatMessage] = list(self._conversation_messages)
+            if prompt_steering and self.history:
+                call_messages.append({"role": "user", "content": _build_current_steering_message(prompt_steering)})
+            messages = _merge_adjacent_messages(call_messages)
 
             if self.verbose:
                 _log(f"── Turn {turn_num}/{self.max_turns} ──")
 
             # Call LLM
             t0 = time.time()
+            active_model_call_started = t0
+            repair_attempts = 0
+            command_block = ""
             if self.model_event_observer is not None:
                 try:
                     self.model_event_observer({"event": "model_call_start", "turn": turn_num})
                 except Exception:
                     pass
             try:
-                raw_output = self.model.complete(system, prompt)
+                raw_output = self._complete_model(system, prompt, messages)
+                command_block = extract_commands(raw_output)
+                while (
+                    not _has_executable_command(command_block)
+                    and repair_attempts < MAX_MODEL_OUTPUT_REPAIR_ATTEMPTS
+                ):
+                    repair_attempts += 1
+                    if self.model_event_observer is not None:
+                        try:
+                            self.model_event_observer(
+                                {
+                                    "event": "model_call_finish",
+                                    "turn": turn_num,
+                                    "elapsed_s": round(time.time() - active_model_call_started, 3),
+                                    "output_chars": len(raw_output),
+                                    "output_valid": False,
+                                    "repair_pending": True,
+                                    "repair_attempt": repair_attempts,
+                                }
+                            )
+                            self.model_event_observer(
+                                {
+                                    "event": "model_call_start",
+                                    "turn": turn_num,
+                                    "repair_attempt": repair_attempts,
+                                }
+                            )
+                        except Exception:
+                            pass
+                    repair_instruction = _build_output_repair_instruction()
+                    repair_output_excerpt = raw_output
+                    if len(repair_output_excerpt) > 8000:
+                        repair_output_excerpt = repair_output_excerpt[:8000] + "\n… (invalid output truncated)"
+                    repair_messages = _merge_adjacent_messages(
+                        [
+                            *messages,
+                            {"role": "assistant", "content": repair_output_excerpt},
+                            {"role": "user", "content": repair_instruction},
+                        ]
+                    )
+                    repair_prompt = "\n\n".join(
+                        [
+                            prompt,
+                            "═══ INVALID MODEL OUTPUT ═══",
+                            repair_output_excerpt,
+                            "═══ REQUIRED FORMAT REPAIR ═══",
+                            repair_instruction,
+                        ]
+                    )
+                    active_model_call_started = time.time()
+                    raw_output = self._complete_model(system, repair_prompt, repair_messages)
+                    command_block = extract_commands(raw_output)
             except KeyboardInterrupt:
                 if self.model_event_observer is not None:
                     try:
@@ -548,11 +829,14 @@ class TreeLoop:
             except Exception as exc:
                 if self.model_event_observer is not None:
                     try:
+                        metadata = _model_error_metadata(exc)
                         self.model_event_observer(
                             {
                                 "event": "model_call_error",
                                 "turn": turn_num,
+                                "elapsed_s": time.time() - active_model_call_started,
                                 "error": str(exc),
+                                **metadata,
                             }
                         )
                     except Exception:
@@ -560,7 +844,9 @@ class TreeLoop:
                 raise
             if self._checkpoint_steering:
                 self._checkpoint_steering = ""
-            llm_elapsed = time.time() - t0
+            if self._recovery_steering:
+                self._recovery_steering = ""
+            llm_elapsed = time.time() - active_model_call_started
             if self.model_event_observer is not None:
                 try:
                     self.model_event_observer(
@@ -569,16 +855,18 @@ class TreeLoop:
                             "turn": turn_num,
                             "elapsed_s": round(llm_elapsed, 3),
                             "output_chars": len(raw_output),
+                            "output_valid": _has_executable_command(command_block),
+                            "repair_attempt": repair_attempts,
                         }
                     )
                 except Exception:
                     pass
 
             if self.verbose:
-                _log(f"LLM responded ({llm_elapsed:.1f}s, {len(raw_output)} chars)")
+                repair_suffix = f", repaired after {repair_attempts} format retry" if repair_attempts else ""
+                _log(f"LLM responded ({time.time() - t0:.1f}s, {len(raw_output)} chars{repair_suffix})")
 
             # Extract and execute commands
-            command_block = extract_commands(raw_output)
             commands_issued: List[str] = []
             results: List[CommandResult] = []
             turn_annotations: List[Annotation] = []
@@ -626,22 +914,47 @@ class TreeLoop:
                 if self.verbose:
                     _log("  (no commands extracted)")
 
-            executable_results = [candidate for candidate in results if candidate.command_type != "annotation"]
+            executable_results = [
+                candidate
+                for candidate in results
+                if candidate.command_type not in {"annotation", "planning_only"}
+            ]
             if not executable_results:
                 commandless_turns += 1
                 output_excerpt = " ".join(str(raw_output or "").strip().split())
                 if len(output_excerpt) > 180:
                     output_excerpt = output_excerpt[:180] + "..."
-                guidance = (
-                    "No executable tree commands extracted from model output. "
-                    "Do not respond with numbered prose steps or an `I will...` plan. "
-                    "Start the next turn with `>>th:` and `>>pl:`, then emit executable commands such as "
-                    "`cat /repo/file`, `s1: cat /repo/file`, or `finish <summary>`."
+                has_annotations = bool(turn_annotations) or any(
+                    candidate.command_type == "annotation" for candidate in results
                 )
+                if has_annotations:
+                    guidance = (
+                        "Planning-only output accepted. You emitted thoughts/plan but no executable Playground OS command. "
+                        "Proceed from that plan on the next turn: keep `>>th:` and `>>pl:` brief, then emit exactly one "
+                        "executable command or strategy such as `cat /repo/file`, `repo-map /repo topic=\"...\"`, "
+                        "`s1: cat /repo/file`, or `finish <discovery summary>`."
+                    )
+                    if self._recent_reads:
+                        guidance += " Since recent file context is already available, prefer `finish <concise discovery summary>` if discovery is complete."
+                    self._recovery_steering = (
+                        "[RECOVERY] Your previous turn only emitted thoughts/planning. Continue from that plan now. "
+                        "After brief `>>th:` and `>>pl:` annotations, emit an executable Playground OS command. "
+                        "If enough context has been gathered, use `finish <concise summary>`."
+                    )
+                    commands_issued.append("planning_only")
+                    results.append(CommandResult(ok=True, output=guidance, command_type="planning_only"))
+                else:
+                    guidance = (
+                        "No executable tree commands extracted from model output. "
+                        "Do not respond with numbered prose steps or an `I will...` plan. "
+                        "Start the next turn with `>>th:` and `>>pl:`, then emit executable commands such as "
+                        "`cat /repo/file`, `s1: cat /repo/file`, or `finish <summary>`."
+                    )
+                    commands_issued.append("model_output_invalid")
+                    results.append(CommandResult(ok=False, output=guidance, command_type="error"))
                 if output_excerpt:
                     guidance += f" Output excerpt: {output_excerpt}"
-                commands_issued.append("model_output_invalid")
-                results.append(CommandResult(ok=False, output=guidance, command_type="error"))
+                    results[-1].output = guidance
             else:
                 commandless_turns = 0
 
@@ -724,7 +1037,12 @@ class TreeLoop:
             )
             self.history.append(turn)
             self._capture_recent_reads(turn)
+            self._record_run_issue_inspections(turn)
             self._refresh_log_issue_signals()
+            self._conversation_messages.extend([
+                {"role": "assistant", "content": raw_output},
+                {"role": "user", "content": _build_turn_result_message(turn)},
+            ])
 
             if commandless_turns >= MAX_CONSECUTIVE_COMMANDLESS_TURNS:
                 finish_message = (
@@ -792,6 +1110,67 @@ class TreeLoop:
 
         return result
 
+    def reset_conversation(self) -> None:
+        self._conversation_messages.clear()
+        self._conversation_task = ""
+        self._conversation_compaction_count = 0
+        self._inspected_run_issue_ids.clear()
+
+    def _ensure_conversation_task(self, task: str, os_state: str, *, steering: str = "") -> None:
+        normalized = str(task or "").strip()
+        if not self._conversation_messages:
+            self._inspected_run_issue_ids.clear()
+            self._conversation_messages.append({
+                "role": "user",
+                "content": _build_initial_context_message(normalized, os_state, steering=steering),
+            })
+            self._conversation_task = normalized
+            return
+        if normalized and normalized != self._conversation_task:
+            self._inspected_run_issue_ids.clear()
+            self._conversation_messages.append({
+                "role": "user",
+                "content": _build_initial_context_message(normalized, os_state, steering=steering).replace("═══ TASK ═══", "═══ NEW TASK ═══", 1),
+            })
+            self._conversation_task = normalized
+
+    def _compact_conversation_if_needed(self, task: str, os_state: str, *, steering: str = "") -> None:
+        if self._conversation_char_budget <= 0:
+            return
+        if _message_chars(self._conversation_messages) <= self._conversation_char_budget:
+            return
+        self._conversation_compaction_count += 1
+        self._conversation_messages = [{
+            "role": "user",
+            "content": _build_context_summary_message(task, self.history, os_state, steering=steering),
+        }]
+        self._conversation_task = str(task or "").strip()
+
+    def _compact_messages_for_final_retry(
+        self,
+        _messages: Sequence[ChatMessage],
+    ) -> Sequence[ChatMessage]:
+        """Refresh provider input before the cooled-down final 500 retry."""
+        os_state = self.bridge.render_for_prompt(repo_depth=2)
+        steering = self._compose_steering()
+        self._conversation_compaction_count += 1
+        self._conversation_messages = [{
+            "role": "user",
+            "content": _build_context_summary_message(
+                self._conversation_task,
+                self.history,
+                os_state,
+                steering=steering,
+            ),
+        }]
+        return list(self._conversation_messages)
+
+    def _complete_model(self, system: str, prompt: str, messages: Sequence[ChatMessage]) -> str:
+        complete_messages = getattr(self.model, "complete_messages", None)
+        if callable(complete_messages):
+            return str(complete_messages(system, list(messages)) or "")
+        return self.model.complete(system, prompt)
+
     def _capture_recent_reads(self, turn: Turn, *, max_items: int = 8) -> None:
         captured: List[RecentRead] = []
         for cmd, result in zip(turn.commands_issued, turn.results):
@@ -802,6 +1181,25 @@ class TreeLoop:
             return
         self._recent_reads.extend(captured)
         self._recent_reads = self._recent_reads[-max_items:]
+
+    def _record_run_issue_inspections(self, turn: Turn) -> None:
+        run_issues = self.bridge.tree.list_log_issues()
+        if not run_issues:
+            return
+        for command, result in zip(turn.commands_issued, turn.results):
+            if not result.ok or result.command_type == "annotation":
+                continue
+            normalized = self._normalize_recent_command(command)
+            if normalized.startswith("show-run-issue "):
+                issue_id = normalized.split(None, 1)[1].strip()
+                if issue_id:
+                    self._inspected_run_issue_ids.add(issue_id)
+                continue
+            for issue in run_issues:
+                issue_id = str(issue.get("id", "") or "").strip()
+                file_path = str(issue.get("file", "") or "").strip().removeprefix("/repo/").removeprefix("repo/")
+                if issue_id and file_path and f"/repo/{file_path}" in normalized:
+                    self._inspected_run_issue_ids.add(issue_id)
 
     def _normalize_recent_command(self, command: str) -> str:
         stripped = command.strip()
@@ -937,7 +1335,11 @@ class TreeLoop:
         return status
 
     def _compose_steering(self) -> str:
-        parts = [part for part in [self._base_steering, self._signal_steering, self._checkpoint_steering] if part]
+        parts = [
+            part
+            for part in [self._base_steering, self._signal_steering, self._checkpoint_steering, self._recovery_steering]
+            if part
+        ]
         return "\n".join(parts)
 
     def _refresh_log_issue_signals(self) -> None:
@@ -963,10 +1365,13 @@ class TreeLoop:
 
         current_focus = str(self._signal_state.get("current_focus_issue_id", ""))
         unresolved_ids = [str(issue.get("id", "")) for issue in unresolved]
+        uninspected_ids = [issue_id for issue_id in unresolved_ids if issue_id not in self._inspected_run_issue_ids]
         if current_focus not in unresolved_ids:
             if current_focus:
                 raw_signals.append("focus_invalidated")
-            current_focus = unresolved_ids[0] if unresolved_ids else ""
+            current_focus = uninspected_ids[0] if uninspected_ids else (unresolved_ids[0] if unresolved_ids else "")
+        elif current_focus in self._inspected_run_issue_ids and uninspected_ids:
+            current_focus = uninspected_ids[0]
 
         meta_signal = ""
         if previous_unresolved and not unresolved:
@@ -980,6 +1385,7 @@ class TreeLoop:
 
         self._signal_state["issue_status_map"] = status_map
         self._signal_state["current_focus_issue_id"] = current_focus
+        self._signal_state["current_focus_issue_namespace"] = "run" if current_focus else ""
         self._signal_state["unresolved_issue_count"] = len(unresolved)
         self._signal_state["resolved_issue_count"] = len(resolved)
         self._signal_state["raw_signals"] = raw_signals
@@ -993,21 +1399,47 @@ class TreeLoop:
         if unresolved:
             focus_issue = next((issue for issue in unresolved if str(issue.get("id", "")) == current_focus), unresolved[0])
             focus_summary = str(focus_issue.get("summary", focus_issue.get("message", current_focus)))
+            focus_reads = self.bridge.tree.log_issue_read_commands(focus_issue)
+            focus_read = focus_reads[0] if focus_reads else ""
+            focus_inspected = current_focus in self._inspected_run_issue_ids
             if meta_signal == "issue_batch_ready":
-                issue_ids = ", ".join(unresolved_ids[:5])
+                strategy_reads: List[str] = []
+                for issue in unresolved[:4]:
+                    reads = self.bridge.tree.log_issue_read_commands(issue)
+                    issue_id = str(issue.get("id", "") or "").strip()
+                    command = reads[0] if reads else f"show-run-issue {issue_id}"
+                    if command not in strategy_reads:
+                        strategy_reads.append(command)
+                strategy_example = " and ".join(
+                    f"`s{index}: {command}`" for index, command in enumerate(strategy_reads, start=1)
+                )
                 self._signal_steering = "\n".join([
-                    f"[SIGNAL {meta_signal}] There are {len(unresolved)} unresolved parsed issue(s).",
+                    f"[SIGNAL {meta_signal}] There are {len(unresolved)} unresolved run diagnostic(s).",
                     f"[RAW SIGNALS] {', '.join(raw_signals[:6]) if raw_signals else 'open_issue_set'}",
-                    f"[ISSUE FOCUS] Current focus: {current_focus} — {focus_summary}",
-                    f"Read the issue set before acting. Prefer a strategy block that inspects multiple issues in parallel, for example: `s1: show-issue {issue_ids.split(', ')[0]}` and sibling `show-issue` steps for the other issue ids.",
-                    "After the strategy read, pick one issue to fix, verify it, and only then use `resolve-issue <id>`.",
+                    f"[RUN DIAGNOSTIC FOCUS] Current focus: {current_focus} — {focus_summary}",
+                    "Run diagnostics are transient and separate from the active durable planner issue.",
+                    f"Inspect the referenced files directly in parallel, for example: {strategy_example}.",
+                    "After inspection, pick one diagnostic to fix, verify it, and only then use `resolve-run-issue <id>`.",
                 ])
             else:
+                if focus_inspected:
+                    inspection_guidance = (
+                        f"This exact diagnostic revision is already inspected. Do not call `show-run-issue {current_focus}` again; "
+                        "continue with the fix or rerun validation."
+                    )
+                elif focus_read:
+                    inspection_guidance = (
+                        f"Inspect its referenced code directly with `{focus_read}`. Use `show-run-issue {current_focus}` only if full diagnostic evidence is needed."
+                    )
+                else:
+                    inspection_guidance = f"Use `show-run-issue {current_focus}` to inspect its evidence."
                 self._signal_steering = "\n".join([
-                    f"[SIGNAL {meta_signal or 'open_issues_present'}] There are {len(unresolved)} unresolved parsed issue(s).",
+                    f"[SIGNAL {meta_signal or 'open_issues_present'}] There are {len(unresolved)} unresolved run diagnostic(s).",
                     f"[RAW SIGNALS] {', '.join(raw_signals[:6]) if raw_signals else 'focus_ready'}",
-                    f"[ISSUE FOCUS] Current focus: {current_focus} — {focus_summary}",
-                    "Use `show-issue <id>` to inspect the focused issue, read the referenced repo files, fix one issue at a time, and only use `resolve-issue <id>` after verification.",
+                    f"[RUN DIAGNOSTIC FOCUS] Current focus: {current_focus} — {focus_summary}",
+                    "Run diagnostics are transient and separate from the active durable planner issue.",
+                    inspection_guidance,
+                    "Fix one diagnostic at a time and only use `resolve-run-issue <id>` after verification.",
                 ])
             return
 
@@ -1018,12 +1450,14 @@ class TreeLoop:
                 "Verify the workspace end-to-end, then use `finish` with a concise summary if the trace-driven work is complete.",
             ])
             self._signal_state["current_focus_issue_id"] = ""
+            self._signal_state["current_focus_issue_namespace"] = ""
             return
 
         self._signal_steering = ""
         self._signal_state["active_signal"] = ""
         self._signal_state["meta_signal"] = ""
         self._signal_state["current_focus_issue_id"] = ""
+        self._signal_state["current_focus_issue_namespace"] = ""
         self._signal_state["unresolved_issue_count"] = 0
         self._signal_state["resolved_issue_count"] = 0
         self._signal_state["raw_signals"] = []
@@ -1393,6 +1827,11 @@ class TreeLoop:
         command = str(action.get("command", "") or "").strip()
         if not command:
             return "run_shell: missing command"
+        if re.search(r"(?:^|(?:&&|\|\||;|\|)\s*)(?:/usr/bin/)?git(?:\s|$)", command):
+            return (
+                "run_shell: direct git commands are disabled; use the typed `git <subcommand>` beta grammar "
+                "so path, history-rewrite, and push authorization policies are enforced"
+            )
         if _is_long_running_shell_command(command):
             return (
                 "run_shell: refused long-running dev/watch command: "

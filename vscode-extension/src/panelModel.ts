@@ -77,6 +77,14 @@ export interface ContinuousModeState extends JsonMap {
 export interface PlannerState extends JsonMap {
   issue_state?: JsonMap;
   discovery_phase?: string;
+  execution_paused?: boolean;
+  paused_plan?: JsonMap | null;
+  pending_checkpoint_results?: JsonMap[];
+  paused_failed_goal_id?: string;
+  paused_failure_reason?: string;
+  paused_failure_status_code?: number | null;
+  paused_failure_request_id?: string;
+  resume_checkpoint?: JsonMap | null;
   continuous_mode?: ContinuousModeState;
   suggested_next_actions?: PlannerSuggestedAction[];
   worker_state?: WorkerState | null;
@@ -197,6 +205,21 @@ export function progressTimelineTarget(
     return 'discovery';
   }
   return undefined;
+}
+
+export function preferredRuntimeModel(
+  selectedProvider: string,
+  currentProvider: string,
+  currentModel: string,
+  defaultModel: string,
+): string {
+  const selected = String(selectedProvider || '').trim();
+  const current = String(currentProvider || '').trim();
+  const activeModel = String(currentModel || '').trim();
+  if (selected && selected === current && activeModel) {
+    return activeModel;
+  }
+  return String(defaultModel || '').trim();
 }
 
 export function buildPlannerActionMessage(action: CombinedSuggestedAction): { action: string; mode?: string; payload?: JsonMap } {

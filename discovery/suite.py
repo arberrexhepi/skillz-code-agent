@@ -29,7 +29,7 @@ from .common import (
     tokenise_query,
     try_read_text,
 )
-from .models import DependencyTrace, DiscoveryHit, DiscoveryResult, FileOutline, InvestigationResult
+from .models import DependencyTrace, DiscoveryHit, DiscoveryResult, FileOutline, InvestigationResult, RepoMapResult
 
 
 def list_files(
@@ -780,6 +780,120 @@ def semantic_search(intent: str, *, path: str = ".", limit: int = 20, root: Path
     return _discovery_result(True, intent, "semantic_search", hits[:limit], {"count": min(len(hits), limit)}, path=path)
 
 
+def repo_map(
+    *,
+    path: str = ".",
+    topic: Optional[str] = None,
+    limit: int = 30,
+    symbols_per_file: int = 12,
+    include_hidden: bool = False,
+    root: Path | str | None = None,
+) -> RepoMapResult:
+    workspace_root = resolve_root(root)
+    base = safe_join(workspace_root, path)
+    topic_tokens = tokenise_query(topic or "")
+    graph = _build_dependency_graph(workspace_root)
+    candidates: Iterable[Path] = [base] if base.is_file() else iter_files(base, include_hidden=include_hidden)
+    file_records: list[dict[str, Any]] = []
+    symbol_records: list[dict[str, Any]] = []
+    files_scanned = 0
+    files_skipped = 0
+    symbol_count = 0
+    constant_count = 0
+
+    for candidate in candidates:
+        text, skip_reason = try_read_text(candidate)
+        if text is None:
+            files_skipped += 1
+            continue
+        files_scanned += 1
+        rel = normalize_relpath(workspace_root, candidate)
+        symbols = collect_symbols_for_file(candidate, text)
+        constants = constants_for_file(candidate, text)
+        dependencies = extract_dependencies_for_file(candidate, text, symbols)
+        symbol_count += len(symbols)
+        constant_count += len(constants)
+        topic_overlap = sorted((path_tokens(rel) | set(tokenise_query(" ".join(str(symbol.get("name", "")) for symbol in symbols)))) & set(topic_tokens))
+        imported_by_count = len(graph["imported_by"].get(rel, []))
+        imports_count = len(graph["imports"].get(rel, []))
+        export_count = len(dependencies["exports"])
+        structural_score = (
+            imported_by_count * 0.45
+            + imports_count * 0.08
+            + export_count * 0.18
+            + min(len(symbols), 20) * 0.035
+            + min(len(constants), 10) * 0.02
+            + len(topic_overlap) * 0.5
+        )
+        if any(part in rel.lower() for part in ["test", "spec", "mock", "fixture", "example", "dist", "build", "generated"]):
+            structural_score -= 0.25
+        compact_symbols = [_compact_symbol(symbol) for symbol in symbols[:symbols_per_file]]
+        compact_constants = [
+            {"name": item.get("name"), "line": item.get("line"), "preview": item.get("preview")}
+            for item in constants[: min(symbols_per_file, 8)]
+        ]
+        record = {
+            "file_path": rel,
+            "language": symbols[0].get("language") if symbols else candidate.suffix.lower().lstrip(".") or "text",
+            "line_count": len(text.splitlines()),
+            "score": round(max(structural_score, 0.0), 3),
+            "imports_count": imports_count,
+            "imported_by_count": imported_by_count,
+            "export_count": export_count,
+            "symbol_count": len(symbols),
+            "constant_count": len(constants),
+            "topic_overlap": topic_overlap,
+            "symbols": compact_symbols,
+            "constants": compact_constants,
+            "imports": dependencies["imports"][:10],
+            "exports": dependencies["exports"][:10],
+        }
+        file_records.append(record)
+        for symbol in compact_symbols:
+            symbol_records.append(
+                {
+                    "file_path": rel,
+                    "name": symbol.get("name"),
+                    "qualified_name": symbol.get("qualified_name"),
+                    "kind": symbol.get("kind"),
+                    "line": symbol.get("line"),
+                    "signature": symbol.get("signature"),
+                    "score": round(max(structural_score, 0.0) + (0.2 if symbol.get("kind") in {"class", "function", "async_function", "exported_function", "exported_class"} else 0.0), 3),
+                }
+            )
+
+    file_records.sort(key=lambda item: (-float(item.get("score", 0.0)), str(item.get("file_path") or "")))
+    symbol_records.sort(key=lambda item: (-float(item.get("score", 0.0)), str(item.get("file_path") or ""), str(item.get("name") or "")))
+    selected_files = file_records[:limit]
+    selected_paths = {str(item.get("file_path", "") or "") for item in selected_files}
+    dependency_edges = [
+        edge
+        for rel in selected_paths
+        for edge in [*graph["imports"].get(rel, [])[:5], *graph["imported_by"].get(rel, [])[:5]]
+    ]
+    drill_down = [_repo_map_drill_down(item) for item in selected_files[: min(limit, 10)]]
+    return {
+        "ok": True,
+        "path": path,
+        "topic": topic,
+        "files": selected_files,
+        "top_symbols": symbol_records[: min(limit * 2, 80)],
+        "drill_down": drill_down,
+        "dependency_edges": dependency_edges,
+        "summary": {
+            "files_scanned": files_scanned,
+            "files_skipped": files_skipped,
+            "file_count": len(file_records),
+            "returned_file_count": len(selected_files),
+            "symbol_count": symbol_count,
+            "constant_count": constant_count,
+            "dependency_edge_count": len(dependency_edges),
+            "limit": limit,
+            "symbols_per_file": symbols_per_file,
+        },
+    }
+
+
 def investigate(topic: str, *, path: str = ".", mode: str = "standard", root: Path | str | None = None) -> InvestigationResult:
     workspace_root = resolve_root(root)
     safe_join(workspace_root, path)
@@ -877,6 +991,50 @@ def investigate(topic: str, *, path: str = ".", mode: str = "standard", root: Pa
             "semantic_hits": semantic.get("hits", [])[:limit],
             "related_files": related_files[:limit],
         },
+    }
+
+
+def _compact_symbol(symbol: dict[str, Any]) -> dict[str, Any]:
+    compact = {
+        "name": symbol.get("name"),
+        "kind": symbol.get("kind"),
+        "line": symbol.get("line"),
+        "end_line": symbol.get("end_line"),
+        "signature": symbol.get("signature"),
+    }
+    if symbol.get("parent"):
+        compact["parent"] = symbol.get("parent")
+    if symbol.get("qualified_name"):
+        compact["qualified_name"] = symbol.get("qualified_name")
+    return compact
+
+
+def _repo_map_drill_down(file_record: dict[str, Any]) -> dict[str, Any]:
+    symbols = file_record.get("symbols", [])
+    first_symbol = symbols[0] if symbols else {}
+    recommended_action: dict[str, Any]
+    if first_symbol.get("name"):
+        recommended_action = {
+            "type": "read_symbol",
+            "path": file_record.get("file_path"),
+            "symbol_name": first_symbol.get("qualified_name") or first_symbol.get("name"),
+            "symbol_kind": first_symbol.get("kind"),
+        }
+    else:
+        recommended_action = {
+            "type": "outline_file",
+            "path": file_record.get("file_path"),
+        }
+    return {
+        "file_path": file_record.get("file_path"),
+        "why": {
+            "centrality_score": file_record.get("score"),
+            "imported_by_count": file_record.get("imported_by_count"),
+            "imports_count": file_record.get("imports_count"),
+            "export_count": file_record.get("export_count"),
+            "topic_overlap": file_record.get("topic_overlap", []),
+        },
+        "next_action": recommended_action,
     }
 
 

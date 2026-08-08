@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, NotRequired, TypedDict
+from typing import Any, TypedDict
 
 
 class DiscoveryHit(TypedDict, total=False):
@@ -82,25 +82,12 @@ class DependencyTrace(TypedDict, total=False):
     summary: dict[str, Any]
 
 
-class FileOutline(TypedDict, total=False):
+class RepoMapResult(TypedDict, total=False):
     ok: bool
-    file_path: str
-    language: str
-    line_count: int
-    imports: list[dict[str, Any]]
-    exports: list[dict[str, Any]]
-    symbols: list[SymbolRecord]
-    constants: list[dict[str, Any]]
-    sections: list[dict[str, Any]]
-    summary: dict[str, Any]
-
-
-class DependencyTrace(TypedDict, total=False):
-    ok: bool
-    file_path: str
-    direction: str
-    depth: int
-    imports: list[dict[str, Any]]
-    imported_by: list[dict[str, Any]]
-    edges: list[dict[str, Any]]
+    path: str
+    topic: str | None
+    files: list[dict[str, Any]]
+    top_symbols: list[dict[str, Any]]
+    drill_down: list[dict[str, Any]]
+    dependency_edges: list[dict[str, Any]]
     summary: dict[str, Any]

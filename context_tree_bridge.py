@@ -163,11 +163,11 @@ READ (free, no tool call — use these instead of tool actions for exploration):
   read-diagnostics [path]           Ingest a local diagnostics snapshot
     diagnose <path> [limit=N]         Run backend diagnostics for one file and ingest issues
   run-route-check <route-or-url> [base=<url>]  Visit a route and ingest browser/runtime errors
-  list-run-issues                   List parsed run diagnostic issues
-  show-run-issue <id>               Show one parsed run diagnostic issue
-  list-issues                       Compatibility alias: list run + durable issues
-  show-issue <id>                   Compatibility alias: show run or durable issue
-  reopen-run-issue <id>             Mark one parsed run issue open again
+  list-run-issues                   List transient run diagnostics (`run-*` ids)
+  show-run-issue <run-id>           Show one transient run diagnostic
+  list-issues                       List run diagnostics + durable planner issues
+  show-issue <issue-id>             Show a durable planner issue (`issue-*` id)
+  reopen-run-issue <run-id>         Mark one transient run diagnostic open again
 
 WRITE (dispatches to real tools):
   write <path> <content>            Write file (single line content)
@@ -183,10 +183,22 @@ WRITE (dispatches to real tools):
     show-diff [path]                  Show git diff for the workspace or one path
     review-changes [path] [limit=N]   Review changed files and risk summary
   shell <command>                   Run shell command
-  git status                        Git status
-  git diff [path]                   Git diff
-  git add <paths...>                Stage files
-  git commit <message>              Commit staged changes
+  git status [--branch]             Git status
+  git diff [--staged] [--stat|--name-only] [path]
+  git log [-N] [ref|left..right] [-- path]  Recent/ahead commits
+  git show [ref] [--stat|--name-only] [-- path]
+  git blame [-L start,end] <path>   Line ownership
+  git branch [-vv]                  Current/local branches
+  git remote [-v|get-url <name>]    Configured remotes
+  git rev-parse <safe-ref query>    Resolve HEAD/current/upstream refs
+  git ls-remote <remote> [ref]      Verify a remote ref
+  git add <paths...>                Stage explicit paths only
+  git restore [--staged] <paths...> Restore explicit paths
+  git mv <source> <destination>     Move one tracked path
+  git rm <paths...>                 Remove explicit tracked paths
+  git commit [-m] <message>         Commit staged changes
+  git push [-u] [remote] [branch]   Push only when the task explicitly authorizes it
+  Git force pushes, deletion refspecs, reset, clean, stash, rebase, merge, checkout, switch, fetch, pull, and tag are unavailable in beta.
 
 HEREDOC (<<< ... >>> works on ANY command or strategy step):
   s2: write /repo/file.tsx <<<      Strategy step with heredoc
@@ -209,8 +221,8 @@ CONTEXT:
   drop                              Clear active context
   batch start                       Begin edit batch mode
   batch end                         End edit batch mode
-  resolve-run-issue <id>            Mark a parsed run issue resolved
-  reopen-run-issue <id>             Mark a parsed run issue open again
+  resolve-run-issue <run-id>        Mark a transient run diagnostic resolved
+  reopen-run-issue <run-id>         Mark a transient run diagnostic open again
   finish [message]                  Signal task completion
 
 SKILLS:
@@ -247,10 +259,11 @@ STRATEGIES (multi-step DAG pipelines):
   s2: grep /repo "class Worker"
   s1, s2 -> s3: fact demo/arch/overview main.py is worker
 
-  - sN: labels a step. Comma-separated commands run as a parallel group.
+  - sN: labels a step; dotted sublabels like s1.a: and s1.b: are valid for grouped moves.
+    Comma-separated commands run as a parallel group.
   - -> sN, sM at end of a step declares targets that receive output.
   - sN, sM -> sK on the left declares deps that must finish first.
-  - Use {sN} in downstream commands to inject upstream output.
+  - Use {sN} or {s1.a} in downstream commands to inject upstream output.
   - Supported placeholder transforms are limited text operations only:
     {s1.stdout}, {s1.trim()}, {s1.replace("old", "new")},
         {s1.split('\n').filter(line => !line.includes("React")).join('\n')},

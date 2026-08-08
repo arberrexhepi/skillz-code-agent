@@ -12,6 +12,7 @@ READ (free, in-context — no tool call):
   read-line-range /repo/src/main.py 100-200  Read line range with numbering
   symbols /repo/src/main.py        List functions/classes/variables in a file
   find-symbol /repo/src useTodo    Find a symbol by name in a file or directory
+  repo-map /repo/src topic="billing"  Structural map ranked before line reads
   stat /repo/src/main.py           File metadata
   find /repo *.py                  Glob search
   grep /facts "pattern"            Search content
@@ -19,10 +20,10 @@ READ (free, in-context — no tool call):
   read-diagnostics [path]          Ingest a local diagnostics snapshot
     diagnose <path> [limit=N]        Run backend diagnostics for one file and ingest issues
   run-route-check <route-or-url> [base=<url>]  Visit a route with Playwright and ingest runtime errors
-  list-run-issues                  List parsed run diagnostic issues
-  show-run-issue <id>              Show one parsed run diagnostic issue
-  list-issues                      Compatibility alias: list run + durable issues
-  show-issue <id>                  Compatibility alias: show run or durable issue
+  list-run-issues                  List transient run diagnostics (`run-*` ids)
+  show-run-issue <run-id>          Show one transient run diagnostic
+  list-issues                      List run diagnostics + durable planner issues
+  show-issue <issue-id>            Show a durable planner issue (`issue-*` id; legacy fallback only)
 
 WRITE (real tool dispatch):
   write <path> <content>           Write full file
@@ -32,10 +33,21 @@ WRITE (real tool dispatch):
     show-diff [path]                 Show git diff for the workspace or one path
     review-changes [path] [limit=N]  Review changed files and surface risk summary
   shell <command>                  Run shell command
-  git status                       Git status
-  git diff                         Git diff
-  git add <path>                   Stage file
-  git commit <message>             Commit
+  git status [--branch]            Git status
+  git diff [--staged] [--stat|--name-only] [path]
+  git log [-N] [ref|left..right] [-- path]  Recent/ahead commits
+  git show [ref] [--stat|--name-only] [-- path]
+  git blame [-L start,end] <path>  Line ownership
+  git branch [-vv]                 Current/local branches
+  git remote [-v|get-url <name>]   Configured remotes
+  git rev-parse <safe-ref query>   Resolve HEAD/current/upstream refs
+  git ls-remote <remote> [ref]     Verify a remote ref
+  git add <paths...>               Stage explicit paths
+  git restore [--staged] <paths...> Restore explicit paths
+  git mv <source> <destination>    Move one tracked path
+  git rm <paths...>                Remove explicit tracked paths
+  git commit [-m] <message>        Commit staged changes
+  git push [-u] [remote] [branch]  Push when the task explicitly authorizes it
 
 TREE MUTATIONS (in-process):
   fact <issue>/<type>/<key> <value>   Set/update fact
@@ -47,8 +59,8 @@ TREE MUTATIONS (in-process):
   batch end                        End edit batch
     approve-npm                      Approve the pending npm command
     reject-npm                       Reject the pending npm command
-  resolve-run-issue <id>           Mark a parsed run issue resolved
-  reopen-run-issue <id>            Mark a parsed run issue open again
+  resolve-run-issue <run-id>       Mark a transient run diagnostic resolved
+  reopen-run-issue <run-id>        Mark a transient run diagnostic open again
   finish [message]                 Signal completion
 
 SKILLS (preloaded cache or handler):
@@ -65,6 +77,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from context_tree import ContextTree
+from discovery import repo_map
 from issue_facts import (
     format_issue_not_found,
     format_issue_summary_detail,
@@ -194,6 +207,8 @@ class TreeCommandParser:
             "symbols": self._cmd_symbols,
             "find-symbol": self._cmd_find_symbol,
             "find_symbol": self._cmd_find_symbol,
+            "repo-map": self._cmd_repo_map,
+            "repo_map": self._cmd_repo_map,
             "stat": self._cmd_stat,
             "find": self._cmd_find,
             "grep": self._cmd_grep,
@@ -202,8 +217,8 @@ class TreeCommandParser:
             "run-route-check": self._cmd_run_route_check,
             "run_route_check": self._cmd_run_route_check,
             "ingest-log": self._cmd_ingest_log,
-            "list-run-issues": self._cmd_list_issues,
-            "list_run_issues": self._cmd_list_issues,
+            "list-run-issues": self._cmd_list_run_issues,
+            "list_run_issues": self._cmd_list_run_issues,
             "list-issues": self._cmd_list_issues,
             "show-run-issue": self._cmd_show_run_issue,
             "show_run_issue": self._cmd_show_run_issue,
@@ -333,6 +348,54 @@ class TreeCommandParser:
             return CommandResult(ok=True, output="(no symbol matches)", command_type="read")
         return CommandResult(ok=True, output=json.dumps(matches, indent=2), command_type="read")
 
+    def _cmd_repo_map(self, rest: str) -> CommandResult:
+        try:
+            parts = shlex.split(rest)
+        except ValueError as exc:
+            return CommandResult(ok=False, output=f"repo-map parse error: {exc}", command_type="error")
+
+        path = "."
+        topic = ""
+        limit = 30
+        symbols_per_file = 12
+        include_hidden = False
+        if parts and not _is_key_value_arg(parts[0]):
+            path = parts[0]
+            parts = parts[1:]
+
+        for part in parts:
+            key, sep, value = part.partition("=")
+            if not sep:
+                if not topic:
+                    topic = part
+                continue
+            normalized_key = key.replace("_", "-").lower()
+            if normalized_key == "topic":
+                topic = value
+            elif normalized_key == "limit":
+                try:
+                    limit = int(value)
+                except ValueError:
+                    return CommandResult(ok=False, output="repo-map limit must be an integer", command_type="error")
+            elif normalized_key in {"symbols", "symbols-per-file"}:
+                try:
+                    symbols_per_file = int(value)
+                except ValueError:
+                    return CommandResult(ok=False, output="repo-map symbols-per-file must be an integer", command_type="error")
+            elif normalized_key in {"hidden", "include-hidden"}:
+                include_hidden = value.lower() in {"1", "true", "yes", "on"}
+
+        rel_path = _repo_tree_path_to_rel(path)
+        payload = repo_map(
+            path=rel_path,
+            topic=topic or None,
+            limit=max(1, limit),
+            symbols_per_file=max(1, symbols_per_file),
+            include_hidden=include_hidden,
+            root=self.tree.workspace_root,
+        )
+        return CommandResult(ok=True, output=json.dumps(payload, indent=2), command_type="read")
+
     def _cmd_stat(self, rest: str) -> CommandResult:
         path = rest.strip() or "/"
         info = self.tree.stat(path)
@@ -402,6 +465,11 @@ class TreeCommandParser:
             parts.append("(no run issues and no durable repo_facts issues)")
         return CommandResult(ok=True, output="\n\n".join(parts), command_type="read")
 
+    def _cmd_list_run_issues(self, rest: str) -> CommandResult:
+        issues = self.tree.list_log_issues()
+        output = self.tree.format_log_issue_list(issues) if issues else "(no run diagnostic issues)"
+        return CommandResult(ok=True, output=output, command_type="read")
+
     def _show_durable_issue(self, issue_id: str) -> Optional[CommandResult]:
         durable_state = self._durable_issue_state()
         for durable_issue in issue_summaries_from_payload(durable_state):
@@ -412,16 +480,35 @@ class TreeCommandParser:
     def _cmd_show_run_issue(self, rest: str) -> CommandResult:
         issue_id = rest.strip()
         if not issue_id:
-            return CommandResult(ok=False, output="Usage: show-run-issue <id>", command_type="error")
+            return CommandResult(ok=False, output="Usage: show-run-issue <run-id>", command_type="error")
+        if issue_id.startswith("issue-"):
+            return CommandResult(
+                ok=False,
+                output=f"Namespace mismatch: {issue_id} is a durable planner issue id. Use show-issue {issue_id}.",
+                command_type="error",
+            )
         issue = self.tree.show_log_issue(issue_id)
         if issue is None:
-            return CommandResult(ok=True, output=format_issue_not_found(issue_id, self._durable_issue_state()), command_type="read")
+            return CommandResult(
+                ok=True,
+                output=(
+                    f"Run diagnostic not found: {issue_id}\n"
+                    "Run diagnostics are transient and may disappear after validation. Use list-run-issues for the current diagnostic set."
+                ),
+                command_type="read",
+            )
         return CommandResult(ok=True, output=self.tree.format_log_issue_detail(issue), command_type="read")
 
     def _cmd_show_issue(self, rest: str) -> CommandResult:
         issue_id = rest.strip()
         if not issue_id:
-            return CommandResult(ok=False, output="Usage: show-issue <id>", command_type="error")
+            return CommandResult(ok=False, output="Usage: show-issue <issue-id>", command_type="error")
+        if issue_id.startswith("run-"):
+            return CommandResult(
+                ok=False,
+                output=f"Namespace mismatch: {issue_id} is a transient run diagnostic id. Use show-run-issue {issue_id}.",
+                command_type="error",
+            )
         durable = self._show_durable_issue(issue_id)
         if durable is not None:
             return durable
@@ -790,51 +877,287 @@ class TreeCommandParser:
 
     def _cmd_git(self, rest: str) -> CommandResult:
         parts = rest.split(None, 1)
-        subcmd = parts[0] if parts else ""
+        subcmd = parts[0].lower() if parts else ""
         args = parts[1] if len(parts) > 1 else ""
 
-        git_map = {
-            "status": "git_status",
-            "diff": "git_diff",
-            "add": "git_add",
-            "rm": "git_rm",
-            "restore": "git_restore",
-            "commit": "git_commit",
-            "log": "git_log",
-            "branch": "git_branch",
-        }
+        def error(message: str) -> CommandResult:
+            return CommandResult(ok=False, output=message, command_type="error")
 
-        action_type = git_map.get(subcmd)
-        if action_type is None:
-            return CommandResult(ok=False, output=f"Unknown git subcommand: {subcmd}", command_type="error")
-
-        tool_action: Dict[str, Any] = {"type": action_type}
-        if subcmd == "add" and args:
-            tool_action["path"] = [p.strip() for p in args.split()]
-        elif subcmd == "rm" and args:
-            path_tokens = [p.strip().removeprefix("/repo/").removeprefix("repo/") for p in args.split() if p.strip()]
-            if not path_tokens:
-                return CommandResult(ok=False, output="Usage: git rm <path>", command_type="error")
-            shell_command = "git rm -- " + " ".join(shlex.quote(token) for token in path_tokens)
+        def dispatch(action_type: str, **payload: Any) -> CommandResult:
             return CommandResult(
                 ok=True,
-                output="[dispatch: git_rm]",
+                output=f"[dispatch: {action_type}]",
                 command_type="write",
                 needs_tool=True,
-                tool_action={"type": "run_shell", "command": shell_command},
+                tool_action={"type": action_type, **payload},
             )
-        elif subcmd == "commit" and args:
-            tool_action["message"] = args
-        elif subcmd == "diff" and args:
-            tool_action["path"] = args.strip()
 
-        return CommandResult(
-            ok=True,
-            output=f"[dispatch: {action_type}]",
-            command_type="write",
-            needs_tool=True,
-            tool_action=tool_action,
-        )
+        try:
+            tokens = shlex.split(args)
+        except ValueError as exc:
+            return error(f"Invalid git arguments: {exc}")
+
+        def explicit_paths(values: List[str]) -> Tuple[List[str], str]:
+            normalized: List[str] = []
+            for value in values:
+                path = str(value or "").strip().removeprefix("/repo/").removeprefix("repo/")
+                segments = [segment for segment in path.split("/") if segment]
+                if (
+                    not path
+                    or path in {".", "..", "/"}
+                    or path.startswith("-")
+                    or path.startswith("/")
+                    or ".." in segments
+                    or any(marker in path for marker in ("*", "?", "["))
+                ):
+                    return [], f"Unsafe or broad git path rejected: {value}"
+                normalized.append(path)
+            return normalized, ""
+
+        def safe_name(value: str, *, kind: str) -> bool:
+            if not value or value.startswith(("-", "+")):
+                return False
+            if any(marker in value for marker in ("..", "@{", "\\", " ", "~", "^", ":")):
+                return False
+            pattern = r"[A-Za-z0-9._-]+" if kind == "remote" else r"[A-Za-z0-9._/-]+"
+            return re.fullmatch(pattern, value) is not None
+
+        def safe_revision_atom(value: str) -> bool:
+            if value in {"HEAD", "@", "@{u}"}:
+                return True
+            if value.startswith((".", "/")) or value.endswith((".", "/")) or "/." in value:
+                return False
+            return safe_name(value, kind="ref")
+
+        def safe_revision(value: str) -> bool:
+            for separator in ("...", ".."):
+                if separator not in value:
+                    continue
+                if value.count(separator) != 1:
+                    return False
+                left, right = value.split(separator, 1)
+                return safe_revision_atom(left) and safe_revision_atom(right)
+            return safe_revision_atom(value)
+
+        if subcmd == "status":
+            allowed = {"--short", "-s", "--branch", "-b", "-sb", "--porcelain", "--ignored"}
+            if any(token not in allowed for token in tokens):
+                return error("Usage: git status [--short] [--branch] [--ignored]")
+            return dispatch(
+                "git_status",
+                branch=any(token in {"--branch", "-b", "-sb"} for token in tokens),
+                ignored="--ignored" in tokens,
+            )
+
+        if subcmd == "diff":
+            staged = False
+            stat = False
+            name_only = False
+            path_tokens: List[str] = []
+            after_separator = False
+            for token in tokens:
+                if token == "--":
+                    after_separator = True
+                elif not after_separator and token in {"--staged", "--cached"}:
+                    staged = True
+                elif not after_separator and token == "--stat":
+                    stat = True
+                elif not after_separator and token == "--name-only":
+                    name_only = True
+                elif not after_separator and token.startswith("-"):
+                    return error(f"Unsupported git diff option: {token}")
+                else:
+                    path_tokens.append(token)
+            paths, path_error = explicit_paths(path_tokens)
+            if path_error:
+                return error(path_error)
+            if len(paths) > 1:
+                return error("git diff accepts at most one explicit path in beta")
+            return dispatch(
+                "git_diff",
+                path=paths[0] if paths else "",
+                staged=staged,
+                stat=stat,
+                name_only=name_only,
+            )
+
+        if subcmd == "log":
+            limit = 5
+            revision = ""
+            path_tokens: List[str] = []
+            after_separator = False
+            index = 0
+            while index < len(tokens):
+                token = tokens[index]
+                if token == "--":
+                    after_separator = True
+                elif after_separator:
+                    path_tokens.append(token)
+                elif token == "--oneline":
+                    pass
+                elif re.fullmatch(r"-\d+", token):
+                    limit = int(token[1:])
+                elif token in {"-n", "--max-count"} and index + 1 < len(tokens):
+                    index += 1
+                    limit = int(tokens[index]) if tokens[index].isdigit() else 0
+                elif token.startswith("--max-count="):
+                    value = token.split("=", 1)[1]
+                    limit = int(value) if value.isdigit() else 0
+                elif not token.startswith("-") and not revision and safe_revision(token):
+                    revision = token
+                else:
+                    return error(f"Unsupported git log argument: {token}")
+                index += 1
+            if not 1 <= limit <= 100:
+                return error("git log limit must be between 1 and 100")
+            paths, path_error = explicit_paths(path_tokens)
+            if path_error:
+                return error(path_error)
+            if len(paths) > 1:
+                return error("git log accepts at most one explicit path in beta")
+            return dispatch("git_log", limit=limit, revision=revision, path=paths[0] if paths else "")
+
+        if subcmd == "branch":
+            if not tokens:
+                return dispatch("git_branch", mode="current")
+            if tokens == ["--show-current"]:
+                return dispatch("git_branch", mode="current")
+            if tokens in (["-vv"], ["-v"], ["--list"]):
+                return dispatch("git_branch", mode="verbose" if tokens[0] != "--list" else "list")
+            return error("Beta git branch is read-only. Usage: git branch [-vv|--list]")
+
+        if subcmd == "remote":
+            if not tokens:
+                return dispatch("git_remote", mode="list")
+            if tokens in (["-v"], ["--verbose"]):
+                return dispatch("git_remote", mode="verbose")
+            if len(tokens) == 2 and tokens[0] == "get-url" and safe_name(tokens[1], kind="remote"):
+                return dispatch("git_remote", mode="get_url", remote=tokens[1])
+            return error("Beta git remote is read-only. Usage: git remote [-v|get-url <name>]")
+
+        if subcmd == "rev-parse":
+            allowed_options = {"--show-toplevel", "--abbrev-ref", "--symbolic-full-name", "--verify"}
+            if not tokens or any(token.startswith("-") and token not in allowed_options for token in tokens):
+                return error("Usage: git rev-parse [--show-toplevel|--abbrev-ref|--symbolic-full-name|--verify] <ref>")
+            refs = [token for token in tokens if not token.startswith("-")]
+            if any(not safe_name(ref, kind="ref") and ref not in {"HEAD", "@", "@{u}"} for ref in refs):
+                return error("Unsafe git revision expression rejected")
+            return dispatch("git_rev_parse", args=tokens)
+
+        if subcmd == "show":
+            stat = "--stat" in tokens
+            name_only = "--name-only" in tokens
+            remaining = [token for token in tokens if token not in {"--stat", "--name-only"}]
+            path_tokens: List[str] = []
+            if "--" in remaining:
+                separator = remaining.index("--")
+                path_tokens = remaining[separator + 1:]
+                remaining = remaining[:separator]
+            if len(remaining) > 1 or any(token.startswith("-") for token in remaining):
+                return error("Usage: git show [ref] [--stat|--name-only] [-- path]")
+            ref = remaining[0] if remaining else "HEAD"
+            if not safe_name(ref, kind="ref") and ref not in {"HEAD", "@", "@{u}"}:
+                return error("Unsafe git revision expression rejected")
+            paths, path_error = explicit_paths(path_tokens)
+            if path_error:
+                return error(path_error)
+            if len(paths) > 1:
+                return error("git show accepts at most one explicit path in beta")
+            return dispatch("git_show", ref=ref, stat=stat, name_only=name_only, path=paths[0] if paths else "")
+
+        if subcmd == "blame":
+            line_range = ""
+            remaining = list(tokens)
+            if len(remaining) >= 2 and remaining[0] == "-L":
+                line_range = remaining[1]
+                remaining = remaining[2:]
+            if line_range and re.fullmatch(r"\d+,\d+", line_range) is None:
+                return error("git blame line range must use start,end")
+            paths, path_error = explicit_paths(remaining)
+            if path_error or len(paths) != 1:
+                return error(path_error or "Usage: git blame [-L start,end] <path>")
+            return dispatch("git_blame", path=paths[0], line_range=line_range)
+
+        if subcmd in {"add", "rm"}:
+            path_tokens = [token for token in tokens if token != "--"]
+            paths, path_error = explicit_paths(path_tokens)
+            if path_error or not paths:
+                return error(path_error or f"Usage: git {subcmd} <paths...>")
+            return dispatch(f"git_{subcmd}", paths=paths)
+
+        if subcmd == "restore":
+            staged = False
+            path_tokens = []
+            for token in tokens:
+                if token == "--staged":
+                    staged = True
+                elif token == "--":
+                    continue
+                elif token.startswith("-"):
+                    return error(f"Unsupported git restore option: {token}")
+                else:
+                    path_tokens.append(token)
+            paths, path_error = explicit_paths(path_tokens)
+            if path_error or not paths:
+                return error(path_error or "Usage: git restore [--staged] <paths...>")
+            return dispatch("git_restore", paths=paths, staged=staged)
+
+        if subcmd == "mv":
+            paths, path_error = explicit_paths([token for token in tokens if token != "--"])
+            if path_error or len(paths) != 2:
+                return error(path_error or "Usage: git mv <source> <destination>")
+            return dispatch("git_mv", source=paths[0], destination=paths[1])
+
+        if subcmd == "commit":
+            message_tokens = list(tokens)
+            if message_tokens and message_tokens[0] in {"-m", "--message"}:
+                message_tokens = message_tokens[1:]
+            if not message_tokens or any(token.startswith("-") for token in message_tokens):
+                return error("Usage: git commit [-m] <message>; amend/no-verify flags are not available in beta")
+            return dispatch("git_commit", message=" ".join(message_tokens))
+
+        if subcmd == "push":
+            if any(
+                token.startswith(("--force", "--delete", "--mirror", "--all", "--tags", "+"))
+                or ":" in token
+                for token in tokens
+            ):
+                return error("Force, deletion, mirror, all-branch, and tag pushes are not available in beta")
+            set_upstream = False
+            names: List[str] = []
+            for token in tokens:
+                if token in {"-u", "--set-upstream"}:
+                    set_upstream = True
+                elif token.startswith("-"):
+                    return error(f"Unsupported git push option: {token}")
+                else:
+                    names.append(token)
+            if len(names) > 2:
+                return error("Usage: git push [-u] [remote] [branch]")
+            remote = names[0] if names else ""
+            branch = names[1] if len(names) == 2 else ""
+            if set_upstream and len(names) != 2:
+                return error("git push -u requires an explicit remote and branch")
+            if remote and not safe_name(remote, kind="remote"):
+                return error("Unsafe git remote name rejected")
+            if branch and not safe_name(branch, kind="ref"):
+                return error("Unsafe git branch name rejected")
+            return dispatch("git_push", remote=remote, branch=branch, set_upstream=set_upstream)
+
+        if subcmd == "ls-remote":
+            if not 1 <= len(tokens) <= 2:
+                return error("Usage: git ls-remote <remote> [ref]")
+            remote = tokens[0]
+            ref = tokens[1] if len(tokens) == 2 else ""
+            if not safe_name(remote, kind="remote"):
+                return error("Unsafe git remote name rejected")
+            if ref and not safe_name(ref, kind="ref"):
+                return error("Unsafe git remote ref rejected")
+            return dispatch("git_ls_remote", remote=remote, ref=ref)
+
+        if subcmd in {"reset", "clean", "stash", "rebase", "merge", "cherry-pick", "checkout", "switch", "fetch", "pull", "tag"}:
+            return error(f"git {subcmd} is not available to beta agents")
+        return error(f"Unknown git subcommand: {subcmd}")
 
     # ------------------------------------------------------------------
     # TREE MUTATIONS (in-process)
@@ -931,7 +1254,13 @@ class TreeCommandParser:
     def _cmd_resolve_issue(self, rest: str) -> CommandResult:
         issue_id = rest.strip()
         if not issue_id:
-            return CommandResult(ok=False, output="Usage: resolve-run-issue <id>", command_type="error")
+            return CommandResult(ok=False, output="Usage: resolve-run-issue <run-id>", command_type="error")
+        if not issue_id.startswith("run-"):
+            return CommandResult(
+                ok=False,
+                output=f"Namespace mismatch: {issue_id} is not a transient run diagnostic id.",
+                command_type="error",
+            )
         resolved = self.tree.resolve_log_issue(issue_id)
         if not resolved:
             return CommandResult(ok=False, output=f"Issue not found: {issue_id}", command_type="error")
@@ -940,7 +1269,13 @@ class TreeCommandParser:
     def _cmd_reopen_issue(self, rest: str) -> CommandResult:
         issue_id = rest.strip()
         if not issue_id:
-            return CommandResult(ok=False, output="Usage: reopen-run-issue <id>", command_type="error")
+            return CommandResult(ok=False, output="Usage: reopen-run-issue <run-id>", command_type="error")
+        if not issue_id.startswith("run-"):
+            return CommandResult(
+                ok=False,
+                output=f"Namespace mismatch: {issue_id} is not a transient run diagnostic id.",
+                command_type="error",
+            )
         reopened = self.tree.reopen_log_issue(issue_id)
         if not reopened:
             return CommandResult(ok=False, output=f"Issue not found: {issue_id}", command_type="error")
@@ -1084,11 +1419,22 @@ def _starts_new_command_boundary(line: str) -> bool:
         return True
     first = line.split(None, 1)[0].lower() if line else ""
     return first in {
-        "ls", "cat", "read-line-range", "read_line_range", "symbols", "find-symbol", "find_symbol", "stat", "find", "grep",
+        "ls", "cat", "read-line-range", "read_line_range", "symbols", "find-symbol", "find_symbol", "repo-map", "repo_map", "stat", "find", "grep",
         "read-diagnostics", "diagnose", "run-route-check", "run_route_check", "ingest-log", "list-run-issues", "list_run_issues", "list-issues", "show-run-issue", "show_run_issue", "show-issue", "resolve-run-issue", "resolve_run_issue", "resolve-issue", "reopen-run-issue", "reopen_run_issue", "reopen-issue", "run-check",
         "write", "replace-lines", "replace_lines", "patch", "discover", "mutate", "show-diff", "show_diff", "review-changes", "review_changes", "shell", "git",
         "fact", "expand", "drop", "batch", "finish", "skill",
     }
+
+
+def _is_key_value_arg(value: str) -> bool:
+    return bool(re.match(r"^[A-Za-z_][A-Za-z0-9_-]*=", value or ""))
+
+
+def _repo_tree_path_to_rel(path: str) -> str:
+    normalized = str(path or ".").strip()
+    if normalized in {"", ".", "/", "/repo", "/repo/"}:
+        return "."
+    return normalized.removeprefix("/repo/").removeprefix("repo/").strip() or "."
 
 
 def execute_multi(parser: TreeCommandParser, raw: str) -> Tuple[List[CommandResult], List[Annotation]]:
@@ -1123,12 +1469,13 @@ def execute_multi(parser: TreeCommandParser, raw: str) -> Tuple[List[CommandResu
 #   s3: fact demo/arch/worker Found in main.py
 #
 # Rules:
-#   - "sN:" labels a strategy step. Commands after the colon are the group.
+#   - "sN:" labels a strategy step. Dotted sublabels such as "s1.a:" are also valid.
+#     Commands after the colon are the group.
 #   - Comma-separated commands within a step run in parallel.
 #   - "-> sN, sM" at the end of a step declares dependents that receive output.
 #   - A step won't execute until all steps that point to it have finished.
 #   - The accumulated output of upstream steps is available to downstream
-#     commands via the {sN} placeholder (expands to that step's output).
+#     commands via the {sN} or {s1.a} placeholder (expands to that step's output).
 #   - Placeholders support a small text transform chain, e.g.
 #       {s1.stdout.split('\n').filter(line => !line.includes("React")).join('\n')}
 #       {s1.stdout.split('\n')[0].trim()}
@@ -1144,8 +1491,9 @@ def execute_multi(parser: TreeCommandParser, raw: str) -> Tuple[List[CommandResu
 # after both complete. s3's command can reference {s1} and {s2} to use their
 # output.
 
+_STRATEGY_LABEL_RE = r"s\w+(?:\.\w+)*"
 _STRATEGY_LINE_RE = re.compile(
-    r"^(?:(?P<deps>[\w\s,]+)->\s*)?(?P<label>s\w+)\s*:\s*(?P<body>.+?)(?:\s*->\s*(?P<targets>[\w\s,]+))?\Z",
+    rf"^(?:(?P<deps>[\w.\s,]+)->\s*)?(?P<label>{_STRATEGY_LABEL_RE})\s*:\s*(?P<body>.+?)(?:\s*->\s*(?P<targets>[\w.\s,]+))?\Z",
     re.IGNORECASE | re.DOTALL,
 )
 
@@ -1288,7 +1636,7 @@ def parse_strategy(raw: str) -> Optional[StrategyPlan]:
                                 ok=False,
                                 output=(
                                     f"Invalid strategy: duplicate label `{label}`. "
-                                    "Emit exactly one executable strategy block with unique labels like `s1:`, `s2:`."
+                                    "Emit exactly one executable strategy block with unique labels like `s1:`, `s2:`, or `s1.a:`."
                                 ),
                                 command_type="error",
                             )
@@ -1348,7 +1696,7 @@ def _topological_tiers(steps: Dict[str, StrategyStep]) -> List[List[str]]:
     return tiers
 
 
-_PLACEHOLDER_RE = re.compile(r"\{(s\w+[^{}]*)\}", re.IGNORECASE)
+_PLACEHOLDER_RE = re.compile(r"\{(s\w+(?:\.[^{}]*)?)\}", re.IGNORECASE)
 _QUOTED_ARG_RE = r'(?:"(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\')'
 
 
@@ -1470,17 +1818,27 @@ def _decode_placeholder_regex(token: str) -> Tuple[str, int]:
 
 def _evaluate_placeholder_expression(expr: str, steps: Dict[str, StrategyStep]) -> str:
     expr = expr.strip()
-    base_match = re.match(r"^(?P<label>s\w+)(?P<tail>.*)$", expr, re.IGNORECASE)
+    base_match = re.match(rf"^(?P<head>{_STRATEGY_LABEL_RE}(?:\.\w+)*)(?P<tail>.*)$", expr, re.IGNORECASE)
     if base_match is None:
         raise ValueError(f"placeholder must start with a strategy label: {expr}")
 
-    label = base_match.group("label").lower()
-    step = steps.get(label)
+    head = base_match.group("head").lower()
+    tail = base_match.group("tail")
+    label = ""
+    step: Optional[StrategyStep] = None
+    head_parts = head.split(".")
+    for end in range(len(head_parts), 0, -1):
+        candidate = ".".join(head_parts[:end])
+        candidate_step = steps.get(candidate)
+        if candidate_step is not None:
+            label = candidate
+            step = candidate_step
+            tail = "." + ".".join(head_parts[end:]) + tail if end < len(head_parts) else tail
+            break
     if step is None:
-        raise ValueError(f"unknown strategy placeholder: {label}")
+        raise ValueError(f"unknown strategy placeholder: {head}")
 
     value: Any = step.output
-    tail = base_match.group("tail")
 
     while tail:
         if tail.startswith(".stdout") or tail.startswith(".output"):

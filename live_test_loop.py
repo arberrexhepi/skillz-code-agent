@@ -44,6 +44,7 @@ from main import (  # noqa: E402
     refresh_runtime_provider_catalog_once,
 )
 from issue_facts import (  # noqa: E402
+    CompletedGoalCheckpoint,
     FACT_TYPE_ARCHITECTURE,
     FACT_TYPE_GOAL,
     IssueFactLedger,
@@ -62,7 +63,26 @@ from tree_loop import TreeLoop, Turn  # noqa: E402
 
 REPO_FACTS_FILENAME = "repo_facts.md"
 OBSERVABILITY_TRACE_BLOCK_LIMIT = 24
-DISCOVERY_REMEDIATION_READ_SATISFIERS = {"read_file", "read_line_range", "read-line-range", "grep"}
+DISCOVERY_REMEDIATION_READ_SATISFIERS = {"read_file", "read_line_range", "read-line-range", "grep", "repo-map", "repo_map"}
+GIT_MUTATION_ACTION_TYPES = {
+    "git_add",
+    "git_restore",
+    "git_mv",
+    "git_rm",
+    "git_commit",
+    "git_push",
+}
+GIT_READ_ACTION_TYPES = {
+    "git_status",
+    "git_diff",
+    "git_log",
+    "git_branch",
+    "git_remote",
+    "git_rev_parse",
+    "git_show",
+    "git_blame",
+    "git_ls_remote",
+}
 
 
 def _normalize_cli_argv(argv: Sequence[str]) -> List[str]:
@@ -226,6 +246,10 @@ class TreeLoopPlannerWorker:
         self._observability_buffer: List[str] = []
         self._observability_started_at = 0.0
         self._observability_metrics: Dict[str, Any] = {}
+        self._session_usage_totals = self._empty_usage_totals()
+        self._active_run_usage_totals = self._empty_usage_totals()
+        self._issue_usage_totals: Dict[str, Dict[str, Any]] = {}
+        self._recent_model_turn_usage: List[Dict[str, Any]] = []
         self._llm_activity: Dict[str, Any] = {
             "in_flight": False,
             "turn": 0,
@@ -233,10 +257,21 @@ class TreeLoopPlannerWorker:
             "elapsed_s": 0.0,
             "output_chars": 0,
             "error": "",
+            "status_code": None,
+            "request_id": "",
+            "retry_attempts": 0,
+            "retry_request_ids": [],
+            "retry_after": "",
+            "retry_delays_s": [],
+            "rate_limit_headers": {},
+            "fresh_context_retry": False,
+            "repair_attempt": 0,
+            "output_valid": True,
         }
         self.loop = self._build_loop(model)
         self.history = self.loop.history
         self._sync_fact_map()
+        self._import_legacy_observability_checkpoints()
 
     def _reload_repo_facts(self) -> None:
         try:
@@ -249,7 +284,90 @@ class TreeLoopPlannerWorker:
         self.active_issue_id = active_issue.issue_id if active_issue is not None else ""
         self._sync_fact_map()
 
+    def _import_legacy_observability_checkpoints(self) -> int:
+        """Recover pre-ledger goal checkpoints from the last worker transcript.
+
+        Older sessions only kept completed goals inside memory_observability.md.
+        Importing is root- and issue-scoped, and only reads the explicit
+        ``Prior goal results`` block; the current (possibly failed) goal is
+        never inferred as complete.
+        """
+        issue = self.issue_ledger.active_issue()
+        if issue is None:
+            return 0
+        removed_duplicates = self.issue_ledger.deduplicate_legacy_completed_goals(issue.issue_id)
+        if removed_duplicates:
+            self._persist_repo_facts()
+        try:
+            text = self._observability_path().read_text(encoding="utf-8")
+        except Exception:
+            return 0
+        match = re.search(r"## Run Metrics\s*```json\s*(.*?)\s*```", text, flags=re.DOTALL)
+        if match is None:
+            return 0
+        try:
+            metrics = json.loads(match.group(1))
+        except Exception:
+            return 0
+        if Path(str(metrics.get("root", "") or "")).resolve() != self.root:
+            return 0
+        usage = metrics.get("usage_accounting") if isinstance(metrics, dict) else None
+        current_issue = usage.get("current_issue") if isinstance(usage, dict) else None
+        observed_issue_id = str((current_issue or {}).get("issue_id", "") or "").strip()
+        if observed_issue_id != issue.issue_id:
+            return 0
+        task = str(metrics.get("task", "") or "")
+        prior_match = re.search(
+            r"Prior goal results:\s*(.*?)(?:\n\nUse the discovery findings|\Z)",
+            task,
+            flags=re.DOTALL,
+        )
+        if prior_match is None:
+            return 0
+        total_match = re.search(r"Planner goal\s+\d+/(\d+)", task, flags=re.IGNORECASE)
+        total_goal_count = int(total_match.group(1)) if total_match else 0
+        imported = 0
+        for result_match in re.finditer(
+            r"^-\s+(goal-\d+):\s+\[finish:\s*(.*?)\]\s*$",
+            prior_match.group(1),
+            flags=re.MULTILINE | re.DOTALL,
+        ):
+            goal_id = result_match.group(1).strip()
+            final_message = result_match.group(2).strip()
+            normalized_message = re.sub(r"\s+", " ", final_message.lower()).strip()
+            if any(
+                existing.source == "legacy_observability"
+                and existing.goal_id == goal_id
+                and re.sub(r"\s+", " ", str(existing.final_message or "").lower()).strip() == normalized_message
+                for existing in issue.completed_goals
+            ):
+                continue
+            index_match = re.search(r"(\d+)$", goal_id)
+            original_index = int(index_match.group(1)) if index_match else 0
+            self.issue_ledger.record_completed_goal(
+                issue_id=issue.issue_id,
+                checkpoint=CompletedGoalCheckpoint(
+                    goal_id=goal_id,
+                    plan_summary=issue.plan_summary,
+                    final_message=final_message,
+                    original_index=original_index,
+                    total_goal_count=total_goal_count,
+                    source="legacy_observability",
+                ),
+            )
+            imported += 1
+        if imported:
+            self._persist_repo_facts()
+        return imported
+
     def _build_loop(self, model: Any) -> TreeLoop:
+        cache_setter = getattr(model, "set_prompt_cache_key", None)
+        if callable(cache_setter):
+            try:
+                root_digest = hashlib.sha256(str(self.root.resolve()).encode("utf-8")).hexdigest()[:16]
+                cache_setter(f"treeloop:{root_digest}:{self.provider}:{self.model_name}")
+            except Exception:
+                pass
         loop = TreeLoop(
             model=model,
             workspace_root=self.root,
@@ -344,6 +462,7 @@ class TreeLoopPlannerWorker:
         self._delete_session_artifacts()
         self.loop.history.clear()
         self.loop._recent_reads.clear()
+        self.loop.reset_conversation()
         self.loop._total_reads = 0
         self.loop._total_writes = 0
         self.history = self.loop.history
@@ -412,12 +531,24 @@ class TreeLoopPlannerWorker:
         if not preserve_context:
             self.loop.history.clear()
             self.loop._recent_reads.clear()
+            self.loop.reset_conversation()
             self.loop._total_reads = 0
             self.loop._total_writes = 0
         self.history = self.loop.history
         self._current_task = ""
 
     def render_last_usage_summary(self) -> str:
+        error_metrics = getattr(self.model, "get_last_error_metrics", None)
+        if callable(error_metrics):
+            try:
+                failure = error_metrics() or {}
+            except Exception:
+                failure = {}
+            if failure:
+                attempts = int(failure.get("attempts", 0) or 0)
+                retry_after = str(failure.get("retry_after", "") or "").strip()
+                suffix = f"; Retry-After={retry_after}s" if retry_after else ""
+                return f"Usage: unavailable for failed request after {attempts} attempt(s){suffix}"
         metrics = getattr(self.model, "get_last_metrics", None)
         if not callable(metrics):
             return "Usage: unavailable"
@@ -430,7 +561,190 @@ class TreeLoopPlannerWorker:
             return "Usage: unavailable"
         input_tokens = int(usage.get("input_tokens", 0) or 0)
         output_tokens = int(usage.get("output_tokens", 0) or 0)
-        return f"Usage: input={input_tokens:,} output={output_tokens:,}"
+        cached_tokens = int(usage.get("cached_tokens", 0) or 0)
+        cache_suffix = f" cached={cached_tokens:,}" if cached_tokens else ""
+        return f"Usage: input={input_tokens:,} output={output_tokens:,}{cache_suffix}"
+
+    def _empty_usage_totals(self) -> Dict[str, int]:
+        return {
+            "model_calls": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+            "cached_tokens": 0,
+            "reasoning_tokens": 0,
+        }
+
+    def _usage_int(self, payload: Dict[str, Any], key: str) -> int:
+        try:
+            return max(0, int(payload.get(key, 0) or 0))
+        except Exception:
+            return 0
+
+    def _last_model_usage_payload(self) -> Dict[str, int]:
+        usage: Dict[str, Any] = {}
+        metrics = getattr(self.model, "get_last_metrics", None)
+        if callable(metrics):
+            try:
+                payload = metrics() or {}
+            except Exception:
+                payload = {}
+            if isinstance(payload, dict) and isinstance(payload.get("usage"), dict):
+                usage = payload.get("usage") or {}
+        input_tokens = self._usage_int(usage, "input_tokens") or self._usage_int(usage, "prompt_token_count")
+        output_tokens = self._usage_int(usage, "output_tokens") or self._usage_int(usage, "candidates_token_count")
+        total_tokens = (
+            self._usage_int(usage, "total_tokens")
+            or self._usage_int(usage, "total_token_count")
+            or (input_tokens + output_tokens)
+        )
+        cached_tokens = (
+            self._usage_int(usage, "cached_tokens")
+            or self._usage_int(usage, "cached_content_token_count")
+            or self._usage_int(usage, "cachedContentTokenCount")
+        )
+        reasoning_tokens = self._usage_int(usage, "reasoning_tokens") or self._usage_int(usage, "thoughts_token_count")
+        return {
+            "model_calls": 1,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": total_tokens,
+            "cached_tokens": cached_tokens,
+            "reasoning_tokens": reasoning_tokens,
+        }
+
+    def _merge_usage_totals(self, target: Dict[str, int], usage: Dict[str, int]) -> Dict[str, int]:
+        for key in self._empty_usage_totals().keys():
+            try:
+                target[key] = int(target.get(key, 0) or 0) + int(usage.get(key, 0) or 0)
+            except Exception:
+                target[key] = int(target.get(key, 0) or 0)
+        return target
+
+    def _usage_cache_ratio(self, totals: Dict[str, Any]) -> float:
+        input_tokens = max(0, int(totals.get("input_tokens", 0) or 0))
+        if input_tokens <= 0:
+            return 0.0
+        cached_tokens = max(0, int(totals.get("cached_tokens", 0) or 0))
+        return round(min(1.0, cached_tokens / input_tokens), 4)
+
+    def _current_usage_issue(self) -> Dict[str, str]:
+        self._reload_repo_facts()
+        issue = self.issue_ledger.active_issue()
+        if issue is None:
+            return {"issue_id": "__no_active_issue__", "label": "No active issue"}
+        label = str(issue.plan_summary or issue.request_summary or issue.issue_id or "Active issue").strip()
+        return {"issue_id": str(issue.issue_id or ""), "label": label[:140]}
+
+    def _usage_totals_payload(self, totals: Dict[str, int]) -> Dict[str, Any]:
+        payload = dict(self._empty_usage_totals())
+        for key in payload.keys():
+            payload[key] = int(totals.get(key, 0) or 0)
+        payload["cache_hit_ratio"] = self._usage_cache_ratio(payload)
+        return payload
+
+    def _record_model_usage_turn(self, *, turn: int, elapsed_s: float, output_chars: int) -> Dict[str, Any]:
+        usage = self._last_model_usage_payload()
+        metrics_getter = getattr(self.model, "get_last_metrics", None)
+        try:
+            model_metrics = metrics_getter() if callable(metrics_getter) else {}
+        except Exception:
+            model_metrics = {}
+        if not isinstance(model_metrics, dict):
+            model_metrics = {}
+        issue_info = self._current_usage_issue()
+        issue_id = issue_info["issue_id"] or "__no_active_issue__"
+
+        self._merge_usage_totals(self._session_usage_totals, usage)
+        self._merge_usage_totals(self._active_run_usage_totals, usage)
+
+        issue_bucket = self._issue_usage_totals.setdefault(
+            issue_id,
+            {
+                "issue_id": issue_id,
+                "label": issue_info["label"],
+                "totals": self._empty_usage_totals(),
+            },
+        )
+        issue_bucket["label"] = issue_info["label"]
+        self._merge_usage_totals(issue_bucket["totals"], usage)
+
+        turn_record = {
+            "turn": int(turn or 0),
+            "issue_id": issue_id,
+            "issue_label": issue_info["label"],
+            "provider": self.provider,
+            "model": self.model_name,
+            "elapsed_s": round(max(0.0, float(elapsed_s or 0.0)), 3),
+            "output_chars": max(0, int(output_chars or 0)),
+            "usage": self._usage_totals_payload(usage),
+            "rate_limit_headers": dict(model_metrics.get("rate_limit_headers", {}) or {}),
+            "retry": dict(model_metrics.get("retry", {}) or {}),
+            "recorded_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+        }
+        self._recent_model_turn_usage.append(turn_record)
+        if len(self._recent_model_turn_usage) > 20:
+            self._recent_model_turn_usage = self._recent_model_turn_usage[-20:]
+        return turn_record
+
+    def _record_recovered_model_errors(self, turn_record: Dict[str, Any]) -> None:
+        if not self._observability_metrics:
+            return
+        retry = dict(turn_record.get("retry", {}) or {})
+        errors = [dict(item) for item in retry.get("errors", []) if isinstance(item, dict)]
+        if not errors:
+            return
+        recovery_record = {
+            "turn": int(turn_record.get("turn", 0) or 0),
+            "provider": str(turn_record.get("provider", self.provider) or self.provider),
+            "model": str(turn_record.get("model", self.model_name) or self.model_name),
+            "attempts": int(retry.get("attempts", 0) or 0),
+            "retry_delays_s": list(retry.get("retry_delays_s", []) or []),
+            "fresh_context_retry": bool(retry.get("fresh_context_retry", False)),
+            "errors": errors,
+            "recovered_at": str(turn_record.get("recorded_at", "") or ""),
+        }
+        recoveries = self._observability_metrics.setdefault("recovered_model_errors", [])
+        if isinstance(recoveries, list):
+            recoveries.append(recovery_record)
+            if len(recoveries) > 50:
+                del recoveries[:-50]
+        self._append_observability_block(
+            "".join(
+                [
+                    f"## {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())} - model call recovered\n\n",
+                    "```json\n",
+                    json.dumps(recovery_record, indent=2, ensure_ascii=False),
+                    "\n```\n\n---\n\n",
+                ]
+            )
+        )
+
+    def usage_accounting_state(self) -> Dict[str, Any]:
+        current = self._current_usage_issue()
+        current_issue = dict(self._issue_usage_totals.get(current["issue_id"], {}))
+        if not current_issue:
+            current_issue = {
+                "issue_id": current["issue_id"],
+                "label": current["label"],
+                "totals": self._empty_usage_totals(),
+            }
+        current_issue["totals"] = self._usage_totals_payload(current_issue.get("totals", {}))
+        issues = []
+        for issue_id, bucket in sorted(self._issue_usage_totals.items()):
+            item = {
+                "issue_id": issue_id,
+                "label": str(bucket.get("label", "") or issue_id),
+                "totals": self._usage_totals_payload(bucket.get("totals", {})),
+            }
+            issues.append(item)
+        return {
+            "session": self._usage_totals_payload(self._session_usage_totals),
+            "current_run": self._usage_totals_payload(self._active_run_usage_totals),
+            "current_issue": current_issue,
+            "issues": issues,
+            "recent_turns": list(self._recent_model_turn_usage[-5:]),
+        }
 
     def configure_backoff(self, *, enabled: bool, token_limit_k: int = 0) -> Dict[str, Any]:
         backoff = getattr(self.model, "backoff", None)
@@ -513,11 +827,14 @@ class TreeLoopPlannerWorker:
         if self._discovery_remediation is not None:
             path = str(self._discovery_remediation.get("path", "") or "").strip()
             issue_id = str(self._discovery_remediation.get("issue_id", "") or "").strip()
+            diagnostic_issue_id = str(self._discovery_remediation.get("diagnostic_issue_id", "") or "").strip()
             repo_path = f"/repo/{path}" if path else ""
             focused_block: List[str] = []
             if path:
                 focused_block.append(f"s{len(focused_block) + 1}: cat {repo_path}")
-            if issue_id:
+            elif diagnostic_issue_id:
+                focused_block.append(f"s{len(focused_block) + 1}: show-run-issue {diagnostic_issue_id}")
+            elif issue_id:
                 focused_block.append(f"s{len(focused_block) + 1}: show-issue {issue_id}")
             if not focused_block:
                 focused_block.append("s1: list-run-issues")
@@ -633,6 +950,7 @@ class TreeLoopPlannerWorker:
                 "used": self._goal_skill_mode_used,
             },
             "llm_activity": dict(self._llm_activity),
+            "usage_accounting": self.usage_accounting_state(),
             "patch_resolution": self.patch_resolution_state(),
             "discovery_remediation": self.discovery_remediation_state(),
             "pending_npm_command": dict(self._pending_npm_command) if isinstance(self._pending_npm_command, dict) else None,
@@ -644,6 +962,27 @@ class TreeLoopPlannerWorker:
             "available_skills": self._available_skills_payload(),
             "suggested_next_actions": self.runtime_suggested_next_actions(),
             "issue_state": self.issue_ledger.planner_payload(path=str(self._repo_facts_path())),
+            "issue_context": self._issue_context_state(),
+        }
+
+    def _issue_context_state(self) -> Dict[str, Any]:
+        active = self.issue_ledger.active_issue()
+        run_issues = self.loop.bridge.tree.list_log_issues()
+        return {
+            "active_durable_issue": active.summary() if active is not None else None,
+            "run_diagnostics": [
+                {
+                    "issue_id": str(issue.get("id", "") or ""),
+                    "namespace": "run",
+                    "status": str(issue.get("status", "open") or "open"),
+                    "summary": str(issue.get("summary", issue.get("message", "")) or ""),
+                    "file": str(issue.get("file", "") or ""),
+                    "line": str(issue.get("line", "") or ""),
+                    "code": str(issue.get("code", "") or ""),
+                }
+                for issue in run_issues[:20]
+            ],
+            "focused_run_diagnostic_id": str(self.loop._signal_state.get("current_focus_issue_id", "") or ""),
         }
 
     def execute_operator_action(self, action: Dict[str, Any], *, thought: str = "Operator action from extension UI.") -> ActionResult:
@@ -711,8 +1050,20 @@ class TreeLoopPlannerWorker:
             issue_id = str(action.get("issue_id", "") or action.get("id", "") or "").strip()
             if not issue_id:
                 return ActionResult(ok=False, name=action_type, payload={"error": "show_issue requires issue_id"})
-            issue = self.loop.bridge.tree.show_log_issue(issue_id)
-            durable_issue = None if action_type == "show_run_issue" else self.issue_ledger.get_issue(issue_id)
+            if action_type == "show_run_issue" and issue_id.startswith("issue-"):
+                return ActionResult(
+                    ok=False,
+                    name=action_type,
+                    payload={"error": f"Namespace mismatch: use show_issue for durable planner issue {issue_id}."},
+                )
+            if action_type == "show_issue" and issue_id.startswith("run-"):
+                return ActionResult(
+                    ok=False,
+                    name=action_type,
+                    payload={"error": f"Namespace mismatch: use show_run_issue for transient diagnostic {issue_id}."},
+                )
+            issue = self.loop.bridge.tree.show_log_issue(issue_id) if action_type == "show_run_issue" else None
+            durable_issue = self.issue_ledger.get_issue(issue_id) if action_type == "show_issue" else None
             durable_state = self.issue_ledger.planner_payload(path=str(self._repo_facts_path()))
             found = issue is not None or durable_issue is not None
             if found:
@@ -731,7 +1082,12 @@ class TreeLoopPlannerWorker:
             elif durable_issue is not None:
                 summary = format_issue_record_detail(durable_issue)
             else:
-                summary = format_issue_not_found(issue_id, durable_state)
+                summary = (
+                    f"Run diagnostic not found: {issue_id}\n"
+                    "Run diagnostics are transient and may disappear after validation. Use list-run-issues for the current diagnostic set."
+                    if action_type == "show_run_issue"
+                    else format_issue_not_found(issue_id, durable_state)
+                )
                 self._mark_stale_issue_id(issue_id)
             return ActionResult(
                 ok=True,
@@ -843,6 +1199,38 @@ class TreeLoopPlannerWorker:
         self._sync_fact_map()
         return issue.summary()
 
+    def record_completed_goal(
+        self,
+        *,
+        issue_id: str,
+        plan_summary: str,
+        goal: Dict[str, Any],
+        result: Dict[str, Any],
+        original_index: int,
+        total_goal_count: int,
+    ) -> Dict[str, Any]:
+        # Parallel goal workers may have persisted new facts while this worker
+        # was idle. Merge against the latest ledger before adding a checkpoint.
+        self._reload_repo_facts()
+        resolved_issue_id = str(issue_id or self.active_issue_id or "").strip()
+        checkpoint = CompletedGoalCheckpoint(
+            goal_id=str(goal.get("goal_id", "") or "").strip(),
+            title=str(goal.get("title", "") or "").strip(),
+            goal_signature=str(goal.get("goal_signature", "") or "").strip(),
+            plan_summary=str(plan_summary or "").strip(),
+            final_message=str(result.get("final_message", "") or "").strip(),
+            validation_summary=str(result.get("validation_summary", "") or "").strip(),
+            original_index=int(original_index or 0),
+            total_goal_count=int(total_goal_count or 0),
+            source="execution",
+        )
+        persisted = self.issue_ledger.record_completed_goal(
+            issue_id=resolved_issue_id,
+            checkpoint=checkpoint,
+        )
+        self._persist_repo_facts()
+        return persisted.to_dict()
+
     def create_issue(
         self,
         *,
@@ -910,6 +1298,7 @@ class TreeLoopPlannerWorker:
     def activate_issue(self, issue_id: str) -> Dict[str, Any]:
         issue = self.issue_ledger.activate_issue(str(issue_id or "").strip())
         self.active_issue_id = issue.issue_id
+        self._import_legacy_observability_checkpoints()
         self._persist_repo_facts()
         self._sync_fact_map()
         return issue.summary()
@@ -923,7 +1312,15 @@ class TreeLoopPlannerWorker:
         self._bridge_step_counter = 0
         self._reset_run_observability(self._current_task)
         self._refresh_loop_steering()
-        loop_result = self.loop.run(self._current_task)
+        try:
+            loop_result = self.loop.run(self._current_task)
+        except Exception as exc:
+            self.history = self.loop.history
+            self._task_satisfied = False
+            self._observability_metrics["outcome"] = "failed"
+            failure_message = f"Worker execution failed: {exc}"
+            self._flush_observability(failure_message)
+            raise
         self.history = self.loop.history
         touched_paths = self._collect_touched_paths(self.loop.history)
         validation = self._finalize_validation(loop_result)
@@ -932,6 +1329,7 @@ class TreeLoopPlannerWorker:
         final_message = str(loop_result.finish_message or loop_result.summary())
         if loop_result.finished and not validation.passed:
             final_message = f"{final_message} Validation required: {validation.summary}"
+        self._observability_metrics["outcome"] = "completed" if task_satisfied else "incomplete"
         self._flush_observability(final_message)
         return WorkerRunResult(
             ok=bool(loop_result.finished and task_satisfied),
@@ -948,10 +1346,13 @@ class TreeLoopPlannerWorker:
             return None
 
         command_preview = str(command or "").strip()
+        normalized_command_preview = command_preview
+        if normalized_command_preview.startswith("[") and "] " in normalized_command_preview:
+            normalized_command_preview = normalized_command_preview.split("] ", 1)[1].strip()
         action = result.tool_action if isinstance(result.tool_action, dict) else {}
         action_type = str(action.get("type", "") or "").strip()
         if not action_type:
-            parts = shlex.split(command_preview) if command_preview else []
+            parts = shlex.split(normalized_command_preview) if normalized_command_preview else []
             action_type = str(parts[0]).strip().lower().replace("-", "_") if parts else (result.command_type or "step")
 
         path_value = action.get("path", "")
@@ -960,9 +1361,24 @@ class TreeLoopPlannerWorker:
         else:
             path = str(path_value or "").strip()
 
-        if not path and command_preview:
-            parts = shlex.split(command_preview)
-            if len(parts) >= 2 and parts[0].lower() not in {"finish", "skill", "git", "shell", "batch"}:
+        issue_namespace = ""
+        issue_id = ""
+        preview_parts = shlex.split(normalized_command_preview) if normalized_command_preview else []
+        if action_type in {"show_run_issue", "resolve_run_issue", "reopen_run_issue"}:
+            issue_namespace = "run"
+            issue_id = str(preview_parts[1] or "").strip() if len(preview_parts) >= 2 else ""
+        elif action_type in {"show_issue", "resolve_issue", "reopen_issue"}:
+            issue_namespace = "durable"
+            issue_id = str(preview_parts[1] or "").strip() if len(preview_parts) >= 2 else ""
+
+        if not path and normalized_command_preview:
+            parts = preview_parts
+            non_path_commands = {
+                "finish", "skill", "git", "shell", "batch", "fact",
+                "list-issues", "list-run-issues", "show-issue", "show-run-issue",
+                "resolve-issue", "resolve-run-issue", "reopen-issue", "reopen-run-issue",
+            }
+            if len(parts) >= 2 and parts[0].lower() not in non_path_commands:
                 candidate = str(parts[1] or "").strip().removeprefix("/repo/").removeprefix("repo/")
                 path = candidate.split(":", 1)[0]
 
@@ -990,6 +1406,9 @@ class TreeLoopPlannerWorker:
             "step": self._bridge_step_counter,
             "action_type": action_type or "step",
             "path": path,
+            "command": normalized_command_preview,
+            "issue_namespace": issue_namespace,
+            "issue_id": issue_id,
             "ok": bool(result.ok),
             "elapsed_s": 0,
             "thought": "",
@@ -1019,13 +1438,34 @@ class TreeLoopPlannerWorker:
         except Exception:
             pass
 
-    def _emit_model_progress(self, event: str, *, turn: int = 0, elapsed_s: float = 0.0, output_chars: int = 0, error: str = "") -> None:
+    def _emit_model_progress(
+        self,
+        event: str,
+        *,
+        turn: int = 0,
+        elapsed_s: float = 0.0,
+        output_chars: int = 0,
+        error: str = "",
+        status_code: Optional[int] = None,
+        request_id: str = "",
+        retry_attempts: int = 0,
+        retry_request_ids: Optional[List[str]] = None,
+        retry_after: str = "",
+        retry_delays_s: Optional[List[float]] = None,
+        rate_limit_headers: Optional[Dict[str, str]] = None,
+        fresh_context_retry: bool = False,
+        output_valid: bool = True,
+        repair_pending: bool = False,
+        repair_attempt: int = 0,
+    ) -> None:
         if not callable(self.on_step_callback):
             return
         self._bridge_step_counter += 1
         ok = True
         if event == "model_call_start":
             summary = f"Waiting on {self.provider}/{self.model_name} for turn {turn}."
+        elif event == "model_call_finish" and repair_pending:
+            summary = f"Model output failed command preflight on turn {turn}; retrying format in the same turn."
         elif event == "model_call_finish":
             summary = f"Model responded on turn {turn} in {elapsed_s:.2f}s ({output_chars} chars)."
         elif event == "model_call_interrupted":
@@ -1033,7 +1473,10 @@ class TreeLoopPlannerWorker:
             summary = f"Model call interrupted on turn {turn}."
         elif event == "model_call_error":
             ok = False
-            summary = f"Model call failed on turn {turn}: {error or 'unknown error'}"
+            status = f"HTTP {status_code} " if status_code is not None else ""
+            request = f" (request {request_id})" if request_id else ""
+            attempts = f" after {retry_attempts} attempts" if retry_attempts else ""
+            summary = f"Model call failed on turn {turn}{attempts}: {status}{error or 'unknown error'}{request}"
         else:
             summary = event.replace("_", " ")
         try:
@@ -1070,6 +1513,21 @@ class TreeLoopPlannerWorker:
         elapsed_s = float((payload or {}).get("elapsed_s", 0.0) or 0.0)
         output_chars = int((payload or {}).get("output_chars", 0) or 0)
         error = str((payload or {}).get("error", "") or "").strip()
+        raw_status_code = (payload or {}).get("status_code")
+        try:
+            status_code = int(raw_status_code) if raw_status_code is not None else None
+        except (TypeError, ValueError):
+            status_code = None
+        request_id = str((payload or {}).get("request_id", "") or "").strip()
+        retry_attempts = int((payload or {}).get("retry_attempts", 0) or 0)
+        retry_request_ids = list((payload or {}).get("retry_request_ids", []) or [])
+        retry_after = str((payload or {}).get("retry_after", "") or "").strip()
+        retry_delays_s = list((payload or {}).get("retry_delays_s", []) or [])
+        rate_limit_headers = dict((payload or {}).get("rate_limit_headers", {}) or {})
+        fresh_context_retry = bool((payload or {}).get("fresh_context_retry", False))
+        output_valid = bool((payload or {}).get("output_valid", True))
+        repair_pending = bool((payload or {}).get("repair_pending", False))
+        repair_attempt = int((payload or {}).get("repair_attempt", 0) or 0)
         self._llm_activity = {
             "in_flight": event == "model_call_start",
             "turn": turn,
@@ -1077,8 +1535,72 @@ class TreeLoopPlannerWorker:
             "elapsed_s": round(elapsed_s, 3),
             "output_chars": output_chars,
             "error": error,
+            "status_code": status_code,
+            "request_id": request_id,
+            "retry_attempts": retry_attempts,
+            "retry_request_ids": retry_request_ids,
+            "retry_after": retry_after,
+            "retry_delays_s": retry_delays_s,
+            "rate_limit_headers": rate_limit_headers,
+            "fresh_context_retry": fresh_context_retry,
+            "repair_attempt": repair_attempt,
+            "output_valid": output_valid,
         }
-        self._emit_model_progress(event, turn=turn, elapsed_s=elapsed_s, output_chars=output_chars, error=error)
+        if event == "model_call_finish":
+            turn_record = self._record_model_usage_turn(turn=turn, elapsed_s=elapsed_s, output_chars=output_chars)
+            self._record_recovered_model_errors(turn_record)
+            if self._observability_metrics:
+                self._observability_metrics["usage_accounting"] = self.usage_accounting_state()
+                if repair_pending:
+                    self._observability_metrics["model_output_repairs"] = int(
+                        self._observability_metrics.get("model_output_repairs", 0) or 0
+                    ) + 1
+                self._write_observability_snapshot(final_message="Run in progress.", finished=False)
+        elif event == "model_call_error" and self._observability_metrics:
+            error_record = {
+                "turn": turn,
+                "provider": self.provider,
+                "model": self.model_name,
+                "elapsed_s": round(elapsed_s, 3),
+                "status_code": status_code,
+                "request_id": request_id,
+                "retry_attempts": retry_attempts,
+                "retry_request_ids": retry_request_ids,
+                "retry_after": retry_after,
+                "retry_delays_s": retry_delays_s,
+                "rate_limit_headers": rate_limit_headers,
+                "fresh_context_retry": fresh_context_retry,
+                "error": error,
+            }
+            self._observability_metrics["last_model_error"] = error_record
+            self._append_observability_block(
+                "".join(
+                    [
+                        f"## {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())} - model call error\n\n",
+                        "```json\n",
+                        json.dumps(error_record, indent=2, ensure_ascii=False),
+                        "\n```\n\n---\n\n",
+                    ]
+                )
+            )
+        self._emit_model_progress(
+            event,
+            turn=turn,
+            elapsed_s=elapsed_s,
+            output_chars=output_chars,
+            error=error,
+            status_code=status_code,
+            request_id=request_id,
+            retry_attempts=retry_attempts,
+            retry_request_ids=retry_request_ids,
+            retry_after=retry_after,
+            retry_delays_s=retry_delays_s,
+            rate_limit_headers=rate_limit_headers,
+            fresh_context_retry=fresh_context_retry,
+            output_valid=output_valid,
+            repair_pending=repair_pending,
+            repair_attempt=repair_attempt,
+        )
 
     def _compose_steering(self) -> str:
         parts: List[str] = []
@@ -1096,6 +1618,17 @@ class TreeLoopPlannerWorker:
             "Issue lifecycle: treat closed durable repo_facts issues as historical context only. "
             "Do not reopen a closed issue unless the task explicitly requires that exact issue; prefer continuing an open issue or creating a new follow-up issue."
         )
+        active_durable_issue = self.issue_ledger.active_issue()
+        if active_durable_issue is not None:
+            durable_summary = str(
+                active_durable_issue.plan_summary
+                or active_durable_issue.request_summary
+                or active_durable_issue.issue_id
+            ).strip()
+            parts.append(
+                f"[ACTIVE DURABLE ISSUE] {active_durable_issue.issue_id}: {durable_summary}. "
+                "This is the planner work item you are executing. IDs beginning with `run-` are transient validation diagnostics within this work item, not alternate planner issues."
+            )
         if self._stale_issue_ids:
             stale = ", ".join(sorted(self._stale_issue_ids)[:8])
             parts.append(
@@ -1111,6 +1644,7 @@ class TreeLoopPlannerWorker:
                         f"Discovery mode: {self.discovery_budget.mode_label}.",
                         f"Discovery budget: at most {self.discovery_budget.max_tool_calls} tool-backed actions.",
                         "Do not modify files during discovery. Finish with a concise discovery summary.",
+                        "Start broad discovery with `repo-map /repo topic=\"<task topic>\" limit=20`, then drill down with symbols, find-symbol, grep, cat, or read-line-range.",
                         "Record useful findings with executable fact commands, for example: `fact demo/goal/entrypoint planner.py owns discovery mode`.",
                         "Fact commands are allowed after the tool-call budget is exhausted, but they must include a non-empty key and value.",
                     ]
@@ -1183,8 +1717,10 @@ class TreeLoopPlannerWorker:
     def _reset_run_observability(self, task: str) -> None:
         self._observability_started_at = time.time()
         self._observability_buffer = []
+        self._active_run_usage_totals = self._empty_usage_totals()
         self._observability_metrics = {
             "task": str(task or ""),
+            "outcome": "running",
             "provider": self.provider,
             "model": self.model_name,
             "root": str(self.root),
@@ -1192,6 +1728,9 @@ class TreeLoopPlannerWorker:
             "steps": 0,
             "successful_actions": 0,
             "failed_actions": 0,
+            "model_output_repairs": 0,
+            "recovered_model_errors": [],
+            "usage_accounting": self.usage_accounting_state(),
         }
         self._write_observability_snapshot(final_message="Run in progress.", finished=False)
 
@@ -1303,6 +1842,7 @@ class TreeLoopPlannerWorker:
             "available_skills": self._available_skills_payload(),
             "suggested_next_actions": self.runtime_suggested_next_actions(),
             "issue_state": self.issue_ledger.planner_payload(path=str(self._repo_facts_path())),
+            "issue_context": self._issue_context_state(),
         }
         if self._latest_review is not None:
             payload["latest_review"] = dict(self._latest_review)
@@ -1342,6 +1882,10 @@ class TreeLoopPlannerWorker:
             "elapsed_s": 0.0,
             "output_chars": 0,
             "error": "",
+            "status_code": None,
+            "request_id": "",
+            "repair_attempt": 0,
+            "output_valid": True,
         }
         if hasattr(self.loop, "_same_turn_halt_reason"):
             self.loop._same_turn_halt_reason = ""
@@ -1495,6 +2039,8 @@ class TreeLoopPlannerWorker:
         next_required_action: Dict[str, Any]
         if path:
             next_required_action = {"type": "read_file", "path": path}
+        elif diagnostic_issue_id:
+            next_required_action = {"type": "show_run_issue", "issue_id": diagnostic_issue_id}
         elif issue_id:
             next_required_action = {"type": "show_issue", "issue_id": issue_id}
         else:
@@ -1523,12 +2069,17 @@ class TreeLoopPlannerWorker:
             | {"drop_context", "git_diff", "show_diff", "review_changes", "run_check", "run_route_check"}
         ):
             return None
-        target = str((self._discovery_remediation or {}).get("path", "") or (self._discovery_remediation or {}).get("issue_id", "") or "the surfaced issue")
+        target = str(
+            (self._discovery_remediation or {}).get("path", "")
+            or (self._discovery_remediation or {}).get("diagnostic_issue_id", "")
+            or (self._discovery_remediation or {}).get("issue_id", "")
+            or "the surfaced issue"
+        )
         if action_type == "list_issues" and target == "the surfaced issue":
             return None
         return (
             f"discovery remediation active: inspect {target} with read_file, read_line_range, grep, "
-            "show_issue, or show_run_issue before mutating or finishing"
+            "repo_map, show_issue, or show_run_issue before mutating or finishing"
         )
 
     def _maybe_resolve_discovery_remediation(self, action_type: str, path: str = "", issue_id: str = "") -> bool:
@@ -1543,15 +2094,11 @@ class TreeLoopPlannerWorker:
         if action_type in DISCOVERY_REMEDIATION_READ_SATISFIERS:
             resolved = bool(normalized_path and resolution_path and normalized_path == resolution_path)
         elif action_type == "show_issue":
-            resolved = bool(
-                issue_id
-                and (
-                    (resolution_issue_id and issue_id == resolution_issue_id)
-                    or (diagnostic_issue_id and issue_id == diagnostic_issue_id)
-                )
-            )
-        elif action_type == "list_issues":
-            resolved = not resolution_path and not resolution_issue_id
+            resolved = bool(issue_id and resolution_issue_id and issue_id == resolution_issue_id)
+        elif action_type == "show_run_issue":
+            resolved = bool(issue_id and diagnostic_issue_id and issue_id == diagnostic_issue_id)
+        elif action_type in {"list_issues", "list_run_issues"}:
+            resolved = not resolution_path and not resolution_issue_id and not diagnostic_issue_id
 
         if not resolved:
             return False
@@ -1657,7 +2204,7 @@ class TreeLoopPlannerWorker:
         fact_action = action_type in FACT_ACTION_TYPES
 
         if self.discovery_budget is not None and result.needs_tool:
-            if action_type in {"write_file", "replace_lines", "patch_file", "git_add", "git_restore", "git_commit", "npm_command"}:
+            if action_type in {"write_file", "replace_lines", "patch_file", "npm_command"} | GIT_MUTATION_ACTION_TYPES:
                 result.ok = False
                 return "Discovery mode is read-only. Finish discovery before mutating repository state."
             if self.discovery_budget.exhausted and action_type != "finish" and not fact_action:
@@ -1772,8 +2319,8 @@ class TreeLoopPlannerWorker:
             self._refresh_loop_steering()
             self._emit_step_progress(command, result)
             return
-        if action_type in {"write_file", "replace_lines", "patch_file", "git_add", "git_restore", "git_commit", "npm_command"}:
-            path_value = action.get("path")
+        if action_type in {"write_file", "replace_lines", "patch_file", "npm_command"} | GIT_MUTATION_ACTION_TYPES:
+            path_value = action.get("path") or action.get("paths") or action.get("source") or action.get("destination")
             pending_path = ""
             if isinstance(path_value, list):
                 pending_path = str(path_value[0] or "") if path_value else ""
@@ -1815,18 +2362,24 @@ class TreeLoopPlannerWorker:
             pending_path = str((self._pending_verification or {}).get("path", "") or "")
             if read_path and pending_path and read_path == pending_path:
                 self._mark_path_validated(read_path)
-            if shown_issue_id and "Issue not found:" in str(result.output or ""):
+            if shown_issue_id and (
+                "Issue not found:" in str(result.output or "")
+                or "Run diagnostic not found:" in str(result.output or "")
+            ):
                 self._mark_stale_issue_id(shown_issue_id)
             self._maybe_resolve_patch_resolution("read_file", read_path)
             self._maybe_resolve_discovery_remediation("read_file", read_path)
             if shown_issue_id:
-                self._maybe_resolve_discovery_remediation("show_issue", issue_id=shown_issue_id)
-            elif normalized_command in {"list-issues", "list-run-issues"}:
+                shown_action = "show_run_issue" if normalized_command.startswith("show-run-issue ") else "show_issue"
+                self._maybe_resolve_discovery_remediation(shown_action, issue_id=shown_issue_id)
+            elif normalized_command == "list-issues":
                 self._maybe_resolve_discovery_remediation("list_issues")
+            elif normalized_command == "list-run-issues":
+                self._maybe_resolve_discovery_remediation("list_run_issues")
             self._emit_step_progress(command, result)
             return
 
-        if action_type in {"run_check", "git_diff", "show_diff", "review_changes", "run_shell"} and self._has_mutation:
+        if action_type in {"run_check", "show_diff", "review_changes", "run_shell"} | GIT_READ_ACTION_TYPES and self._has_mutation:
             self._pending_verification = None
             self._validation_after_mutation = True
             self._completion_check_pending = True
@@ -1973,7 +2526,7 @@ class TreeLoopPlannerWorker:
 
     def _extract_result_path(self, command: str, result: CommandResult) -> str:
         action = result.tool_action or {}
-        path = action.get("path")
+        path = action.get("path") or action.get("paths") or action.get("source") or action.get("destination")
         if isinstance(path, str) and path.strip():
             return path.strip()
         if isinstance(path, list) and path:
@@ -1998,6 +2551,10 @@ class TreeLoopPlannerWorker:
             if len(parts) >= 2:
                 return parts[1].removeprefix("/repo/").removeprefix("repo/").strip()
         if normalized.startswith("grep /repo/"):
+            parts = normalized.split()
+            if len(parts) >= 2:
+                return parts[1].removeprefix("/repo/").removeprefix("repo/").strip()
+        if normalized.startswith("repo-map /repo/") or normalized.startswith("repo_map /repo/"):
             parts = normalized.split()
             if len(parts) >= 2:
                 return parts[1].removeprefix("/repo/").removeprefix("repo/").strip()
@@ -2080,13 +2637,13 @@ class TreeLoopPlannerWorker:
             return f"Show Issue {issue_id}" if issue_id else "Show Issue"
         if action_type == "show_run_issue":
             issue_id = str(action.get("issue_id", "") or action.get("id", "") or "").strip()
-            return f"Show Run Issue {issue_id}" if issue_id else "Show Run Issue"
+            return f"Show Run Diagnostic {issue_id}" if issue_id else "Show Run Diagnostic"
         if action_type == "close_active_issue":
             return "Close Active Issue"
         if action_type == "list_issues":
             return "List Issues"
         if action_type == "list_run_issues":
-            return "List Run Issues"
+            return "List Run Diagnostics"
         if action_type == "approve_npm_command":
             return "Approve NPM Command"
         if action_type == "reject_npm_command":
@@ -2150,12 +2707,15 @@ class TreeLoopPlannerWorker:
         suggestions: List[Dict[str, Any]] = []
         path = str((self._discovery_remediation or {}).get("path", "") or "").strip()
         issue_id = str((self._discovery_remediation or {}).get("issue_id", "") or "").strip()
+        diagnostic_issue_id = str((self._discovery_remediation or {}).get("diagnostic_issue_id", "") or "").strip()
         if path:
             suggestions.append({"type": "read_file", "path": path})
             suggestions.append({"type": "show_diff", "path": path})
             suggestions.append({"type": "review_changes", "path": path, "limit": 20})
         if issue_id and issue_id not in self._stale_issue_ids:
             suggestions.append({"type": "show_issue", "issue_id": issue_id})
+        if not path and diagnostic_issue_id and diagnostic_issue_id not in self._stale_issue_ids:
+            suggestions.append({"type": "show_run_issue", "issue_id": diagnostic_issue_id})
         suggestions.append({"type": "list_issues"})
         suggestions.append({"type": "list_run_issues"})
         suggestions.append({"type": "drop_context", "reason": "Reset discovery remediation"})
@@ -2301,25 +2861,41 @@ class TreeLoopPlannerWorker:
         self._reset_guard_state()
         return "context dropped"
 
-    def _run_git(self, args: List[str]) -> Tuple[int, str, str]:
-        completed = subprocess.run(
-            ["git", *args],
-            cwd=str(self.root),
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
+    def _run_git(self, args: List[str], *, timeout: int = 60) -> Tuple[int, str, str]:
+        try:
+            completed = subprocess.run(
+                ["git", *args],
+                cwd=str(self.root),
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            return 124, "", f"timed out after {timeout}s"
         return completed.returncode, completed.stdout.strip(), completed.stderr.strip()
 
     def _exec_git_status(self, action: Dict[str, Any]) -> str:
-        code, stdout, stderr = self._run_git(["status", "--short"])
+        args = ["status", "--short"]
+        if action.get("branch"):
+            args.append("--branch")
+        if action.get("ignored"):
+            args.append("--ignored")
+        code, stdout, stderr = self._run_git(args)
         if code != 0:
             return f"git status failed: {stderr or stdout or code}"
         return stdout or "working tree clean"
 
     def _exec_git_diff(self, action: Dict[str, Any]) -> str:
         path = str(action.get("path", "") or "").strip()
-        args = ["diff", "--", path] if path else ["diff"]
+        args = ["diff"]
+        if action.get("staged"):
+            args.append("--staged")
+        if action.get("stat"):
+            args.append("--stat")
+        if action.get("name_only"):
+            args.append("--name-only")
+        if path:
+            args.extend(["--", path])
         code, stdout, stderr = self._run_git(args)
         if code != 0:
             return f"git diff failed: {stderr or stdout or code}"
@@ -2383,22 +2959,41 @@ class TreeLoopPlannerWorker:
         return self._latest_review["summary"]
 
     def _exec_git_add(self, action: Dict[str, Any]) -> str:
-        raw_paths = action.get("path")
+        raw_paths = action.get("paths", action.get("path"))
         paths = raw_paths if isinstance(raw_paths, list) else [raw_paths]
         clean_paths = [str(item or "").strip() for item in paths if str(item or "").strip()]
-        code, stdout, stderr = self._run_git(["add", *clean_paths])
+        code, stdout, stderr = self._run_git(["add", "--", *clean_paths])
         if code != 0:
             return f"git add failed: {stderr or stdout or code}"
         return "staged: " + ", ".join(clean_paths)
 
     def _exec_git_restore(self, action: Dict[str, Any]) -> str:
-        raw_paths = action.get("path")
+        raw_paths = action.get("paths", action.get("path"))
         paths = raw_paths if isinstance(raw_paths, list) else [raw_paths]
         clean_paths = [str(item or "").strip() for item in paths if str(item or "").strip()]
-        code, stdout, stderr = self._run_git(["restore", *clean_paths])
+        args = ["restore"]
+        if action.get("staged"):
+            args.append("--staged")
+        args.extend(["--", *clean_paths])
+        code, stdout, stderr = self._run_git(args)
         if code != 0:
             return f"git restore failed: {stderr or stdout or code}"
         return "restored: " + ", ".join(clean_paths)
+
+    def _exec_git_mv(self, action: Dict[str, Any]) -> str:
+        source = str(action.get("source", "") or "").strip()
+        destination = str(action.get("destination", "") or "").strip()
+        code, stdout, stderr = self._run_git(["mv", "--", source, destination])
+        if code != 0:
+            return f"git mv failed: {stderr or stdout or code}"
+        return f"moved: {source} -> {destination}"
+
+    def _exec_git_rm(self, action: Dict[str, Any]) -> str:
+        paths = [str(item or "").strip() for item in action.get("paths", []) if str(item or "").strip()]
+        code, stdout, stderr = self._run_git(["rm", "--", *paths])
+        if code != 0:
+            return f"git rm failed: {stderr or stdout or code}"
+        return stdout or "removed: " + ", ".join(paths)
 
     def _exec_git_commit(self, action: Dict[str, Any]) -> str:
         message = str(action.get("message", "") or "").strip()
@@ -2410,16 +3005,111 @@ class TreeLoopPlannerWorker:
         return stdout or "commit created"
 
     def _exec_git_log(self, action: Dict[str, Any]) -> str:
-        code, stdout, stderr = self._run_git(["log", "--oneline", "-5"])
+        limit = max(1, min(100, int(action.get("limit", 5) or 5)))
+        revision = str(action.get("revision", "") or "").strip()
+        path = str(action.get("path", "") or "").strip()
+        args = ["log", "--oneline", f"-{limit}"]
+        if revision:
+            args.append(revision)
+        if path:
+            args.extend(["--", path])
+        code, stdout, stderr = self._run_git(args)
         if code != 0:
             return f"git log failed: {stderr or stdout or code}"
         return stdout or "no commits"
 
     def _exec_git_branch(self, action: Dict[str, Any]) -> str:
-        code, stdout, stderr = self._run_git(["branch", "--show-current"])
+        mode = str(action.get("mode", "current") or "current")
+        args = ["branch", "-vv"] if mode == "verbose" else (["branch", "--list"] if mode == "list" else ["branch", "--show-current"])
+        code, stdout, stderr = self._run_git(args)
         if code != 0:
             return f"git branch failed: {stderr or stdout or code}"
         return stdout or "detached"
+
+    def _exec_git_remote(self, action: Dict[str, Any]) -> str:
+        mode = str(action.get("mode", "list") or "list")
+        if mode == "verbose":
+            args = ["remote", "-v"]
+        elif mode == "get_url":
+            args = ["remote", "get-url", str(action.get("remote", "") or "")]
+        else:
+            args = ["remote"]
+        code, stdout, stderr = self._run_git(args)
+        if code != 0:
+            return f"git remote failed: {stderr or stdout or code}"
+        return stdout or "no remotes configured"
+
+    def _exec_git_rev_parse(self, action: Dict[str, Any]) -> str:
+        args = [str(item) for item in action.get("args", [])]
+        code, stdout, stderr = self._run_git(["rev-parse", *args])
+        if code != 0:
+            return f"git rev-parse failed: {stderr or stdout or code}"
+        return stdout
+
+    def _exec_git_show(self, action: Dict[str, Any]) -> str:
+        args = ["show", "--format=fuller"]
+        if action.get("stat"):
+            args.append("--stat")
+        if action.get("name_only"):
+            args.append("--name-only")
+        args.append(str(action.get("ref", "HEAD") or "HEAD"))
+        path = str(action.get("path", "") or "").strip()
+        if path:
+            args.extend(["--", path])
+        code, stdout, stderr = self._run_git(args)
+        if code != 0:
+            return f"git show failed: {stderr or stdout or code}"
+        return stdout or "no commit data"
+
+    def _exec_git_blame(self, action: Dict[str, Any]) -> str:
+        args = ["blame"]
+        line_range = str(action.get("line_range", "") or "").strip()
+        if line_range:
+            args.extend(["-L", line_range])
+        args.extend(["--", str(action.get("path", "") or "")])
+        code, stdout, stderr = self._run_git(args)
+        if code != 0:
+            return f"git blame failed: {stderr or stdout or code}"
+        return stdout or "no blame data"
+
+    def _git_push_is_authorized(self) -> bool:
+        task = str(self._current_task or "").lower()
+        if re.search(r"\b(?:do not|don't|dont|never|without)\s+(?:git\s+)?push\b", task):
+            return False
+        return bool(
+            re.search(r"\bgit\s+push\b", task)
+            or re.search(r"\bcommit\s+and\s+push\b", task)
+            or re.search(r"\bpush(?:ing)?\s+(?:to\s+)?(?:the\s+)?(?:remote|branch|upstream|origin)\b", task)
+        )
+
+    def _exec_git_push(self, action: Dict[str, Any]) -> str:
+        if not self._git_push_is_authorized():
+            return "git push failed: current task does not explicitly authorize a remote push"
+        args = ["push"]
+        if action.get("set_upstream"):
+            args.append("--set-upstream")
+        remote = str(action.get("remote", "") or "").strip()
+        branch = str(action.get("branch", "") or "").strip()
+        if remote:
+            args.append(remote)
+        if branch:
+            args.append(branch)
+        code, stdout, stderr = self._run_git(args, timeout=120)
+        if code != 0:
+            return f"git push failed: {stderr or stdout or code}"
+        return stdout or stderr or "push completed"
+
+    def _exec_git_ls_remote(self, action: Dict[str, Any]) -> str:
+        args = ["ls-remote", str(action.get("remote", "") or "")]
+        ref = str(action.get("ref", "") or "").strip()
+        if ref:
+            args.append(ref)
+        code, stdout, stderr = self._run_git(args, timeout=120)
+        if code != 0:
+            return f"git ls-remote failed: {stderr or stdout or code}"
+        if ref and not stdout:
+            return f"git ls-remote failed: remote ref not found: {ref}"
+        return stdout or "remote has no refs"
 
 
 def make_loop(

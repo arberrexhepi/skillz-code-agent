@@ -47,7 +47,8 @@ modes:
     symbols:    { type: array }
     notes:      { type: array }
   invariants:
-    - Use only lightweight discovery (list_files, find_files, search_in_files)
+    - Start with repo_map when the topic is broad or unfamiliar
+    - Use only lightweight discovery (repo_map, list_files, find_files, search_in_files)
     - Avoid deep tracing or full file reads
     - Return quickly with best-effort candidates
   allowed_variance:
@@ -68,6 +69,7 @@ Use fast discovery when speed matters more than completeness.
    - collect candidate files and symbol mentions
 
 2. If topic provided:
+  - repo_map(path=".", topic="...", limit=10) to orient on files, symbols, constants, imports, and drill-down targets
   - semantic_search(intent="...", path=".") or search_in_files(query="...", path=".")
    - extract likely files
 
@@ -75,6 +77,7 @@ Use fast discovery when speed matters more than completeness.
   - return the normalized file path directly as a candidate
 
 4. Lightweight owned commands in this mode:
+  - repo_map(path=".", topic="...", limit=N)
   - list_files(path=".", recursive=true, max_depth=N)
   - find_files(path=".", glob="pattern")
   - search_in_files(path=".", query="...")
@@ -127,6 +130,10 @@ Use fast discovery when speed matters more than completeness.
 
 Use standard discovery before most mutations.
 
+0. Start with structural orientation:
+  - repo_map(path=".", topic="...", limit=20) when the request is topic-level or unfamiliar
+  - use its ranked files, symbols, imports, and drill_down suggestions before line-range reads
+
 1. If symbol provided:
   - find_symbol_definitions(symbol_name="...", path=".")
   - read_symbol(path="...", symbol_name="...", symbol_kind="class|function|method|variable")
@@ -139,6 +146,7 @@ Use standard discovery before most mutations.
   - find_related_tests(path="...") when mutation risk touches behavior
 
 3. If topic provided:
+  - repo_map(path=".", topic="...", limit=20)
   - semantic_search(intent="...", path=".")
   - search_in_files(query="...", path=".")
 
@@ -200,6 +208,7 @@ Use deep discovery for structural or high-risk changes.
 1. Perform all standard steps
 
 2. Additionally:
+  - repo_map(path=".", topic="...", limit=40, symbols_per_file=16) to establish repository structure and central files
   - trace_dependencies(path="...", direction="both", depth=2)
   - find_related_configs(path="...")
   - expand related_files and tests with `find_related_files(path="...")` and `find_related_tests(path="...")`

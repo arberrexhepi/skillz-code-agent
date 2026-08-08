@@ -66,6 +66,11 @@ present_plan:
   }
 }
 
+Dependency rules:
+- goals are listed in execution order
+- depends_on may reference only a goal_id that appears earlier in the same goals list
+- for continuation plans, do not reference completed goals omitted from the new goals list
+
 offer_discovery:
 {
   \"thought\": \"...\",
@@ -163,6 +168,8 @@ Rules for present_plan tag mode:
 - <goal_id>, <title>, <goal_text>, <reason>, <depends_on>, <preserve_context>, <parallelizable>, <estimated_scope>, <delegation_note>, <success_signal>, and <relevant_fact_key> must appear only inside a <goal> block
 - never place goal fields directly under <action>
 - after <confirmation_prompt>, emit one or more <goal> blocks immediately
+- goals are listed in execution order; <depends_on> may reference only an earlier goal in the same plan
+- continuation plans must not reference completed goals omitted from the new plan
 """.strip()
 
 

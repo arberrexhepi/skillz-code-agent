@@ -4,10 +4,12 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
+from email.utils import parsedate_to_datetime
 import importlib
 import hashlib
 import json
 import os
+import random
 import re
 import shlex
 import shutil
@@ -18,7 +20,7 @@ import textwrap
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Tuple, cast
+from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple, cast
 from issue_facts import FACT_TYPE_ARCHITECTURE, FACT_TYPE_GOAL, IssueFactLedger, IssueFactRecord
 from memory_manager import MemoryManager, MemoryQuery
 from project_diagnostics import run_backend_diagnostics
@@ -102,11 +104,13 @@ def _env_flag_enabled(name: str, default: bool = True) -> bool:
 #
 # Env vars:
 #   OPENAI_API_KEY=...
+#   META_AI_API_KEY=...
 #   GEMINI_API_KEY=...
 #   ANTHROPIC_API_KEY=...
 #
 # Examples:
 #   python agent_cli.py --provider openai --model gpt-5.4 --root /path/to/repo
+#   python agent_cli.py --provider meta --model muse-spark-1.2 --root /path/to/repo
 #   python agent_cli.py --provider gemini --model gemini-3-flash-preview --root /path/to/repo
 #   python agent_cli.py --provider anthropic --model claude-sonnet-4-20250514 --root /path/to/repo
 #
@@ -404,6 +408,36 @@ def _format_usd(value: float) -> str:
     return f"${value:.6f}"
 
 
+def _extract_attr_or_key(obj: Any, key: str) -> Any:
+    if obj is None:
+        return None
+    if isinstance(obj, dict):
+        return obj.get(key)
+    return getattr(obj, key, None)
+
+
+def _usage_to_dict(usage: Any) -> Dict[str, Any]:
+    usage_dict: Dict[str, Any] = {}
+    if usage is None:
+        return usage_dict
+    if isinstance(usage, dict):
+        usage_dict = dict(usage)
+    else:
+        for key in ["input_tokens", "output_tokens", "total_tokens"]:
+            value = getattr(usage, key, None)
+            if value is not None:
+                usage_dict[key] = value
+    input_details = _extract_attr_or_key(usage, "input_tokens_details")
+    cached_tokens = _extract_attr_or_key(input_details, "cached_tokens")
+    if cached_tokens is not None:
+        usage_dict["cached_tokens"] = cached_tokens
+    output_details = _extract_attr_or_key(usage, "output_tokens_details")
+    reasoning_tokens = _extract_attr_or_key(output_details, "reasoning_tokens")
+    if reasoning_tokens is not None:
+        usage_dict["reasoning_tokens"] = reasoning_tokens
+    return usage_dict
+
+
 class TokenUsageEstimator:
     def __init__(self, pricing_catalog: Optional[List[Dict[str, Any]]] = None) -> None:
         self.pricing_catalog = pricing_catalog or ESTIMATED_MODEL_PRICING
@@ -417,7 +451,7 @@ class TokenUsageEstimator:
     ) -> TokenUsageSnapshot:
         normalized_provider = str(provider or "").strip().lower()
         normalized_model = str(model or "").strip()
-        input_tokens, output_tokens, total_tokens, reasoning_tokens = self._normalize_usage(
+        input_tokens, output_tokens, total_tokens, reasoning_tokens, cached_tokens = self._normalize_usage(
             normalized_provider, usage
         )
         pricing = self._lookup_pricing(normalized_provider, normalized_model)
@@ -443,6 +477,7 @@ class TokenUsageEstimator:
             output_tokens=output_tokens,
             total_tokens=total_tokens,
             reasoning_tokens=reasoning_tokens,
+            cached_tokens=cached_tokens,
             estimated_cost_usd=estimated_cost_usd,
             input_cost_usd=input_cost_usd,
             output_cost_usd=output_cost_usd,
@@ -459,6 +494,8 @@ class TokenUsageEstimator:
         ]
         if snapshot.reasoning_tokens:
             parts.append(f"reasoning={snapshot.reasoning_tokens:,}")
+        if snapshot.cached_tokens:
+            parts.append(f"cached={snapshot.cached_tokens:,}")
         if snapshot.estimated_cost_usd is not None:
             parts.append(f"est={_format_usd(snapshot.estimated_cost_usd)}")
             if snapshot.input_per_million is not None and snapshot.output_per_million is not None:
@@ -482,31 +519,32 @@ class TokenUsageEstimator:
                 return item
         return None
 
-    def _normalize_usage(self, provider: str, usage: Dict[str, Any]) -> Tuple[int, int, int, int]:
+    def _normalize_usage(self, provider: str, usage: Dict[str, Any]) -> Tuple[int, int, int, int, int]:
         input_tokens = 0
         output_tokens = 0
         reasoning_tokens = 0
+        cached_tokens = _safe_int(usage.get("cached_tokens"))
 
-        if provider in {"openai", "local"}:
+        if provider in {"openai", "meta", "local"}:
             input_tokens = _safe_int(usage.get("input_tokens"))
             output_tokens = _safe_int(usage.get("output_tokens"))
             reasoning_tokens = _safe_int(usage.get("reasoning_tokens"))
             total_tokens = _safe_int(usage.get("total_tokens")) or (input_tokens + output_tokens)
-            return input_tokens, output_tokens, total_tokens, reasoning_tokens
+            return input_tokens, output_tokens, total_tokens, reasoning_tokens, cached_tokens
 
         if provider == "gemini":
             input_tokens = _safe_int(usage.get("prompt_token_count"))
             output_tokens = _safe_int(usage.get("candidates_token_count"))
             reasoning_tokens = _safe_int(usage.get("thoughts_token_count"))
             total_tokens = _safe_int(usage.get("total_token_count")) or (input_tokens + output_tokens)
-            return input_tokens, output_tokens, total_tokens, reasoning_tokens
+            return input_tokens, output_tokens, total_tokens, reasoning_tokens, cached_tokens
 
         total_tokens = _safe_int(usage.get("total_tokens")) or _safe_int(usage.get("total_token_count"))
         input_tokens = _safe_int(usage.get("input_tokens")) or _safe_int(usage.get("prompt_token_count"))
         output_tokens = _safe_int(usage.get("output_tokens")) or _safe_int(usage.get("candidates_token_count"))
         if total_tokens <= 0:
             total_tokens = input_tokens + output_tokens
-        return input_tokens, output_tokens, total_tokens, reasoning_tokens
+        return input_tokens, output_tokens, total_tokens, reasoning_tokens, cached_tokens
 
 
 class ToolbeltRunner:
@@ -847,12 +885,149 @@ def _is_rate_limit_error(exc: Exception) -> bool:
     return "rate limit" in msg or "rate_limit" in msg or "429" in msg[:20]
 
 
-_BACKOFF_MAX_RETRIES = 3
+def _model_error_status(exc: Exception) -> Optional[int]:
+    for value in (
+        getattr(exc, "status_code", None),
+        getattr(exc, "status", None),
+        getattr(exc, "code", None),
+    ):
+        try:
+            status = int(value)
+        except (TypeError, ValueError):
+            continue
+        if 100 <= status <= 599:
+            return status
+    match = re.search(r"(?:error code|status(?: code)?|http)\s*[:=]?\s*(\d{3})\b", str(exc), re.IGNORECASE)
+    return int(match.group(1)) if match else None
+
+
+def _is_transient_model_error(exc: Exception) -> bool:
+    status = _model_error_status(exc)
+    if status is not None:
+        return status in {408, 409, 425, 429} or 500 <= status <= 599
+    message = str(exc).lower()
+    return any(
+        marker in message
+        for marker in (
+            "internal server error",
+            "server_error",
+            "service unavailable",
+            "temporarily unavailable",
+            "gateway timeout",
+            "connection reset",
+            "connection aborted",
+            "timed out",
+            "timeout",
+        )
+    )
+
+
+def _selected_model_headers(headers: Any) -> Dict[str, str]:
+    if headers is None:
+        return {}
+    selected: Dict[str, str] = {}
+    for name in (
+        "retry-after",
+        "x-request-id",
+        "request-id",
+        "x-meta-request-id",
+        "x-ratelimit-limit-tokens",
+        "x-ratelimit-remaining-tokens",
+        "x-ratelimit-limit-requests",
+        "x-ratelimit-remaining-requests",
+    ):
+        try:
+            value = str(headers.get(name, "") or "").strip()
+        except Exception:
+            value = ""
+        if value:
+            selected[name] = value
+    return selected
+
+
+def _model_error_headers(exc: Exception) -> Dict[str, str]:
+    response = getattr(exc, "response", None)
+    return _selected_model_headers(getattr(response, "headers", None))
+
+
+def _model_error_request_id(exc: Exception) -> str:
+    direct = str(getattr(exc, "request_id", "") or "").strip()
+    if direct:
+        return direct
+    headers = _model_error_headers(exc)
+    for name in ("x-request-id", "request-id", "x-meta-request-id"):
+        value = headers.get(name, "")
+        if value:
+            return value
+    return ""
+
+
+def _model_error_code(exc: Exception) -> str:
+    direct = getattr(exc, "code", None)
+    if isinstance(direct, str) and direct.strip() and not direct.strip().isdigit():
+        return direct.strip().lower()
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        error = body.get("error")
+        if isinstance(error, dict):
+            value = str(error.get("code", "") or "").strip().lower()
+            if value:
+                return value
+    return ""
+
+
+def _retry_after_seconds(exc: Exception) -> Optional[float]:
+    raw = _model_error_headers(exc).get("retry-after", "").strip()
+    if not raw:
+        return None
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        try:
+            return max(0.0, parsedate_to_datetime(raw).timestamp() - time.time())
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+
+def _transient_retry_delay(exc: Exception, attempt: int) -> float:
+    explicit = _retry_after_seconds(exc)
+    if explicit is not None:
+        return explicit
+
+    status = _model_error_status(exc)
+    code = _model_error_code(exc)
+    if status == 429:
+        return 60.0
+    if status == 503:
+        return 2.0 if code == "server_shutting_down" else 60.0
+    if status == 500 and attempt >= 2:
+        return 60.0 + random.uniform(0.0, 1.0)
+    return (_TRANSIENT_RETRY_BASE_SECONDS * (2 ** attempt)) + random.uniform(0.0, 1.0)
+
+
+_MODEL_MAX_ATTEMPTS = 4
+_TRANSIENT_RETRY_BASE_SECONDS = 1.0
 
 
 # -----------------------------
 # Model clients
 # -----------------------------
+
+def _normalize_chat_messages(messages: Sequence[Dict[str, str]]) -> List[Dict[str, str]]:
+    normalized: List[Dict[str, str]] = []
+    for item in messages:
+        role = str(item.get("role", "user") or "user")
+        if role not in {"user", "assistant", "system"}:
+            role = "user"
+        content = str(item.get("content", "") or "")
+        if not content:
+            continue
+        if normalized and normalized[-1]["role"] == role:
+            normalized[-1]["content"] = normalized[-1]["content"] + "\n\n" + content
+        else:
+            normalized.append({"role": role, "content": content})
+    return normalized
+
 
 class BaseModelClient:
     backoff: BackoffStrategy
@@ -863,13 +1038,127 @@ class BaseModelClient:
     def complete(self, system: str, prompt: str) -> str:
         raise NotImplementedError
 
+    def complete_messages(self, system: str, messages: Sequence[Dict[str, str]]) -> str:
+        return self._complete_messages_with_backoff(system, messages)
+
+    def set_prompt_cache_key(self, key: str) -> None:
+        self._base_prompt_cache_key = str(key or "").strip()
+        self._prompt_cache_generation = 0
+        self.prompt_cache_key = self._base_prompt_cache_key
+
+    def set_final_retry_message_compactor(
+        self,
+        compactor: Optional[Callable[[Sequence[Dict[str, str]]], Sequence[Dict[str, str]]]],
+    ) -> None:
+        self._final_retry_message_compactor = compactor
+
+    def get_last_error_metrics(self) -> Dict[str, Any]:
+        metrics = getattr(self, "_last_error_metrics", None)
+        return dict(metrics) if isinstance(metrics, dict) else {}
+
+    def _rotate_prompt_cache_key(self) -> None:
+        base = str(
+            getattr(self, "_base_prompt_cache_key", "")
+            or getattr(self, "prompt_cache_key", "")
+            or ""
+        ).strip()
+        if not base:
+            return
+        self._prompt_cache_generation = int(getattr(self, "_prompt_cache_generation", 0) or 0) + 1
+        self.prompt_cache_key = f"{base}:recovery-{self._prompt_cache_generation}"
+
+    def _begin_retry_sequence(self) -> Dict[str, Any]:
+        self._last_error_metrics = {}
+        return {
+            "attempts": 0,
+            "request_ids": [],
+            "errors": [],
+            "retry_delays_s": [],
+            "rate_limit_headers": {},
+            "fresh_context_retry": False,
+        }
+
+    def _record_retry_exception(self, metadata: Dict[str, Any], exc: Exception) -> None:
+        metadata["attempts"] = int(metadata.get("attempts", 0) or 0) + 1
+        request_id = _model_error_request_id(exc)
+        error_message = str(exc).strip()
+        if len(error_message) > 1000:
+            error_message = error_message[:1000] + "..."
+        metadata.setdefault("errors", []).append(
+            {
+                "attempt": metadata["attempts"],
+                "status_code": _model_error_status(exc),
+                "error_code": _model_error_code(exc),
+                "message": error_message,
+                "request_id": request_id,
+                "exception_type": type(exc).__name__,
+            }
+        )
+        if request_id and request_id not in metadata["request_ids"]:
+            metadata["request_ids"].append(request_id)
+        headers = _model_error_headers(exc)
+        metadata["rate_limit_headers"].update(
+            {key: value for key, value in headers.items() if key.startswith("x-ratelimit-")}
+        )
+        retry_after = headers.get("retry-after")
+        if retry_after:
+            metadata["retry_after"] = retry_after
+
+    def _finish_retry_success(self, metadata: Dict[str, Any]) -> None:
+        metrics = dict(self.get_last_metrics())
+        metadata["attempts"] = int(metadata.get("attempts", 0) or 0) + 1
+        if metadata["attempts"] > 1:
+            metrics["retry"] = dict(metadata)
+            self._set_last_metrics(metrics)
+        self._last_error_metrics = {}
+
+    def _finish_retry_failure(self, metadata: Dict[str, Any], exc: Exception) -> None:
+        failure = {
+            **metadata,
+            "status_code": _model_error_status(exc),
+            "request_id": _model_error_request_id(exc),
+            "error_code": _model_error_code(exc),
+        }
+        self._last_error_metrics = failure
+        for name, value in (
+            ("retry_attempts", failure["attempts"]),
+            ("retry_request_ids", list(failure["request_ids"])),
+            ("retry_errors", list(failure["errors"])),
+            ("retry_delays_s", list(failure["retry_delays_s"])),
+            ("rate_limit_headers", dict(failure["rate_limit_headers"])),
+            ("retry_after", failure.get("retry_after", "")),
+            ("fresh_context_retry", bool(failure["fresh_context_retry"])),
+        ):
+            try:
+                setattr(exc, name, value)
+            except Exception:
+                pass
+
+    def _prepare_final_retry_messages(
+        self,
+        messages: Sequence[Dict[str, str]],
+        metadata: Dict[str, Any],
+    ) -> List[Dict[str, str]]:
+        self._rotate_prompt_cache_key()
+        compactor = getattr(self, "_final_retry_message_compactor", None)
+        if callable(compactor):
+            try:
+                compacted = list(compactor(messages))
+            except Exception:
+                compacted = []
+            if compacted:
+                metadata["fresh_context_retry"] = True
+                return compacted
+        return list(messages)
+
     def _complete_with_backoff(self, system: str, prompt: str) -> str:
         """Wrap the actual provider call with rate-limit backoff and retry."""
         backoff = getattr(self, "backoff", None)
         if backoff is None:
             self.backoff = BackoffStrategy()
             backoff = self.backoff
-        for attempt in range(_BACKOFF_MAX_RETRIES):
+        retry_metadata = self._begin_retry_sequence()
+        for attempt in range(_MODEL_MAX_ATTEMPTS):
             if backoff.enabled and backoff.should_wait():
                 wait = backoff.wait_seconds()
                 if wait > 0:
@@ -887,24 +1176,88 @@ class BaseModelClient:
                 )
                 if input_tokens > 0 and backoff.enabled:
                     backoff.record_tokens(input_tokens)
+                self._finish_retry_success(retry_metadata)
                 return result
             except Exception as exc:
-                if _is_rate_limit_error(exc) and attempt < _BACKOFF_MAX_RETRIES - 1:
-                    wait = max(60.0, backoff.wait_seconds()) if backoff.enabled else 60.0
-                    eprint(f"Rate limited (attempt {attempt + 1}/{_BACKOFF_MAX_RETRIES}). Waiting {wait:.0f}s before retry...")
+                self._record_retry_exception(retry_metadata, exc)
+                if _is_transient_model_error(exc) and attempt < _MODEL_MAX_ATTEMPTS - 1:
+                    wait = _transient_retry_delay(exc, attempt)
+                    retry_metadata["retry_delays_s"].append(round(wait, 3))
+                    status = _model_error_status(exc)
+                    label = f"HTTP {status}" if status is not None else type(exc).__name__
+                    eprint(
+                        f"Transient model failure ({label}, attempt {attempt + 1}/{_MODEL_MAX_ATTEMPTS}). "
+                        f"Waiting {wait:.0f}s before retry..."
+                    )
                     time.sleep(wait)
-                    # reset window after forced wait
-                    if backoff.enabled:
+                    if _is_rate_limit_error(exc) and backoff.enabled:
                         with backoff._lock:
                             backoff._window_start = time.time()
                             backoff._window_tokens = 0
+                    if status == 500 and attempt == _MODEL_MAX_ATTEMPTS - 2:
+                        self._rotate_prompt_cache_key()
                     continue
+                self._finish_retry_failure(retry_metadata, exc)
                 raise
         # unreachable but satisfies type checker
         raise RuntimeError("Backoff retries exhausted")
 
+    def _complete_messages_with_backoff(self, system: str, messages: Sequence[Dict[str, str]]) -> str:
+        """Wrap message-based provider calls with the same rate-limit backoff."""
+        backoff = getattr(self, "backoff", None)
+        if backoff is None:
+            self.backoff = BackoffStrategy()
+            backoff = self.backoff
+        retry_metadata = self._begin_retry_sequence()
+        current_messages = list(messages)
+        for attempt in range(_MODEL_MAX_ATTEMPTS):
+            if backoff.enabled and backoff.should_wait():
+                wait = backoff.wait_seconds()
+                if wait > 0:
+                    eprint(f"Backoff: token window limit reached ({backoff.token_limit_k}k). Waiting {wait:.0f}s...")
+                    time.sleep(wait)
+            try:
+                result = self._do_complete_messages(system, current_messages)
+                metrics = self.get_last_metrics()
+                usage = metrics.get("usage", {}) if isinstance(metrics, dict) else {}
+                input_tokens = (
+                    _safe_int(usage.get("input_tokens"))
+                    or _safe_int(usage.get("prompt_token_count"))
+                    or 0
+                )
+                if input_tokens > 0 and backoff.enabled:
+                    backoff.record_tokens(input_tokens)
+                self._finish_retry_success(retry_metadata)
+                return result
+            except Exception as exc:
+                self._record_retry_exception(retry_metadata, exc)
+                if _is_transient_model_error(exc) and attempt < _MODEL_MAX_ATTEMPTS - 1:
+                    wait = _transient_retry_delay(exc, attempt)
+                    retry_metadata["retry_delays_s"].append(round(wait, 3))
+                    status = _model_error_status(exc)
+                    label = f"HTTP {status}" if status is not None else type(exc).__name__
+                    eprint(
+                        f"Transient model failure ({label}, attempt {attempt + 1}/{_MODEL_MAX_ATTEMPTS}). "
+                        f"Waiting {wait:.0f}s before retry..."
+                    )
+                    time.sleep(wait)
+                    if _is_rate_limit_error(exc) and backoff.enabled:
+                        with backoff._lock:
+                            backoff._window_start = time.time()
+                            backoff._window_tokens = 0
+                    if status == 500 and attempt == _MODEL_MAX_ATTEMPTS - 2:
+                        current_messages = self._prepare_final_retry_messages(current_messages, retry_metadata)
+                    continue
+                self._finish_retry_failure(retry_metadata, exc)
+                raise
+        raise RuntimeError("Backoff retries exhausted")
+
     def _do_complete(self, system: str, prompt: str) -> str:
         raise NotImplementedError
+
+    def _do_complete_messages(self, system: str, messages: Sequence[Dict[str, str]]) -> str:
+        prompt = "\n\n".join(str(item.get("content", "")) for item in messages if item.get("role") != "assistant")
+        return self._do_complete(system, prompt)
 
     def clone(self) -> "BaseModelClient":
         raise NotImplementedError
@@ -981,8 +1334,52 @@ class AnthropicModelClient(BaseModelClient):
                 parts.append(str(text))
         return "\n".join(parts).strip()
 
+    def _do_complete_messages(self, system: str, messages: Sequence[Dict[str, str]]) -> str:
+        provider_messages = [
+            item for item in _normalize_chat_messages(messages)
+            if item["role"] in {"user", "assistant"}
+        ]
+        response = self.client.messages.create(
+            model=self.model,
+            system=system,
+            messages=provider_messages,
+            max_tokens=4096,
+            temperature=0.1,
+        )
+        usage = getattr(response, "usage", None)
+        usage_dict: Dict[str, Any] = {}
+        if usage is not None:
+            if isinstance(usage, dict):
+                usage_dict = dict(usage)
+            else:
+                for key in [
+                    "input_tokens",
+                    "output_tokens",
+                    "cache_creation_input_tokens",
+                    "cache_read_input_tokens",
+                ]:
+                    value = getattr(usage, key, None)
+                    if value is not None:
+                        usage_dict[key] = value
+        self._set_last_metrics(
+            {
+                "provider": "anthropic",
+                "model": self.model,
+                "usage": usage_dict,
+            }
+        )
+        parts: List[str] = []
+        for block in getattr(response, "content", []) or []:
+            text = getattr(block, "text", None)
+            if text:
+                parts.append(str(text))
+        return "\n".join(parts).strip()
+
 
 class OpenAIModelClient(BaseModelClient):
+    provider_name = "openai"
+    supports_verbosity = True
+
     def __init__(
         self,
         model: str,
@@ -994,11 +1391,12 @@ class OpenAIModelClient(BaseModelClient):
         api_key = os.getenv("OPENAI_API_KEY")
         if not api_key:
             raise RuntimeError("OPENAI_API_KEY is not set.")
-        self.client = OpenAI(api_key=api_key)
+        self.client = OpenAI(api_key=api_key, max_retries=0)
         self.model = model
         self.thinking_mode = thinking_mode
         self.verbosity = verbosity
         self.backoff = BackoffStrategy()
+        self.set_prompt_cache_key("")
 
     def clone(self) -> BaseModelClient:
         c = OpenAIModelClient(
@@ -1007,6 +1405,7 @@ class OpenAIModelClient(BaseModelClient):
             verbosity=self.verbosity,
         )
         c.backoff = BackoffStrategy(enabled=self.backoff.enabled, token_limit_k=self.backoff.token_limit_k)
+        c.set_prompt_cache_key(self.prompt_cache_key)
         return c
 
     def complete(self, system: str, prompt: str) -> str:
@@ -1026,31 +1425,22 @@ class OpenAIModelClient(BaseModelClient):
             kwargs["reasoning"] = {"effort": self.thinking_mode}
 
         # Verbosity is supported on newer GPT-5.x models; harmless to omit if not desired.
-        if self.verbosity:
+        if self.verbosity and getattr(self, "supports_verbosity", True):
             kwargs["text"] = {"verbosity": self.verbosity}
+        self._apply_prompt_cache_kwargs(kwargs)
 
-        response = self.client.responses.create(**kwargs)
-        usage = getattr(response, "usage", None)
-        usage_dict: Dict[str, Any] = {}
-        if usage is not None:
-            if isinstance(usage, dict):
-                usage_dict = dict(usage)
-            else:
-                usage_dict = {
-                    "input_tokens": getattr(usage, "input_tokens", None),
-                    "output_tokens": getattr(usage, "output_tokens", None),
-                    "total_tokens": getattr(usage, "total_tokens", None),
-                }
-                output_details = getattr(usage, "output_tokens_details", None)
-                if output_details is not None:
-                    reasoning_tokens = getattr(output_details, "reasoning_tokens", None)
-                    if reasoning_tokens is not None:
-                        usage_dict["reasoning_tokens"] = reasoning_tokens
+        response, response_headers = self._create_response(kwargs)
+        usage_dict = _usage_to_dict(getattr(response, "usage", None))
         self._set_last_metrics(
             {
-                "provider": "openai",
+                "provider": getattr(self, "provider_name", "openai"),
                 "model": self.model,
                 "usage": usage_dict,
+                "prompt_cache_key": self.prompt_cache_key,
+                "response_headers": response_headers,
+                "rate_limit_headers": {
+                    key: value for key, value in response_headers.items() if key.startswith("x-ratelimit-")
+                },
             }
         )
         text = getattr(response, "output_text", None)
@@ -1065,8 +1455,106 @@ class OpenAIModelClient(BaseModelClient):
                     chunks.append(getattr(content, "text", ""))
         return "\n".join(chunks).strip()
 
+    def _do_complete_messages(self, system: str, messages: Sequence[Dict[str, str]]) -> str:
+        kwargs: Dict[str, Any] = {
+            "model": self.model,
+            "input": [
+                {"role": "system", "content": system},
+                *_normalize_chat_messages(messages),
+            ],
+        }
+
+        if self.thinking_mode and self.thinking_mode != "auto":
+            kwargs["reasoning"] = {"effort": self.thinking_mode}
+        if self.verbosity and getattr(self, "supports_verbosity", True):
+            kwargs["text"] = {"verbosity": self.verbosity}
+        self._apply_prompt_cache_kwargs(kwargs)
+
+        response, response_headers = self._create_response(kwargs)
+        usage_dict = _usage_to_dict(getattr(response, "usage", None))
+        self._set_last_metrics(
+            {
+                "provider": getattr(self, "provider_name", "openai"),
+                "model": self.model,
+                "usage": usage_dict,
+                "prompt_cache_key": self.prompt_cache_key,
+                "response_headers": response_headers,
+                "rate_limit_headers": {
+                    key: value for key, value in response_headers.items() if key.startswith("x-ratelimit-")
+                },
+            }
+        )
+        text = getattr(response, "output_text", None)
+        if text:
+            return text
+
+        chunks: List[str] = []
+        for item in getattr(response, "output", []) or []:
+            for content in getattr(item, "content", []) or []:
+                if getattr(content, "type", None) == "output_text":
+                    chunks.append(getattr(content, "text", ""))
+        return "\n".join(chunks).strip()
+
+    def _create_response(self, kwargs: Dict[str, Any]) -> Tuple[Any, Dict[str, str]]:
+        responses = self.client.responses
+        raw_accessor = getattr(responses, "with_raw_response", None)
+        raw_create = getattr(raw_accessor, "create", None)
+        if callable(raw_create):
+            raw_response = raw_create(**kwargs)
+            response = raw_response.parse()
+            headers = getattr(raw_response, "headers", None)
+            if headers is None:
+                headers = getattr(getattr(raw_response, "http_response", None), "headers", None)
+            return response, _selected_model_headers(headers)
+        return responses.create(**kwargs), {}
+
+    def _apply_prompt_cache_kwargs(self, kwargs: Dict[str, Any]) -> None:
+        cache_key = str(getattr(self, "prompt_cache_key", "") or "").strip()
+        if cache_key:
+            kwargs["prompt_cache_key"] = cache_key
+        if self.model.lower().startswith("gpt-5.5"):
+            kwargs["prompt_cache_retention"] = "24h"
+
+
+class MetaModelClient(OpenAIModelClient):
+    provider_name = "meta"
+    supports_verbosity = False
+
+    def __init__(
+        self,
+        model: str,
+        thinking_mode: str = "medium",
+        verbosity: str = "medium",
+    ) -> None:
+        if OpenAI is None:
+            raise RuntimeError("openai package not installed. Run: pip install openai")
+        api_key = os.getenv("META_AI_API_KEY")
+        if not api_key:
+            raise RuntimeError("META_AI_API_KEY is not set. Add it to .env or the process environment.")
+        if thinking_mode == "none":
+            raise ValueError("Meta Muse Spark does not support thinking mode 'none'; use minimal or higher.")
+        base_url = os.getenv("META_MODEL_API_BASE_URL") or "https://api.meta.ai/v1"
+        self.client = OpenAI(api_key=api_key, base_url=base_url, max_retries=0)
+        self.model = model
+        self.thinking_mode = thinking_mode
+        self.verbosity = verbosity
+        self.backoff = BackoffStrategy()
+        self.set_prompt_cache_key("")
+
+    def clone(self) -> BaseModelClient:
+        c = MetaModelClient(
+            model=self.model,
+            thinking_mode=self.thinking_mode,
+            verbosity=self.verbosity,
+        )
+        c.backoff = BackoffStrategy(enabled=self.backoff.enabled, token_limit_k=self.backoff.token_limit_k)
+        c.set_prompt_cache_key(self.prompt_cache_key)
+        return c
+
 
 class LocalModelClient(OpenAIModelClient):
+    provider_name = "local"
+
     def __init__(
         self,
         model: str,
@@ -1077,11 +1565,12 @@ class LocalModelClient(OpenAIModelClient):
             raise RuntimeError("openai package not installed. Run: pip install openai")
         # Local provider is OpenAI-compatible; use a dummy key if none provided.
         api_key = os.getenv("LOCAL_LLM_API_KEY") or os.getenv("OPENAI_API_KEY") or "local-key"
-        self.client = OpenAI(api_key=api_key, base_url="http://127.0.0.1:5051/v1")
+        self.client = OpenAI(api_key=api_key, base_url="http://127.0.0.1:5051/v1", max_retries=0)
         self.model = model
         self.thinking_mode = thinking_mode
         self.verbosity = verbosity
         self.backoff = BackoffStrategy()
+        self.set_prompt_cache_key("")
 
     def clone(self) -> BaseModelClient:
         c = LocalModelClient(
@@ -1113,7 +1602,11 @@ class OllamaModelClient(BaseModelClient):
     ) -> None:
         if OpenAI is None:
             raise RuntimeError("openai package not installed. Run: pip install openai")
-        self.client = OpenAI(api_key=api_key, base_url=_normalize_chat_completions_base_url(base_url))
+        self.client = OpenAI(
+            api_key=api_key,
+            base_url=_normalize_chat_completions_base_url(base_url),
+            max_retries=0,
+        )
         self.model = model
         self.thinking_mode = thinking_mode
         self.verbosity = verbosity
@@ -1141,6 +1634,56 @@ class OllamaModelClient(BaseModelClient):
             messages=[
                 {"role": "system", "content": system},
                 {"role": "user", "content": prompt},
+            ],
+            temperature=0.1,
+        )
+        usage = getattr(response, "usage", None)
+        usage_dict: Dict[str, Any] = {}
+        if usage is not None:
+            if isinstance(usage, dict):
+                usage_dict = dict(usage)
+            else:
+                usage_dict = {
+                    "input_tokens": getattr(usage, "prompt_tokens", None),
+                    "output_tokens": getattr(usage, "completion_tokens", None),
+                    "total_tokens": getattr(usage, "total_tokens", None),
+                }
+        self._set_last_metrics(
+            {
+                "provider": self.provider_name,
+                "model": self.model,
+                "usage": usage_dict,
+            }
+        )
+        choices = getattr(response, "choices", []) or []
+        if not choices:
+            return ""
+        message = getattr(choices[0], "message", None)
+        if message is None:
+            return ""
+        content = getattr(message, "content", "")
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, list):
+            chunks: List[str] = []
+            for item in content:
+                if isinstance(item, dict):
+                    text = str(item.get("text", "") or "").strip()
+                    if text:
+                        chunks.append(text)
+                else:
+                    text = str(getattr(item, "text", "") or "").strip()
+                    if text:
+                        chunks.append(text)
+            return "\n".join(chunks).strip()
+        return str(content or "").strip()
+
+    def _do_complete_messages(self, system: str, messages: Sequence[Dict[str, str]]) -> str:
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": system},
+                *_normalize_chat_messages(messages),
             ],
             temperature=0.1,
         )
@@ -1254,7 +1797,7 @@ class GeminiModelClient(BaseModelClient):
     def complete(self, system: str, prompt: str) -> str:
         return self._complete_with_backoff(system, prompt)
 
-    def _do_complete(self, system: str, prompt: str) -> str:
+    def _generate_config(self, system: str) -> Any:
         config_kwargs: Dict[str, Any] = {
             "system_instruction": system,
             "temperature": 0.1,
@@ -1263,40 +1806,75 @@ class GeminiModelClient(BaseModelClient):
         if thinking_config is not None:
             config_kwargs["thinking_config"] = thinking_config
 
-        # genai_types should be present because __init__ raised otherwise; assert for type checkers
         assert genai_types is not None
-        response = self.client.models.generate_content(
-            model=self.model,
-            contents=prompt,
-            config=genai_types.GenerateContentConfig(**config_kwargs),
-        )
-        usage_meta = getattr(response, "usage_metadata", None) or getattr(response, "usageMetadata", None)
+        return genai_types.GenerateContentConfig(**config_kwargs)
+
+    def _gemini_content(self, *, role: str, text: str) -> Any:
+        assert genai_types is not None
+        gemini_role = "model" if role == "assistant" else "user"
+        part_ctor = getattr(genai_types, "Part", None)
+        content_ctor = getattr(genai_types, "Content", None)
+        if callable(part_ctor) and callable(content_ctor):
+            return content_ctor(role=gemini_role, parts=[part_ctor(text=text)])
+        return {"role": gemini_role, "parts": [{"text": text}]}
+
+    def _gemini_messages(self, messages: Sequence[Dict[str, str]]) -> List[Any]:
+        provider_messages: List[Any] = []
+        for item in _normalize_chat_messages(messages):
+            role = item["role"]
+            if role == "system":
+                continue
+            content = str(item.get("content", "") or "").strip()
+            if not content:
+                continue
+            provider_messages.append(self._gemini_content(role=role, text=content))
+        return provider_messages
+
+    def _gemini_usage_dict(self, usage_meta: Any) -> Dict[str, Any]:
         usage_dict: Dict[str, Any] = {}
-        if usage_meta is not None:
-            if isinstance(usage_meta, dict):
-                usage_dict = dict(usage_meta)
-            else:
-                for key in [
-                    "prompt_token_count",
-                    "candidates_token_count",
-                    "total_token_count",
-                    "thoughts_token_count",
-                ]:
-                    value = getattr(usage_meta, key, None)
-                    if value is not None:
-                        usage_dict[key] = value
+        if usage_meta is None:
+            return usage_dict
+        if isinstance(usage_meta, dict):
+            usage_dict = dict(usage_meta)
+        else:
+            for key in [
+                "prompt_token_count",
+                "candidates_token_count",
+                "total_token_count",
+                "thoughts_token_count",
+                "cached_content_token_count",
+                "cachedContentTokenCount",
+            ]:
+                value = getattr(usage_meta, key, None)
+                if value is not None:
+                    usage_dict[key] = value
+        cached_tokens = (
+            _safe_int(usage_dict.get("cached_tokens"))
+            or _safe_int(usage_dict.get("cached_content_token_count"))
+            or _safe_int(usage_dict.get("cachedContentTokenCount"))
+        )
+        usage_dict.setdefault("input_tokens", _safe_int(usage_dict.get("prompt_token_count")))
+        usage_dict.setdefault("output_tokens", _safe_int(usage_dict.get("candidates_token_count")))
+        usage_dict.setdefault("total_tokens", _safe_int(usage_dict.get("total_token_count")))
+        usage_dict.setdefault("reasoning_tokens", _safe_int(usage_dict.get("thoughts_token_count")))
+        usage_dict["cached_tokens"] = cached_tokens
+        return usage_dict
+
+    def _record_gemini_metrics(self, response: Any) -> None:
+        usage_meta = getattr(response, "usage_metadata", None) or getattr(response, "usageMetadata", None)
         self._set_last_metrics(
             {
                 "provider": "gemini",
                 "model": self.model,
-                "usage": usage_dict,
+                "usage": self._gemini_usage_dict(usage_meta),
             }
         )
+
+    def _gemini_response_text(self, response: Any) -> str:
         text = getattr(response, "text", None)
         if text:
-            return text
+            return str(text).strip()
 
-        # Fallback extraction.
         parts: List[str] = []
         for cand in getattr(response, "candidates", []) or []:
             content = getattr(cand, "content", None)
@@ -1305,8 +1883,31 @@ class GeminiModelClient(BaseModelClient):
             for part in getattr(content, "parts", []) or []:
                 txt = getattr(part, "text", None)
                 if txt:
-                    parts.append(txt)
+                    parts.append(str(txt))
         return "\n".join(parts).strip()
+
+    def _do_complete(self, system: str, prompt: str) -> str:
+        assert genai_types is not None
+        response = self.client.models.generate_content(
+            model=self.model,
+            contents=prompt,
+            config=self._generate_config(system),
+        )
+        self._record_gemini_metrics(response)
+        return self._gemini_response_text(response)
+
+    def _do_complete_messages(self, system: str, messages: Sequence[Dict[str, str]]) -> str:
+        assert genai_types is not None
+        contents = self._gemini_messages(messages)
+        if not contents:
+            contents = [self._gemini_content(role="user", text="Continue.")]
+        response = self.client.models.generate_content(
+            model=self.model,
+            contents=contents,
+            config=self._generate_config(system),
+        )
+        self._record_gemini_metrics(response)
+        return self._gemini_response_text(response)
 
 
 @dataclass
@@ -1510,6 +2111,7 @@ class TokenUsageSnapshot:
     output_tokens: int
     total_tokens: int
     reasoning_tokens: int = 0
+    cached_tokens: int = 0
     estimated_cost_usd: Optional[float] = None
     input_cost_usd: Optional[float] = None
     output_cost_usd: Optional[float] = None
@@ -1525,6 +2127,7 @@ class TokenUsageSnapshot:
             "output_tokens": self.output_tokens,
             "total_tokens": self.total_tokens,
             "reasoning_tokens": self.reasoning_tokens,
+            "cached_tokens": self.cached_tokens,
             "estimated_cost_usd": self.estimated_cost_usd,
             "input_cost_usd": self.input_cost_usd,
             "output_cost_usd": self.output_cost_usd,
@@ -1621,6 +2224,8 @@ class WorkingFolderAgent:
         self._observability_buffer = []
         self._run_metrics = {}
         self._run_started_at = 0.0
+        self._model_conversation_messages: List[Dict[str, str]] = []
+        self._model_conversation_task = ""
         self.steering_prompt = ""
         self.selected_goal_fact_keys: List[str] = []
         self.discovery_budget = None
@@ -4449,16 +5054,124 @@ class WorkingFolderAgent:
                 "candidates_token_count": 0,
                 "total_token_count": 0,
                 "thoughts_token_count": 0,
+                "cached_tokens": 0,
+                "cached_content_token_count": 0,
+                "cachedContentTokenCount": 0,
             },
             "model_turns": [],
         }
         self._write_observability_snapshot(final_message="Run in progress.", finished=False)
 
+    def _reset_model_conversation(self, task: str) -> None:
+        self._model_conversation_messages = []
+        self._model_conversation_task = str(task or "")
+
+    def _append_model_conversation(self, role: str, content: str) -> None:
+        text = str(content or "").strip()
+        if not text:
+            return
+        normalized_role = role if role in {"user", "assistant"} else "user"
+        if (
+            self._model_conversation_messages
+            and self._model_conversation_messages[-1].get("role") == normalized_role
+        ):
+            self._model_conversation_messages[-1]["content"] = (
+                str(self._model_conversation_messages[-1].get("content", "") or "")
+                + "\n\n"
+                + text
+            )
+            return
+        self._model_conversation_messages.append({"role": normalized_role, "content": text})
+
+    def _model_context_mode(self) -> str:
+        return "initial" if not self._model_conversation_messages else "incremental"
+
+    def _build_incremental_prompt(self, task: str) -> str:
+        status = {
+            "task": str(task or ""),
+            "root": str(self.root),
+            "active_run_id": self._active_run_id,
+            "next_step": len(self.history) + 1,
+            "task_satisfied": bool(self.task_satisfied),
+            "satisfaction_reason": self.satisfaction_reason,
+            "completion_check_pending": bool(self.completion_check_pending),
+            "completion_check_reason": self.completion_check_reason,
+            "pending_verification": self.pending_verification,
+            "pending_patch_recovery": self.pending_patch_recovery,
+            "edit_batch": {
+                "active": bool(self.edit_batch_mode),
+                "pending_paths": sorted(self.edit_batch_pending.keys()),
+                "pending_count": len(self.edit_batch_pending),
+            },
+            "active_error": {
+                "task": self.active_error.task,
+                "action_type": self.active_error.action_type,
+                "error_type": self.active_error.error_type,
+                "message": self.active_error.message,
+                "path": self.active_error.path,
+                "step": self.active_error.step,
+            } if self.active_error is not None else None,
+            "output_format_recovery": self.output_format_recovery,
+            "fulfillment_readiness": self._fulfillment_readiness(task),
+            "discovery_budget": {
+                "mode": self.discovery_budget.mode_label,
+                "tool_calls_used": self.discovery_budget.tool_calls_used,
+                "tool_calls_max": self.discovery_budget.max_tool_calls,
+                "tool_calls_remaining": self.discovery_budget.remaining_tool_calls,
+                "budget_exhausted": self.discovery_budget.exhausted,
+            } if self.discovery_budget is not None else None,
+        }
+        return textwrap.dedent(
+            f"""
+            LATEST HOST STATE FOR NEXT ACTION:
+            {json.dumps(status, indent=2)}
+
+            RECENT EXECUTION SUMMARY:
+            {self._history_snapshot()}
+
+            ACTIVE CONTEXT:
+            {self._active_context_block()}
+
+            FACT CONTEXT:
+            {self._fact_context_block()}
+
+            IMMEDIATE RESOLUTION HANDOFF:
+            {self._recent_resolution_handoff_block()}
+
+            SELECTED GOAL FACTS:
+            {self._selected_goal_facts_block()}
+
+            OPERATOR STEERING:
+            {self._steering_block()}
+
+            {self._shell_access_note()}
+
+            Continue from the transcript above. Produce exactly one JSON object with `thought` and either `action` or `actions`.
+            Do not repeat prose plans or markdown. Use the action schema and rules from the first user message and system prompt.
+            """
+        ).strip()
+
+    def _build_model_turn_prompt(self, task: str) -> str:
+        if not self._model_conversation_messages:
+            return self._build_prompt(task)
+        return self._build_incremental_prompt(task)
+
+    def _complete_worker_model_turn(self, prompt: str) -> str:
+        self._append_model_conversation("user", prompt)
+        system = self._system_prompt()
+        complete_messages = getattr(self.model, "complete_messages", None)
+        if callable(complete_messages):
+            raw = str(complete_messages(system, list(self._model_conversation_messages)) or "")
+        else:
+            raw = str(self.model.complete(system, prompt) or "")
+        self._append_model_conversation("assistant", raw)
+        return raw
+
     def _append_observability_block(self, block: str) -> None:
         self._observability_buffer.append(block)
         self._write_observability_snapshot(final_message="Run in progress.", finished=False)
 
-    def _record_model_turn_metrics(self, *, step_num: int, duration_s: float) -> None:
+    def _record_model_turn_metrics(self, *, step_num: int, duration_s: float, context_mode: str = "") -> None:
         metrics = self.model.get_last_metrics() if hasattr(self.model, "get_last_metrics") else {}
         usage = metrics.get("usage") if isinstance(metrics, dict) else {}
         if not isinstance(usage, dict):
@@ -4474,6 +5187,8 @@ class WorkingFolderAgent:
                         "duration_s": round(duration_s, 3),
                         "provider": metrics.get("provider") if isinstance(metrics, dict) else None,
                         "model": metrics.get("model") if isinstance(metrics, dict) else None,
+                        "context_mode": context_mode,
+                        "conversation_messages": len(self._model_conversation_messages),
                         "usage": usage,
                     }
                 )
@@ -5496,6 +6211,7 @@ class WorkingFolderAgent:
         self._reset_task_satisfaction()
         self._reset_run_observability(task)
         self._start_new_run()
+        self._reset_model_conversation(task)
         self._maybe_reset_context_for_strategy(task)
         if self.discovery_budget is not None:
             self._parallel_discovery_prefetch_payload(task)
@@ -5504,16 +6220,17 @@ class WorkingFolderAgent:
         try:
             for _turn in range(1, self.config.max_steps + 1):
                 step_num = len(self.history) + 1
-                prompt = self._build_prompt(task)
+                context_mode = self._model_context_mode()
+                prompt = self._build_model_turn_prompt(task)
                 self._mark_recent_resolution_handoff_delivered()
                 if self.config.show_prompts:
                     print("\n--- PROMPT ---\n")
                     print(prompt)
 
                 started = time.time()
-                raw = self.model.complete(self._system_prompt(), prompt)
+                raw = self._complete_worker_model_turn(prompt)
                 model_duration = time.time() - started
-                self._record_model_turn_metrics(step_num=step_num, duration_s=model_duration)
+                self._record_model_turn_metrics(step_num=step_num, duration_s=model_duration, context_mode=context_mode)
 
                 if self.config.show_model_output:
                     print("\n--- MODEL RAW OUTPUT ---\n")
@@ -5613,6 +6330,8 @@ class WorkingFolderAgent:
                     self._print_step(step)
                     self._run_automatic_diagnostics_after_step(step)
                     self._run_fact_subagent(task, step)
+                    if action.get("type") == "drop_context" and result.ok:
+                        self._reset_model_conversation(task)
 
                     if action["type"] == "finish" and result.ok:
                         final_message = str(result.payload.get("message", "Done."))
@@ -8400,6 +9119,12 @@ def create_model_client(
             thinking_mode=thinking_mode,
             verbosity=verbosity,
         )
+    if normalized_provider == "meta":
+        return MetaModelClient(
+            model=normalized_model,
+            thinking_mode=thinking_mode,
+            verbosity=verbosity,
+        )
     if normalized_provider == "anthropic":
         return AnthropicModelClient(
             model=normalized_model,
@@ -8707,7 +9432,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--thinking-mode",
         default="medium",
         choices=["auto", "none", "minimal", "low", "medium", "high", "xhigh"],
-        help="OpenAI: reasoning effort. Gemini: mapped to thinking_level or thinking_budget.",
+        help="OpenAI/Meta: reasoning effort. Gemini: mapped to thinking_level or thinking_budget.",
     )
 
     parser.add_argument(
@@ -8752,6 +9477,13 @@ def _handle_bridge_planner_action(
     if action_name == "approve_plan":
         add_exchange("user", "approve")
         message = planner.execute_pending_plan()
+        add_exchange("assistant", message)
+        return message
+    if action_name in {"retry_failed_goal", "resume_execution"}:
+        resumer = getattr(planner, "resume_paused_execution", None)
+        if not callable(resumer):
+            raise ValueError("Planner does not support paused execution recovery")
+        message = resumer()
         add_exchange("assistant", message)
         return message
     if action_name == "start_continuous":
