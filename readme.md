@@ -10,6 +10,7 @@ Planner-first coding agent for real repositories. The planner handles clarificat
 | Auto CLI | Letting the planner run one or more issue cycles without pausing for plan approval. | `start-auto 3 Build the feature described in PROPOSAL.md` from the planner prompt | The optional text becomes the auto-run prompt; cycles create/close issues and use completed issue context to avoid repeats. |
 | Direct Worker CLI | Small, concrete edits when you do not need planner decomposition. | `python main.py --provider openai --model gpt-5.4 --root /your/project --worker-mode` | Give a focused task; the worker reads, edits, validates, and finishes directly. |
 | Beta TreeLoop Worker | Fast command-grammar workflow and current-run diagnostics. | `python main_v2.py --provider gemini --model gemini-3-flash-preview --root /your/project --worker-mode` | Use tree commands like `cat`, `replace-lines`, `run-check`, `list-run-issues`, and `show-run-issue`. |
+| Desktop Workbench | Standalone agent-first editor with Monaco, terminal, and Git controls. | `cd desktop && npm install && npm run dev` | Open a repository, edit files, run terminal commands, review Git changes, and operate the planner without VS Code. |
 | VS Code Extension | Desktop UI for planner state, Auto mode, issues, diagnostics, diffs, and suggested actions. | Open `vscode-extension/` in VS Code and run `Run Python Agent Extension` | Use the panel to submit prompts, create issues, start Auto cycles, approve plans, inspect diagnostics, and open files/diffs. |
 
 Common planner commands: `/reset`, `/start-auto 3 optional prompt`, `/stop-auto`, `/create-issue details`, `reopen issue-123`, `approve`, `reject`.
@@ -134,6 +135,12 @@ Backend requirements:
 - Node.js and `npm` are required only for extension development inside `vscode-extension/`, not for the Python backend itself.
 
 The extension currently targets desktop VS Code APIs and uses the Python runtime as the source of truth for planner/worker behavior.
+
+## Desktop Workbench
+
+The standalone Electron application is under `desktop/`. It uses React/Vite for the UI, Monaco for editing and diffs, xterm.js plus node-pty for terminal sessions, and the existing newline-delimited JSON Python bridge for agent state and actions.
+
+See [`desktop/README.md`](desktop/README.md) for architecture, development commands, packaging, and current distribution constraints.
 
 ## Planner Flow
 

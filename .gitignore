@@ -22,6 +22,10 @@ vscode-extension/dist-integration/
 vscode-extension/dist-integration/*
 vscode-extension/dist-test
 vscode-extension/.vscode-test
+desktop/node_modules/
+desktop/out/
+desktop/dist/
+desktop/release/
 goal_runner.md
 /tests
 /tests/*
