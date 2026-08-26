@@ -1,17 +1,27 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import type { GitStatus, WorkspaceInfo } from '../../shared/contracts';
+import { groupDiagnostics } from '../../shared/agentCore';
+import { AgentWorkspaceProvider } from './agent/AgentWorkspaceContext';
+import { useAgentWorkspace } from './agent/agentWorkspace';
+import { AgentIssues } from './components/AgentIssues';
 import { AgentPanel } from './components/AgentPanel';
+import { AgentTopStatus } from './components/AgentTopStatus';
 import { EditorPane, isFileTab } from './components/EditorPane';
 import { FileExplorer } from './components/FileExplorer';
 import { GitPanel } from './components/GitPanel';
-import { TerminalPanel } from './components/TerminalPanel';
+import { WorkspaceDock } from './components/WorkspaceDock';
 import type { EditorTab } from './editorTypes';
 
 export default function App(): React.JSX.Element {
+  return <AgentWorkspaceProvider><WorkbenchApp /></AgentWorkspaceProvider>;
+}
+
+function WorkbenchApp(): React.JSX.Element {
+  const agent = useAgentWorkspace();
   const [workspace, setWorkspace] = useState<WorkspaceInfo | null>(null);
   const [tabs, setTabs] = useState<EditorTab[]>([]);
   const [activeId, setActiveId] = useState('');
-  const [sidebarMode, setSidebarMode] = useState<'files' | 'git'>('files');
+  const [sidebarMode, setSidebarMode] = useState<'files' | 'git' | 'issues'>('files');
   const [revision, setRevision] = useState(0);
   const [gitStatus, setGitStatus] = useState<GitStatus | null>(null);
   const [error, setError] = useState('');
@@ -109,6 +119,7 @@ export default function App(): React.JSX.Element {
         </button>
         {gitStatus && <div className="topbar-branch">⑂ {gitStatus.branch}{gitStatus.ahead ? ` ↑${gitStatus.ahead}` : ''}{gitStatus.behind ? ` ↓${gitStatus.behind}` : ''}</div>}
         {dirtyCount > 0 && <div className="unsaved-label">{dirtyCount} unsaved</div>}
+        {workspace && <AgentTopStatus />}
       </header>
 
       <div className="workbench">
@@ -118,21 +129,23 @@ export default function App(): React.JSX.Element {
             <button type="button" className={sidebarMode === 'git' ? 'active' : ''} onClick={() => setSidebarMode('git')}>
               Git{gitStatus?.files.length ? <span className="count-badge">{gitStatus.files.length}</span> : null}
             </button>
+            <button type="button" className={sidebarMode === 'issues' ? 'active' : ''} onClick={() => setSidebarMode('issues')}>Issues</button>
           </div>
           <div className="panel-heading">
-            <span>{sidebarMode === 'files' ? workspace?.name.toUpperCase() || 'EXPLORER' : 'SOURCE CONTROL'}</span>
+            <span>{sidebarMode === 'files' ? workspace?.name.toUpperCase() || 'EXPLORER' : sidebarMode === 'git' ? 'SOURCE CONTROL' : 'AGENT CONTEXT'}</span>
             <button type="button" className="icon-button push-right" onClick={() => setRevision((value) => value + 1)}>↻</button>
           </div>
           <div className="sidebar-content">
             {!workspace && <div className="panel-message">Open a repository to begin.</div>}
             {workspace && sidebarMode === 'files' && <FileExplorer revision={revision} onOpenFile={(path) => void openFile(path)} />}
             {workspace && sidebarMode === 'git' && <GitPanel revision={revision} onOpenDiff={(path, staged) => void openDiff(path, staged)} onStatus={setGitStatus} />}
+            {workspace && sidebarMode === 'issues' && <AgentIssues onOpenPath={(path) => void openFile(path)} />}
           </div>
         </aside>
 
         <main className="center-stack">
-          <EditorPane tabs={tabs} activeId={activeId} onActivate={setActiveId} onClose={closeTab} onChange={updateTab} onSave={(id) => void saveTab(id)} />
-          {workspace && <TerminalPanel key={workspace.root} />}
+          <EditorPane diagnostics={groupDiagnostics(agent.state.bridge)} tabs={tabs} activeId={activeId} onActivate={setActiveId} onClose={closeTab} onChange={updateTab} onSave={(id) => void saveTab(id)} />
+          {workspace && <WorkspaceDock key={workspace.root} onOpenPath={(path) => void openFile(path)} onOpenDiff={(path, staged) => void openDiff(path, staged)} />}
         </main>
 
         {workspace ? <AgentPanel key={workspace.root} /> : (

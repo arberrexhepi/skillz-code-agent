@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { FitAddon } from '@xterm/addon-fit';
 import { Terminal } from '@xterm/xterm';
 
-export function TerminalPanel(): React.JSX.Element {
+export function TerminalPanel({ embedded = false }: { embedded?: boolean }): React.JSX.Element {
   const hostRef = useRef<HTMLDivElement>(null);
   const sessionRef = useRef<string | null>(null);
   const [collapsed, setCollapsed] = useState(false);
@@ -48,12 +48,12 @@ export function TerminalPanel(): React.JSX.Element {
   }, [collapsed]);
 
   return (
-    <section className={`terminal-panel ${collapsed ? 'collapsed' : ''}`}>
-      <div className="panel-heading terminal-heading">
+    <section className={`terminal-panel ${embedded ? 'embedded' : ''} ${collapsed ? 'collapsed' : ''}`}>
+      {!embedded && <div className="panel-heading terminal-heading">
         <span>TERMINAL</span>
         {exitLabel && <small>{exitLabel}</small>}
         <button type="button" className="icon-button push-right" onClick={() => setCollapsed((value) => !value)}>{collapsed ? '⌃' : '⌄'}</button>
-      </div>
+      </div>}
       {!collapsed && <div className="terminal-host" ref={hostRef} />}
     </section>
   );

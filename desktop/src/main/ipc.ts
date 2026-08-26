@@ -19,8 +19,9 @@ const terminalId = z.string().uuid();
 export function registerIpc(window: BrowserWindow, services: Services): void {
   for (const channel of [
     'workspace:current', 'workspace:choose', 'workspace:open', 'workspace:list', 'workspace:read', 'workspace:write',
-    'git:status', 'git:file-diff', 'git:stage', 'git:unstage', 'git:commit',
-    'terminal:create', 'agent:start', 'agent:submit', 'agent:planner-action', 'agent:stop',
+    'git:status', 'git:history', 'git:file-diff', 'git:stage', 'git:stage-all', 'git:unstage', 'git:commit', 'git:push',
+    'terminal:create', 'agent:start', 'agent:submit', 'agent:planner-action', 'agent:worker-action',
+    'agent:reconfigure-runtime', 'agent:configure-backoff', 'agent:runtime-options', 'agent:stop',
   ]) ipcMain.removeHandler(channel);
   for (const channel of ['terminal:write', 'terminal:resize', 'terminal:dispose']) ipcMain.removeAllListeners(channel);
 
@@ -58,12 +59,15 @@ export function registerIpc(window: BrowserWindow, services: Services): void {
   ));
 
   handle('git:status', () => services.git.status());
+  handle('git:history', (_event, limit: unknown = 50) => services.git.history(z.number().int().min(1).max(200).parse(limit)));
   handle('git:file-diff', (_event, path: unknown, staged: unknown = false) => (
     services.git.fileDiff(relativePath.parse(path), z.boolean().parse(staged))
   ));
   handle('git:stage', (_event, values: unknown) => services.git.stage(paths.parse(values)));
+  handle('git:stage-all', () => services.git.stageAll());
   handle('git:unstage', (_event, values: unknown) => services.git.unstage(paths.parse(values)));
   handle('git:commit', (_event, message: unknown) => services.git.commit(z.string().min(1).max(2000).parse(message)));
+  handle('git:push', () => services.git.push());
 
   handle('terminal:create', (_event, options: unknown) => services.terminal.create(z.object({
     cols: z.number().int().min(2).max(1000),
@@ -95,6 +99,21 @@ export function registerIpc(window: BrowserWindow, services: Services): void {
   handle('agent:planner-action', (_event, action: unknown, extras: unknown = {}) => services.agent.plannerAction(
     z.string().min(1).max(100).parse(action),
     z.record(z.string(), z.unknown()).parse(extras),
+  ));
+  handle('agent:worker-action', (_event, action: unknown) => services.agent.workerAction(
+    z.record(z.string(), z.unknown()).parse(action),
+  ));
+  handle('agent:reconfigure-runtime', (_event, provider: unknown, model: unknown) => services.agent.reconfigureRuntime(
+    z.string().min(1).max(80).parse(provider),
+    z.string().min(1).max(200).parse(model),
+  ));
+  handle('agent:configure-backoff', (_event, enabled: unknown, tokenLimitK: unknown) => services.agent.configureBackoff(
+    z.boolean().parse(enabled),
+    z.number().int().min(0).max(10_000_000).parse(tokenLimitK),
+  ));
+  handle('agent:runtime-options', (_event, provider: unknown = '', model: unknown = '') => services.agent.runtimeOptions(
+    z.string().max(80).parse(provider),
+    z.string().max(200).parse(model),
   ));
   handle('agent:stop', () => services.agent.stop());
 }

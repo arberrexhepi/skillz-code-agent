@@ -1,7 +1,10 @@
+import { useEffect, useRef } from 'react';
 import Editor, { DiffEditor, type Monaco, type OnMount } from '@monaco-editor/react';
+import type { DiagnosticItem } from '../../../shared/agentTypes';
 import type { EditorTab, FileTab } from '../editorTypes';
 
 interface EditorPaneProps {
+  diagnostics: Record<string, DiagnosticItem[]>;
   tabs: EditorTab[];
   activeId: string;
   onActivate: (id: string) => void;
@@ -12,6 +15,8 @@ interface EditorPaneProps {
 
 export function EditorPane(props: EditorPaneProps): React.JSX.Element {
   const active = props.tabs.find((tab) => tab.id === props.activeId);
+  const monacoRef = useRef<Monaco | null>(null);
+  const editorRef = useRef<Parameters<OnMount>[0] | null>(null);
   const beforeMount = (monaco: Monaco): void => {
     monaco.editor.defineTheme('skillz-dark', {
       base: 'vs-dark',
@@ -28,10 +33,28 @@ export function EditorPane(props: EditorPaneProps): React.JSX.Element {
     });
   };
   const mount: OnMount = (editor, monaco) => {
+    editorRef.current = editor;
+    monacoRef.current = monaco;
     editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => {
       if (active?.kind === 'file') props.onSave(active.id);
     });
   };
+
+  useEffect(() => {
+    const monaco = monacoRef.current;
+    const model = editorRef.current?.getModel();
+    if (!monaco || !model || active?.kind !== 'file') return;
+    const items = props.diagnostics[active.document.path] || [];
+    monaco.editor.setModelMarkers(model, 'skillz-agent', items.map((item) => ({
+      startLineNumber: Math.max(1, Number(item.line || 1)),
+      startColumn: Math.max(1, Number(item.column || 1)),
+      endLineNumber: Math.max(1, Number(item.line || 1)),
+      endColumn: Math.max(2, Number(item.column || 1) + 1),
+      message: String(item.message || item.code || 'Agent diagnostic'),
+      code: item.code,
+      severity: monaco.MarkerSeverity.Error,
+    })));
+  }, [active, props.diagnostics]);
 
   return (
     <section className="editor-pane">

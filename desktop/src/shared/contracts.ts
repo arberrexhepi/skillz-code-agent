@@ -38,35 +38,39 @@ export interface GitFileDiff {
   language: string;
 }
 
+export interface GitCommit {
+  hash: string;
+  shortHash: string;
+  subject: string;
+  body: string;
+  authorName: string;
+  authorEmail: string;
+  authoredAt: string;
+  parents: string[];
+}
+
 export interface AgentStartOptions {
   provider: string;
   model: string;
   backendScript?: string;
 }
 
-export interface AgentTranscriptEntry {
-  role: string;
-  content: string;
-}
-
-export interface AgentBridgeState {
-  planner: Record<string, unknown>;
-  transcript: AgentTranscriptEntry[];
-  last_message?: string;
-  bridge_warning?: string;
-}
+import type { AgentBackoff, AgentBridgeState, AgentProgressMessage, JsonMap, RuntimeOptionsPayload } from './agentTypes';
+export type { AgentBridgeState } from './agentTypes';
 
 export interface AgentResponse {
   id?: string;
   ok: boolean;
   message?: string;
   state: AgentBridgeState;
+  backoff?: AgentBackoff;
+  runtime_options?: RuntimeOptionsPayload;
   [key: string]: unknown;
 }
 
 export type AgentEvent =
   | { type: 'state'; state: AgentBridgeState }
-  | { type: 'progress'; payload: Record<string, unknown> }
+  | { type: 'progress'; payload: AgentProgressMessage }
   | { type: 'status'; status: 'stopped' | 'starting' | 'running' | 'error'; message?: string }
   | { type: 'stderr'; message: string };
 
@@ -91,10 +95,13 @@ export interface WorkbenchApi {
   };
   git: {
     status(): Promise<GitStatus>;
+    history(limit?: number): Promise<GitCommit[]>;
     fileDiff(path: string, staged?: boolean): Promise<GitFileDiff>;
     stage(paths: string[]): Promise<GitStatus>;
+    stageAll(): Promise<GitStatus>;
     unstage(paths: string[]): Promise<GitStatus>;
     commit(message: string): Promise<GitStatus>;
+    push(): Promise<GitStatus>;
   };
   terminal: {
     create(options: TerminalCreateOptions): Promise<string>;
@@ -106,7 +113,11 @@ export interface WorkbenchApi {
   agent: {
     start(options: AgentStartOptions): Promise<AgentResponse>;
     submit(text: string): Promise<AgentResponse>;
-    plannerAction(action: string, extras?: Record<string, unknown>): Promise<AgentResponse>;
+    plannerAction(action: string, extras?: JsonMap): Promise<AgentResponse>;
+    workerAction(action: JsonMap): Promise<AgentResponse>;
+    reconfigureRuntime(provider: string, model: string): Promise<AgentResponse>;
+    configureBackoff(enabled: boolean, tokenLimitK: number): Promise<AgentResponse>;
+    runtimeOptions(provider?: string, model?: string): Promise<RuntimeOptionsPayload>;
     stop(): Promise<void>;
     onEvent(listener: (event: AgentEvent) => void): () => void;
   };

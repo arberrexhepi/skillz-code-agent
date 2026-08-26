@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process';
 import { promises as fs } from 'node:fs';
-import type { GitFileDiff, GitFileStatus, GitStatus } from '../../shared/contracts';
+import type { GitCommit, GitFileDiff, GitFileStatus, GitStatus } from '../../shared/contracts';
 import { languageForPath, type WorkspaceService } from './workspace';
 
 interface GitResult {
@@ -43,9 +43,40 @@ export class GitService {
     return { path: relativePath, original, modified, language: languageForPath(relativePath) };
   }
 
+  async history(limit = 50): Promise<GitCommit[]> {
+    const count = Math.max(1, Math.min(200, Math.floor(limit)));
+    try {
+      const output = await this.run([
+        'log', `-${count}`, '--date=iso-strict',
+        '--pretty=format:%x1e%H%x1f%h%x1f%an%x1f%ae%x1f%aI%x1f%P%x1f%s%x1f%b',
+      ]);
+      return output.stdout.split('\x1e').map((record) => record.trim()).filter(Boolean).map((record) => {
+        const [hash = '', shortHash = '', authorName = '', authorEmail = '', authoredAt = '', parents = '', subject = '', ...body] = record.split('\x1f');
+        return {
+          hash,
+          shortHash,
+          authorName,
+          authorEmail,
+          authoredAt,
+          parents: parents.split(' ').filter(Boolean),
+          subject,
+          body: body.join('\x1f').trim(),
+        };
+      });
+    } catch (error) {
+      if (/does not have any commits|unknown revision|bad default revision/i.test(String(error))) return [];
+      throw error;
+    }
+  }
+
   async stage(paths: string[]): Promise<GitStatus> {
     const safePaths = this.validatePaths(paths);
     await this.run(['add', '--', ...safePaths]);
+    return this.status();
+  }
+
+  async stageAll(): Promise<GitStatus> {
+    await this.run(['add', '-A', '--', '.']);
     return this.status();
   }
 
@@ -62,7 +93,35 @@ export class GitService {
   async commit(message: string): Promise<GitStatus> {
     const cleaned = message.trim();
     if (!cleaned) throw new Error('Commit message cannot be empty.');
+    const status = await this.status();
+    const staged = status.files.some((file) => file.indexStatus !== ' ' && file.indexStatus !== '?');
+    if (!staged) throw new Error('Stage at least one changed file before committing.');
     await this.run(['commit', '-m', cleaned]);
+    return this.status();
+  }
+
+  async push(): Promise<GitStatus> {
+    const status = await this.status();
+    if (status.behind > 0) {
+      throw new Error(`This branch is ${status.behind} commit${status.behind === 1 ? '' : 's'} behind ${status.upstream || 'its upstream'}. Pull and resolve incoming changes before pushing.`);
+    }
+
+    const branch = await this.run(['symbolic-ref', '--quiet', '--short', 'HEAD'])
+      .then((result) => result.stdout.trim())
+      .catch(() => '');
+    if (!branch) throw new Error('Create or switch to a branch before pushing; detached HEAD cannot be published safely.');
+
+    if (status.upstream) {
+      if (status.ahead === 0) throw new Error(`Branch ${branch} is already synced with ${status.upstream}.`);
+      await this.run(['push'], 120_000);
+      return this.status();
+    }
+
+    const remotes = (await this.run(['remote'])).stdout.split('\n').map((remote) => remote.trim()).filter(Boolean);
+    if (!remotes.length) throw new Error('Add a Git remote before publishing this branch.');
+    const remote = remotes.includes('origin') ? 'origin' : remotes.length === 1 ? remotes[0] : '';
+    if (!remote) throw new Error('This repository has multiple remotes. Configure an upstream branch before pushing.');
+    await this.run(['push', '--set-upstream', remote, branch], 120_000);
     return this.status();
   }
 
@@ -82,12 +141,14 @@ export class GitService {
     }
   }
 
-  private run(args: string[]): Promise<GitResult> {
+  private run(args: string[], timeout = 0): Promise<GitResult> {
     return new Promise((resolve, reject) => {
       execFile('git', args, {
         cwd: this.workspace.requireRoot(),
         encoding: 'utf8',
         maxBuffer: 20 * 1024 * 1024,
+        timeout: timeout || undefined,
+        env: timeout ? { ...process.env, GIT_TERMINAL_PROMPT: '0' } : process.env,
       }, (error, stdout, stderr) => {
         if (error) {
           reject(new Error(String(stderr || error.message).trim()));

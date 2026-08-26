@@ -8,7 +8,9 @@ Electron desktop shell for the Python planner/worker. The application is intenti
 - Monaco file tabs, dirty-state tracking, save shortcuts, and Git diff views
 - real PTY terminal through xterm.js and node-pty
 - Git branch/status, stage, unstage, diff, and commit controls
-- existing Python agent bridge with stable/beta runtime selection, transcript, discovery choices, and plan approval
+- exact Python bridge parity for planner actions, worker actions, runtime discovery/switching, backoff, and lifecycle progress
+- workspace-native agent UI: calm conversation rail, pinned lifecycle decisions, durable issues/run facts, and continuous-mode status
+- bottom workspace dock for Terminal, Activity, Problems, and Review; diagnostics also become Monaco markers
 - sandboxed renderer with a narrow, validated preload API
 
 ## Development
@@ -50,6 +52,8 @@ Python planner/worker
 ```
 
 The desktop process reuses the same `--extension-bridge` protocol as the VS Code extension.
+
+Agent protocol types and UI derivation live in `src/shared/agentTypes.ts` and `src/shared/agentCore.ts`. The reducer/selectors have no React or Electron dependency, keeping the bridge payload authoritative while allowing the desktop and VS Code shells to present it differently.
 
 ## Python resolution
 

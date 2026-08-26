@@ -1,4 +1,4 @@
-import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { execFile, spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { app } from 'electron';
@@ -8,6 +8,7 @@ import type {
   AgentResponse,
   AgentStartOptions,
 } from '../../shared/contracts';
+import type { JsonMap, RuntimeOptionsPayload } from '../../shared/agentTypes';
 import type { WorkspaceService } from './workspace';
 
 interface PendingRequest {
@@ -83,6 +84,49 @@ export class AgentService {
     return this.request('planner_action', { action, ...extras });
   }
 
+  workerAction(action: JsonMap): Promise<AgentResponse> {
+    return this.request('worker_action', { action });
+  }
+
+  reconfigureRuntime(provider: string, model: string): Promise<AgentResponse> {
+    return this.request('reconfigure_runtime', { provider, model });
+  }
+
+  configureBackoff(enabled: boolean, tokenLimitK: number): Promise<AgentResponse> {
+    return this.request('configure_backoff', { enabled, token_limit_k: tokenLimitK });
+  }
+
+  async runtimeOptions(provider = '', model = ''): Promise<RuntimeOptionsPayload> {
+    if (this.process) {
+      const response = await this.request('runtime_options', {});
+      return response.runtime_options || {};
+    }
+    const agentRoot = this.agentRoot();
+    const script = [
+      'import json, sys',
+      'from runtime_catalog import runtime_options_payload',
+      'print(json.dumps(runtime_options_payload(current_provider=sys.argv[1], current_model=sys.argv[2])))',
+    ].join('; ');
+    return new Promise<RuntimeOptionsPayload>((resolve, reject) => {
+      execFile(this.pythonExecutable(agentRoot), ['-c', script, provider, model], {
+        cwd: agentRoot,
+        env: process.env,
+        encoding: 'utf8',
+        maxBuffer: 2 * 1024 * 1024,
+      }, (error, stdout, stderr) => {
+        if (error) {
+          reject(new Error(`Could not load Python runtime catalog: ${String(stderr || error.message).trim()}`));
+          return;
+        }
+        try {
+          resolve(JSON.parse(stdout) as RuntimeOptionsPayload);
+        } catch (cause) {
+          reject(new Error(`Python runtime catalog returned invalid JSON: ${String(cause)}`));
+        }
+      });
+    });
+  }
+
   async stop(): Promise<void> {
     if (!this.process) return;
     this.stopping = true;
@@ -118,7 +162,7 @@ export class AgentService {
           this.emit({ type: 'state', state: this.state });
         }
         if (payload.type === 'progress' || payload.type === 'goal_start' || payload.type === 'goal_finish') {
-          this.emit({ type: 'progress', payload });
+          this.emit({ type: 'progress', payload: payload as import('../../shared/agentTypes').AgentProgressMessage });
           continue;
         }
         const response = payload as unknown as AgentResponse;
