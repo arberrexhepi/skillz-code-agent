@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Dict, List, Sequence
 
 from tree_commands import CommandResult
-from tree_loop import TreeLoop, Turn
+from tree_loop import TreeLoop, Turn, extract_commands
 
 
 class RecordingMessageModel:
@@ -29,6 +29,36 @@ class RecordingMessageModel:
 
 
 class TreeLoopMessageTranscriptTests(unittest.TestCase):
+    def test_issue_lifecycle_commands_are_extracted_as_executable(self) -> None:
+        output = "\n".join([
+            ">>th: the diagnostic is now clean",
+            ">>pl: resolve it",
+            "resolve-run-issue run-ts2339-deadbeef01",
+        ])
+
+        extracted = extract_commands(output)
+
+        self.assertIn("resolve-run-issue run-ts2339-deadbeef01", extracted)
+
+    def test_external_stop_ends_current_run_as_incomplete(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "note.txt").write_text("hello\n", encoding="utf-8")
+            model = RecordingMessageModel([
+                ">>th: inspect\n>>pl: read note\ncat /repo/note.txt",
+            ])
+            loop = TreeLoop(model=model, workspace_root=root, max_turns=3, verbose=False)
+
+            def stop_after_command(_command: str, _result: CommandResult) -> None:
+                loop.request_stop("execution made no progress")
+
+            loop.command_observer = stop_after_command
+            result = loop.run("Read the note")
+
+        self.assertFalse(result.finished)
+        self.assertEqual(len(model.calls), 1)
+        self.assertIn("execution made no progress", result.finish_message)
+
     def test_run_uses_stable_message_transcript_instead_of_rebuilt_history_prompt(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

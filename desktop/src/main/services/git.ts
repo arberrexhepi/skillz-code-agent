@@ -1,0 +1,178 @@
+import { execFile } from 'node:child_process';
+import { promises as fs } from 'node:fs';
+import type { GitCommit, GitFileDiff, GitFileStatus, GitStatus } from '../../shared/contracts';
+import { languageForPath, type WorkspaceService } from './workspace';
+
+interface GitResult {
+  stdout: string;
+  stderr: string;
+}
+
+export class GitService {
+  constructor(private readonly workspace: WorkspaceService) {}
+
+  async status(): Promise<GitStatus> {
+    const output = await this.run(['status', '--porcelain=v1', '-z', '--branch']);
+    const records = output.stdout.split('\0').filter(Boolean);
+    const header = records.shift() || '## HEAD';
+    const branch = parseBranch(header);
+    const files: GitFileStatus[] = [];
+
+    for (let index = 0; index < records.length; index += 1) {
+      const record = records[index];
+      if (record.length < 4) continue;
+      const indexStatus = record[0];
+      const workTreeStatus = record[1];
+      const filePath = record.slice(3);
+      const item: GitFileStatus = { path: filePath, indexStatus, workTreeStatus };
+      if (indexStatus === 'R' || indexStatus === 'C') {
+        item.originalPath = records[index + 1];
+        index += 1;
+      }
+      files.push(item);
+    }
+    return { ...branch, files };
+  }
+
+  async fileDiff(relativePath: string, staged = false): Promise<GitFileDiff> {
+    const target = this.workspace.resolve(relativePath);
+    const modified = staged
+      ? await this.tryGitShow(`:${relativePath}`)
+      : await fs.readFile(target, 'utf8').catch(() => '');
+    const original = await this.tryGitShow(`HEAD:${relativePath}`);
+    return { path: relativePath, original, modified, language: languageForPath(relativePath) };
+  }
+
+  async history(limit = 50): Promise<GitCommit[]> {
+    const count = Math.max(1, Math.min(200, Math.floor(limit)));
+    try {
+      const output = await this.run([
+        'log', `-${count}`, '--date=iso-strict',
+        '--pretty=format:%x1e%H%x1f%h%x1f%an%x1f%ae%x1f%aI%x1f%P%x1f%s%x1f%b',
+      ]);
+      return output.stdout.split('\x1e').map((record) => record.trim()).filter(Boolean).map((record) => {
+        const [hash = '', shortHash = '', authorName = '', authorEmail = '', authoredAt = '', parents = '', subject = '', ...body] = record.split('\x1f');
+        return {
+          hash,
+          shortHash,
+          authorName,
+          authorEmail,
+          authoredAt,
+          parents: parents.split(' ').filter(Boolean),
+          subject,
+          body: body.join('\x1f').trim(),
+        };
+      });
+    } catch (error) {
+      if (/does not have any commits|unknown revision|bad default revision/i.test(String(error))) return [];
+      throw error;
+    }
+  }
+
+  async stage(paths: string[]): Promise<GitStatus> {
+    const safePaths = this.validatePaths(paths);
+    await this.run(['add', '--', ...safePaths]);
+    return this.status();
+  }
+
+  async stageAll(): Promise<GitStatus> {
+    await this.run(['add', '-A', '--', '.']);
+    return this.status();
+  }
+
+  async unstage(paths: string[]): Promise<GitStatus> {
+    const safePaths = this.validatePaths(paths);
+    try {
+      await this.run(['restore', '--staged', '--', ...safePaths]);
+    } catch {
+      await this.run(['reset', '--', ...safePaths]);
+    }
+    return this.status();
+  }
+
+  async commit(message: string): Promise<GitStatus> {
+    const cleaned = message.trim();
+    if (!cleaned) throw new Error('Commit message cannot be empty.');
+    const status = await this.status();
+    const staged = status.files.some((file) => file.indexStatus !== ' ' && file.indexStatus !== '?');
+    if (!staged) throw new Error('Stage at least one changed file before committing.');
+    await this.run(['commit', '-m', cleaned]);
+    return this.status();
+  }
+
+  async push(): Promise<GitStatus> {
+    const status = await this.status();
+    if (status.behind > 0) {
+      throw new Error(`This branch is ${status.behind} commit${status.behind === 1 ? '' : 's'} behind ${status.upstream || 'its upstream'}. Pull and resolve incoming changes before pushing.`);
+    }
+
+    const branch = await this.run(['symbolic-ref', '--quiet', '--short', 'HEAD'])
+      .then((result) => result.stdout.trim())
+      .catch(() => '');
+    if (!branch) throw new Error('Create or switch to a branch before pushing; detached HEAD cannot be published safely.');
+
+    if (status.upstream) {
+      if (status.ahead === 0) throw new Error(`Branch ${branch} is already synced with ${status.upstream}.`);
+      await this.run(['push'], 120_000);
+      return this.status();
+    }
+
+    const remotes = (await this.run(['remote'])).stdout.split('\n').map((remote) => remote.trim()).filter(Boolean);
+    if (!remotes.length) throw new Error('Add a Git remote before publishing this branch.');
+    const remote = remotes.includes('origin') ? 'origin' : remotes.length === 1 ? remotes[0] : '';
+    if (!remote) throw new Error('This repository has multiple remotes. Configure an upstream branch before pushing.');
+    await this.run(['push', '--set-upstream', remote, branch], 120_000);
+    return this.status();
+  }
+
+  private validatePaths(paths: string[]): string[] {
+    if (paths.length === 0) throw new Error('Select at least one path.');
+    return paths.map((item) => {
+      this.workspace.resolve(item);
+      return item.replaceAll('\\', '/');
+    });
+  }
+
+  private async tryGitShow(revision: string): Promise<string> {
+    try {
+      return (await this.run(['show', revision])).stdout;
+    } catch {
+      return '';
+    }
+  }
+
+  private run(args: string[], timeout = 0): Promise<GitResult> {
+    return new Promise((resolve, reject) => {
+      execFile('git', args, {
+        cwd: this.workspace.requireRoot(),
+        encoding: 'utf8',
+        maxBuffer: 20 * 1024 * 1024,
+        timeout: timeout || undefined,
+        env: timeout ? { ...process.env, GIT_TERMINAL_PROMPT: '0' } : process.env,
+      }, (error, stdout, stderr) => {
+        if (error) {
+          reject(new Error(String(stderr || error.message).trim()));
+          return;
+        }
+        resolve({ stdout, stderr });
+      });
+    });
+  }
+}
+
+function parseBranch(header: string): Omit<GitStatus, 'files'> {
+  const value = header.replace(/^##\s*/, '');
+  if (value.startsWith('Initial commit on ')) {
+    return { branch: value.slice('Initial commit on '.length), ahead: 0, behind: 0 };
+  }
+  if (value.startsWith('No commits yet on ')) {
+    return { branch: value.slice('No commits yet on '.length), ahead: 0, behind: 0 };
+  }
+  const match = /^(.*?)(?:\.\.\.([^\s]+))?(?: \[(.*?)\])?$/.exec(value);
+  const branch = match?.[1] || value;
+  const upstream = match?.[2];
+  const tracking = match?.[3] || '';
+  const ahead = Number(/ahead (\d+)/.exec(tracking)?.[1] || 0);
+  const behind = Number(/behind (\d+)/.exec(tracking)?.[1] || 0);
+  return { branch, upstream, ahead, behind };
+}

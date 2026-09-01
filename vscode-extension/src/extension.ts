@@ -346,6 +346,7 @@ interface RuntimeOptionsResponse extends BridgeResponse {
 
 const DEFAULT_MODEL_BY_PROVIDER: Record<string, string> = {
   openai: 'gpt-5.4',
+  'codex-subscription': 'gpt-5.6-terra',
   meta: 'muse-spark-1.2',
   anthropic: 'claude-sonnet-4-6',
   gemini: 'gemini-3-flash-preview',

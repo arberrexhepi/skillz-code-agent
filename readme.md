@@ -1,11 +1,15 @@
-# Python Agent
+# Skillz Code Agent
 
-Planner-first coding agent for real repositories. The planner handles clarification, discovery, goal sequencing, and final next steps. The worker executes concrete repository actions.
+Skillz is a planner-first coding agent for real repositories, available as a standalone Electron/React workbench, a CLI, and a VS Code extension. The planner handles clarification, bounded discovery, goal sequencing, approvals, recovery, and final next steps; the worker performs concrete repository actions and validation.
+
+Model invocation is provider-neutral. API-backed providers remain available, while the additive `codex-subscription` backend can invoke supported Codex models through an existing local ChatGPT subscription session without converting or replacing the OpenAI API path.
 
 ## TLDR: Ways To Use The Agent
 
 | Interface | Best for | How to start | How to use |
 | --- | --- | --- | --- |
+| Desktop Workbench | The complete local workflow: repository browsing, editing, terminal, Git, planner execution, runtime selection, and live goal activity. | `cd desktop && npm install && npm run dev` | Open a repository, configure the provider/model/backend in Runtime settings, start the agent, then work through discovery, approval, execution, and goal reports. |
+| Codex subscription runtime | Running either stable or TreeLoop workers with a locally authenticated ChatGPT/Codex subscription instead of API-key billing. | Run `codex login`, then select `codex-subscription` in the desktop Runtime drawer or pass it to the CLI. | Choose a model from the detected local catalog. The existing `openai` provider remains available separately. |
 | Planner CLI | Normal repo work where you want discovery, a reviewable plan, then execution. | `python main.py --provider openai --model gpt-5.4 --root /your/project` | Type the request, choose discovery depth if offered, then `approve` to run the plan. |
 | Auto CLI | Letting the planner run one or more issue cycles without pausing for plan approval. | `start-auto 3 Build the feature described in PROPOSAL.md` from the planner prompt | The optional text becomes the auto-run prompt; cycles create/close issues and use completed issue context to avoid repeats. |
 | Direct Worker CLI | Small, concrete edits when you do not need planner decomposition. | `python main.py --provider openai --model gpt-5.4 --root /your/project --worker-mode` | Give a focused task; the worker reads, edits, validates, and finishes directly. |
@@ -13,6 +17,8 @@ Planner-first coding agent for real repositories. The planner handles clarificat
 | VS Code Extension | Desktop UI for planner state, Auto mode, issues, diagnostics, diffs, and suggested actions. | Open `vscode-extension/` in VS Code and run `Run Python Agent Extension` | Use the panel to submit prompts, create issues, start Auto cycles, approve plans, inspect diagnostics, and open files/diffs. |
 
 Common planner commands: `/reset`, `/start-auto 3 optional prompt`, `/stop-auto`, `/create-issue details`, `reopen issue-123`, `approve`, `reject`.
+
+> **Roadmap note:** The Electron/React Workbench is the primary desktop direction and is expected to phase out the VS Code extension. The extension remains useful for current development and compatibility, but should not be the sole reason to adopt Skillz or be treated as a long-term product commitment.
 
 ## Latest Development Update
 
@@ -25,13 +31,46 @@ The current development work tightens the full planner/worker loop, from provide
 - **Preemptive output recovery:** annotation-only, prose-only, and malformed command turns are repaired into the beta command grammar before they become terminal `model_output_invalid` failures.
 - **Expanded guarded Git support:** the beta worker now supports bounded status, diff, revision-range log, branch, remote, rev-parse, show, blame, add, restore, move, remove, commit, and push operations. Mutating or remote operations remain authorization-gated, paths are explicit, and broad or unsafe revision expressions are rejected.
 - **Meta Muse Spark support:** `muse-spark-1.2` is available through Meta's OpenAI-compatible API using `META_AI_API_KEY`, including provider/model selection in the extension. The standard model remains distinct from the opt-in contributor tier whose prompts and completions may be used for Meta training.
+- **Local Codex subscription support:** `codex-subscription` invokes models through the locally installed Codex CLI and its ChatGPT-managed session. It remains isolated from the existing `openai` API-key provider and appears with account, plan, and live-model status in the Electron Runtime drawer.
+- **Standalone desktop workbench:** the Electron main process hosts workspace, Git, PTY, and Python bridge services behind validated IPC, while the sandboxed React renderer provides Monaco editing/diffs, an xterm terminal, lifecycle-aware agent cards, goal reports, and live model/tool activity.
+- **Bounded execution recovery:** the beta/live TreeLoop stops broad exploration after repeated empty searches or sustained action without a repository mutation, then requires a focused edit, validation, explicit blocker, or incomplete stop instead of consuming turns indefinitely.
 - **Better extension state:** the panel shows provider-specific model choices, per-session and per-issue usage, transient recovery details, durable-versus-run issue context, completed checkpoints, and the exact goal where a paused plan will resume.
 
 These changes are covered by targeted provider, prompt-cache, transcript, recovery, continuation, usage-accounting, beta Git, command-repair, and extension panel tests.
 
+## Architecture
+
+```text
+Electron / React workbench                 CLI / VS Code extension
+            │ validated IPC                         │
+            ▼                                       │
+Electron main process                               │
+  ├── workspace, Git, PTY                           │
+  ├── Codex account/model status                    │
+  └── Python process manager ───── NDJSON bridge ───┘
+                                      │
+                                      ▼
+                         Python planner + worker
+                           ├── stable runtime
+                           ├── beta/live TreeLoop
+                           └── provider adapters
+                                ├── API providers
+                                ├── local providers
+                                └── Codex subscription
+```
+
+The Python planner/worker is the source of truth for lifecycle and repository actions. Skillz uses Codex only as a model backend: a subscription-backed Codex subprocess cannot directly edit the target repository, and must return Skillz actions for the host to validate and execute.
+
 ## Setup
 
-Install dependencies:
+Requirements:
+
+- Python 3.13 is the current development target.
+- Git must be available for status, diff, review, and repository mutation flows.
+- Node.js and npm are required for the Electron workbench or VS Code extension.
+- The Codex CLI, or the Codex executable bundled with the macOS ChatGPT app, is required only for `codex-subscription`.
+
+Install Python provider dependencies:
 
 ```bash
 pip install openai google-genai anthropic
@@ -46,12 +85,25 @@ export GEMINI_API_KEY=...
 export ANTHROPIC_API_KEY=...
 ```
 
+Only configure credentials for the API-backed providers you use. `codex-subscription` does not require `OPENAI_API_KEY`; it requires a local Codex session authenticated with ChatGPT.
+
+Start the desktop workbench:
+
+```bash
+cd desktop
+npm install
+npm run dev
+```
+
+Then open a repository, open Runtime settings, choose a provider/model and one of the stable, beta, or live backends, and select **Start agent**.
+
 ## Run
 
 Planner-first mode:
 
 ```bash
 python main.py --provider openai --model gpt-5.4 --root /your/project
+python main.py --provider codex-subscription --model gpt-5.6-terra --root /your/project
 python main.py --provider meta --model muse-spark-1.2 --root /your/project
 python main.py --provider anthropic --model claude-sonnet-4-6 --root /your/project
 python main.py --provider local --model gemma4 --root /your/project
@@ -61,6 +113,7 @@ Direct worker mode:
 
 ```bash
 python main.py --provider openai --model gpt-5.4 --root /your/project --worker-mode
+python main.py --provider codex-subscription --model gpt-5.6-terra --root /your/project --worker-mode
 python main.py --provider meta --model muse-spark-1.2 --root /your/project --worker-mode
 python main.py --provider anthropic --model claude-sonnet-4-6 --root /your/project --worker-mode
 python main_v2.py --provider gemini --model gemini-3-flash-preview --root /your/project --worker-mode
@@ -84,13 +137,43 @@ Live runtime switching in the CLI:
 /models gemini
 ```
 
-`/providers` lists supported runtimes. `/models [provider]` shows the current provider by default and prints suggested model names for any supported provider. On startup, the backend does one best-effort live model refresh for providers with installed SDKs and credentials, then falls back to the built-in catalog if a provider cannot be queried. Custom model strings are still allowed.
+`/providers` lists supported runtimes. `/models [provider]` shows the current provider by default and prints suggested model names for any supported provider. On startup, the backend does one best-effort live model refresh for providers with installed SDKs and credentials, then falls back to the built-in catalog if a provider cannot be queried. Custom model strings remain available for providers that support them; `codex-subscription` is intentionally limited to its local live/fallback catalog.
+
+### Codex / ChatGPT subscription runtime
+
+The `codex-subscription` provider is an additive alternative to `openai`; it does not replace or modify API-key invocation.
+
+1. Install the Codex CLI, or use the Codex executable bundled with the macOS ChatGPT app.
+2. Run `codex login` and complete the browser flow. Confirm the active method with `codex login status`; it must report ChatGPT authentication rather than API-key authentication.
+3. In the Electron Workbench Runtime drawer, choose **Codex / ChatGPT subscription**. The drawer shows the detected account, subscription plan, CLI version, and live model catalog. If needed, use **Sign in with ChatGPT**.
+4. Select one of the models advertised by the local Codex catalog and apply the runtime.
+
+You can inspect the same integration without starting the desktop app:
+
+```bash
+python codex_subscription.py status
+python main.py --provider codex-subscription --model gpt-5.6-terra --root /your/project
+```
+
+Skillz discovers the executable in this order: `CODEX_CLI_PATH`, `codex` on `PATH`, then the Codex binary bundled with `/Applications/ChatGPT.app` on macOS. Override discovery when needed:
+
+```bash
+export CODEX_CLI_PATH=/absolute/path/to/codex
+```
+
+Each model turn runs through `codex exec --ephemeral` in a temporary, read-only workspace. Skillz removes `OPENAI_API_KEY`, OpenAI base-URL overrides, and Codex API/access-token variables from the child process, preventing this provider from silently falling back to usage-based API authentication. Repository reads, writes, and validation remain controlled by the Skillz host.
+
+Set `CODEX_SUBSCRIPTION_TIMEOUT_SECONDS` to override the default model-turn timeout. Authentication and model discovery use the local Codex app-server; credentials remain owned by Codex and are never copied into the renderer or Skillz configuration.
+
+OpenAI documents ChatGPT subscription and API-key login as separate Codex authentication paths. API-key invocation continues to use standard API billing, while ChatGPT sign-in uses the permissions and limits of the selected ChatGPT account/workspace. See [Codex authentication](https://learn.chatgpt.com/docs/auth), [Codex app-server](https://learn.chatgpt.com/docs/app-server), and [Codex non-interactive mode](https://learn.chatgpt.com/docs/non-interactive-mode).
 
 Muse Spark uses Meta's OpenAI-compatible Responses API. Add `META_AI_API_KEY=...` to the repository `.env`, then select `--provider meta --model muse-spark-1.2`. The shared startup loader reads `.env` before constructing any provider client, including when the VS Code extension launches the backend. The base URL defaults to `https://api.meta.ai/v1` and can be overridden with `META_MODEL_API_BASE_URL`. Meta does not support `--thinking-mode none`; use `minimal` or higher. The discounted `muse-spark-1.2-contributor` model is also listed, but its prompts and completions may be used by Meta for training, unlike the standard tier.
 
 ## VS Code Extension
 
 An initial desktop VS Code extension shell is available under `vscode-extension/`.
+
+The extension is a transitional integration surface. Ongoing product development is centered on the standalone Electron/React Workbench, which is intended to replace the extension rather than maintain permanent feature parity with it.
 
 What it currently provides:
 
@@ -134,6 +217,33 @@ Backend requirements:
 - Node.js and `npm` are required only for extension development inside `vscode-extension/`, not for the Python backend itself.
 
 The extension currently targets desktop VS Code APIs and uses the Python runtime as the source of truth for planner/worker behavior.
+
+## Desktop Workbench
+
+The standalone Electron application is under `desktop/`. It is an agent-first coding workbench rather than a VS Code clone.
+
+Current workspace capabilities:
+
+- lazy repository tree, Monaco tabs, dirty-state tracking, save shortcuts, and file/Git diffs
+- real PTY terminals through xterm.js and `node-pty`
+- branch/status inspection, staging, unstaging, diff review, and commits
+- Activity, Problems, Review, and Terminal dock surfaces, with diagnostics mirrored into Monaco markers
+- planner conversation, bounded discovery choices, plan approval, continuous execution, durable issues, run diagnostics, work handoffs, and per-goal reports
+- live model-call and tool-action feedback so long subscription-backed turns do not appear frozen
+- Runtime settings for provider, live model catalog, stable/beta/live backend, token backoff, agent start/stop, and Codex subscription account status
+
+The renderer is sandboxed and has no direct Node, filesystem, shell, or credential access. Workspace, Git, terminal, Codex status/login, and Python bridge operations run in Electron's main process behind a narrow validated preload API.
+
+Development and packaging commands:
+
+```bash
+cd desktop
+npm run typecheck
+npm run build
+npm run package
+```
+
+See [`desktop/README.md`](desktop/README.md) for architecture, development commands, packaging, and current distribution constraints.
 
 ## Planner Flow
 

@@ -22,6 +22,25 @@ from .text_ops import (
 OperationHandler = Callable[..., MutationResult]
 
 
+_SINGLE_PATH_OPERATIONS = {
+    "replace_range",
+    "replace_snippet",
+    "insert_before",
+    "insert_after",
+    "delete_range",
+    "delete_snippet",
+    "append_block",
+    "prepend_block",
+    "replace_symbol",
+    "insert_symbol_member",
+    "rename_symbol",
+    "move_block",
+    "create_file",
+    "delete_file",
+    "fill_template",
+}
+
+
 def batch_mutate(
     operations: list[dict[str, Any]],
     *,
@@ -75,8 +94,7 @@ def _dispatch_operation(operation: dict[str, Any], *, root: Path, index: int) ->
             reason="unknown_operation",
             diagnostics=[{"code": "UNKNOWN_OPERATION", "message": f"Unknown mutation operation: {op_type}"}],
         )
-    kwargs = dict(operation)
-    kwargs.pop("type", None)
+    kwargs = _operation_kwargs(op_type, operation)
     kwargs["root"] = root
     try:
         return handler(**kwargs)
@@ -90,6 +108,17 @@ def _dispatch_operation(operation: dict[str, Any], *, root: Path, index: int) ->
             reason="bad_request",
             diagnostics=[{"code": "BAD_REQUEST", "message": str(exc)}],
         )
+
+
+def _operation_kwargs(op_type: str, operation: dict[str, Any]) -> dict[str, Any]:
+    """Translate the public action schema into mutation-handler arguments."""
+    kwargs = dict(operation)
+    kwargs.pop("type", None)
+    if op_type in _SINGLE_PATH_OPERATIONS and "file_path" not in kwargs and "path" in kwargs:
+        kwargs["file_path"] = kwargs.pop("path")
+    if op_type == "replace_snippet" and "replace_all" not in kwargs and "all" in kwargs:
+        kwargs["replace_all"] = kwargs.pop("all")
+    return kwargs
 
 
 def _handler_map() -> dict[str, OperationHandler]:
