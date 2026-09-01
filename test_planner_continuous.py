@@ -45,6 +45,9 @@ class FakeWorker:
         self.closed = True
         return {"ok": True, "note": note}
 
+    def render_last_usage_summary(self):
+        return ""
+
 
 class ContinuousPlannerForTest(PlannerAgent):
     def __init__(self, *args, execution_results=None, **kwargs):
@@ -137,6 +140,281 @@ def present_plan(summary: str, goal: str, notes):
 
 
 class ContinuousAutoApprovalTests(unittest.TestCase):
+    def test_beta_turn_history_detects_nested_workspace_mutation(self):
+        mutation_result = SimpleNamespace(ok=True, tool_action={"type": "write_file", "path": "src/app.ts"})
+        turn = SimpleNamespace(results=[mutation_result])
+
+        self.assertTrue(PlannerAgent._history_has_successful_workspace_mutation([turn]))
+
+    def test_subscription_skips_optional_between_goal_model_call(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            model = FakeModel([])
+            config = SimpleNamespace(
+                root=str(root),
+                provider="codex-subscription",
+                model="gpt-5.6-terra",
+                thinking_mode="low",
+                verbosity="medium",
+                max_parallel_workers=1,
+            )
+            planner = PlannerAgent(model, config, lambda: FakeWorker(root), json.loads)
+            first = PlannerGoal("goal-1", "First", "Complete first.", "Needed.")
+            second = PlannerGoal("goal-2", "Second", "Complete second.", "Needed.")
+            plan = PlannerPlan(original_request="Complete both", summary="Complete both", goals=[first, second])
+            result = GoalExecutionResult(
+                goal_id="goal-1",
+                title="First",
+                delegated_task="Complete first.",
+                final_message="Done.",
+                status="completed",
+                task_satisfied=True,
+                validation_ran=True,
+                validation_passed=True,
+            )
+
+            guidance = planner._plan_next_goal_guidance(plan, first, result)
+
+        self.assertEqual(guidance, "")
+        self.assertEqual(model.prompts, [])
+
+    def test_goal_finish_callback_sees_incremental_completed_results(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            model = FakeModel([{"summary": "Both goals completed.", "next_steps": []}])
+            config = SimpleNamespace(
+                root=str(root),
+                provider="codex-subscription",
+                model="gpt-5.6-terra",
+                thinking_mode="low",
+                verbosity="medium",
+                max_parallel_workers=1,
+            )
+            planner = ImmediateExecutionPlannerForTest(model, config, lambda: FakeWorker(root), json.loads)
+            planner.session.pending_plan = PlannerPlan(
+                original_request="Complete both",
+                summary="Complete both",
+                goals=[
+                    PlannerGoal("goal-1", "First", "Complete first.", "Needed."),
+                    PlannerGoal("goal-2", "Second", "Complete second.", "Needed."),
+                ],
+                not_in_scope=["Unrelated files."],
+            )
+            completed_counts = []
+            planner.on_goal_callback = lambda event, *_args: (
+                completed_counts.append(len(planner.session.completed_results)) if event == "goal_finish" else None
+            )
+
+            planner.execute_pending_plan()
+
+        self.assertEqual(completed_counts, [1, 2])
+        self.assertEqual(planner.session.last_next_steps, [])
+        self.assertEqual(planner.export_state()["last_next_steps"], [])
+
+    def test_manual_discovery_handoff_continues_to_plan(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            model = FakeModel(
+                [
+                    {
+                        "action": {
+                            "type": "respond",
+                            "message": "Discovery is complete; pass the findings to the planner.",
+                        }
+                    },
+                    present_plan(
+                        "Implement the discovered project workflow.",
+                        "Implement the bounded project workflow from discovery.",
+                        ["Use the completed discovery findings directly."],
+                    ),
+                ]
+            )
+            config = SimpleNamespace(
+                root=str(root),
+                provider="openai",
+                model="test",
+                thinking_mode="low",
+                verbosity="medium",
+                max_parallel_workers=1,
+            )
+            planner = PlannerAgent(model, config, lambda: FakeWorker(root), json.loads)
+            planner.session.latest_request = "Implement projects"
+            planner.session.intake_messages = [{"role": "user", "content": "Implement projects"}]
+            planner.session.pending_discovery = DiscoveryRequest(
+                reason="Inspect project persistence first.",
+                prompt="Trace the relevant project workflow.",
+                recommended_mode="moderate",
+            )
+            run_result = SimpleNamespace(
+                ok=True,
+                final_message="Project persistence and command workflow entry points were identified.",
+                task_satisfied=True,
+                validation_ran=False,
+                validation_passed=True,
+                touched_paths=["src/services/projectService.ts"],
+                validation=SimpleNamespace(summary="Read-only discovery completed."),
+            )
+            planner._run_worker_task = lambda **_kwargs: {  # type: ignore[method-assign]
+                "run_result": run_result,
+                "history_slice": [],
+                "elapsed": 0.1,
+                "budget_state": {"tool_calls_used": 2, "max_tool_calls": 8},
+            }
+
+            message = planner.execute_discovery("moderate")
+
+        self.assertIsNotNone(planner.session.pending_plan)
+        self.assertIsNone(planner.session.pending_discovery)
+        self.assertIn("Plan", message)
+        self.assertIn("Continue to planning now", model.prompts[-1])
+
+    def test_subscription_write_goal_cannot_complete_without_mutation_or_validation(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            config = SimpleNamespace(
+                root=str(root),
+                provider="codex-subscription",
+                model="gpt-5.6-terra",
+                thinking_mode="low",
+                verbosity="medium",
+                max_parallel_workers=1,
+            )
+            planner = PlannerAgent(FakeModel([]), config, lambda: FakeWorker(root), json.loads)
+            worker = SimpleNamespace(history=[], render_last_usage_summary=lambda: "")
+            run_result = SimpleNamespace(
+                ok=True,
+                final_message="Done.",
+                task_satisfied=True,
+                validation_ran=False,
+                validation_passed=True,
+                touched_paths=[],
+                validation=SimpleNamespace(summary="No mutating actions required validation."),
+            )
+            planner._run_worker_task = lambda **_kwargs: {  # type: ignore[method-assign]
+                "run_result": run_result,
+                "history_slice": [],
+                "elapsed": 0.1,
+            }
+            goal = PlannerGoal(
+                goal_id="goal-write",
+                title="Implement project modeling",
+                goal="Add the required project model.",
+                reason="The feature requires repository changes.",
+                estimated_scope="write",
+            )
+            plan = PlannerPlan(original_request="Implement projects", summary="Implement projects", goals=[goal])
+
+            result = planner._execute_goal_with_worker(worker, plan, goal, 1)
+
+        self.assertEqual(result.status, "failed")
+        self.assertFalse(result.task_satisfied)
+        self.assertFalse(result.validation_passed)
+        self.assertIn("without a workspace mutation or validation", result.validation_summary)
+
+    def test_subscription_write_goal_retries_noop_and_accepts_real_validation(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            config = SimpleNamespace(
+                root=str(root),
+                provider="codex-subscription",
+                model="gpt-5.6-terra",
+                thinking_mode="low",
+                verbosity="medium",
+                max_parallel_workers=1,
+            )
+            planner = PlannerAgent(FakeModel([]), config, lambda: FakeWorker(root), json.loads)
+            recovery_prepares = []
+            worker = SimpleNamespace(
+                history=[],
+                render_last_usage_summary=lambda: "",
+                prepare_unverified_completion_recovery=lambda: recovery_prepares.append(True),
+            )
+            no_op = SimpleNamespace(
+                ok=True,
+                final_message="Already complete.",
+                task_satisfied=True,
+                validation_ran=False,
+                validation_passed=True,
+                touched_paths=[],
+                validation=SimpleNamespace(summary="No validation ran."),
+            )
+            validated = SimpleNamespace(
+                ok=True,
+                final_message="Validated the existing implementation.",
+                task_satisfied=True,
+                validation_ran=True,
+                validation_passed=True,
+                touched_paths=["src/context/TodoContext.tsx"],
+                validation=SimpleNamespace(summary="TypeScript diagnostics passed."),
+            )
+            executions = [
+                {"run_result": no_op, "history_slice": [], "elapsed": 0.1},
+                {"run_result": validated, "history_slice": [], "elapsed": 0.2},
+            ]
+            calls = []
+
+            def run_worker_task(**kwargs):
+                calls.append(kwargs)
+                return executions.pop(0)
+
+            planner._run_worker_task = run_worker_task  # type: ignore[method-assign]
+            goal = PlannerGoal(
+                goal_id="goal-write",
+                title="Complete project integration",
+                goal="Finish the project context contract.",
+                reason="The partial implementation must be completed.",
+                estimated_scope="write",
+            )
+            plan = PlannerPlan(original_request="Proceed", summary="Complete issue", goals=[goal])
+
+            result = planner._execute_goal_with_worker(worker, plan, goal, 1)
+
+        self.assertEqual(result.status, "completed")
+        self.assertTrue(result.validation_ran)
+        self.assertTrue(result.validation_passed)
+        self.assertEqual(result.duration_s, 0.3)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(recovery_prepares, [True])
+        self.assertTrue(calls[1]["preserve_context"])
+        self.assertIn("previous turn claimed", calls[1]["task"])
+
+    def test_discovery_selection_becomes_running_before_worker_starts(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            config = SimpleNamespace(
+                root=str(root),
+                provider="codex-subscription",
+                model="gpt-5.6-luna",
+                thinking_mode="low",
+                verbosity="medium",
+                max_parallel_workers=1,
+            )
+            planner = PlannerAgent(FakeModel([]), config, lambda: FakeWorker(root), json.loads)
+            planner.session.pending_discovery = DiscoveryRequest(
+                reason="Inspect the implementation.",
+                prompt="Choose a discovery depth.",
+                recommended_mode="quick",
+            )
+            planner.session.discovery_phase = "pending"
+            observed = []
+            planner.on_discovery_callback = lambda event, mode: observed.append(
+                (event, mode, planner.session.pending_discovery, planner.session.discovery_phase, planner.session.active_discovery_mode)
+            )
+
+            def fail_after_observing(**_kwargs):
+                self.assertIsNone(planner.session.pending_discovery)
+                self.assertEqual(planner.session.discovery_phase, "running")
+                self.assertEqual(planner.session.active_discovery_mode, "quick")
+                self.assertEqual(planner.export_state()["status"], "discovering")
+                raise RuntimeError("stop after lifecycle assertion")
+
+            planner._run_worker_task = fail_after_observing  # type: ignore[method-assign]
+            message = planner.execute_discovery("quick")
+
+        self.assertIn("Discovery failed before planning could continue", message)
+        self.assertEqual(observed[0], ("discovery_start", "quick", None, "running", "quick"))
+        self.assertEqual(observed[-1], ("discovery_finish", "quick", None, "complete", ""))
+
     def test_plan_execution_marks_discovery_phase_complete(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

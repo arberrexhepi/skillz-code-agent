@@ -86,6 +86,61 @@ from issue_facts import (
 )
 
 
+COMMAND_VERBS = frozenset({
+    "approve-npm",
+    "batch",
+    "cat",
+    "diagnose",
+    "discover",
+    "drop",
+    "expand",
+    "fact",
+    "find",
+    "find-symbol",
+    "find_symbol",
+    "finish",
+    "git",
+    "grep",
+    "ingest-log",
+    "list-issues",
+    "list-run-issues",
+    "list_run_issues",
+    "ls",
+    "mutate",
+    "npm",
+    "patch",
+    "read-diagnostics",
+    "read-line-range",
+    "read_line_range",
+    "reject-npm",
+    "reopen-issue",
+    "reopen-run-issue",
+    "reopen_run_issue",
+    "replace-lines",
+    "replace_lines",
+    "repo-map",
+    "repo_map",
+    "resolve-issue",
+    "resolve-run-issue",
+    "resolve_run_issue",
+    "review-changes",
+    "review_changes",
+    "run-check",
+    "run-route-check",
+    "run_route_check",
+    "shell",
+    "show-diff",
+    "show-issue",
+    "show-run-issue",
+    "show_diff",
+    "show_run_issue",
+    "skill",
+    "stat",
+    "symbols",
+    "write",
+})
+
+
 # ---------------------------------------------------------------------------
 # Command result
 # ---------------------------------------------------------------------------
@@ -1418,12 +1473,7 @@ def _starts_new_command_boundary(line: str) -> bool:
     if is_strategy(line):
         return True
     first = line.split(None, 1)[0].lower() if line else ""
-    return first in {
-        "ls", "cat", "read-line-range", "read_line_range", "symbols", "find-symbol", "find_symbol", "repo-map", "repo_map", "stat", "find", "grep",
-        "read-diagnostics", "diagnose", "run-route-check", "run_route_check", "ingest-log", "list-run-issues", "list_run_issues", "list-issues", "show-run-issue", "show_run_issue", "show-issue", "resolve-run-issue", "resolve_run_issue", "resolve-issue", "reopen-run-issue", "reopen_run_issue", "reopen-issue", "run-check",
-        "write", "replace-lines", "replace_lines", "patch", "discover", "mutate", "show-diff", "show_diff", "review-changes", "review_changes", "shell", "git",
-        "fact", "expand", "drop", "batch", "finish", "skill",
-    }
+    return first in COMMAND_VERBS
 
 
 def _is_key_value_arg(value: str) -> bool:
