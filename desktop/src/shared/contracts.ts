@@ -55,7 +55,7 @@ export interface AgentStartOptions {
   backendScript?: string;
 }
 
-import type { AgentBackoff, AgentBridgeState, AgentProgressMessage, JsonMap, RuntimeOptionsPayload } from './agentTypes';
+import type { AgentBackoff, AgentBridgeState, AgentProgressMessage, CodexSubscriptionStatus, JsonMap, RuntimeOptionsPayload } from './agentTypes';
 export type { AgentBridgeState } from './agentTypes';
 
 export interface AgentResponse {
@@ -118,6 +118,8 @@ export interface WorkbenchApi {
     reconfigureRuntime(provider: string, model: string): Promise<AgentResponse>;
     configureBackoff(enabled: boolean, tokenLimitK: number): Promise<AgentResponse>;
     runtimeOptions(provider?: string, model?: string): Promise<RuntimeOptionsPayload>;
+    codexSubscriptionStatus(): Promise<CodexSubscriptionStatus>;
+    codexSubscriptionLogin(): Promise<CodexSubscriptionStatus>;
     stop(): Promise<void>;
     onEvent(listener: (event: AgentEvent) => void): () => void;
   };

@@ -23,6 +23,25 @@ BASE_RUNTIME_PROVIDER_CATALOG: Dict[str, Dict[str, Any]] = {
         ],
         "notes": "Uses the Responses API. Any compatible OpenAI model string is allowed.",
     },
+    "codex-subscription": {
+        "label": "Codex / ChatGPT subscription",
+        "package": None,
+        "env_var": None,
+        "default_model": "gpt-5.6-terra",
+        "models": [
+            "gpt-5.6-terra",
+            "gpt-5.6-sol",
+            "gpt-5.6-luna",
+            "gpt-5.5",
+            "gpt-5.4",
+        ],
+        "notes": (
+            "Uses the locally installed Codex CLI and its ChatGPT-managed subscription session. "
+            "This is separate from the OpenAI API provider and never reads OPENAI_API_KEY."
+        ),
+        "accepts_custom_model": False,
+        "authentication": "chatgpt_subscription",
+    },
     "meta": {
         "label": "Meta Model API",
         "package": "openai",
@@ -167,7 +186,7 @@ def _looks_like_supported_runtime_model(provider: str, model_name: str) -> bool:
     normalized = str(model_name or "").strip().lower()
     if not normalized:
         return False
-    if provider == "openai":
+    if provider in {"openai", "codex-subscription"}:
         allowed_prefix = normalized.startswith(("gpt-", "o1", "o3", "o4", "chatgpt-"))
         blocked_terms = ("image", "realtime", "tts", "transcribe", "embedding", "moderation")
         return allowed_prefix and not any(term in normalized for term in blocked_terms)
@@ -204,6 +223,18 @@ def _refresh_openai_models() -> List[str]:
         _extract_model_name(item)
         for item in client.models.list()
         if _looks_like_supported_runtime_model("openai", _extract_model_name(item))
+    )
+
+
+def _refresh_codex_subscription_models() -> List[str]:
+    module = importlib.import_module("codex_subscription")
+    status = module.codex_subscription_status(timeout=8.0)
+    if not status.get("authenticated"):
+        return []
+    return _dedupe_preserve_order(
+        model
+        for model in status.get("models", [])
+        if _looks_like_supported_runtime_model("codex-subscription", str(model))
     )
 
 
@@ -280,6 +311,7 @@ def refresh_runtime_provider_catalog_once() -> Dict[str, Any]:
             RUNTIME_PROVIDER_CATALOG[key] = deepcopy(BASE_RUNTIME_PROVIDER_CATALOG[key])
         refreshers = {
             "openai": _refresh_openai_models,
+            "codex-subscription": _refresh_codex_subscription_models,
             "meta": _refresh_meta_models,
             "anthropic": _refresh_anthropic_models,
             "gemini": _refresh_gemini_models,
@@ -323,10 +355,24 @@ def validate_provider_model_selection(provider: Optional[str], model: Optional[s
     normalized_model = str(model or "").strip().lower()
     if not normalized_model:
         raise ValueError("Model cannot be empty.")
+    provider_info = RUNTIME_PROVIDER_CATALOG[key]
+    if not bool(provider_info.get("accepts_custom_model", True)):
+        advertised = {str(item).strip().lower() for item in provider_info.get("models", [])}
+        if normalized_model not in advertised:
+            raise ValueError(
+                "Model '"
+                + str(model)
+                + "' is not available for provider '"
+                + key
+                + "'. Use /models "
+                + key
+                + " to see models from the local Codex catalog."
+            )
 
     provider_named_model = normalized_model in RUNTIME_PROVIDER_CATALOG
     known_provider_prefixes = {
         "openai": ("gpt-", "o1", "o3", "o4", "chatgpt-"),
+        "codex-subscription": ("gpt-", "o1", "o3", "o4", "chatgpt-"),
         "meta": ("muse-",),
         "anthropic": ("claude-",),
         "gemini": ("gemini-",),
@@ -338,7 +384,9 @@ def validate_provider_model_selection(provider: Optional[str], model: Optional[s
     obvious_mismatch_prefixes = {
         provider_name
         for provider_name, prefixes in known_provider_prefixes.items()
-        if provider_name != key and any(normalized_model.startswith(prefix) for prefix in prefixes)
+        if provider_name != key
+        and {provider_name, key} != {"openai", "codex-subscription"}
+        and any(normalized_model.startswith(prefix) for prefix in prefixes)
     }
 
     if provider_named_model and normalized_model != key:
@@ -389,7 +437,8 @@ def runtime_options_payload(
                 "notes": info.get("notes", ""),
                 "active": key == normalized_current_provider,
                 "active_model": normalized_current_model if key == normalized_current_provider else "",
-                "accepts_custom_model": True,
+                "accepts_custom_model": bool(info.get("accepts_custom_model", True)),
+                "authentication": info.get("authentication"),
                 "hidden": bool(info.get("hidden", False)),
             }
         )
@@ -421,7 +470,7 @@ def runtime_provider_lines(current_provider: Optional[str] = None) -> List[str]:
         lines.append(" ".join(parts))
     lines.append("")
     lines.append("Use /models <provider> to see suggested models.")
-    lines.append("Custom model strings are still allowed even if not listed here.")
+    lines.append("Custom model strings are allowed for providers that advertise that capability.")
     return lines
 
 
@@ -449,5 +498,8 @@ def runtime_model_lines(provider: Optional[str], current_model: Optional[str] = 
         lines.append("")
         lines.append("Notes:")
         lines.append("- " + notes)
-    lines.append("- Custom model strings are allowed.")
+    if bool(info.get("accepts_custom_model", True)):
+        lines.append("- Custom model strings are allowed.")
+    else:
+        lines.append("- Model selection is limited to the local provider catalog.")
     return lines

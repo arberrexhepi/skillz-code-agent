@@ -26,6 +26,7 @@ The current development work tightens the full planner/worker loop, from provide
 - **Preemptive output recovery:** annotation-only, prose-only, and malformed command turns are repaired into the beta command grammar before they become terminal `model_output_invalid` failures.
 - **Expanded guarded Git support:** the beta worker now supports bounded status, diff, revision-range log, branch, remote, rev-parse, show, blame, add, restore, move, remove, commit, and push operations. Mutating or remote operations remain authorization-gated, paths are explicit, and broad or unsafe revision expressions are rejected.
 - **Meta Muse Spark support:** `muse-spark-1.2` is available through Meta's OpenAI-compatible API using `META_AI_API_KEY`, including provider/model selection in the extension. The standard model remains distinct from the opt-in contributor tier whose prompts and completions may be used for Meta training.
+- **Local Codex subscription support:** `codex-subscription` invokes models through the locally installed Codex CLI and its ChatGPT-managed session. It remains isolated from the existing `openai` API-key provider and appears with account, plan, and live-model status in the Electron Runtime drawer.
 - **Better extension state:** the panel shows provider-specific model choices, per-session and per-issue usage, transient recovery details, durable-versus-run issue context, completed checkpoints, and the exact goal where a paused plan will resume.
 
 These changes are covered by targeted provider, prompt-cache, transcript, recovery, continuation, usage-accounting, beta Git, command-repair, and extension panel tests.
@@ -53,6 +54,7 @@ Planner-first mode:
 
 ```bash
 python main.py --provider openai --model gpt-5.4 --root /your/project
+python main.py --provider codex-subscription --model gpt-5.6-terra --root /your/project
 python main.py --provider meta --model muse-spark-1.2 --root /your/project
 python main.py --provider anthropic --model claude-sonnet-4-6 --root /your/project
 python main.py --provider local --model gemma4 --root /your/project
@@ -62,6 +64,7 @@ Direct worker mode:
 
 ```bash
 python main.py --provider openai --model gpt-5.4 --root /your/project --worker-mode
+python main.py --provider codex-subscription --model gpt-5.6-terra --root /your/project --worker-mode
 python main.py --provider meta --model muse-spark-1.2 --root /your/project --worker-mode
 python main.py --provider anthropic --model claude-sonnet-4-6 --root /your/project --worker-mode
 python main_v2.py --provider gemini --model gemini-3-flash-preview --root /your/project --worker-mode
@@ -85,7 +88,19 @@ Live runtime switching in the CLI:
 /models gemini
 ```
 
-`/providers` lists supported runtimes. `/models [provider]` shows the current provider by default and prints suggested model names for any supported provider. On startup, the backend does one best-effort live model refresh for providers with installed SDKs and credentials, then falls back to the built-in catalog if a provider cannot be queried. Custom model strings are still allowed.
+`/providers` lists supported runtimes. `/models [provider]` shows the current provider by default and prints suggested model names for any supported provider. On startup, the backend does one best-effort live model refresh for providers with installed SDKs and credentials, then falls back to the built-in catalog if a provider cannot be queried. Custom model strings remain available for providers that support them; `codex-subscription` is intentionally limited to its local live/fallback catalog.
+
+### Codex / ChatGPT subscription runtime
+
+The `codex-subscription` provider is an additive alternative to `openai`; it does not replace or modify API-key invocation.
+
+1. Install Codex CLI or the ChatGPT desktop app and sign in with ChatGPT (`codex login status` should report ChatGPT authentication).
+2. In the Electron Workbench Runtime drawer, choose **Codex / ChatGPT subscription**. The drawer shows the detected account, subscription plan, CLI version, and live model catalog. If needed, use **Sign in with ChatGPT**.
+3. Select one of the models advertised by the local Codex catalog and apply the runtime.
+
+Skillz launches each backend model turn with `codex exec --ephemeral` in a temporary, read-only workspace. It removes API credential variables from that child process, so this route cannot silently become OpenAI API usage. Override CLI discovery with `CODEX_CLI_PATH=/absolute/path/to/codex`; override the model-turn timeout with `CODEX_SUBSCRIPTION_TIMEOUT_SECONDS`.
+
+This integration follows OpenAI's documented split between [ChatGPT subscription sign-in and API-key access](https://learn.chatgpt.com/docs/auth), uses the [Codex app-server account and model APIs](https://learn.chatgpt.com/docs/app-server) for Runtime settings, and uses [Codex non-interactive mode](https://learn.chatgpt.com/docs/non-interactive-mode) for isolated model turns.
 
 Muse Spark uses Meta's OpenAI-compatible Responses API. Add `META_AI_API_KEY=...` to the repository `.env`, then select `--provider meta --model muse-spark-1.2`. The shared startup loader reads `.env` before constructing any provider client, including when the VS Code extension launches the backend. The base URL defaults to `https://api.meta.ai/v1` and can be overridden with `META_MODEL_API_BASE_URL`. Meta does not support `--thinking-mode none`; use `minimal` or higher. The discounted `muse-spark-1.2-contributor` model is also listed, but its prompts and completions may be used by Meta for training, unlike the standard tier.
 

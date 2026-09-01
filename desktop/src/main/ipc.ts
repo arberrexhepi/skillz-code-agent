@@ -21,7 +21,8 @@ export function registerIpc(window: BrowserWindow, services: Services): void {
     'workspace:current', 'workspace:choose', 'workspace:open', 'workspace:list', 'workspace:read', 'workspace:write',
     'git:status', 'git:history', 'git:file-diff', 'git:stage', 'git:stage-all', 'git:unstage', 'git:commit', 'git:push',
     'terminal:create', 'agent:start', 'agent:submit', 'agent:planner-action', 'agent:worker-action',
-    'agent:reconfigure-runtime', 'agent:configure-backoff', 'agent:runtime-options', 'agent:stop',
+    'agent:reconfigure-runtime', 'agent:configure-backoff', 'agent:runtime-options',
+    'agent:codex-subscription-status', 'agent:codex-subscription-login', 'agent:stop',
   ]) ipcMain.removeHandler(channel);
   for (const channel of ['terminal:write', 'terminal:resize', 'terminal:dispose']) ipcMain.removeAllListeners(channel);
 
@@ -115,5 +116,7 @@ export function registerIpc(window: BrowserWindow, services: Services): void {
     z.string().max(80).parse(provider),
     z.string().max(200).parse(model),
   ));
+  handle('agent:codex-subscription-status', () => services.agent.codexSubscriptionStatus());
+  handle('agent:codex-subscription-login', () => services.agent.codexSubscriptionLogin());
   handle('agent:stop', () => services.agent.stop());
 }

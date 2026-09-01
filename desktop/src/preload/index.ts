@@ -36,6 +36,8 @@ const api: WorkbenchApi = {
     reconfigureRuntime: (provider, model) => ipcRenderer.invoke('agent:reconfigure-runtime', provider, model),
     configureBackoff: (enabled, tokenLimitK) => ipcRenderer.invoke('agent:configure-backoff', enabled, tokenLimitK),
     runtimeOptions: (provider = '', model = '') => ipcRenderer.invoke('agent:runtime-options', provider, model),
+    codexSubscriptionStatus: () => ipcRenderer.invoke('agent:codex-subscription-status'),
+    codexSubscriptionLogin: () => ipcRenderer.invoke('agent:codex-subscription-login'),
     stop: () => ipcRenderer.invoke('agent:stop'),
     onEvent: (listener) => subscribe<AgentEvent>('agent:event', listener),
   },

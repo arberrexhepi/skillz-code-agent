@@ -8,7 +8,7 @@ import type {
   AgentResponse,
   AgentStartOptions,
 } from '../../shared/contracts';
-import type { JsonMap, RuntimeOptionsPayload } from '../../shared/agentTypes';
+import type { CodexSubscriptionStatus, JsonMap, RuntimeOptionsPayload } from '../../shared/agentTypes';
 import type { WorkspaceService } from './workspace';
 
 interface PendingRequest {
@@ -127,6 +127,14 @@ export class AgentService {
     });
   }
 
+  codexSubscriptionStatus(): Promise<CodexSubscriptionStatus> {
+    return this.runCodexSubscriptionCommand('status', 20_000);
+  }
+
+  codexSubscriptionLogin(): Promise<CodexSubscriptionStatus> {
+    return this.runCodexSubscriptionCommand('login', 5 * 60_000);
+  }
+
   async stop(): Promise<void> {
     if (!this.process) return;
     this.stopping = true;
@@ -206,6 +214,37 @@ export class AgentService {
       : path.join(agentRoot, '.venv', 'bin', 'python');
     if (existsSync(localPython)) return localPython;
     return process.platform === 'win32' ? 'python' : 'python3';
+  }
+
+  private runCodexSubscriptionCommand(
+    command: 'status' | 'login',
+    timeout: number,
+  ): Promise<CodexSubscriptionStatus> {
+    const agentRoot = this.agentRoot();
+    const helper = path.join(agentRoot, 'codex_subscription.py');
+    if (!existsSync(helper)) return Promise.reject(new Error('Codex subscription helper is missing.'));
+    return new Promise<CodexSubscriptionStatus>((resolve, reject) => {
+      execFile(this.pythonExecutable(agentRoot), [helper, command], {
+        cwd: agentRoot,
+        env: process.env,
+        encoding: 'utf8',
+        timeout,
+        maxBuffer: 2 * 1024 * 1024,
+      }, (error, stdout, stderr) => {
+        let payload: CodexSubscriptionStatus | undefined;
+        try {
+          payload = JSON.parse(stdout) as CodexSubscriptionStatus;
+        } catch {
+          // The process error below carries the useful diagnostic.
+        }
+        if (payload) {
+          resolve(payload);
+          return;
+        }
+        const detail = String(stderr || error?.message || 'Codex subscription helper returned invalid JSON.').trim();
+        reject(new Error(detail));
+      });
+    });
   }
 }
 

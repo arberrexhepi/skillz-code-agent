@@ -223,6 +223,7 @@ export interface RuntimeProviderOption extends JsonMap {
   active?: boolean;
   active_model?: string;
   accepts_custom_model?: boolean;
+  authentication?: string;
   hidden?: boolean;
 }
 
@@ -231,6 +232,21 @@ export interface RuntimeOptionsPayload extends JsonMap {
   provider_keys?: string[];
   current_provider?: string;
   current_model?: string;
+}
+
+export interface CodexSubscriptionStatus extends JsonMap {
+  available: boolean;
+  authenticated: boolean;
+  provider?: string;
+  auth_mode?: string | null;
+  account_type?: string | null;
+  email?: string | null;
+  plan_type?: string | null;
+  cli_path?: string;
+  cli_version?: string;
+  models?: string[];
+  error?: string;
+  status_text?: string;
 }
 
 export interface AgentProgressMessage extends JsonMap {
