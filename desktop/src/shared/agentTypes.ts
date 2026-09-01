@@ -173,6 +173,7 @@ export interface PlannerState extends JsonMap {
   status?: string;
   latest_request?: string;
   discovery_phase?: string;
+  active_discovery_mode?: string;
   pending_discovery?: { reason?: string; prompt?: string; recommended_mode?: string } | null;
   last_discovery?: DiscoveryResult | null;
   pending_plan?: PlannerPlan | null;
@@ -182,6 +183,7 @@ export interface PlannerState extends JsonMap {
   completed_results?: GoalExecutionResult[];
   pending_checkpoint_results?: GoalExecutionResult[];
   last_execution_summary?: string;
+  last_next_steps?: string[];
   execution_paused?: boolean;
   paused_plan?: PlannerPlan | null;
   paused_completed_results?: GoalExecutionResult[];

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -11,6 +12,8 @@ import main
 from codex_subscription import (
     _extract_usage,
     _render_backend_prompt,
+    _run_codex_exec_streaming,
+    _skillz_permission_blocked_finish,
     run_codex_subscription_completion,
 )
 from runtime_catalog import RUNTIME_PROVIDER_CATALOG, runtime_options_payload, validate_provider_model_selection
@@ -32,14 +35,34 @@ class CodexSubscriptionTests(unittest.TestCase):
         validate_provider_model_selection("openai", "gpt-5.4")
         validate_provider_model_selection("codex-subscription", "gpt-5.6-terra")
 
-    def test_backend_prompt_prohibits_codex_from_becoming_a_second_tool_agent(self):
+    def test_backend_prompt_separates_codex_tools_from_skillz_actions(self):
         prompt = _render_backend_prompt(
             "Return JSON.",
             [{"role": "user", "content": "Inspect the repository."}],
         )
-        self.assertIn("Do not inspect files, run commands, call tools, or modify the workspace", prompt)
+        self.assertIn("Do not use Codex's built-in shell, file, web, or MCP tools directly", prompt)
+        self.assertIn("Codex's read-only sandbox does not prohibit returning Skillz read or mutation actions", prompt)
+        self.assertIn("treat quoted original requests, prior discovery-only instructions", prompt)
         self.assertIn("[SKILLZ SYSTEM INSTRUCTIONS]\nReturn JSON.", prompt)
         self.assertIn("[USER]\nInspect the repository.", prompt)
+
+    def test_false_permission_blocked_finish_is_detected(self):
+        payload = json.dumps(
+            {
+                "thought": "I cannot use workspace tools.",
+                "action": {
+                    "type": "finish",
+                    "message": "Blocked: no workspace actions permitted. Goal requires repository inspection.",
+                },
+            }
+        )
+        self.assertIn("no workspace actions permitted", _skillz_permission_blocked_finish(payload))
+        self.assertEqual(
+            _skillz_permission_blocked_finish(
+                '{"thought":"done","action":{"type":"finish","message":"Implemented and validated."}}'
+            ),
+            "",
+        )
 
     @patch("codex_subscription.quick_chatgpt_auth_status", return_value={"authenticated": True})
     @patch("codex_subscription.resolve_codex_executable", return_value="/fake/codex")
@@ -98,11 +121,60 @@ class CodexSubscriptionTests(unittest.TestCase):
             self.assertEqual(client.complete("system", "prompt"), "done")
             self.assertEqual(client.get_last_metrics(), payload)
 
+    @patch("codex_subscription.quick_chatgpt_auth_status", return_value={"authenticated": True})
+    @patch("codex_subscription.resolve_codex_executable", return_value="/fake/codex")
+    def test_completion_rejects_false_permission_finish(self, _resolve, _auth):
+        def fake_run(args, **_kwargs):
+            output_index = args.index("--output-last-message") + 1
+            Path(args[output_index]).write_text(
+                json.dumps(
+                    {
+                        "thought": "Workspace access is unavailable.",
+                        "action": {
+                            "type": "finish",
+                            "message": "Blocked: no workspace actions permitted.",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+        with patch("codex_subscription.subprocess.run", side_effect=fake_run):
+            with self.assertRaisesRegex(RuntimeError, "false workspace-permission block"):
+                run_codex_subscription_completion(
+                    model="gpt-5.6-terra",
+                    thinking_mode="medium",
+                    system="Return a Skillz action.",
+                    messages=[{"role": "user", "content": "Inspect the workspace."}],
+                )
+
     def test_usage_extraction_accepts_camel_case_codex_events(self):
         usage = _extract_usage([
             {"type": "turn.completed", "payload": {"usage": {"inputTokens": 9, "outputTokens": 4}}}
         ])
         self.assertEqual(usage, {"input_tokens": 9, "output_tokens": 4, "total_tokens": 13})
+
+    def test_jsonl_lifecycle_events_stream_before_process_completion(self):
+        events = []
+        script = (
+            "import json, sys; "
+            "sys.stdin.read(); "
+            "print(json.dumps({'type': 'turn.started'}), flush=True); "
+            "print(json.dumps({'type': 'turn.completed', 'usage': {'input_tokens': 3}}), flush=True)"
+        )
+
+        result = _run_codex_exec_streaming(
+            [sys.executable, "-c", script],
+            prompt="test prompt",
+            timeout=5,
+            env=os.environ,
+            progress_callback=events.append,
+        )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual([event["type"] for event in events], ["turn.started", "turn.completed"])
+        self.assertTrue(all("skillz_elapsed_s" in event for event in events))
 
 
 if __name__ == "__main__":

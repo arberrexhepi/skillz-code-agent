@@ -524,6 +524,19 @@ class TreeLoopPlannerWorker:
         self.discovery_budget = None
         self._refresh_loop_steering()
 
+    def unverified_completion_recovery_hint(self) -> str:
+        return (
+            "For the beta TreeLoop command grammar, begin with one executable block such as "
+            "`s1: show-diff` followed by `s2: review-changes limit=20`; inspect a specific path if the review "
+            "surfaces a defect, then mutate or run the relevant check before finish."
+        )
+
+    def prepare_unverified_completion_recovery(self) -> None:
+        # Keep durable facts and TreeLoop history, but start a fresh model
+        # conversation so a prior unsupported `finish` is not simply repeated.
+        self.loop.reset_conversation()
+        self._refresh_loop_steering()
+
     def prepare_for_goal(self, preserve_context: bool) -> None:
         self._reset_guard_state()
         self._goal_skill_mode_pending = True
@@ -1327,6 +1340,9 @@ class TreeLoopPlannerWorker:
         task_satisfied = bool(loop_result.finished and validation.passed)
         self._task_satisfied = task_satisfied
         final_message = str(loop_result.finish_message or loop_result.summary())
+        wrapped_finish = re.fullmatch(r"\[finish:\s*(.*?)\]\s*", final_message, flags=re.DOTALL)
+        if wrapped_finish is not None:
+            final_message = wrapped_finish.group(1).strip()
         if loop_result.finished and not validation.passed:
             final_message = f"{final_message} Validation required: {validation.summary}"
         self._observability_metrics["outcome"] = "completed" if task_satisfied else "incomplete"

@@ -19,7 +19,7 @@ import threading
 import time
 import webbrowser
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 
 CODEX_SUBSCRIPTION_PROVIDER = "codex-subscription"
@@ -332,13 +332,59 @@ def _render_backend_prompt(system: str, messages: Sequence[Mapping[str, str]]) -
             transcript.append(f"[{role}]\n{content}")
     return (
         "You are the language-model backend inside Skillz Code Agent. "
-        "Do not inspect files, run commands, call tools, or modify the workspace. "
-        "Follow the supplied system instructions and return only the response that "
-        "Skillz requested, with no wrapper or commentary about this invocation.\n\n"
+        "Skillz—not Codex—owns repository access and executes workspace tools. "
+        "Do not use Codex's built-in shell, file, web, or MCP tools directly. "
+        "Instead, follow the Skillz system protocol and return the requested Skillz JSON action; "
+        "Skillz will execute that action and provide its result on the next turn. "
+        "Repository inspection, diagnostics, and mutations requested through the Skillz action schema "
+        "are permitted unless the current Skillz host state explicitly blocks that specific action. "
+        "Codex's read-only sandbox does not prohibit returning Skillz read or mutation actions. "
+        "Do not claim workspace actions are unavailable merely because this Codex subprocess cannot "
+        "perform them directly. Follow the current planner goal and operator steering; treat quoted "
+        "original requests, prior discovery-only instructions, discovery findings, and prior goal "
+        "results as context rather than current execution restrictions unless the current goal repeats them. "
+        "Return only the response Skillz requested, with no wrapper or commentary about this invocation.\n\n"
         f"[SKILLZ SYSTEM INSTRUCTIONS]\n{system}\n\n"
         "[SKILLZ CONVERSATION]\n"
         + "\n\n".join(transcript)
     )
+
+
+def _skillz_permission_blocked_finish(text: str) -> str:
+    """Return a false permission-block message from a Skillz finish action."""
+
+    decoder = json.JSONDecoder()
+    payload: Optional[Dict[str, Any]] = None
+    for index, character in enumerate(text):
+        if character != "{":
+            continue
+        try:
+            candidate, _end = decoder.raw_decode(text[index:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(candidate, dict):
+            payload = candidate
+            break
+    if payload is None:
+        return ""
+    action = payload.get("action")
+    if not isinstance(action, dict) or str(action.get("type", "") or "").strip() != "finish":
+        return ""
+    message = str(action.get("message", "") or "").strip()
+    normalized = message.lower()
+    permission_markers = (
+        "no workspace actions permitted",
+        "workspace actions are not permitted",
+        "workspace inspection and edits were not permitted",
+        "repository inspection and/or diagnostics, which are prohibited",
+        "repository inspection or diagnostics, which are prohibited",
+        "cannot inspect or modify the workspace",
+    )
+    if normalized.startswith("blocked:") and any(
+        term in normalized for term in ("workspace", "repository", "inspection", "mutation", "diagnostic")
+    ):
+        return message
+    return message if any(marker in normalized for marker in permission_markers) else ""
 
 
 def _extract_usage(events: Iterable[Mapping[str, Any]]) -> Dict[str, int]:
@@ -370,6 +416,93 @@ def _extract_usage(events: Iterable[Mapping[str, Any]]) -> Dict[str, int]:
     return best
 
 
+def _run_codex_exec_streaming(
+    args: Sequence[str],
+    *,
+    prompt: str,
+    timeout: float,
+    env: Mapping[str, str],
+    progress_callback: Callable[[Dict[str, Any]], None],
+) -> subprocess.CompletedProcess[str]:
+    """Run ``codex exec --json`` while forwarding lifecycle events.
+
+    Codex writes JSONL events to stdout. Reading that stream incrementally keeps
+    the desktop UI alive during long subscription-backed model turns while the
+    final response remains isolated in ``--output-last-message``.
+    """
+
+    process = subprocess.Popen(
+        list(args),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+        env=dict(env),
+    )
+    stderr_parts: List[str] = []
+
+    def drain_stderr() -> None:
+        if process.stderr is None:
+            return
+        for line in process.stderr:
+            stderr_parts.append(line)
+
+    stderr_thread = threading.Thread(target=drain_stderr, daemon=True)
+    stderr_thread.start()
+    timed_out = threading.Event()
+
+    def stop_after_timeout() -> None:
+        if process.poll() is None:
+            timed_out.set()
+            process.kill()
+
+    timer = threading.Timer(max(0.1, timeout), stop_after_timeout)
+    timer.daemon = True
+    timer.start()
+    stdout_parts: List[str] = []
+    started = time.monotonic()
+    try:
+        if process.stdin is None or process.stdout is None:
+            raise RuntimeError("Codex subscription process did not expose stdio streams.")
+        process.stdin.write(prompt)
+        process.stdin.close()
+        for line in process.stdout:
+            stdout_parts.append(line)
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(event, dict):
+                continue
+            event = dict(event)
+            event["skillz_elapsed_s"] = round(time.monotonic() - started, 1)
+            try:
+                progress_callback(event)
+            except Exception:
+                # UI feedback must never make a model invocation fail.
+                pass
+        returncode = process.wait()
+    except BaseException:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+        raise
+    finally:
+        timer.cancel()
+        stderr_thread.join(timeout=1)
+        if process.stdout is not None:
+            process.stdout.close()
+        if process.stderr is not None:
+            process.stderr.close()
+
+    stdout = "".join(stdout_parts)
+    stderr = "".join(stderr_parts)
+    if timed_out.is_set():
+        raise subprocess.TimeoutExpired(list(args), timeout, output=stdout, stderr=stderr)
+    return subprocess.CompletedProcess(list(args), returncode, stdout=stdout, stderr=stderr)
+
+
 def run_codex_subscription_completion(
     *,
     model: str,
@@ -377,6 +510,7 @@ def run_codex_subscription_completion(
     system: str,
     messages: Sequence[Mapping[str, str]],
     timeout: Optional[float] = None,
+    progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> Tuple[str, Dict[str, Any]]:
     executable = resolve_codex_executable()
     auth = quick_chatgpt_auth_status(executable)
@@ -392,6 +526,7 @@ def run_codex_subscription_completion(
             effective_timeout = float(os.environ.get("CODEX_SUBSCRIPTION_TIMEOUT_SECONDS", "600"))
         except ValueError:
             effective_timeout = 600.0
+    effective_timeout = max(0.1, float(effective_timeout))
     effort = str(thinking_mode or "medium").strip().lower()
     if effort in {"", "auto", "none", "minimal"}:
         effort = "low" if effort in {"none", "minimal"} else "medium"
@@ -419,15 +554,25 @@ def run_codex_subscription_completion(
             str(output_path),
             "-",
         ]
-        result = subprocess.run(
-            args,
-            input=prompt,
-            capture_output=True,
-            text=True,
-            timeout=effective_timeout,
-            env=_clean_cli_environment(),
-            check=False,
-        )
+        cli_env = _clean_cli_environment()
+        if progress_callback is None:
+            result = subprocess.run(
+                args,
+                input=prompt,
+                capture_output=True,
+                text=True,
+                timeout=effective_timeout,
+                env=cli_env,
+                check=False,
+            )
+        else:
+            result = _run_codex_exec_streaming(
+                args,
+                prompt=prompt,
+                timeout=effective_timeout,
+                env=cli_env,
+                progress_callback=progress_callback,
+            )
         events: List[Dict[str, Any]] = []
         for line in result.stdout.splitlines():
             try:
@@ -443,6 +588,12 @@ def run_codex_subscription_completion(
                 errors = [str(event.get("message") or event.get("error") or "").strip() for event in events]
                 detail = next((item for item in reversed(errors) if item), "Codex returned no response.")
             raise RuntimeError(f"Codex subscription invocation failed: {detail}")
+        false_block = _skillz_permission_blocked_finish(text)
+        if false_block:
+            raise RuntimeError(
+                "Codex subscription returned a false workspace-permission block instead of a Skillz action: "
+                f"{false_block}"
+            )
         return text, {
             "provider": CODEX_SUBSCRIPTION_PROVIDER,
             "model": model,

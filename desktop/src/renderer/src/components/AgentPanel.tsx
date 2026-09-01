@@ -17,6 +17,15 @@ export function AgentPanel(): React.JSX.Element {
   const continuous = bridge.planner.continuous_mode;
   const transcript = presentationTranscript(bridge);
   const handoff = agentHandoff(bridge);
+  const workingLabel = bridge.planner.executing
+    ? `Goal ${bridge.planner.executing_goal_index || handoff.completedGoalCount + 1}/${bridge.planner.executing_goal_count || handoff.totalGoalCount || '?'}: ${bridge.planner.executing_goal_title || 'Executing plan'}`
+    : pendingAction;
+  const liveDetail = pendingAction
+    ? (() => {
+        const latest = [...agent.state.activity].reverse().find((item) => ['model', 'discovery', 'worker', 'plan'].includes(String(item.domain || '')));
+        return latest?.summary || latest?.thought;
+      })()
+    : undefined;
 
   useEffect(() => {
     transcriptRef.current?.scrollTo({ top: transcriptRef.current.scrollHeight, behavior: 'smooth' });
@@ -51,7 +60,7 @@ export function AgentPanel(): React.JSX.Element {
             <article className={`message ${entry.role}`} key={`${entry.role}-${index}`}><header>{entry.role === 'user' ? 'You' : 'Agent'}</header><MarkdownMessage content={entry.content} /></article>
           ))}
           <AgentHandoffCard handoff={handoff} onViewGoalReport={() => setShowGoalReport(true)} />
-          {pendingAction && <div className="agent-working"><i /><span>{humanize(pendingAction)}</span></div>}
+          {pendingAction && <AgentWorking action={workingLabel} detail={liveDetail} />}
         </div>
         <AgentDecisionCard />
       </div>
@@ -72,3 +81,14 @@ export function AgentPanel(): React.JSX.Element {
 }
 
 function humanize(value: string): string { return value.replaceAll('_', ' ').replace(/^./, (letter) => letter.toUpperCase()); }
+
+function AgentWorking({ action, detail }: { action: string; detail?: string }): React.JSX.Element {
+  const [elapsed, setElapsed] = useState(0);
+  useEffect(() => {
+    const started = Date.now();
+    setElapsed(0);
+    const timer = window.setInterval(() => setElapsed(Math.floor((Date.now() - started) / 1000)), 1000);
+    return () => window.clearInterval(timer);
+  }, [action]);
+  return <div className="agent-working"><i /><div><span>{humanize(action)}</span>{detail && <small>{detail}</small>}</div><time>{elapsed}s</time></div>;
+}

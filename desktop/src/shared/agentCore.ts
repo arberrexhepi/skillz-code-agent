@@ -104,27 +104,46 @@ export interface AgentHandoff {
   goalResults: GoalExecutionResult[];
   executionSummary: string;
   plan: PlannerPlan | null;
+  executionState: 'executing' | 'paused' | 'complete' | 'idle';
+  completedGoalCount: number;
+  totalGoalCount: number;
+  currentGoalTitle: string;
 }
 
 export function agentHandoff(state: AgentBridgeState): AgentHandoff {
   const planner = state.planner;
   const plan = planner.pending_plan || planner.paused_plan || planner.last_completed_plan || planner.last_presented_plan || null;
-  const goalResults = planner.last_completed_results?.length
-    ? planner.last_completed_results
-    : planner.paused_completed_results?.length
-      ? planner.paused_completed_results
-      : planner.completed_results || [];
+  const goalResults = planner.executing
+    ? planner.completed_results || []
+    : planner.execution_paused
+      ? [...(planner.paused_completed_results || []), ...(planner.completed_results || []).filter((result) => result.status !== 'completed')]
+      : planner.last_completed_results?.length
+        ? planner.last_completed_results
+        : planner.completed_results || [];
+  const executionState = planner.executing ? 'executing'
+    : planner.execution_paused ? 'paused'
+      : planner.last_completed_plan || planner.last_execution_summary ? 'complete'
+        : 'idle';
   const preview = (plan?.next_steps_preview || []).filter((step) => step.trim());
   const suggested = combineSuggestedActions(state)
     .filter((action) => !['reset_session', 'delete_session', 'create_issue'].includes(action.type))
     .map((action) => String(action.label || action.type).trim())
     .filter(Boolean);
+  const nextSteps = executionState === 'executing'
+    ? []
+    : executionState === 'complete' || executionState === 'paused'
+      ? (planner.last_next_steps || []).filter((step) => step.trim())
+      : [...new Set(preview.length ? preview : suggested)].slice(0, 4);
   return {
     discovery: planner.last_discovery || null,
-    nextSteps: [...new Set(preview.length ? preview : suggested)].slice(0, 4),
+    nextSteps,
     goalResults,
-    executionSummary: String(planner.last_execution_summary || '').trim(),
+    executionSummary: executionState === 'executing' ? '' : String(planner.last_execution_summary || '').trim(),
     plan,
+    executionState,
+    completedGoalCount: goalResults.filter((result) => result.status === 'completed').length,
+    totalGoalCount: Number(planner.executing_goal_count || plan?.goals?.length || goalResults.length || 0),
+    currentGoalTitle: String(planner.executing_goal_title || '').trim(),
   };
 }
 

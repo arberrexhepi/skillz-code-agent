@@ -9,6 +9,7 @@ interface GoalReportDialogProps {
 
 export function GoalReportDialog({ handoff, onClose }: GoalReportDialogProps): React.JSX.Element {
   const closeRef = useRef<HTMLButtonElement>(null);
+  const inProgress = handoff.executionState === 'executing';
 
   useEffect(() => {
     closeRef.current?.focus();
@@ -23,11 +24,12 @@ export function GoalReportDialog({ handoff, onClose }: GoalReportDialogProps): R
     <div className="goal-report-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
       <section className="goal-report-dialog" role="dialog" aria-modal="true" aria-labelledby="goal-report-title">
         <header>
-          <div><span>GOAL REPORT</span><h3 id="goal-report-title">{handoff.plan?.summary || 'Completed work'}</h3></div>
+          <div><span>{inProgress ? 'GOAL PROGRESS' : 'GOAL REPORT'}</span><h3 id="goal-report-title">{handoff.plan?.summary || (inProgress ? 'Work in progress' : 'Completed work')}</h3></div>
           <button ref={closeRef} type="button" className="icon-button" aria-label="Close goal report" onClick={onClose}>×</button>
         </header>
         <div className="goal-report-body">
-          {handoff.executionSummary && <div className="goal-report-summary"><h4>Final summary</h4><MarkdownMessage content={handoff.executionSummary} /></div>}
+          {inProgress && <div className="goal-report-summary"><h4>In progress</h4><p>{handoff.completedGoalCount} of {handoff.totalGoalCount || '?'} goals completed. {handoff.currentGoalTitle ? `Currently executing ${handoff.currentGoalTitle}.` : 'Preparing the next goal.'}</p></div>}
+          {handoff.executionSummary && <div className="goal-report-summary"><h4>{handoff.executionState === 'paused' ? 'Pause summary' : 'Final summary'}</h4><MarkdownMessage content={handoff.executionSummary} /></div>}
           <div className="goal-report-list">
             {handoff.goalResults.map((result, index) => {
               const complete = result.status === 'completed';

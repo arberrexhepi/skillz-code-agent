@@ -1567,6 +1567,13 @@ class CodexSubscriptionModelClient(BaseModelClient):
         self.thinking_mode = thinking_mode
         self.verbosity = verbosity
         self.backoff = BackoffStrategy()
+        self.progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None
+
+    def set_progress_callback(
+        self,
+        callback: Optional[Callable[[Dict[str, Any]], None]],
+    ) -> None:
+        self.progress_callback = callback
 
     def clone(self) -> BaseModelClient:
         client = CodexSubscriptionModelClient(
@@ -1578,6 +1585,7 @@ class CodexSubscriptionModelClient(BaseModelClient):
             enabled=self.backoff.enabled,
             token_limit_k=self.backoff.token_limit_k,
         )
+        client.progress_callback = self.progress_callback
         return client
 
     def complete(self, system: str, prompt: str) -> str:
@@ -1595,6 +1603,7 @@ class CodexSubscriptionModelClient(BaseModelClient):
             thinking_mode=self.thinking_mode,
             system=system,
             messages=messages,
+            progress_callback=self.progress_callback,
         )
         self._set_last_metrics(metrics)
         return text
@@ -9737,6 +9746,66 @@ def _run_extension_bridge(args: argparse.Namespace) -> int:
                 "bridge_warning": f"bridge_state failed: {exc}",
             }
 
+    def _emit_subscription_model_progress(event: Dict[str, Any]) -> None:
+        event_type = str(event.get("type", "") or "").strip()
+        item = event.get("item") if isinstance(event.get("item"), dict) else {}
+        item_type = str(item.get("type", "") or "").strip()
+        summaries = {
+            "thread.started": "Subscription model session started.",
+            "turn.started": "Codex is processing the next agent step.",
+            "turn.completed": "Subscription model step completed.",
+            "turn.failed": "Subscription model step failed.",
+            "error": "Subscription model reported an error.",
+        }
+        if event_type in {"item.started", "item.updated", "item.completed"}:
+            phase = event_type.removeprefix("item.")
+            item_labels = {
+                "reasoning": "Reasoning",
+                "agent_message": "Response composition",
+                "command_execution": "Backend command",
+                "file_change": "Backend file operation",
+                "mcp_tool_call": "Backend tool call",
+                "web_search": "Backend web search",
+                "plan": "Backend planning",
+            }
+            label = item_labels.get(item_type, "Model work")
+            summary = f"{label} {phase}."
+        else:
+            summary = summaries.get(event_type)
+        if not summary:
+            return
+        packet: Dict[str, Any] = {
+            "type": "progress",
+            "domain": "model",
+            "step": 0,
+            "action_type": f"codex_{event_type.replace('.', '_')}",
+            "path": "",
+            "elapsed_s": float(event.get("skillz_elapsed_s", 0) or 0),
+            "thought": "",
+            "summary": summary,
+            "diff": "",
+            "replacements": 0,
+            "added_lines": 0,
+            "removed_lines": 0,
+            "search_excerpt": "",
+            "replace_excerpt": "",
+            "inspected_file_count": 0,
+            "inspected_files": [],
+            "state": safe_bridge_state(),
+        }
+        if event_type in {"turn.completed"}:
+            packet["ok"] = True
+        elif event_type in {"turn.failed", "error"}:
+            packet["ok"] = False
+        _emit_bridge_message(packet)
+
+    def _attach_subscription_progress(client: BaseModelClient) -> None:
+        setter = getattr(client, "set_progress_callback", None)
+        if callable(setter):
+            setter(_emit_subscription_model_progress)
+
+    _attach_subscription_progress(model_holder["client"])
+
     def _make_step_callback(step: AgentStep, domain: str = "") -> None:
         action_type = str(step.action.get("type", "")).strip()
         path = str(step.action.get("path", "") or "").strip()
@@ -9977,6 +10046,7 @@ def _run_extension_bridge(args: argparse.Namespace) -> int:
                     thinking_mode=config.thinking_mode,
                     verbosity=config.verbosity,
                 )
+                _attach_subscription_progress(next_client)
                 model_holder["client"] = next_client
                 updated = planner.reconfigure_runtime(
                     model_client=next_client,

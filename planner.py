@@ -385,11 +385,13 @@ class PlannerSession:
     last_completed_plan: Optional[PlannerPlan] = None
     last_completed_results: List[GoalExecutionResult] = field(default_factory=list)
     last_execution_summary: str = ""
+    last_next_steps: List[str] = field(default_factory=list)
     awaiting_plan_revision: bool = False
     plan_revision_feedback: List[str] = field(default_factory=list)
     pending_discovery: Optional[DiscoveryRequest] = None
     last_discovery: Optional[DiscoveryResult] = None
     discovery_phase: str = "idle"
+    active_discovery_mode: str = ""
     completed_results: List[GoalExecutionResult] = field(default_factory=list)
     latest_request: str = ""
     planner_usage_totals: Dict[str, int] = field(default_factory=dict)
@@ -810,11 +812,13 @@ class PlannerAgent:
         self.session.last_completed_plan = None
         self.session.last_completed_results = []
         self.session.last_execution_summary = ""
+        self.session.last_next_steps = []
         self.session.awaiting_plan_revision = False
         self.session.plan_revision_feedback = []
         self.session.pending_discovery = None
         self.session.last_discovery = None
         self.session.discovery_phase = "idle"
+        self.session.active_discovery_mode = ""
         self.session.completed_results = []
         self.session.planner_usage_totals = {}
         self.session.defer_issue_close_for_review = False
@@ -898,10 +902,12 @@ class PlannerAgent:
                 self.session.intake_messages.append({"role": "user", "content": text})
                 self.session.pending_discovery = None
                 self.session.discovery_phase = "skipped"
+                self.session.active_discovery_mode = ""
                 return "Discovery skipped. Add more detail or let me know what should be assumed instead."
             self.session.intake_messages.append({"role": "user", "content": text})
             self.session.pending_discovery = None
             self.session.discovery_phase = "skipped"
+            self.session.active_discovery_mode = ""
             return self._handle_intake_turn()
 
         if self.session.awaiting_plan_revision and self.session.last_presented_plan is not None:
@@ -966,12 +972,14 @@ class PlannerAgent:
         self.session.pending_discovery = None
         self.session.last_discovery = None
         self.session.discovery_phase = "idle"
+        self.session.active_discovery_mode = ""
         self.session.executing = False
         self.session.executing_goal_index = -1
         self.session.executing_goal_id = ""
         self.session.executing_goal_title = ""
         self.session.executing_goal_count = 0
         self.session.last_execution_summary = ""
+        self.session.last_next_steps = []
         self.session.last_completed_plan = None
         self.session.last_completed_results = []
         self.session.completed_results = []
@@ -1037,12 +1045,14 @@ class PlannerAgent:
         self.session.pending_discovery = None
         self.session.last_discovery = None
         self.session.discovery_phase = "idle"
+        self.session.active_discovery_mode = ""
         self.session.executing = False
         self.session.executing_goal_index = -1
         self.session.executing_goal_id = ""
         self.session.executing_goal_title = ""
         self.session.executing_goal_count = 0
         self.session.last_execution_summary = ""
+        self.session.last_next_steps = []
         self.session.last_completed_plan = None
         self.session.last_completed_results = []
         self.session.completed_results = []
@@ -1060,11 +1070,13 @@ class PlannerAgent:
         self.session.last_completed_plan = None
         self.session.last_completed_results = []
         self.session.last_execution_summary = ""
+        self.session.last_next_steps = []
         self.session.awaiting_plan_revision = False
         self.session.plan_revision_feedback = []
         self.session.pending_discovery = None
         self.session.last_discovery = None
         self.session.discovery_phase = "idle"
+        self.session.active_discovery_mode = ""
         self.session.completed_results = []
         self.session.planner_usage_totals = {}
         self._clear_paused_execution()
@@ -1205,6 +1217,54 @@ class PlannerAgent:
             "validation_summary": "Worker returned an unstructured result.",
         }
 
+    @staticmethod
+    def _history_has_successful_workspace_mutation(history_slice: List[Dict[str, Any]] | List[Any]) -> bool:
+        mutation_actions = {
+            "write_file", "patch_file", "replace_range", "replace_snippet", "insert_before",
+            "insert_after", "delete_range", "delete_snippet", "append_block", "prepend_block",
+            "move_block", "replace_symbol", "insert_symbol_member", "rename_symbol", "create_file",
+            "delete_file", "rename_file", "copy_file", "fill_template", "batch_mutate",
+        }
+        candidates: List[tuple[Any, Any]] = []
+        for item in history_slice:
+            action = getattr(item, "action", None)
+            result = getattr(item, "result", None)
+            if not isinstance(action, dict) and isinstance(item, dict):
+                action = item.get("action")
+                result = item.get("result")
+            candidates.append((action, result))
+            # TreeLoop beta history stores tool actions inside each turn's
+            # command results rather than as top-level AgentStep objects.
+            nested_results = getattr(item, "results", None)
+            if isinstance(nested_results, list):
+                for nested in nested_results:
+                    candidates.append((getattr(nested, "tool_action", None), nested))
+        for action, result in candidates:
+            if not isinstance(action, dict) or str(action.get("type", "") or "") not in mutation_actions:
+                continue
+            if isinstance(result, dict):
+                result_ok = bool(result.get("ok", False))
+            else:
+                result_ok = bool(getattr(result, "ok", False))
+            if result_ok:
+                return True
+        return False
+
+    def _subscription_write_goal_is_unverified_noop(
+        self,
+        goal: PlannerGoal,
+        worker_result: Dict[str, Any],
+        history_slice: List[Dict[str, Any]] | List[Any],
+    ) -> bool:
+        scope = str(goal.estimated_scope or "mixed").strip().lower()
+        return (
+            str(getattr(self.config, "provider", "") or "").strip().lower() == "codex-subscription"
+            and scope not in {"read", "validation", "analysis", "discovery"}
+            and bool(worker_result["ok"])
+            and not bool(worker_result["validation_ran"])
+            and not self._history_has_successful_workspace_mutation(history_slice)
+        )
+
     def _goal_is_parallel_safe(self, goal: PlannerGoal) -> bool:
         scope = str(goal.estimated_scope or "mixed").strip().lower()
         return bool(goal.parallelizable) and not goal.preserve_context and scope in {"read", "validation"}
@@ -1271,17 +1331,70 @@ class PlannerAgent:
                 goal_fact_keys=goal.relevant_fact_keys,
                 preserve_context=goal.preserve_context,
             )
-            worker_result = self._coerce_worker_run_result(execution["run_result"], execution["history_slice"])
+            history_slice = list(execution["history_slice"])
+            elapsed = float(execution["elapsed"])
+            worker_result = self._coerce_worker_run_result(execution["run_result"], history_slice)
+            subscription_write_noop = self._subscription_write_goal_is_unverified_noop(
+                goal,
+                worker_result,
+                history_slice,
+            )
+            if subscription_write_noop:
+                recovery_instruction = (
+                    "Recovery: your previous turn claimed this write goal was complete, but the host observed neither "
+                    "a workspace mutation nor a validation action in that turn. Existing dirty files are partial input, "
+                    "not proof of completion. Inspect the current git diff and relevant diagnostics now. Repair the "
+                    "implementation if needed; otherwise run a concrete targeted validation. Do not finish until this "
+                    "attempt contains a successful mutation or real validation evidence."
+                )
+                recovery_hint_getter = getattr(worker, "unverified_completion_recovery_hint", None)
+                if callable(recovery_hint_getter):
+                    recovery_hint = str(recovery_hint_getter() or "").strip()
+                    if recovery_hint:
+                        recovery_instruction += "\n" + recovery_hint
+                recovery_preparer = getattr(worker, "prepare_unverified_completion_recovery", None)
+                if callable(recovery_preparer):
+                    recovery_preparer()
+                recovery = self._run_worker_task(
+                    worker=worker,
+                    task=task + "\n\n" + recovery_instruction,
+                    steering=steering + "\n" + recovery_instruction,
+                    goal_fact_keys=goal.relevant_fact_keys,
+                    preserve_context=True,
+                )
+                history_slice.extend(list(recovery["history_slice"]))
+                elapsed += float(recovery["elapsed"])
+                worker_result = self._coerce_worker_run_result(recovery["run_result"], recovery["history_slice"])
+                subscription_write_noop = self._subscription_write_goal_is_unverified_noop(
+                    goal,
+                    worker_result,
+                    recovery["history_slice"],
+                )
+            if subscription_write_noop:
+                worker_result.update(
+                    {
+                        "ok": False,
+                        "task_satisfied": False,
+                        "validation_passed": False,
+                        "validation_summary": (
+                            "Subscription-backed write goal returned without a workspace mutation or validation."
+                        ),
+                        "final_message": (
+                            "Goal did not complete: the subscription backend returned without performing or validating "
+                            "the required workspace change."
+                        ),
+                    }
+                )
             return GoalExecutionResult(
                 goal_id=goal.goal_id,
                 title=goal.title,
                 delegated_task=task,
                 final_message=worker_result["final_message"],
                 usage_summary=str(worker.render_last_usage_summary() or "").strip(),
-                worker_history_summary=self._summarize_worker_history(execution["history_slice"]),
-                touched_paths=worker_result["touched_paths"] or self._collect_touched_paths(execution["history_slice"]),
+                worker_history_summary=self._summarize_worker_history(history_slice),
+                touched_paths=worker_result["touched_paths"] or self._collect_touched_paths(history_slice),
                 preserve_context_used=goal.preserve_context,
-                duration_s=round(float(execution["elapsed"]), 3),
+                duration_s=round(elapsed, 3),
                 status="completed" if worker_result["ok"] and worker_result["task_satisfied"] else "failed",
                 task_satisfied=bool(worker_result["task_satisfied"]),
                 validation_ran=bool(worker_result["validation_ran"]),
@@ -1323,7 +1436,12 @@ class PlannerAgent:
 
         steering = self._build_discovery_steering(request, mode)
         task = self._build_discovery_task(request, mode)
+        # A mode has been accepted, so this is no longer a pending decision.
+        # Clearing it before the long worker run lets clients render an active
+        # discovery state instead of leaving the chooser visibly stuck.
+        self.session.pending_discovery = None
         self.session.discovery_phase = "running"
+        self.session.active_discovery_mode = mode.key
         self._fire_discovery_callback("discovery_start", mode.key)
         try:
             execution = self._run_worker_task(
@@ -1369,6 +1487,7 @@ class PlannerAgent:
             )
             self.session.pending_discovery = None
             self.session.discovery_phase = "complete"
+            self.session.active_discovery_mode = ""
             self._fire_discovery_callback("discovery_finish", mode_key)
             return f"Discovery failed before planning could continue: {exc}"
 
@@ -1376,22 +1495,52 @@ class PlannerAgent:
             self.session.last_discovery = result
             self.session.pending_discovery = None
             self.session.discovery_phase = "complete"
+            self.session.active_discovery_mode = ""
             self._fire_discovery_callback("discovery_finish", result.mode)
             return self._render_discovery_result(result)
 
         self.session.last_discovery = result
         self.session.pending_discovery = None
         self.session.discovery_phase = "complete"
+        self.session.active_discovery_mode = ""
         self._fire_discovery_callback("discovery_finish", result.mode)
         self._rehydrate_active_issue_context()
 
         plan_response = self._handle_intake_turn()
+        if self.session.pending_plan is None and not self.continuous_state.enabled:
+            continuation = self._continue_manual_planning_after_discovery()
+            if continuation:
+                plan_response = "\n\n".join([plan_response, continuation])
         discovery_summary = self._render_discovery_result(result)
         return "\n\n".join([discovery_summary, plan_response])
+
+    def _continue_manual_planning_after_discovery(self) -> str:
+        discovery = self.session.last_discovery
+        if discovery is None or not discovery.ok or self.session.pending_plan is not None:
+            return ""
+        # The selected discovery pass is evidence for the current request, not
+        # a terminal handoff. Clear any redundant second offer and explicitly
+        # drive the planner to the approval boundary.
+        self.session.pending_discovery = None
+        self.session.discovery_phase = "complete"
+        self.session.active_discovery_mode = ""
+        self.session.intake_messages.append(
+            {
+                "role": "user",
+                "content": (
+                    "The selected discovery pass is complete for this request. Continue to planning now. "
+                    "Use last_discovery as the implementation evidence, do not repeat discovery, and do not "
+                    "stop at a discovery handoff or generic response. Present a concrete 1-5 goal plan with "
+                    "success signals and not_in_scope for operator approval."
+                ),
+            }
+        )
+        return self._handle_intake_turn()
 
     def _mark_discovery_complete_for_plan_approval(self) -> None:
         self.session.pending_discovery = None
         self.session.discovery_phase = "complete"
+        self.session.active_discovery_mode = ""
 
     def execute_pending_plan(self) -> str:
         plan = self.session.pending_plan
@@ -1502,18 +1651,21 @@ class PlannerAgent:
                         _dataclass_replace(goal, preserve_context=effective_preserve),
                         index,
                     )
-                    self._fire_goal_callback("goal_finish", index, goal.goal_id, goal.title)
                     if result.status == "completed":
                         self._record_completed_goal_checkpoint(plan, goal, result, index)
-                    if result.status == "completed" and index < len(plan.goals):
-                        result.commentary_for_next_goal = self._plan_next_goal_guidance(plan, goal, result)
-                        self._apply_guidance_to_next_goal(plan, index, result.commentary_for_next_goal)
                     self.session.completed_results.append(result)
                     output.append(self._render_goal_result(index, len(plan.goals), result))
                     if result.status == "completed":
                         completed_ids.add(goal.goal_id)
                     else:
                         failed = True
+                    # Publish the completed result before any optional
+                    # between-goal guidance so clients can render honest
+                    # incremental progress.
+                    self._fire_goal_callback("goal_finish", index, goal.goal_id, goal.title)
+                    if result.status == "completed" and index < len(plan.goals):
+                        result.commentary_for_next_goal = self._plan_next_goal_guidance(plan, goal, result)
+                        self._apply_guidance_to_next_goal(plan, index, result.commentary_for_next_goal)
                     continue
 
                 workers: Dict[str, PlannerWorker] = {
@@ -2054,9 +2206,11 @@ class PlannerAgent:
                 self.session.pending_plan = None
                 self.session.pending_discovery = None
                 self.session.discovery_phase = "idle"
+                self.session.active_discovery_mode = ""
                 self.session.last_completed_plan = None
                 self.session.last_completed_results = []
                 self.session.last_execution_summary = ""
+                self.session.last_next_steps = []
                 self.session.defer_issue_close_for_review = True
 
                 self.continuous_state.status = "planning"
@@ -2299,6 +2453,7 @@ class PlannerAgent:
             )
             self.session.pending_discovery = request
             self.session.discovery_phase = "pending"
+            self.session.active_discovery_mode = ""
             return self._render_discovery_offer(request)
 
         if action_type == "present_plan":
@@ -2863,6 +3018,13 @@ class PlannerAgent:
         if not remaining_goals:
             return ""
 
+        # Subscription-backed goals already receive prior result summaries,
+        # validation evidence, touched paths, and preserved worker context in
+        # _build_goal_task. A second model call here is redundant and can make
+        # the UI appear frozen for minutes between otherwise completed goals.
+        if str(getattr(self.config, "provider", "") or "").strip().lower() == "codex-subscription":
+            return ""
+
         prompt = json.dumps(
             {
                 "original_request": plan.original_request,
@@ -2907,6 +3069,14 @@ class PlannerAgent:
         if failed_results:
             failed_result = failed_results[0]
             partial_changes = bool(failed_result.touched_paths)
+            self.session.last_next_steps = [
+                (
+                    f"Inspect the current diff and validation failure for {failed_result.title}, then repair the partial implementation."
+                    if partial_changes
+                    else f"Inspect the failed goal output and validation summary for {failed_result.title}."
+                ),
+                "Retry the failed goal from its preserved context; do not restart completed issue work.",
+            ]
             lines = [
                 "Execution Summary",
                 f"- Plan execution stopped after a failed goal: {failed_result.title}.",
@@ -2928,6 +3098,10 @@ class PlannerAgent:
 
         if len(results) < len(plan.goals):
             remaining = [goal.title for goal in plan.goals if goal.goal_id not in {result.goal_id for result in results}]
+            self.session.last_next_steps = [
+                "Inspect goal dependencies, then resume execution without re-approving the plan.",
+                f"Remaining goals: {', '.join(remaining[:5]) or '(none)' }.",
+            ]
             lines = [
                 "Execution Summary",
                 "- Plan execution stopped before all goals became dependency-ready.",
@@ -2984,6 +3158,7 @@ class PlannerAgent:
         summary = str(payload.get("summary") or "Plan execution finished.").strip()
         next_steps = [str(item) for item in payload.get("next_steps") or [] if str(item).strip()]
         next_steps = self._filter_completed_next_steps(plan, results, next_steps)
+        self.session.last_next_steps = list(next_steps)
         lines = [
             "Execution Summary",
             f"- {summary}",
@@ -3363,6 +3538,8 @@ class PlannerAgent:
     def _session_status(self) -> str:
         if self.session.executing:
             return "executing"
+        if self.session.discovery_phase == "running":
+            return "discovering"
         if self.session.execution_paused:
             return "execution_paused"
         if self.session.pending_plan is not None:
@@ -3584,6 +3761,7 @@ class PlannerAgent:
             "status": self._session_status(),
             "latest_request": self.session.latest_request,
             "discovery_phase": self.session.discovery_phase,
+            "active_discovery_mode": self.session.active_discovery_mode,
             "project_intent": self._load_project_intent_payload(),
             "continuous_mode": {
                 "enabled": self.continuous_state.enabled,
@@ -3625,6 +3803,7 @@ class PlannerAgent:
             "last_completed_results": [self._result_payload(result) for result in self.session.last_completed_results[-5:]],
             "completed_results": [self._result_payload(result) for result in self.session.completed_results[-5:]],
             "last_execution_summary": self.session.last_execution_summary,
+            "last_next_steps": list(self.session.last_next_steps),
             "executing": self.session.executing,
             "executing_goal_index": self.session.executing_goal_index,
             "executing_goal_id": self.session.executing_goal_id,
