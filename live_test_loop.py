@@ -64,6 +64,10 @@ from tree_loop import TreeLoop, Turn  # noqa: E402
 REPO_FACTS_FILENAME = "repo_facts.md"
 OBSERVABILITY_TRACE_BLOCK_LIMIT = 24
 DISCOVERY_REMEDIATION_READ_SATISFIERS = {"read_file", "read_line_range", "read-line-range", "grep", "repo-map", "repo_map"}
+EXECUTION_EXPLORATION_ACTION_LIMIT = 14
+EXECUTION_EMPTY_SEARCH_LIMIT = 3
+EXECUTION_RECOVERY_FOCUSED_READ_LIMIT = 1
+EXECUTION_SEARCH_COMMANDS = {"find", "find-symbol", "find_symbol", "grep", "repo-map", "repo_map", "symbols"}
 GIT_MUTATION_ACTION_TYPES = {
     "git_add",
     "git_restore",
@@ -239,6 +243,9 @@ class TreeLoopPlannerWorker:
         self._edit_batch_last_failure: Optional[Dict[str, Any]] = None
         self._has_mutation = False
         self._validation_after_mutation = False
+        self._execution_non_mutating_actions = 0
+        self._execution_empty_searches = 0
+        self._execution_stagnation: Optional[Dict[str, Any]] = None
         self._run_sequence = 0
         self._active_run_id = 0
         self._last_validation = WorkerValidationResult(kind="none", passed=True, summary="No mutating actions required validation.")
@@ -488,6 +495,9 @@ class TreeLoopPlannerWorker:
         self._edit_batch_last_failure = None
         self._has_mutation = False
         self._validation_after_mutation = False
+        self._execution_non_mutating_actions = 0
+        self._execution_empty_searches = 0
+        self._execution_stagnation = None
         self._run_sequence = 0
         self._active_run_id = 0
         self._last_validation = WorkerValidationResult(kind="none", passed=True, summary="No mutating actions required validation.")
@@ -785,6 +795,9 @@ class TreeLoopPlannerWorker:
     def discovery_remediation_state(self) -> Optional[Dict[str, Any]]:
         return dict(self._discovery_remediation) if isinstance(self._discovery_remediation, dict) else None
 
+    def execution_stagnation_state(self) -> Optional[Dict[str, Any]]:
+        return dict(self._execution_stagnation) if isinstance(self._execution_stagnation, dict) else None
+
     def _mark_stale_issue_id(self, issue_id: str) -> None:
         normalized = str(issue_id or "").strip()
         if not normalized:
@@ -903,6 +916,15 @@ class TreeLoopPlannerWorker:
                     "If validation contradicts completion, make one corrective edit and let the host reopen normal execution.",
                 ],
             }
+        if self._execution_stagnation is not None:
+            return {
+                "mode": "execution_recovery",
+                "steps": [
+                    "Stop broad repository searches; the current evidence is sufficient to choose a direction.",
+                    "Use at most one focused read of an already identified target, then make the narrow mutation the goal requires.",
+                    "If no mutation is appropriate, run one targeted validation and finish with the result or an explicit blocker.",
+                ],
+            }
         return None
 
     def _format_strategy_blocks(self, strategy: Dict[str, Any]) -> str:
@@ -953,6 +975,7 @@ class TreeLoopPlannerWorker:
                 "deterministic_pending_verification": True,
                 "goal_start_skill_mode": True,
                 "approved_npm_commands": True,
+                "execution_stagnation_guard": True,
             },
             "current_task": self._current_task,
             "task_satisfied": self._task_satisfied,
@@ -966,6 +989,7 @@ class TreeLoopPlannerWorker:
             "usage_accounting": self.usage_accounting_state(),
             "patch_resolution": self.patch_resolution_state(),
             "discovery_remediation": self.discovery_remediation_state(),
+            "execution_stagnation": self.execution_stagnation_state(),
             "pending_npm_command": dict(self._pending_npm_command) if isinstance(self._pending_npm_command, dict) else None,
             "active_mode_strategy": self._active_mode_strategy(),
             "pending_verification": dict(self._pending_verification) if isinstance(self._pending_verification, dict) else None,
@@ -1716,6 +1740,16 @@ class TreeLoopPlannerWorker:
                     "Choose the verification strategy path that best fits the current diff surface. "
                     "Do not return numbered prose steps. After >>th: and >>pl:, emit exactly one executable strategy block such as:\n" + strategy_text
                 )
+        elif self._execution_stagnation is not None:
+            reason = str(self._execution_stagnation.get("reason", "") or "exploration stopped producing new evidence")
+            parts.append(
+                "EXECUTION RECOVERY MODE is active because "
+                + reason
+                + ". Stop repo-map, find, grep, symbol searches, broad listings, repeated diagnostics, and fact gathering. "
+                "The next useful action must be one narrow repository mutation, one targeted validation proving no edit is needed, "
+                "or `finish <explicit blocker>` if the goal cannot be completed. You may use at most one final cat/read-line-range "
+                "on an already identified target before that action."
+            )
         if self._completion_check_pending and self._completion_check_reason:
             parts.append(self._completion_check_reason)
             parts.append(
@@ -1837,6 +1871,7 @@ class TreeLoopPlannerWorker:
             "completion_check_reason": self._completion_check_reason,
             "patch_resolution": self.patch_resolution_state(),
             "discovery_remediation": self.discovery_remediation_state(),
+            "execution_stagnation": self.execution_stagnation_state(),
             "active_mode_strategy": self._active_mode_strategy(),
             "pending_verification": dict(self._pending_verification) if isinstance(self._pending_verification, dict) else None,
             "edit_batch": self.edit_batch_state(),
@@ -1847,6 +1882,7 @@ class TreeLoopPlannerWorker:
                 "discovery_remediation": True,
                 "deterministic_pending_verification": True,
                 "goal_start_skill_mode": True,
+                "execution_stagnation_guard": True,
             },
             "goal_start_skill_mode": {
                 "pending": self._goal_skill_mode_pending,
@@ -1889,6 +1925,9 @@ class TreeLoopPlannerWorker:
         self._edit_batch_last_failure = None
         self._has_mutation = False
         self._validation_after_mutation = False
+        self._execution_non_mutating_actions = 0
+        self._execution_empty_searches = 0
+        self._execution_stagnation = None
         self._last_validation = WorkerValidationResult(kind="none", passed=True, summary="No mutating actions required validation.")
         self._latest_review = None
         self._llm_activity = {
@@ -2127,6 +2166,148 @@ class TreeLoopPlannerWorker:
         if hasattr(self.loop, "_same_turn_halt_reason"):
             self.loop._same_turn_halt_reason = str(reason or "").strip()
 
+    def _normalized_execution_command(self, command: str) -> str:
+        normalized = str(command or "").strip()
+        if normalized.startswith("[") and "] " in normalized:
+            normalized = normalized.split("] ", 1)[1].strip()
+        return normalized
+
+    def _execution_command_verb(self, command: str) -> str:
+        normalized = self._normalized_execution_command(command)
+        return normalized.split(None, 1)[0].strip().lower() if normalized else ""
+
+    def _is_successful_execution_mutation(self, result: CommandResult) -> bool:
+        if not result.ok:
+            return False
+        action_type = str((result.tool_action or {}).get("type", "") or "").strip()
+        return action_type in {
+            "npm_command",
+            "patch_file",
+            "replace_lines",
+            "write_file",
+        } | GIT_MUTATION_ACTION_TYPES
+
+    def _reset_execution_stagnation(self) -> None:
+        self._execution_non_mutating_actions = 0
+        self._execution_empty_searches = 0
+        self._execution_stagnation = None
+        self._refresh_loop_steering()
+
+    def _execution_result_is_empty_search(self, command: str, result: CommandResult) -> bool:
+        if self._execution_command_verb(command) not in EXECUTION_SEARCH_COMMANDS:
+            return False
+        output = " ".join(str(result.output or "").strip().lower().split())
+        return output in {
+            "(empty)",
+            "(no matches)",
+            "(no symbol matches)",
+            "(no symbols found)",
+        }
+
+    def _execution_target_paths(self) -> List[str]:
+        targets: List[str] = []
+        recent_reads = list(getattr(getattr(self, "loop", None), "_recent_reads", []) or [])
+        for item in reversed(recent_reads):
+            command = str(getattr(item, "command", "") or "")
+            match = re.search(r"/repo/([^\s:]+)", command)
+            if match is None:
+                continue
+            path = match.group(1).strip()
+            if path and path not in targets:
+                targets.append(path)
+            if len(targets) >= 4:
+                break
+        return targets
+
+    def _track_execution_progress(self, command: str, result: CommandResult) -> None:
+        if getattr(self, "discovery_budget", None) is not None:
+            return
+        if self._is_successful_execution_mutation(result):
+            self._reset_execution_stagnation()
+            return
+        if not result.ok or result.command_type in {"annotation", "finish"}:
+            return
+
+        verb = self._execution_command_verb(command)
+        action_type = str((result.tool_action or {}).get("type", "") or "").strip()
+        if verb in {"batch", "finish"} or action_type in {"begin_edit_batch", "end_edit_batch"}:
+            return
+
+        self._execution_non_mutating_actions = int(getattr(self, "_execution_non_mutating_actions", 0) or 0) + 1
+        if self._execution_result_is_empty_search(command, result):
+            self._execution_empty_searches = int(getattr(self, "_execution_empty_searches", 0) or 0) + 1
+
+        if getattr(self, "_execution_stagnation", None) is not None:
+            return
+
+        action_count = self._execution_non_mutating_actions
+        empty_count = int(getattr(self, "_execution_empty_searches", 0) or 0)
+        reason = ""
+        trigger = ""
+        if empty_count >= EXECUTION_EMPTY_SEARCH_LIMIT:
+            reason = f"{empty_count} repository searches returned no matches without a mutation"
+            trigger = "empty_searches"
+        elif action_count >= EXECUTION_EXPLORATION_ACTION_LIMIT:
+            reason = f"{action_count} actions completed without a repository mutation"
+            trigger = "non_mutating_actions"
+        if not reason:
+            return
+
+        self._execution_stagnation = {
+            "reason": reason,
+            "trigger": trigger,
+            "non_mutating_actions": action_count,
+            "empty_searches": empty_count,
+            "focused_reads_used": 0,
+            "blocked_actions": 0,
+            "recent_targets": self._execution_target_paths(),
+        }
+        self._refresh_loop_steering()
+        self._request_same_turn_halt(f"execution recovery active: {reason}")
+
+    def _apply_execution_stagnation_guard(self, command: str, result: CommandResult) -> bool:
+        state = getattr(self, "_execution_stagnation", None)
+        if not isinstance(state, dict) or getattr(self, "discovery_budget", None) is not None:
+            return False
+        if self._is_successful_execution_mutation(result) or result.command_type in {"annotation", "finish"}:
+            return False
+
+        verb = self._execution_command_verb(command)
+        action_type = str((result.tool_action or {}).get("type", "") or "").strip()
+        focused_read = verb in {"cat", "read-line-range", "read_line_range"}
+        validation_actions = {
+            "review_changes",
+            "run_check",
+            "run_route_check",
+            "run_shell",
+            "show_diff",
+        } | GIT_READ_ACTION_TYPES
+        validation = action_type in validation_actions
+        if focused_read and int(state.get("focused_reads_used", 0) or 0) < EXECUTION_RECOVERY_FOCUSED_READ_LIMIT:
+            state["focused_reads_used"] = int(state.get("focused_reads_used", 0) or 0) + 1
+            self._request_same_turn_halt("execution recovery: focused read consumed; mutate, validate, finish, or report a blocker next")
+            return False
+        if validation or verb in {"drop", "finish"} or action_type in {"drop_context", "begin_edit_batch", "end_edit_batch"}:
+            self._request_same_turn_halt("execution recovery: targeted action completed; finish or make the required mutation next")
+            return False
+
+        state["blocked_actions"] = int(state.get("blocked_actions", 0) or 0) + 1
+        result.ok = False
+        result.output = (
+            "execution recovery blocked more exploration after sustained no-progress activity. "
+            "Use a narrow write/patch/replace action, one targeted validation, or finish with an explicit blocker."
+        )
+        self._refresh_loop_steering()
+        self._request_same_turn_halt("execution recovery blocked another exploratory action")
+        if int(state.get("blocked_actions", 0) or 0) >= 3:
+            request_stop = getattr(getattr(self, "loop", None), "request_stop", None)
+            if callable(request_stop):
+                request_stop(
+                    "execution recovery exhausted after three additional exploratory actions; "
+                    "the goal made no repository mutation"
+                )
+        return True
+
     def _current_file_sha256(self, path: str) -> str:
         target = self._resolve_repo_path(path)
         content = target.read_text(encoding="utf-8")
@@ -2293,6 +2474,10 @@ class TreeLoopPlannerWorker:
         return message
 
     def _observe_command_result(self, command: str, result: CommandResult) -> None:
+        guarded_by_stagnation = self._apply_execution_stagnation_guard(command, result)
+        if not guarded_by_stagnation:
+            self._track_execution_progress(command, result)
+
         if result.command_type != "annotation" and self._goal_skill_mode_pending and not self._goal_skill_mode_used:
             self._goal_skill_mode_pending = False
             self._goal_skill_mode_used = True

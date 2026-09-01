@@ -7,14 +7,6 @@ export function AgentDecisionCard(): React.JSX.Element | null {
   const planner = agent.state.bridge.planner;
   const busy = Boolean(agent.state.pendingAction);
   const locked = continuousIsActive(agent.state.bridge);
-  const discoveryRunning = planner.discovery_phase === 'running' || agent.state.pendingAction === 'select_discovery_mode';
-  if (discoveryRunning) {
-    const latest = [...agent.state.activity].reverse().find((item) => item.domain === 'model' || item.domain === 'discovery');
-    const mode = String(planner.active_discovery_mode || '').trim();
-    return <Decision title="Discovery in progress" meta={mode ? `${humanize(mode)} scan selected. Repository findings will stream into Activity as they arrive.` : 'Starting the selected scan…'}>
-      <div className="decision-running"><i /><span>{latest?.summary || 'Preparing the first subscription model step…'}</span>{latest?.elapsed_s !== undefined && <small>{latest.elapsed_s}s</small>}</div>
-    </Decision>;
-  }
   if (planner.pending_discovery) {
     return <Decision title="Choose discovery depth" meta={planner.pending_discovery.reason || planner.pending_discovery.prompt}>
       <div className="decision-buttons"><button className="primary-button" disabled={busy || locked} onClick={() => void agent.plannerAction('select_discovery_mode', { mode: 'quick' })}>Quick</button><button disabled={busy || locked} onClick={() => void agent.plannerAction('select_discovery_mode', { mode: 'moderate' })}>Moderate</button><button disabled={busy || locked} onClick={() => void agent.plannerAction('select_discovery_mode', { mode: 'deep' })}>Deep</button><button className="quiet" disabled={busy || locked} onClick={() => void agent.plannerAction('skip_discovery')}>Skip</button></div>
@@ -29,10 +21,21 @@ export function AgentDecisionCard(): React.JSX.Element | null {
     </Decision>;
   }
   const error = planner.worker_state?.active_error;
-  if (error && !busy && !locked) return <Decision title="Agent needs direction" meta={error.message || error.error_type} tone="danger"><ActionButtons actions={(error.suggested_next_actions || []).map((action) => ({ ...action, source: 'worker' }))} /></Decision>;
-  const actions = combineSuggestedActions(agent.state.bridge).filter((action) => !['create_issue', 'reopen_issue', 'delete_session'].includes(action.type));
-  if (!actions.length) return null;
-  return <Decision title="Suggested next step" meta={planner.executing ? planner.executing_goal_title : undefined}><ActionButtons actions={actions.slice(0, 4)} /></Decision>;
+  const elicitationActions = [
+    ...combineSuggestedActions(agent.state.bridge),
+    ...(error?.suggested_next_actions || []).map((action) => ({ ...action, source: 'worker' as const })),
+  ].filter(isExplicitElicitation).filter((action, index, actions) => actions.findIndex((candidate) => candidate.type === action.type && candidate.confirmation_prompt === action.confirmation_prompt) === index);
+  if (!busy && !locked && elicitationActions.length) {
+    const prompt = elicitationActions.find((action) => action.confirmation_prompt)?.confirmation_prompt;
+    return <Decision title={error ? 'Agent needs direction' : 'Permission required'} meta={prompt || error?.message || error?.error_type} tone={error ? 'danger' : ''}><ActionButtons actions={elicitationActions.slice(0, 4)} /></Decision>;
+  }
+  return null;
+}
+
+function isExplicitElicitation(action: SuggestedAction): boolean {
+  if (['approve_npm_command', 'reject_npm_command'].includes(action.type)) return true;
+  if (['delete_session', 'drop_context'].includes(action.type)) return false;
+  return action.source === 'worker' && action.requires_confirmation === true;
 }
 
 function ActionButtons({ actions }: { actions: SuggestedAction[] }): React.JSX.Element {

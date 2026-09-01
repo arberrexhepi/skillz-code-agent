@@ -56,6 +56,7 @@ from mutations import (
 from project_diagnostics import run_backend_diagnostics
 from tree_commands import (
     Annotation,
+    COMMAND_VERBS,
     CommandResult,
     format_strategy_results,
     is_annotation,
@@ -213,13 +214,7 @@ def _looks_like_command(line: str) -> bool:
     if is_strategy(line):
         return True
     first = line.split(None, 1)[0].lower() if line else ""
-    return first in {
-        "ls", "cat", "read-line-range", "read_line_range", "symbols", "find-symbol", "find_symbol", "repo-map", "repo_map", "stat", "find", "grep",
-        "read-diagnostics", "diagnose", "run-route-check", "run_route_check", "ingest-log", "list-issues", "show-issue", "resolve-issue", "reopen-issue", "run-check",
-        "write", "replace-lines", "replace_lines", "patch", "show-diff", "show_diff", "review-changes", "review_changes", "shell", "git",
-        "fact", "expand", "drop", "batch", "finish",
-        "skill",
-    }
+    return first in COMMAND_VERBS
 
 
 _MARKDOWN_COMMAND_PREFIX_RE = re.compile(r"^(?:[-*+]\s+|\d{1,3}[.)]\s+|\[[ xX]\]\s+)")
@@ -702,6 +697,7 @@ class TreeLoop:
         self._total_reads = 0
         self._total_writes = 0
         self._same_turn_halt_reason = ""
+        self._external_stop_reason = ""
         self._inspected_run_issue_ids: set[str] = set()
         compactor_setter = getattr(self.model, "set_final_retry_message_compactor", None)
         if callable(compactor_setter):
@@ -729,6 +725,7 @@ class TreeLoop:
         finished = False
         interrupted = False
         commandless_turns = 0
+        self._external_stop_reason = ""
         self._refresh_log_issue_signals()
 
         for turn_num in range(1, self.max_turns + 1):
@@ -1044,6 +1041,12 @@ class TreeLoop:
                 {"role": "user", "content": _build_turn_result_message(turn)},
             ])
 
+            if self._external_stop_reason:
+                finish_message = f"stopped: {self._external_stop_reason}"
+                if self.verbose:
+                    _log(f"  ■ STOPPED: {finish_message}")
+                break
+
             if commandless_turns >= MAX_CONSECUTIVE_COMMANDLESS_TURNS:
                 finish_message = (
                     "stopped: model produced no executable tree commands for "
@@ -1109,6 +1112,10 @@ class TreeLoop:
             _log(result.summary())
 
         return result
+
+    def request_stop(self, reason: str) -> None:
+        """Stop after the current turn without treating the run as completed."""
+        self._external_stop_reason = str(reason or "").strip() or "external stop requested"
 
     def reset_conversation(self) -> None:
         self._conversation_messages.clear()
