@@ -58,6 +58,7 @@ from planner import PlannerAgent, interactive_planner_loop  # noqa: E402
 from runtime_catalog import runtime_options_payload  # noqa: E402
 from skill_loader import load_markdown_skills_from_dir  # noqa: E402
 from tree_commands import CommandResult  # noqa: E402
+from bridge_presentation import bridge_exchange  # noqa: E402
 from tree_loop import TreeLoop, Turn  # noqa: E402
 from discovery.dispatch import DISCOVERY_ACTION_TYPES, execute_discovery_action  # noqa: E402
 from execution_evidence import repository_observation  # noqa: E402
@@ -193,7 +194,11 @@ class TreeLoopDiscoveryBudget:
         return self.tool_calls_used >= self.max_tool_calls
 
 
-class TreeLoopPlannerWorker:
+from proposal_runtime import ProposalRuntimeMixin
+from issue_proposals import PROPOSAL_GUIDANCE
+
+
+class TreeLoopPlannerWorker(ProposalRuntimeMixin):
     def __init__(
         self,
         *,
@@ -414,6 +419,7 @@ class TreeLoopPlannerWorker:
         loop.bridge.tree.set_fact("demo", "architecture", "entrypoint", "live_test_loop.py is the beta TreeLoop entrypoint")
         loop.bridge.tree.set_fact("demo", "architecture", "planner", "planner.py orchestrates discovery and goals")
         loop.setup()
+        loop.bridge.tree.diagnostic_disposition = self._apply_proposal_deferrals
         return loop
 
     def reconfigure_runtime(
@@ -1004,6 +1010,7 @@ class TreeLoopPlannerWorker:
             "suggested_next_actions": self.runtime_suggested_next_actions(),
             "issue_state": self.issue_ledger.planner_payload(path=str(self._repo_facts_path())),
             "issue_context": self._issue_context_state(),
+            "issue_proposals": self.proposal_state(),
         }
 
     def _issue_context_state(self) -> Dict[str, Any]:
@@ -1418,7 +1425,7 @@ class TreeLoopPlannerWorker:
         if not path and normalized_command_preview:
             parts = preview_parts
             non_path_commands = {
-                "finish", "skill", "git", "shell", "batch", "fact",
+                "finish", "skill", "git", "shell", "batch", "fact", "propose-issue",
                 "list-issues", "list-run-issues", "show-issue", "show-run-issue",
                 "resolve-issue", "resolve-run-issue", "reopen-issue", "reopen-run-issue",
             }
@@ -1553,6 +1560,17 @@ class TreeLoopPlannerWorker:
         event = str((payload or {}).get("event", "") or "").strip()
         if not event:
             return
+        if event == "turn_thought":
+            if callable(self.on_step_callback):
+                self._bridge_step_counter += 1
+                self.on_step_callback({
+                    "step": self._bridge_step_counter,
+                    "turn": payload.get("turn", 0),
+                    "action_type": "turn_thought",
+                    "thought": str(payload.get("thought", "") or ""),
+                    "summary": "",
+                })
+            return
         turn = int((payload or {}).get("turn", 0) or 0)
         elapsed_s = float((payload or {}).get("elapsed_s", 0.0) or 0.0)
         output_chars = int((payload or {}).get("output_chars", 0) or 0)
@@ -1662,6 +1680,7 @@ class TreeLoopPlannerWorker:
             "Issue lifecycle: treat closed durable repo_facts issues as historical context only. "
             "Do not reopen a closed issue unless the task explicitly requires that exact issue; prefer continuing an open issue or creating a new follow-up issue."
         )
+        parts.append(PROPOSAL_GUIDANCE)
         active_durable_issue = self.issue_ledger.active_issue()
         if active_durable_issue is not None:
             durable_summary = str(
@@ -1917,6 +1936,7 @@ class TreeLoopPlannerWorker:
         return sorted(skills, key=lambda item: (-int(item.get("priority", 0)), str(item.get("name", ""))))
 
     def _reset_guard_state(self, *, clear_budget_usage: bool = False) -> None:
+        self._proposal_validation_checkpoint = None
         self._task_satisfied = False
         self._completion_check_pending = False
         self._completion_check_reason = ""
@@ -2082,7 +2102,7 @@ class TreeLoopPlannerWorker:
         issues = [
             issue
             for issue in self.loop.bridge.tree.list_log_issues()
-            if str(issue.get("status", "open")) != "resolved"
+            if str(issue.get("status", "open")) not in {"resolved", "deferred"}
         ]
         if not issues:
             return
@@ -2405,6 +2425,11 @@ class TreeLoopPlannerWorker:
         return True, f"edit batch ended; host verified {len(queued_paths)} file(s)"
 
     def _command_reported_issue_count(self, result: CommandResult) -> int:
+        tree = getattr(getattr(getattr(self, "loop", None), "bridge", None), "tree", None)
+        if tree is not None and hasattr(tree, "list_log_issues"):
+            issues = tree.list_log_issues()
+            if issues and all(item.get("status") in {"resolved", "deferred"} for item in issues):
+                return 0
         match = re.search(r"issues=(\d+)", str(result.output or ""))
         if match is not None:
             return int(match.group(1))
@@ -2417,6 +2442,14 @@ class TreeLoopPlannerWorker:
         action = result.tool_action or {}
         action_type = str(action.get("type", "") or "")
         fact_action = action_type in FACT_ACTION_TYPES
+
+        if action_type == "propose_issue":
+            try:
+                proposal = self.propose_issue(action)
+                return f"Recorded {proposal['proposal_id']} ({proposal['status']}). Linked diagnostics are deferred now, not completion gates. Continue the current goal."
+            except Exception as exc:
+                result.ok = False
+                return f"propose_issue failed: {exc}"
 
         if self.discovery_budget is not None and result.needs_tool:
             if action_type in {"write_file", "replace_lines", "patch_file", "npm_command"} | GIT_MUTATION_ACTION_TYPES:
@@ -2497,6 +2530,28 @@ class TreeLoopPlannerWorker:
         return message
 
     def _observe_command_result(self, command: str, result: CommandResult) -> None:
+        action_type = str((result.tool_action or {}).get("type") or "")
+        if action_type == "propose_issue":
+            self._emit_step_progress(command, result)
+            return
+        if not result.ok and action_type in {"diagnose", "run_check", "run_route_check"} and re.search(r"issues=[1-9]\d*", str(result.output)):
+            diagnostics = self._proposal_diagnostics()
+            if diagnostics and all(item.get("status") in {"resolved", "deferred"} for item in diagnostics):
+                self._emit_step_progress(command, result)
+                return
+            if diagnostics and not getattr(self, "_proposal_validation_checkpoint", None):
+                self._proposal_validation_checkpoint = {
+                    "validation": self._validation_after_mutation,
+                    "pending": self._pending_verification,
+                    "diagnostics": diagnostics,
+                }
+            elif diagnostics:
+                checkpoint = self._proposal_validation_checkpoint
+                checkpoint['diagnostics'] = list({item['id']: item for item in checkpoint['diagnostics'] + diagnostics}.values())
+        elif not result.ok and action_type in {"diagnose", "run_check", "run_route_check", "run_shell"}:
+            # A later unstructured/tool failure is independent evidence. An
+            # earlier diagnostic proposal must not restore over its gate.
+            self._proposal_validation_checkpoint = None
         guarded_by_stagnation = self._apply_execution_stagnation_guard(command, result)
         if not guarded_by_stagnation:
             self._track_execution_progress(command, result)
@@ -2544,6 +2599,7 @@ class TreeLoopPlannerWorker:
             self._emit_step_progress(command, result)
             return
         if action_type in {"write_file", "replace_lines", "patch_file", "npm_command"} | GIT_MUTATION_ACTION_TYPES:
+            self._proposal_validation_checkpoint = None
             path_value = action.get("path") or action.get("paths") or action.get("source") or action.get("destination")
             pending_path = ""
             if isinstance(path_value, list):
@@ -2605,6 +2661,7 @@ class TreeLoopPlannerWorker:
             return
 
         if action_type in {"run_check", "show_diff", "review_changes", "run_shell"} | GIT_READ_ACTION_TYPES and self._has_mutation:
+            self._proposal_validation_checkpoint = None
             self._pending_verification = None
             self._validation_after_mutation = True
             self._completion_check_pending = True
@@ -2642,10 +2699,27 @@ class TreeLoopPlannerWorker:
             pending_path = str((self._pending_verification or {}).get("path", "") or "")
             suffix = f" for {pending_path}" if pending_path else ""
             validation = WorkerValidationResult(kind="missing", passed=False, summary=f"Mutation completed without a concrete validation step{suffix}.")
+        validation = WorkerValidationResult(kind=validation.kind, passed=validation.passed, summary=validation.summary + self._proposal_deferral_summary())
         self._last_validation = validation
         if not loop_result.finished and validation.passed:
             self._task_satisfied = False
         return validation
+
+    def _refresh_proposal_deferrals(self) -> None:
+        self.loop.bridge.tree.diagnostic_disposition = self._apply_proposal_deferrals
+        diagnostics = self._proposal_diagnostics()
+        deferred_ids = {item['id'] for item in diagnostics if item.get('status') == 'deferred'}
+        if (self._discovery_remediation or {}).get('diagnostic_issue_id') in deferred_ids:
+            self._discovery_remediation = None
+        checkpoint = getattr(self, '_proposal_validation_checkpoint', None)
+        if checkpoint and all(item.get('status') in {'resolved', 'deferred'} for item in self._apply_proposal_deferrals(checkpoint['diagnostics'])):
+            self._validation_after_mutation = checkpoint['validation']
+            self._pending_verification = checkpoint['pending']
+            self._completion_check_pending = not checkpoint['validation'] or checkpoint['pending'] is not None
+            self._proposal_validation_checkpoint = None
+            self._completion_check_reason = 'Unrelated validation findings are deferred. Validate the current change only; do not rerun baseline checks to clear them.'
+        self.loop._refresh_log_issue_signals()
+        self._refresh_loop_steering()
 
     def _repo_facts_path(self) -> Path:
         return self.root / REPO_FACTS_FILENAME
@@ -3392,7 +3466,7 @@ def _run_extension_bridge(args: argparse.Namespace) -> int:
             verbosity=args.verbosity,
         )
     }
-    transcript: List[Dict[str, str]] = []
+    transcript: List[Dict[str, Any]] = []
     last_bridge_state: Optional[Dict[str, Any]] = None
 
     config = SimpleNamespace(
@@ -3464,7 +3538,7 @@ def _run_extension_bridge(args: argparse.Namespace) -> int:
             return state
         except Exception as exc:
             fallback_planner: Dict[str, Any] = {}
-            fallback_transcript: List[Dict[str, str]] = transcript[-40:]
+            fallback_transcript: List[Dict[str, Any]] = transcript[-40:]
             if isinstance(last_bridge_state, dict):
                 cached_planner = last_bridge_state.get("planner")
                 cached_transcript = last_bridge_state.get("transcript")
@@ -3485,7 +3559,7 @@ def _run_extension_bridge(args: argparse.Namespace) -> int:
         text = str(content or "").strip()
         if not text:
             return
-        transcript.append({"role": role, "content": text})
+        transcript.append(bridge_exchange(planner, role, text))
 
     def summarize_bridge_action_result(action: Dict[str, Any], result: ActionResult) -> str:
         action_type = str(action.get("type", "") or result.name or "action")

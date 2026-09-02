@@ -80,7 +80,7 @@ def _assign_stable_run_issue_ids(issues: Sequence[Dict[str, Any]]) -> List[Dict[
 
 
 def _run_issue_sort_key(issue: Dict[str, Any]) -> Tuple[int, int, str, int, str]:
-    status_rank = 1 if str(issue.get("status", "open") or "open") == "resolved" else 0
+    status_rank = 1 if str(issue.get("status", "open") or "open") in {"resolved", "deferred"} else 0
     try:
         severity_rank = -int(issue.get("severity", 0) or 0)
     except (TypeError, ValueError):
@@ -878,6 +878,9 @@ class ContextTree:
                 if isinstance(entry, FileNode):
                     issue[entry.name] = entry.content
             issues.append(issue)
+        disposition = getattr(self, "diagnostic_disposition", None)
+        if callable(disposition):
+            issues = disposition(issues)
         return sorted(issues, key=_run_issue_sort_key)
 
     def show_log_issue(self, issue_id: str) -> Optional[Dict[str, Any]]:
@@ -941,6 +944,9 @@ class ContextTree:
             lines.append(" ".join(header_bits))
             if summary:
                 lines.append(f"  summary: {summary}")
+            if status == "deferred":
+                lines.append(f"  deferred to {issue.get('proposal_id', 'agent suggestion')}; not a current-goal gate, no further inspection required")
+                continue
             next_reads = self.log_issue_read_commands(issue)
             next_steps = next_reads or [f"show-run-issue {issue_id}"]
             lines.append(f"  next: {'; '.join(next_steps)}")
@@ -973,7 +979,9 @@ class ContextTree:
             if text:
                 lines.append(f"{key}: {text}")
 
-        next_reads = self.log_issue_read_commands(issue)
+        if status == "deferred":
+            lines.append(f"deferred to: {issue.get('proposal_id', 'agent suggestion')}; not a current-goal gate, no further inspection required")
+        next_reads = [] if status == "deferred" else self.log_issue_read_commands(issue)
         if next_reads:
             lines.append("next_reads:")
             lines.extend(f"- {command}" for command in next_reads)

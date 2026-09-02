@@ -17,6 +17,7 @@ export interface AgentWorkspaceValue {
   submit: (text: string) => Promise<boolean>;
   plannerAction: (action: string, extras?: JsonMap) => Promise<boolean>;
   createIssue: (summary: string) => Promise<void>;
+  decideIssueProposal: (proposalId: string, decision: 'accept' | 'ignore') => Promise<void>;
   workerAction: (action: JsonMap) => Promise<boolean>;
   runSuggestedAction: (action: SuggestedAction) => Promise<boolean>;
   switchRuntime: (provider: string, model: string) => Promise<boolean>;

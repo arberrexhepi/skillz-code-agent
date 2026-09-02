@@ -1,8 +1,13 @@
 import { combineSuggestedActions, continuousIsActive } from '../../../../shared/agentCore';
 import type { SuggestedAction } from '../../../../shared/agentTypes';
 import { useAgentWorkspace } from '../../agent/agentWorkspace';
+import { PlanDecisionCard } from './PlanDecisionCard';
 
 export function AgentDecisionCard(): React.JSX.Element | null {
+  return <><PlanDecisionCard /><OtherDecisionCard /></>;
+}
+
+function OtherDecisionCard(): React.JSX.Element | null {
   const agent = useAgentWorkspace();
   const planner = agent.state.bridge.planner;
   const busy = Boolean(agent.state.pendingAction);
@@ -13,13 +18,7 @@ export function AgentDecisionCard(): React.JSX.Element | null {
     </Decision>;
   }
   const plan = planner.pending_plan || (planner.execution_paused ? planner.paused_plan : null);
-  if (plan) {
-    const next = planner.resume_checkpoint?.next_goal_index;
-    return <Decision title={planner.execution_paused ? 'Execution paused' : 'Plan ready'} meta={plan.summary}>
-      {plan.goals?.slice(0, 3).map((goal, index) => <div className="decision-goal" key={goal.goal_id || index}><span>{index + 1}</span>{goal.title || goal.goal}</div>)}
-      <div className="decision-buttons"><button className="primary-button" disabled={busy || locked} onClick={() => void agent.plannerAction(planner.execution_paused ? 'continue_issue' : 'approve_plan', planner.active_issue_id ? { issue_id: planner.active_issue_id } : {})}>{planner.execution_paused ? `Resume${next ? ` at goal ${next}` : ''}` : 'Approve plan'}</button><button disabled={busy || locked} onClick={() => void agent.plannerAction('reject_plan')}>Reject</button></div>
-    </Decision>;
-  }
+  if (plan) return null;
   const error = planner.worker_state?.active_error;
   const elicitationActions = [
     ...combineSuggestedActions(agent.state.bridge),

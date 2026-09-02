@@ -1,8 +1,25 @@
 export type JsonMap = Record<string, unknown>;
 
 export interface AgentTranscriptEntry {
+  id?: string;
   role: string;
   content: string;
+  presentation?: TranscriptPart[];
+}
+
+export type TranscriptPart = { kind: 'message'; content: string } | WorkflowPart;
+
+export interface WorkflowPart {
+  kind: 'workflow';
+  category: 'discovery' | 'plan' | 'issue';
+  status: string;
+  title: string;
+  content: string;
+  summary?: string;
+  selection?: string;
+  discovery?: DiscoveryResult;
+  plan?: PlannerPlan;
+  goals?: GoalExecutionResult[];
 }
 
 export interface SuggestedAction extends JsonMap {
@@ -67,6 +84,7 @@ export interface IssueSummary extends JsonMap {
 }
 
 export interface WorkerState extends JsonMap {
+  issue_proposals?: { proposals?: IssueProposal[]; error?: string };
   issue_context?: {
     active_durable_issue?: IssueSummary | null;
     focused_run_diagnostic_id?: string;
@@ -89,6 +107,19 @@ export interface WorkerState extends JsonMap {
   backoff?: AgentBackoff;
 }
 
+export interface IssueProposal {
+  proposal_id: string;
+  status: 'proposed' | 'accepted' | 'ignored';
+  author: 'agent';
+  summary: string;
+  reason: string;
+  evidence: string;
+  paths: string[];
+  parent_issue_id: string;
+  goal: string;
+  created_at: string;
+}
+
 export interface PlannerGoal extends JsonMap {
   goal_id?: string;
   title?: string;
@@ -97,6 +128,10 @@ export interface PlannerGoal extends JsonMap {
   depends_on?: string[];
   estimated_scope?: string;
   success_signals?: string[];
+  delegation_notes?: string[];
+  preserve_context?: boolean;
+  parallelizable?: boolean;
+  relevant_fact_keys?: string[];
 }
 
 export interface PlannerPlan extends JsonMap {
@@ -255,6 +290,7 @@ export interface AgentProgressMessage extends JsonMap {
   type: 'progress' | 'goal_start' | 'goal_finish';
   domain?: string;
   step?: number;
+  turn?: number;
   action_type?: string;
   skill_name?: string;
   skill_mode?: string;

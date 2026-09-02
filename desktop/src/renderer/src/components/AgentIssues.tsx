@@ -3,6 +3,7 @@ import { issueState } from '../../../shared/agentCore';
 import type { IssueSummary } from '../../../shared/agentTypes';
 import { useAgentWorkspace } from '../agent/agentWorkspace';
 import { IssueCreateForm } from './IssueCreateForm';
+import { AgentSuggestions } from './AgentSuggestions';
 
 export function AgentIssues({ onOpenPath }: { onOpenPath: (path: string) => void }): React.JSX.Element {
   const agent = useAgentWorkspace();
@@ -37,6 +38,7 @@ export function AgentIssues({ onOpenPath }: { onOpenPath: (path: string) => void
   return <div className="issues-panel">
     <IssueCreateForm summary={summary} creating={creating} executionBusy={busy || Boolean(agent.state.bridge.planner.executing)} error={createError} onChange={setSummary} onCreate={() => void create()} />
     <div className="issue-summary"><span>{issues.open.length + (issues.active ? 1 : 0)} open</span><span>{issues.totalFacts} facts</span><span>{diagnostics.length} run findings</span></div>
+    <AgentSuggestions proposals={worker?.issue_proposals?.proposals || []} error={worker?.issue_proposals?.error} busy={busy || Boolean(agent.state.bridge.planner.executing)} onDecide={agent.decideIssueProposal} />
 
     {issues.active && <IssueCard
       issue={issues.active}
@@ -60,7 +62,7 @@ export function AgentIssues({ onOpenPath }: { onOpenPath: (path: string) => void
       onClose={() => void agent.submit(`/close-issue ${issue.issue_id}`)}
     />)}</Section>}
 
-    {diagnostics.length > 0 && <Section title="RUN DIAGNOSTICS">{diagnostics.map((item, index) => <button className="run-diagnostic" key={item.issue_id || index} onClick={() => item.file ? onOpenPath(item.file) : void agent.workerAction({ type: 'show_run_issue', issue_id: item.issue_id })}><span>!</span><div><strong>{item.summary || item.code || item.issue_id}</strong><small>{item.file}{item.line ? `:${item.line}` : ''}</small></div></button>)}</Section>}
+    {diagnostics.length > 0 && <Section title="RUN DIAGNOSTICS">{diagnostics.map((item, index) => <button className="run-diagnostic" key={item.issue_id || index} onClick={() => item.file ? onOpenPath(item.file) : void agent.workerAction({ type: 'show_run_issue', issue_id: item.issue_id })}><span>{item.status === 'deferred' ? '↗' : '!'}</span><div><strong>{item.summary || item.code || item.issue_id}</strong><small>{item.status === 'deferred' ? 'Deferred · ' : ''}{item.file}{item.line ? `:${item.line}` : ''}</small></div></button>)}</Section>}
     {facts.length > 0 && <Section title="RUN FACTS">{facts.slice(0, 12).map((fact, index) => <div className="fact-row" key={`${fact.key}-${index}`}><strong>{fact.key}</strong><span>{fact.value}</span></div>)}</Section>}
 
     {issues.reopenable.length > 0 && <Section title="RECENTLY CLOSED">{issues.reopenable.slice(0, 6).map((issue) => <IssueCard

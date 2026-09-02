@@ -61,6 +61,7 @@ TREE MUTATIONS (in-process):
     approve-npm                      Approve the pending npm command
     reject-npm                       Reject the pending npm command
   resolve-run-issue <run-id>       Mark a transient run diagnostic resolved
+  propose-issue <json>             Propose unrelated work and defer linked run diagnostics
   reopen-run-issue <run-id>        Mark a transient run diagnostic open again
   finish [message]                 Signal completion
 
@@ -112,6 +113,7 @@ COMMAND_VERBS = frozenset({
     "mutate",
     "npm",
     "patch",
+    "propose-issue",
     "read-diagnostics",
     "read-line-range",
     "read_line_range",
@@ -294,6 +296,7 @@ class TreeCommandParser:
             "replace-lines": self._cmd_replace_lines,
             "replace_lines": self._cmd_replace_lines,
             "patch": self._cmd_patch,
+            "propose-issue": self._cmd_propose_issue,
             "discover": self._cmd_discover,
             "mutate": self._cmd_mutate,
             "show-diff": self._cmd_show_diff,
@@ -1259,6 +1262,16 @@ class TreeCommandParser:
                 tool_action={"type": "end_edit_batch"},
             )
         return CommandResult(ok=False, output="Usage: batch start|end", command_type="error")
+
+    def _cmd_propose_issue(self, rest: str) -> CommandResult:
+        try:
+            payload = json.loads(rest)
+            if not isinstance(payload, dict):
+                raise ValueError("Expected a JSON object")
+        except (ValueError, TypeError) as exc:
+            return CommandResult(ok=False, command_type="error", output=f"propose-issue: {exc}")
+        return CommandResult(ok=True, command_type="write", needs_tool=True,
+            output="[dispatch: propose_issue]", tool_action={**payload, "type": "propose_issue"})
 
     def _cmd_finish(self, rest: str) -> CommandResult:
         message = rest.strip() or "Done."

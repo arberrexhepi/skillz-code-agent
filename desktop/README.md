@@ -23,6 +23,18 @@ Drag the divider to the left of the agent to adjust its width. The divider also 
 
 Agent chat uses 14px body/composer text, 13px code, and 11px supporting labels at normal zoom; editor and sidebar typography remain independent.
 
+Discovery choices, plan approvals/results, and issue lifecycle actions appear in collapsed workflow report cards, in conversation order. Expand a card for selections, outcomes, and original workflow text. New bridge messages carry explicit presentation boundaries so conversational replies appended to reports remain in the chat. The original bridge transcript is unchanged; older bridge messages use conservative format recognition.
+
+Operator-facing turn thoughts appear above the composer while work runs (collapsible when space is tight). Full thoughts remain readable, and Activity retains tool-level history. The beta loop forwards explicit `>>th` annotations; provider-internal reasoning is not displayed.
+
+## Agent-authored issue suggestions
+
+An agent can dispatch `propose-issue {"summary":"…","reason":"Why outside this goal","evidence":"Already observed evidence","run_issue_ids":["run-…"]}` (classic worker: JSON action type `propose_issue`). Optional `paths` capture findings without run diagnostics. No extra investigation is needed just to file a suggestion.
+
+After the proposal is successfully persisted, linked diagnostics immediately stop gating the current goal—even before user review. Identical findings remain deferred after re-ingestion/restart; different findings and different goals do not inherit the deferral. A failed proposal write releases nothing. Previously passing focused validation is preserved, but a proposal cannot substitute for missing validation of the requested change. Raw failing checks remain failures and completion reports disclose separately recorded findings.
+
+The Issues tab has an **Agent suggestions** inbox. **Accept** promotes a suggestion into an open, inactive issue; **Ignore** removes it from the inbox without creating an executable issue. Both controls work while another task runs, with decisions queued through the bridge. Neither action changes the current task. The workspace-local `.agent-issue-proposals.json` retains evidence and fingerprints, including ignored records, to prevent repeated proposals; it and its lock are gitignored. Only user-facing bridge actions can accept or ignore suggestions.
+
 ## Development
 
 From this directory:
@@ -35,6 +47,14 @@ npm run dev
 The `predev` check resolves Electron before electron-vite starts. Electron 44 can restore a missing local runtime lazily, while electron-vite otherwise fails early with `Error: Electron uninstall` when `path.txt` is absent.
 
 Layout regression checks: `npm run test:layout`. For browser interaction checks, `npm run test:layout:preview` serves `/scripts/fixtures/workspace-view.html` with the real renderer and a mock bridge (no real files, shell, or Python process). The workspace switcher alternates two fixture repositories for checking preference isolation.
+
+Transcript/turn-thought checks: `npm run test:timeline`; append `?workflow=1` to the fixture URL for a sample discovery, approved goal plan, and live thought.
+
+Issue checks: `npm run test:issues`; append `?suggestions=1&failDecision=1` to test agent suggestions during execution, a failed save, retry, acceptance, and ignore using the real renderer with a mock bridge. Backend regressions: `../.venv/bin/python -m pytest -q ../test_issue_proposals.py` from this directory. Restart the agent bridge to load Python runtime changes.
+
+Plan-review checks: `npm run test:plans`; append `?plan=1` for a full five-goal plan, or `?plan=1&failRevision=1` to test revision failure and retry. The inline card stays compact: a two-line summary, goal count, and review/change controls. The reading dialog shows the complete plan with approval/rejection actions. Suggest plan changes submits explicit revision feedback (not chat commands) and requires a fresh approval afterward.
+
+With the fixture server running, `/scripts/fixtures/plan-review-interactions.html` runs native-dialog interaction regressions against deferred mock actions. It covers dismissing while execution/revision is pending, duplicate-action protection, late responses, and retryable failures. Closing a review never cancels an agent action; approval/resume/rejection dismiss immediately.
 
 Production checks and local packaging:
 

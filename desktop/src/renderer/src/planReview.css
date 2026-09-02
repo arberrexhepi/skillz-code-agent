@@ -1,0 +1,48 @@
+.agent-panel .plan-decision { display: flex; flex-direction: column; flex: 0 0 auto; gap: 8px; }
+.plan-decision > header { flex-wrap: wrap; flex-shrink: 0; }
+.plan-decision > header small { margin-left: auto; color: #96a99e; font-size: 12px; }
+.agent-panel .plan-decision > .plan-preview-summary { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; max-height: none; overflow: hidden; margin: 0; color: #b7c3bc; font-size: 13px; line-height: 1.5; }
+.plan-decision > .decision-buttons { flex-shrink: 0; flex-wrap: wrap; }
+.plan-details { color: #bac3cb; font-size: 14px; line-height: 1.65; overflow-wrap: anywhere; }
+.plan-details p { margin: 0 0 12px; white-space: pre-wrap; }
+.plan-details .plan-summary { color: #d8e0e5; }
+.plan-details h3 { margin: 18px 0 6px; font-size: 12px; font-weight: 600; color: #99a4b0; }
+.plan-details h4 { display: flex; align-items: baseline; gap: 8px; margin: 0 0 10px; font-size: 14px; font-weight: 600; color: #e0e6eb; }
+.plan-details h4 span { display: inline-grid; place-items: center; flex: 0 0 22px; height: 22px; border-radius: 6px; background: #26372f; color: #a5d6bc; font-size: 12px; }
+.plan-details ul { margin: 6px 0 14px; padding-left: 22px; }
+.plan-details li { white-space: pre-wrap; }
+.plan-details .plan-goals { list-style: none; margin: 0; padding: 0; }
+.plan-goals > li { margin: 10px 0; padding: 14px 16px; border: 1px solid #2a3038; border-radius: 10px; background: #181d23; }
+.plan-goals section h3 { margin-top: 12px; }
+.plan-goal-meta { display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; margin: 10px 0; font-size: 13px; }
+.plan-goal-meta dt { color: #8d9a94; }
+.plan-goal-meta dd { margin: 0; }
+.plan-review-dialog { color: #dce3e8; background: #14181e; border: 1px solid #ffffff1c; border-radius: 16px; padding: 0; width: min(720px, calc(100vw - 48px)); max-width: none; height: min(640px, 80dvh); max-height: none; box-shadow: 0 24px 80px #0008, 0 4px 16px #0005; }
+.plan-review-dialog::backdrop { background: #070b116b; backdrop-filter: blur(3px); }
+.plan-review-layout { height: 100%; display: grid; grid-template-rows: auto minmax(0, 1fr) auto; }
+.plan-review-layout > header { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; padding: 18px 22px 16px; border-bottom: 1px solid #ffffff0c; }
+.plan-review-layout h2 { margin: 0; font-size: 18px; font-weight: 600; letter-spacing: -.02em; }
+.plan-review-subtitle { display: flex; align-items: center; gap: 8px; margin-top: 7px; color: #929daa; font-size: 12px; }
+.plan-review-subtitle > span { padding: 1px 7px; border: 1px solid #ffffff12; border-radius: 6px; background: #ffffff05; color: #b2bdc8; }
+.plan-review-layout > header button { display: grid; place-items: center; width: 28px; height: 28px; padding: 0; border: 0; border-radius: 7px; background: transparent; color: #96a2af; cursor: pointer; }
+.plan-review-layout > header button:hover { background: #ffffff0a; color: #e0e6eb; }
+.plan-review-body { overflow: auto; padding: 18px 22px; scrollbar-gutter: stable; scrollbar-width: thin; scrollbar-color: #3b444e transparent; }
+.plan-review-body .plan-details { font-size: 14px; line-height: 1.65; }
+.plan-review-layout > footer { padding: 14px 20px; border-top: 1px solid #ffffff0c; background: #11151a; max-height: 48dvh; overflow: auto; }
+.plan-review-layout .decision-buttons { justify-content: flex-end; flex-wrap: wrap; gap: 8px; }
+.plan-review-layout .decision-buttons button { min-height: 34px; padding: 6px 12px; border: 1px solid #343c46; border-radius: 7px; background: #20262e; color: #cbd4de; font-size: 13px; }
+.plan-review-layout .decision-buttons button.primary-button { background: #9bd6b6; border-color: #9bd6b6; color: #11241a; font-weight: 600; }
+.plan-review-layout .decision-buttons button:hover:not(:disabled) { filter: brightness(1.12); }
+.plan-review-layout .decision-buttons button:disabled { opacity: .45; }
+.plan-review-layout .decision-buttons .plan-reject { margin-right: auto; border-color: transparent; background: transparent; color: #a3aeba; }
+.plan-review-layout .decision-buttons .plan-reject:hover:not(:disabled) { background: #ef8c8c0d; color: #efb0b0; }
+.plan-review-layout label { display: block; font-size: 14px; margin-bottom: 8px; font-weight: 600; }
+.plan-review-layout textarea { box-sizing: border-box; width: 100%; min-height: 76px; max-height: 20dvh; resize: vertical; padding: 10px 12px; border: 1px solid #343e49; border-radius: 8px; background: #0e1217; color: #e0e6eb; font: inherit; font-size: 14px; line-height: 1.5; }
+.plan-review-layout footer p { margin: 0 0 12px; font-size: 13px; line-height: 1.5; }
+.plan-review-layout form > p { margin-top: 8px; color: #96a2af; }
+.agent-panel .plan-error { color: #ffb2a9; }
+.plan-review-dialog :focus-visible, .plan-decision :focus-visible { outline: 2px solid #8ad0ac; outline-offset: 3px; }
+@media (max-width: 600px) {
+  .plan-review-dialog { width: calc(100vw - 24px); height: min(640px, 84dvh); }
+  .plan-review-layout > header, .plan-review-body, .plan-review-layout > footer { padding: 14px 16px; }
+}

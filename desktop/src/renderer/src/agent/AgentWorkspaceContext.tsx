@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import { initialAgentUiState, reduceAgentUi } from '../../../shared/agentCore';
 import { createInactiveIssue } from '../../../shared/issueCreation';
+import { decideIssueProposal as sendProposalDecision } from '../../../shared/issueProposals';
 import type { AgentEvent, AgentResponse } from '../../../shared/contracts';
 import type { AgentBackoff, JsonMap, SuggestedAction } from '../../../shared/agentTypes';
 import { AgentWorkspaceContext, type AgentWorkspaceValue, type RuntimeSelection } from './agentWorkspace';
@@ -103,6 +104,12 @@ export function AgentWorkspaceProvider({ children }: { children: React.ReactNode
     return run(String(action.type || 'worker_action'), () => window.workbench.agent.workerAction(action));
   }, [ensureRunning, run]);
 
+  const decideIssueProposal = useCallback(async (proposalId: string, decision: 'accept' | 'ignore'): Promise<void> => {
+    if (!(await ensureRunning())) throw new Error('Could not start the agent. Your suggestion is unchanged.');
+    // Queue without overwriting a running action's UI state.
+    accept(await sendProposalDecision(window.workbench.agent, proposalId, decision));
+  }, [accept, ensureRunning]);
+
   const runSuggestedAction = useCallback(async (action: SuggestedAction): Promise<boolean> => {
     if (action.requires_confirmation && !window.confirm(action.confirmation_prompt || 'Proceed with this action?')) return false;
     const payload = isMap(action.payload) ? { ...action.payload } : {};
@@ -149,12 +156,13 @@ export function AgentWorkspaceProvider({ children }: { children: React.ReactNode
     submit,
     plannerAction,
     createIssue,
+    decideIssueProposal,
     workerAction,
     runSuggestedAction,
     switchRuntime,
     setBackoff,
     clearNotice: () => dispatch({ type: 'notice', message: '' }),
-  }), [backoff, createIssue, plannerAction, runSuggestedAction, setBackoff, start, state, submit, switchRuntime, workerAction, runtime]);
+  }), [backoff, createIssue, decideIssueProposal, plannerAction, runSuggestedAction, setBackoff, start, state, submit, switchRuntime, workerAction, runtime]);
 
   return <AgentWorkspaceContext.Provider value={value}>{children}</AgentWorkspaceContext.Provider>;
 }

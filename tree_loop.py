@@ -28,6 +28,8 @@ import time
 import subprocess
 import json
 import tempfile
+import hashlib
+from issue_proposals import IssueProposalStore, PROPOSAL_GUIDANCE
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Protocol, Sequence, Tuple, TypedDict
@@ -64,6 +66,7 @@ from tree_commands import (
     is_annotation,
     is_strategy,
     parse_multi_command,
+    parse_annotation,
     parse_strategy,
 )
 
@@ -710,6 +713,8 @@ class TreeLoop:
         self._recent_reads: List[RecentRead] = []
         self._conversation_messages: List[ChatMessage] = []
         self._conversation_task = ""
+        self.bridge.tree.diagnostic_disposition = lambda diagnostics: IssueProposalStore(self.workspace_root).apply_deferrals(
+            diagnostics, scope='task:' + hashlib.sha256(getattr(self, '_proposal_task', self._conversation_task).encode()).hexdigest())
         self._conversation_compaction_count = 0
         self._conversation_char_budget = int(os.getenv("TREELOOP_MESSAGE_CONTEXT_CHARS", "120000") or "120000")
         self._total_reads = 0
@@ -734,6 +739,7 @@ class TreeLoop:
 
     def run(self, task: str) -> LoopResult:
         """Run the agent loop until finish or max turns."""
+        self._proposal_task = str(task or "").strip()
         if not self.bridge._indexed:
             self.setup()
 
@@ -881,6 +887,20 @@ class TreeLoop:
                 repair_suffix = f", repaired after {repair_attempts} format retry" if repair_attempts else ""
                 _log(f"LLM responded ({time.time() - t0:.1f}s, {len(raw_output)} chars{repair_suffix})")
 
+            # Publish only explicit operator-facing annotations, never provider
+            # reasoning or source text inside a write/patch/heredoc payload.
+            if self.model_event_observer is not None:
+                thoughts = []
+                for command in parse_multi_command(command_block or ""):
+                    annotation = parse_annotation(command)
+                    if annotation is not None and annotation.tag == "th":
+                        thoughts.append(annotation.content)
+                if thoughts:
+                    try:
+                        self.model_event_observer({"event": "turn_thought", "turn": turn_num, "thought": "\n".join(thoughts)})
+                    except Exception:
+                        pass
+
             # Extract and execute commands
             commands_issued: List[str] = []
             results: List[CommandResult] = []
@@ -911,7 +931,6 @@ class TreeLoop:
                     for line in command_block.splitlines():
                         stripped = line.strip()
                         if is_annotation(stripped):
-                            from tree_commands import parse_annotation
                             ann = parse_annotation(stripped)
                             if ann:
                                 turn_annotations.append(ann)
@@ -1360,7 +1379,7 @@ class TreeLoop:
     def _system_prompt(self) -> str:
         grammar = self.bridge.render_command_grammar()
         shell_note = "\nSHELL ACCESS POLICY: SHELL_ACCESS=false. Do not emit `shell <command>` or any action that dispatches to `run_shell`. Prefer structured file, git, and diagnostics commands.\n" if not self.allow_shell else ""
-        return (_SYSTEM_PROMPT_TEMPLATE + shell_note).format(command_grammar=grammar)
+        return (_SYSTEM_PROMPT_TEMPLATE + shell_note).format(command_grammar=grammar) + "\n" + PROPOSAL_GUIDANCE
 
     def _combined_status(self) -> Dict[str, Any]:
         status = {
@@ -1389,11 +1408,11 @@ class TreeLoop:
         issues = self.bridge.tree.list_log_issues()
         status_map = {str(issue.get("id", "")): str(issue.get("status", "open")) for issue in issues if issue.get("id")}
         previous_map = dict(self._signal_state.get("issue_status_map", {}))
-        unresolved = [issue for issue in issues if str(issue.get("status", "open")) != "resolved"]
+        unresolved = [issue for issue in issues if str(issue.get("status", "open")) not in {"resolved", "deferred"}]
         resolved = [issue for issue in issues if str(issue.get("status", "open")) == "resolved"]
 
         raw_signals: List[str] = []
-        previous_unresolved = [issue_id for issue_id, status in previous_map.items() if status != "resolved"]
+        previous_unresolved = [issue_id for issue_id, status in previous_map.items() if status not in {"resolved", "deferred"}]
         changed_to_resolved = [
             issue_id
             for issue_id, status in status_map.items()
@@ -1401,7 +1420,7 @@ class TreeLoop:
         ]
         newly_added = [issue_id for issue_id in status_map if issue_id not in previous_map]
         for issue_id in newly_added:
-            if status_map.get(issue_id) != "resolved":
+            if status_map.get(issue_id) not in {"resolved", "deferred"}:
                 raw_signals.append(f"issue_ingested:{issue_id}")
         for issue_id in changed_to_resolved:
             raw_signals.append(f"issue_resolved:{issue_id}")
@@ -1418,7 +1437,7 @@ class TreeLoop:
 
         meta_signal = ""
         if previous_unresolved and not unresolved:
-            meta_signal = "all_issues_resolved"
+            meta_signal = "no_blocking_issues" if any(issue.get("status") == "deferred" for issue in issues) else "all_issues_resolved"
         elif len(unresolved) > 1:
             meta_signal = "issue_batch_ready"
         elif len(unresolved) == 1:
@@ -1462,7 +1481,7 @@ class TreeLoop:
                     f"[RUN DIAGNOSTIC FOCUS] Current focus: {current_focus} — {focus_summary}",
                     "Run diagnostics are transient and separate from the active durable planner issue.",
                     f"Inspect the referenced files directly in parallel, for example: {strategy_example}.",
-                    "After inspection, pick one diagnostic to fix, verify it, and only then use `resolve-run-issue <id>`.",
+                    "Triage relevance using existing evidence. For unrelated findings, use propose-issue with run_issue_ids; do not investigate them further. Fix and verify only in-scope diagnostics before resolve-run-issue.",
                 ])
             else:
                 if focus_inspected:
@@ -1482,15 +1501,15 @@ class TreeLoop:
                     f"[RUN DIAGNOSTIC FOCUS] Current focus: {current_focus} — {focus_summary}",
                     "Run diagnostics are transient and separate from the active durable planner issue.",
                     inspection_guidance,
-                    "Fix one diagnostic at a time and only use `resolve-run-issue <id>` after verification.",
+                    "For unrelated findings, use propose-issue with run_issue_ids and existing evidence; no further inspection is needed. Fix only in-scope diagnostics and use resolve-run-issue after verification.",
                 ])
             return
 
         if issues:
             self._signal_steering = "\n".join([
-                f"[SIGNAL {meta_signal or 'all_issues_resolved'}] All parsed log issues are resolved.",
+                f"[SIGNAL {meta_signal or 'no_blocking_issues'}] No blocking run diagnostics remain; findings may be resolved or deferred to agent suggestions.",
                 f"[RAW SIGNALS] {', '.join(raw_signals[:6]) if raw_signals else 'resolved_issue_set'}",
-                "Verify the workspace end-to-end, then use `finish` with a concise summary if the trace-driven work is complete.",
+                "Validate the current goal only, then finish. Deferred findings must not trigger more reads, validation gates, or remediation; mention them separately without claiming broader checks passed.",
             ])
             self._signal_state["current_focus_issue_id"] = ""
             self._signal_state["current_focus_issue_namespace"] = ""
@@ -1536,6 +1555,16 @@ class TreeLoop:
             payload = execute_discovery_action(action, root=self.workspace_root)
             r.ok = bool(payload.get("ok", True))
             return json.dumps(payload, indent=2)
+        if action_type == "propose_issue":
+            store = IssueProposalStore(self.workspace_root)
+            scope = 'task:' + hashlib.sha256(self._conversation_task.encode()).hexdigest()
+            try:
+                proposal = store.propose(action, diagnostics=self.bridge.tree.list_log_issues(), scope=scope, parent_issue_id='', goal=self._conversation_task)
+                self._refresh_log_issue_signals()
+                return f"Recorded {proposal['proposal_id']}; linked diagnostics no longer gate this task."
+            except Exception as exc:
+                r.ok = False
+                return f"propose_issue failed: {exc}"
         if action_type == "write_file":
             message = self._exec_write_file(action)
         elif action_type == "replace_lines":

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from copy import deepcopy
 import hashlib
 import json
 import os
@@ -841,15 +842,15 @@ class PlannerAgent:
         if self.session.execution_paused and self.session.paused_plan is not None:
             if text.lower() in {"retry", "/retry", "resume", "/resume", "continue", "/continue"}:
                 return self.resume_paused_execution()
+            if not self._is_rejection(text):
+                return self.request_plan_revision(text)
             paused_plan = self.session.paused_plan
             self.session.intake_messages.append({"role": "user", "content": text})
             self.session.last_presented_plan = paused_plan
             self._clear_paused_execution()
             self.session.awaiting_plan_revision = True
             self.session.plan_revision_feedback.append(text)
-            if self._is_rejection(text):
-                return "Paused execution rejected. Describe what should change and I will revise the plan."
-            return self._handle_intake_turn()
+            return "Paused execution rejected. Describe what should change and I will revise the plan."
 
         if self.session.pending_plan is not None:
             if self._is_approval(text):
@@ -877,21 +878,7 @@ class PlannerAgent:
                     },
                 )
                 return "Plan rejected. Describe what should change and I will revise it."
-            self.session.intake_messages.append({"role": "user", "content": text})
-            pending = self.session.pending_plan
-            self.session.last_presented_plan = self.session.pending_plan
-            self.session.pending_plan = None
-            self._clear_pending_checkpoint()
-            self.session.awaiting_plan_revision = True
-            self.session.plan_revision_feedback.append(text)
-            self._fire_plan_callback(
-                "plan_revision_requested",
-                {
-                    "summary": str(getattr(pending, "summary", "") or ""),
-                    "feedback": text,
-                },
-            )
-            return self._handle_intake_turn()
+            return self.request_plan_revision(text)
 
         if self.session.pending_discovery is not None:
             mode = self._parse_discovery_selection(text)
@@ -921,6 +908,30 @@ class PlannerAgent:
 
         self.session.intake_messages.append({"role": "user", "content": text})
         return self._handle_intake_turn()
+
+    def request_plan_revision(self, feedback: str) -> str:
+        """Revise explicitly; feedback is never parsed as a command or approval."""
+        text = feedback.strip()
+        plan = self.session.pending_plan or (self.session.paused_plan if self.session.execution_paused else None)
+        if not text:
+            raise ValueError("Describe what should change in the plan.")
+        if plan is None or self.session.executing:
+            raise ValueError("No plan is available for revision. Review the current planner state.")
+        previous = deepcopy(self.session)
+        try:
+            self.session.intake_messages.append({"role": "user", "content": text})
+            self.session.last_presented_plan = plan
+            self.session.pending_plan = None
+            self._clear_pending_checkpoint()
+            self._clear_paused_execution()
+            self.session.awaiting_plan_revision = True
+            self.session.plan_revision_feedback.append(text)
+            self._fire_plan_callback("plan_revision_requested", {"summary": plan.summary, "feedback": text})
+            return self._handle_intake_turn(strict=True)
+        except Exception:
+            # A failed generation must leave the reviewed plan/checkpoint retryable.
+            self.session = previous
+            raise
 
     def show_pending_plan(self) -> str:
         if self.session.pending_plan is None:
@@ -2399,7 +2410,7 @@ class PlannerAgent:
         self.continuous_state.stop_reason = str(reason or "stopped_by_user")
         return f"Continuous mode stopped: {self.continuous_state.stop_reason}."
 
-    def _handle_intake_turn(self) -> str:
+    def _handle_intake_turn(self, *, strict: bool = False) -> str:
         prompt = self._build_planner_prompt()
         system = self._planner_system_prompt()
         parsed = None
@@ -2432,6 +2443,8 @@ class PlannerAgent:
 
         if parsed is None or not isinstance(parsed.get("action"), dict):
             snippet = (last_raw or "")[:200].strip()
+            if strict:
+                raise ValueError(f"Plan revision failed: invalid planner response after 2 attempts. {last_error}")
             return (
                 "The planner produced an invalid control response after 2 attempts. "
                 f"Error: {last_error}. "
@@ -2481,6 +2494,8 @@ class PlannerAgent:
         if action_type == "respond":
             return str(action.get("message", "No plan generated."))
 
+        if strict:
+            raise ValueError("Plan revision failed: unsupported planner response.")
         return (
             "The planner produced an unsupported control response. "
             "Retry the request, or switch to discovery/worker mode."
