@@ -643,14 +643,14 @@ MAX_CONSECUTIVE_COMMANDLESS_TURNS = 2
 MAX_MODEL_OUTPUT_REPAIR_ATTEMPTS = 1
 
 
-def _executable_command_count(command_block: str) -> int:
-    """Count commands before execution so one model turn cannot fan out unboundedly."""
+def _executable_commands(command_block: str) -> List[str]:
+    """Inspect commands before execution without interpreting text payloads as commands."""
     if is_strategy(command_block):
         plan = parse_strategy(command_block)
         if plan is None:
-            return 0
-        return sum(len(step.commands) for label, step in plan.steps.items() if label != "error")
-    return sum(1 for command in parse_multi_command(command_block) if not is_annotation(command))
+            return []
+        return [command for label, step in plan.steps.items() if label != "error" for command in step.commands]
+    return [command for command in parse_multi_command(command_block) if not is_annotation(command)]
 
 
 class TreeLoop:
@@ -753,6 +753,9 @@ class TreeLoop:
         self._refresh_log_issue_signals()
 
         for turn_num in range(1, self.max_turns + 1):
+            before_turn = getattr(self, "before_turn", None)
+            if before_turn is not None:
+                before_turn()
             # Build prompt with current OS state + history
             os_state = self.bridge.render_for_prompt(repo_depth=2)
             prompt_steering = self._compose_steering()
@@ -907,8 +910,13 @@ class TreeLoop:
             turn_annotations: List[Annotation] = []
 
             if command_block:
-                executable_command_count = _executable_command_count(command_block)
-                if executable_command_count > MAX_EXECUTABLE_COMMANDS_PER_TURN:
+                parsed_commands = _executable_commands(command_block)
+                executable_command_count = len(parsed_commands)
+                has_extension = any(command.split(None, 1)[0].lower() == "request-discovery-extension" for command in parsed_commands)
+                if has_extension and executable_command_count != 1:
+                    commands_issued = ["command_batch_rejected"]
+                    results = [CommandResult(ok=False, command_type="error", output="A discovery extension request must be the only executable command in its turn. No commands were executed.")]
+                elif executable_command_count > MAX_EXECUTABLE_COMMANDS_PER_TURN:
                     commands_issued = ["command_batch_rejected"]
                     results = [CommandResult(
                         ok=False,

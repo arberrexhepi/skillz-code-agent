@@ -61,6 +61,7 @@ from tree_commands import CommandResult  # noqa: E402
 from bridge_presentation import bridge_exchange  # noqa: E402
 from tree_loop import TreeLoop, Turn  # noqa: E402
 from discovery.dispatch import DISCOVERY_ACTION_TYPES, execute_discovery_action  # noqa: E402
+from discovery_budget import DiscoveryBudget as TreeLoopDiscoveryBudget  # noqa: E402
 from execution_evidence import repository_observation  # noqa: E402
 
 
@@ -176,22 +177,6 @@ def _checkpoint_prompt(loop: TreeLoop, turn_num: int) -> bool:
         if answer in ("stop", "s", "no", "n"):
             return False
         print("  (type 'proceed' or 'stop')")
-
-
-@dataclass
-class TreeLoopDiscoveryBudget:
-    mode_key: str
-    mode_label: str
-    max_tool_calls: int
-    tool_calls_used: int = 0
-
-    @property
-    def remaining_tool_calls(self) -> int:
-        return max(0, self.max_tool_calls - self.tool_calls_used)
-
-    @property
-    def exhausted(self) -> bool:
-        return self.tool_calls_used >= self.max_tool_calls
 
 
 from proposal_runtime import ProposalRuntimeMixin
@@ -536,6 +521,7 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
             mode_key=str(mode_key or "discovery").strip() or "discovery",
             mode_label=str(mode_label or "Discovery").strip() or "Discovery",
             max_tool_calls=max(0, int(max_tool_calls)),
+            max_turns=self.loop.max_turns,
         )
         self._refresh_loop_steering()
 
@@ -1351,6 +1337,11 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
         self._sync_fact_map()
         return issue.summary()
 
+    def _begin_discovery_turn(self) -> None:
+        if self.discovery_budget is not None:
+            self.discovery_budget.turns_used += 1
+            self._refresh_loop_steering()
+
     def run_task(self, task: str) -> WorkerRunResult:
         self._reload_repo_facts()
         self._current_task = str(task or "").strip()
@@ -1360,6 +1351,14 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
         self._bridge_step_counter = 0
         self._reset_run_observability(self._current_task)
         self._refresh_loop_steering()
+        budget = getattr(self, "discovery_budget", None)
+        original_limit = getattr(self.loop, "max_turns", 0)
+        if budget:
+            if budget.pending_extension:
+                raise ValueError("Discovery is awaiting an extension decision.")
+            budget.resuming = False
+            self.loop.max_turns = budget.remaining_turns
+        self.loop.before_turn = self._begin_discovery_turn
         try:
             loop_result = self.loop.run(self._current_task)
         except Exception as exc:
@@ -1369,12 +1368,15 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
             failure_message = f"Worker execution failed: {exc}"
             self._flush_observability(failure_message)
             raise
+        finally:
+            self.loop.max_turns = original_limit
+            self.loop.before_turn = None
         self.history = self.loop.history
         touched_paths = self._collect_touched_paths(self.loop.history)
         validation = self._finalize_validation(loop_result)
         task_satisfied = bool(loop_result.finished and validation.passed)
         self._task_satisfied = task_satisfied
-        final_message = str(loop_result.finish_message or loop_result.summary())
+        final_message = budget.pending_extension["findings"] if budget and budget.pending_extension else str(loop_result.finish_message or loop_result.summary())
         wrapped_finish = re.fullmatch(r"\[finish:\s*(.*?)\]\s*", final_message, flags=re.DOTALL)
         if wrapped_finish is not None:
             final_message = wrapped_finish.group(1).strip()
@@ -1704,6 +1706,7 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
                 "\n".join(
                     [
                         "Planner-controlled discovery phase.",
+                        self.discovery_budget.guidance(tree_commands=True),
                         f"Discovery mode: {self.discovery_budget.mode_label}.",
                         f"Discovery budget: at most {self.discovery_budget.max_tool_calls} tool-backed actions.",
                         "Do not modify files during discovery. Finish with a concise discovery summary.",
@@ -2443,6 +2446,20 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
         action_type = str(action.get("type", "") or "")
         fact_action = action_type in FACT_ACTION_TYPES
 
+        if self.discovery_budget is not None and self.discovery_budget.pending_extension:
+            result.ok = False
+            return "Discovery is awaiting the user's extension decision."
+        if action_type == "request_discovery_extension":
+            try:
+                if self.discovery_budget is None:
+                    raise ValueError("Extensions are only available during planner discovery.")
+                self.discovery_budget.request_extension(action)
+                self.loop._same_turn_halt_reason = "Discovery is awaiting the user's extension decision."
+                self.loop.request_stop(self.loop._same_turn_halt_reason)
+                return self.loop._same_turn_halt_reason
+            except ValueError as exc:
+                result.ok = False
+                return str(exc)
         if action_type == "propose_issue":
             try:
                 proposal = self.propose_issue(action)
@@ -2457,7 +2474,7 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
                 return "Discovery mode is read-only. Finish discovery before mutating repository state."
             if self.discovery_budget.exhausted and action_type != "finish" and not fact_action:
                 result.ok = False
-                return "Discovery tool-call budget exhausted. Use finish to return control to the planner."
+                return "Discovery tool-call budget exhausted. Use finish or request-discovery-extension to return control to the planner."
             if action_type != "finish" and not fact_action:
                 self.discovery_budget.tool_calls_used += 1
 

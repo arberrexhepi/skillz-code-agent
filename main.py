@@ -37,6 +37,7 @@ from runtime_catalog import (
 from skill_loader import MarkdownSkill, load_markdown_skills_from_dir
 from codex_subscription import run_codex_subscription_completion
 from bridge_presentation import bridge_exchange
+from discovery_budget import DiscoveryBudget
 from proposal_runtime import ProposalRuntimeMixin
 from issue_proposals import PROPOSAL_GUIDANCE
 
@@ -2134,22 +2135,6 @@ class AgentConfig:
 
 
 @dataclass
-class DiscoveryBudget:
-    mode_key: str
-    mode_label: str
-    max_tool_calls: int
-    tool_calls_used: int = 0
-
-    @property
-    def remaining_tool_calls(self) -> int:
-        return max(0, self.max_tool_calls - self.tool_calls_used)
-
-    @property
-    def exhausted(self) -> bool:
-        return self.tool_calls_used >= self.max_tool_calls
-
-
-@dataclass
 class ActiveErrorState:
     task: str
     action_type: str
@@ -2465,6 +2450,7 @@ class WorkingFolderAgent(ProposalRuntimeMixin):
             mode_key=mode_key,
             mode_label=mode_label,
             max_tool_calls=max(0, int(max_tool_calls)),
+            max_turns=self.config.max_steps,
         )
 
     def clear_discovery_budget(self) -> None:
@@ -5206,6 +5192,9 @@ class WorkingFolderAgent(ProposalRuntimeMixin):
             "output_format_recovery": self.output_format_recovery,
             "fulfillment_readiness": self._fulfillment_readiness(task),
             "discovery_budget": {
+                "guidance": self.discovery_budget.guidance(),
+                "turns_used": self.discovery_budget.turns_used,
+                "turns_max": self.discovery_budget.max_turns,
                 "mode": self.discovery_budget.mode_label,
                 "tool_calls_used": self.discovery_budget.tool_calls_used,
                 "tool_calls_max": self.discovery_budget.max_tool_calls,
@@ -6309,14 +6298,24 @@ class WorkingFolderAgent(ProposalRuntimeMixin):
         self._reset_task_satisfaction()
         self._reset_run_observability(task)
         self._start_new_run()
-        self._reset_model_conversation(task)
-        self._maybe_reset_context_for_strategy(task)
-        if self.discovery_budget is not None:
-            self._parallel_discovery_prefetch_payload(task)
+        budget = self.discovery_budget
+        resuming = bool(budget and budget.resuming)
+        if budget:
+            if budget.pending_extension:
+                raise ValueError("Discovery is awaiting an extension decision.")
+            budget.resuming = False
+        if not resuming:
+            self._reset_model_conversation(task)
+            self._maybe_reset_context_for_strategy(task)
+            if budget is not None:
+                self._parallel_discovery_prefetch_payload(task)
         final_message = "Stopped: max steps reached."
         run_ok = False
         try:
-            for _turn in range(1, self.config.max_steps + 1):
+            turn_limit = budget.remaining_turns if budget else self.config.max_steps
+            for _turn in range(1, turn_limit + 1):
+                if budget:
+                    budget.turns_used += 1
                 step_num = len(self.history) + 1
                 context_mode = self._model_context_mode()
                 prompt = self._build_model_turn_prompt(task)
@@ -6426,6 +6425,9 @@ class WorkingFolderAgent(ProposalRuntimeMixin):
                     )
 
                     self._print_step(step)
+                    if budget and budget.pending_extension:
+                        final_message = budget.pending_extension["findings"]
+                        return self._build_run_result(final_message, False)
                     self._run_automatic_diagnostics_after_step(step)
                     self._run_fact_subagent(task, step)
                     if action.get("type") == "drop_context" and result.ok:
@@ -7113,20 +7115,7 @@ class WorkingFolderAgent(ProposalRuntimeMixin):
             3. If it contradicts completion, make one corrective edit and continue normally.
             """).strip()
 
-        discovery_budget_note = ""
-        if self.discovery_budget is not None:
-            discovery_budget_note = textwrap.dedent(f"""
-            DISCOVERY BUDGET:
-            {{
-              "mode": {json.dumps(self.discovery_budget.mode_label)},
-              "tool_calls_used": {self.discovery_budget.tool_calls_used},
-              "tool_calls_max": {self.discovery_budget.max_tool_calls},
-              "tool_calls_remaining": {self.discovery_budget.remaining_tool_calls},
-              "budget_exhausted": {str(self.discovery_budget.exhausted).lower()}
-            }}
-
-                        Host policy: discovery is read-only, every tool-backed action counts against this budget, and exhaustion blocks further tool use until `finish`.
-            """).strip()
+        discovery_budget_note = self.discovery_budget.guidance() if self.discovery_budget is not None else ""
 
         skills_note = ""
         if self._registered_skills:
@@ -7265,6 +7254,8 @@ class WorkingFolderAgent(ProposalRuntimeMixin):
                     },
                 )
 
+            if len(actions) != 1 and any(isinstance(item, dict) and item.get("type") == "request_discovery_extension" for item in actions):
+                return None, self._error_action_result("schema_error", {"error": "A discovery extension request must be the only action in its turn."})
             normalized_actions: List[Dict[str, Any]] = []
             finish_seen = False
             for index, item in enumerate(actions, start=1):
@@ -9071,7 +9062,7 @@ class WorkingFolderAgent(ProposalRuntimeMixin):
                     payload={
                         "error": (
                             "Discovery tool-call budget exhausted. "
-                            "Use finish to return control to the planner."
+                            "Use finish or request_discovery_extension to return control to the planner."
                         ),
                         "discovery_budget": {
                             "mode": self.discovery_budget.mode_label,
@@ -9092,6 +9083,13 @@ class WorkingFolderAgent(ProposalRuntimeMixin):
         action_type = str(t or "")
 
         try:
+            if self.discovery_budget is not None and self.discovery_budget.pending_extension:
+                return self._error_action_result(action_type, {"error": "Discovery is awaiting the user's extension decision."})
+            if action_type == "request_discovery_extension":
+                if self.discovery_budget is None:
+                    raise ValueError("Extensions are only available during planner discovery.")
+                request = self.discovery_budget.request_extension(action)
+                return ActionResult(ok=True, name=action_type, payload={"extension_request": request})
             if action_type == "propose_issue":
                 proposal = self.propose_issue(action)
                 return ActionResult(ok=True, name=action_type, payload={"proposal": proposal, "message": f"Recorded {proposal['proposal_id']}; linked findings no longer gate the current goal."})
@@ -9583,6 +9581,22 @@ def _handle_bridge_planner_action(
     emit_progress: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> str:
     action_name = str(request.get("action", "") or "").strip()
+    if action_name in {"approve_discovery_extension", "decline_discovery_extension"}:
+        payload = request.get("payload")
+        request_id = str(request.get("request_id") or (payload.get("request_id") if isinstance(payload, dict) else "") or "").strip()
+        pending = planner.session.pending_discovery_extension
+        if pending is None or pending.get("request_id") != request_id:
+            raise ValueError("This discovery extension is no longer pending. Review the current request.")
+        accept = action_name == "approve_discovery_extension"
+        add_exchange("user", "approve" if accept else "no")
+        message = planner.decide_discovery_extension(request_id, accept=accept)
+        add_exchange("assistant", message)
+        return message
+    if getattr(getattr(planner, "session", None), "pending_discovery_extension", None) is not None and action_name in {
+        "approve_plan", "reject_plan", "revise_plan", "select_discovery_mode", "skip_discovery",
+        "retry_failed_goal", "resume_execution",
+    }:
+        raise ValueError("Discovery is awaiting an extension decision. Review the current request before continuing.")
     if action_name in {"accept_issue_proposal", "ignore_issue_proposal"}:
         proposal_id = str(request.get("proposal_id") or "").strip()
         decision = "accept" if action_name == "accept_issue_proposal" else "ignore"

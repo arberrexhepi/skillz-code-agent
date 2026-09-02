@@ -28,7 +28,12 @@ def presentation_parts(planner: Any, role: str, text: str) -> list[dict]:
     session = planner.session
     pending_plan = getattr(session, "pending_plan", None)
     pending_discovery = getattr(session, "pending_discovery", None)
+    extension = getattr(session, "pending_discovery_extension", None)
     if role == "user":
+        if extension is not None and (planner._is_approval(text) or planner._is_rejection(text)):
+            return [_report("discovery", "selected", "Discovery extension", text,
+                            selection="Extension approved" if planner._is_approval(text) else "Plan with current findings",
+                            extension=deepcopy(extension))]
         revision_plan = pending_plan or (getattr(session, "paused_plan", None) if getattr(session, "execution_paused", False) else None)
         if revision_plan is not None and text.startswith("Suggest plan changes:\n"):
             return [_report("plan", "selected", "Goal plan", text, selection="Changes requested", plan=_snapshot(revision_plan))]
@@ -54,13 +59,16 @@ def presentation_parts(planner: Any, role: str, text: str) -> list[dict]:
         return [_report("discovery", "skipped", "Discovery", text, selection="Skipped")]
 
     blocks: list[tuple[str, dict]] = []
+    if extension is not None:
+        rendered = planner._render_discovery_extension()
+        blocks.append((rendered, _report("discovery", "paused", "Discovery extension", rendered, extension=deepcopy(extension))))
     if pending_discovery is not None:
         rendered = planner._render_discovery_offer(pending_discovery)
         blocks.append((rendered, _report("discovery", "offered", "Discovery", rendered, summary=getattr(pending_discovery, "reason", ""))))
     discovery = getattr(session, "last_discovery", None)
     if discovery is not None:
         rendered = planner._render_discovery_result(discovery)
-        blocks.append((rendered, _report("discovery", "complete" if discovery.ok else "failed", "Discovery", rendered, discovery=_snapshot(discovery))))
+        blocks.append((rendered, _report("discovery", getattr(discovery, "outcome", "") or ("complete" if discovery.ok else "failed"), "Discovery", rendered, discovery=_snapshot(discovery))))
     plans = [pending_plan, getattr(session, "paused_plan", None), getattr(session, "last_completed_plan", None), getattr(session, "last_presented_plan", None)]
     for plan in plans:
         if plan is not None:

@@ -22,6 +22,14 @@ Common planner commands: `/reset`, `/start-auto 3 optional prompt`, `/stop-auto`
 
 ## Latest Development Update
 
+Discovery can now pause at its action limit or on its last allotted turn to request **1–10 additional turns** when material ambiguity remains. The request shows the turn count, reason, a short investigation proposal, unresolved questions, and findings collected so far.
+
+- **Allow more turns** resumes the same discovery conversation, retaining its history, context, and cumulative budget. Each approved turn also adds one tool-action slot; discovery stays read-only.
+- **Plan with current findings** ends discovery and passes the unresolved questions and unperformed checks to the goal planner, which must state assumptions, risks, and necessary validation rather than treat ambiguity as resolved.
+- Stable and beta workers share validation and budget accounting. Continuous/Auto mode also pauses for this decision; it never grants an extension automatically. Once discovery finishes, the plan returns for review.
+- In the CLI, use `approve` or `no` for the pending extension (`/discovery` shows it again). An additional extension requires a new explicit decision. Paused worker context is held in the running session; stopping the agent or switching folders ends that session.
+
+
 The desktop workbench now handles common Windows setup failures, provides a manual Codex location fallback, and helps users start version control in a new project folder:
 
 - **Windows Python discovery:** agent startup, runtime options, and Codex status/login share interpreter detection. The workbench checks an explicit override and the repository virtual environment, then tries `python`, the Windows `py -3` launcher, and `python3`. This fixes `spawn python ENOENT` when Python is installed through the launcher but absent from `PATH`.

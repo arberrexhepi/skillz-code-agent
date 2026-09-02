@@ -298,6 +298,11 @@ class DiscoveryResult:
     validation_ran: bool = False
     validation_passed: bool = False
     validation_summary: str = ""
+    turns_used: int = 0
+    turns_max: int = 0
+    outcome: str = ""
+    ambiguities: List[str] = field(default_factory=list)
+    extension_requests: List[Dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -390,6 +395,7 @@ class PlannerSession:
     awaiting_plan_revision: bool = False
     plan_revision_feedback: List[str] = field(default_factory=list)
     pending_discovery: Optional[DiscoveryRequest] = None
+    pending_discovery_extension: Optional[Dict[str, Any]] = None
     last_discovery: Optional[DiscoveryResult] = None
     discovery_phase: str = "idle"
     active_discovery_mode: str = ""
@@ -679,6 +685,7 @@ class PlannerAgent:
             return None, f"Issue activation failed: {exc}"
         if not isinstance(issue, dict):
             issue = {"issue_id": normalized}
+        self._discard_discovery_extension()
         activated_id = str(issue.get("issue_id", "") or normalized).strip()
         self.session.active_issue_id = activated_id
         self.session.pending_plan = None
@@ -805,6 +812,7 @@ class PlannerAgent:
         builtin = self.try_builtin_command(user_request)
         if builtin is not None:
             return builtin
+        self._discard_discovery_extension()
         self.session.latest_request = user_request.strip()
         self.session.intake_messages = [{"role": "user", "content": user_request.strip()}]
         self.session.pending_plan = None
@@ -838,6 +846,11 @@ class PlannerAgent:
         builtin = self.try_builtin_command(text)
         if builtin is not None:
             return builtin
+
+        if self.session.pending_discovery_extension is not None:
+            if self._is_approval(text) or self._is_rejection(text):
+                return self.decide_discovery_extension(self.session.pending_discovery_extension["request_id"], accept=self._is_approval(text))
+            return self._render_discovery_extension()
 
         if self.session.execution_paused and self.session.paused_plan is not None:
             if text.lower() in {"retry", "/retry", "resume", "/resume", "continue", "/continue"}:
@@ -939,11 +952,14 @@ class PlannerAgent:
         return self._render_plan(self.session.pending_plan)
 
     def show_pending_discovery(self) -> str:
+        if self.session.pending_discovery_extension is not None:
+            return self._render_discovery_extension()
         if self.session.pending_discovery is None:
             return "No pending discovery offer."
         return self._render_discovery_offer(self.session.pending_discovery)
 
     def clear_session(self) -> None:
+        self._discard_discovery_extension()
         self.session = PlannerSession()
         try:
             self.worker.clear_steering()
@@ -973,6 +989,7 @@ class PlannerAgent:
             issue = reopen(normalized_issue_id)
         except Exception as exc:
             return f"Issue reopen failed: {exc}"
+        self._discard_discovery_extension()
         self.session.intake_messages = []
         self.session.latest_request = ""
         self.session.pending_plan = None
@@ -1022,6 +1039,7 @@ class PlannerAgent:
             return f"Issue creation failed: {exc}"
         issue_id = str((issue or {}).get("issue_id", "") or "").strip()
         if activate and issue_id:
+            self._discard_discovery_extension()
             self.session.active_issue_id = issue_id
         if issue_id:
             return f"Created issue {issue_id}: {normalized}"
@@ -1045,6 +1063,7 @@ class PlannerAgent:
                 return "Worker does not support issue closing."
         except Exception as exc:
             return f"Issue close failed: {exc}"
+        self._discard_discovery_extension()
         issue_id_closed = str((issue or {}).get("issue_id", normalized_issue_id) or normalized_issue_id)
         self.session.intake_messages = []
         self.session.latest_request = ""
@@ -1147,6 +1166,7 @@ class PlannerAgent:
         goal_fact_keys: List[str],
         preserve_context: bool,
         discovery_budget: Optional[DiscoveryMode] = None,
+        resume_discovery: bool = False,
     ) -> Dict[str, Any]:
         target_worker = worker or self.worker
         progress_domain = "discovery" if discovery_budget is not None else "plan"
@@ -1154,10 +1174,11 @@ class PlannerAgent:
             setattr(target_worker, "bridge_progress_domain", progress_domain)
         except Exception:
             pass
-        target_worker.prepare_for_goal(preserve_context=preserve_context)
+        if not resume_discovery:
+            target_worker.prepare_for_goal(preserve_context=preserve_context)
         target_worker.set_goal_fact_keys(goal_fact_keys)
         target_worker.set_steering(steering)
-        if discovery_budget is not None:
+        if discovery_budget is not None and not resume_discovery:
             target_worker.configure_discovery_budget(
                 discovery_budget.key,
                 discovery_budget.label,
@@ -1178,6 +1199,9 @@ class PlannerAgent:
                 "budget_state": {
                     "tool_calls_used": int(getattr(budget_state, "tool_calls_used", 0) or 0),
                     "max_tool_calls": int(getattr(budget_state, "max_tool_calls", 0) or 0),
+                    "turns_used": int(getattr(budget_state, "turns_used", 0) or 0),
+                    "max_turns": int(getattr(budget_state, "max_turns", 0) or 0),
+                    "pending_extension": deepcopy(getattr(budget_state, "pending_extension", None)),
                 },
             }
         finally:
@@ -1185,7 +1209,8 @@ class PlannerAgent:
                 target_worker.clear_steering()
             finally:
                 target_worker.clear_goal_fact_keys()
-                target_worker.clear_discovery_budget()
+                if not getattr(getattr(target_worker, "discovery_budget", None), "pending_extension", None):
+                    target_worker.clear_discovery_budget()
                 try:
                     setattr(target_worker, "bridge_progress_domain", "")
                 except Exception:
@@ -1439,95 +1464,149 @@ class PlannerAgent:
                 failure_request_id=_execution_error_request_id(exc),
             )
 
-    def execute_discovery(self, mode_key: str) -> str:
-        request = self.session.pending_discovery
+    def execute_discovery(self, mode_key: str, *, resume: bool = False) -> str:
+        if self.session.pending_discovery_extension is not None:
+            return self._render_discovery_extension()
+        previous = self.session.last_discovery if resume else None
+        request = (DiscoveryRequest(previous.reason, previous.prompt, previous.mode)
+                   if previous else self.session.pending_discovery)
         mode = DISCOVERY_MODES.get(mode_key)
         if request is None or mode is None:
             return "No pending discovery to execute."
-
         steering = self._build_discovery_steering(request, mode)
-        task = self._build_discovery_task(request, mode)
-        # A mode has been accepted, so this is no longer a pending decision.
-        # Clearing it before the long worker run lets clients render an active
-        # discovery state instead of leaving the chooser visibly stuck.
+        task = previous.delegated_task if previous else self._build_discovery_task(request, mode)
+        if previous and previous.extension_requests:
+            accepted = previous.extension_requests[-1]
+            steering += ("\nThe user approved continuation of this same discovery phase. "
+                         "Use the current host budget, which supersedes the initial task budget.\n"
+                         + json.dumps(accepted, ensure_ascii=False))
         self.session.pending_discovery = None
         self.session.discovery_phase = "running"
         self.session.active_discovery_mode = mode.key
         self._fire_discovery_callback("discovery_start", mode.key)
         try:
             execution = self._run_worker_task(
-                task=task,
-                steering=steering,
-                goal_fact_keys=[],
-                preserve_context=False,
-                discovery_budget=mode,
+                task=task, steering=steering, goal_fact_keys=[], preserve_context=resume,
+                discovery_budget=mode, resume_discovery=resume,
             )
             worker_result = self._coerce_worker_run_result(execution["run_result"], execution["history_slice"])
-            # Models often finish discovery with a terse "Done." — recover the
-            # substantive analysis from the last finish-step thought instead.
             raw_msg = worker_result["final_message"].strip()
             if len(raw_msg) < 40:
                 thought = self._extract_last_finish_thought(execution["history_slice"])
                 if thought and len(thought) > len(raw_msg):
                     worker_result["final_message"] = thought
+            budget = execution.get("budget_state", {})
+            pending = budget.get("pending_extension")
             result = DiscoveryResult(
-                mode=mode.key,
-                delegated_task=task,
-                final_message=worker_result["final_message"],
-                reason=request.reason if request else "",
-                prompt=request.prompt if request else "",
-                tool_calls_used=int(execution.get("budget_state", {}).get("tool_calls_used", 0) or 0),
-                tool_calls_max=int(execution.get("budget_state", {}).get("max_tool_calls", mode.max_tool_calls) or mode.max_tool_calls),
+                mode=mode.key, delegated_task=task,
+                final_message=pending["findings"] if pending else worker_result["final_message"],
+                reason=request.reason, prompt=request.prompt,
+                tool_calls_used=budget.get("tool_calls_used", 0),
+                tool_calls_max=budget.get("max_tool_calls", mode.max_tool_calls),
+                turns_used=budget.get("turns_used", 0), turns_max=budget.get("max_turns", 0),
                 usage_summary=str(self.worker.render_last_usage_summary() or "").strip(),
-                worker_history_summary=self._summarize_worker_history(execution["history_slice"]),
-                touched_paths=worker_result["touched_paths"] or self._collect_touched_paths(execution["history_slice"]),
-                duration_s=round(float(execution["elapsed"]), 3),
-                ok=bool(worker_result["ok"]),
-                task_satisfied=bool(worker_result["task_satisfied"]),
+                worker_history_summary=(previous.worker_history_summary if previous else []) + self._summarize_worker_history(execution["history_slice"]),
+                touched_paths=list(dict.fromkeys((previous.touched_paths if previous else []) +
+                    (worker_result["touched_paths"] or self._collect_touched_paths(execution["history_slice"])))),
+                duration_s=round((previous.duration_s if previous else 0) + float(execution["elapsed"]), 3),
+                ok=bool(worker_result["ok"]), task_satisfied=bool(worker_result["task_satisfied"]),
                 validation_ran=bool(worker_result["validation_ran"]),
                 validation_passed=bool(worker_result["validation_passed"]),
                 validation_summary=str(worker_result["validation_summary"]),
+                outcome="awaiting_extension" if pending else "complete" if worker_result["ok"] else "failed",
+                ambiguities=list(pending["ambiguities"]) if pending else [],
+                extension_requests=deepcopy(previous.extension_requests) if previous else [],
             )
+            if pending:
+                result.extension_requests.append({**deepcopy(pending), "decision": "pending"})
+                self.session.last_discovery = result
+                self.session.pending_discovery_extension = deepcopy(pending)
+                self.session.discovery_phase = "awaiting_extension"
+                self._fire_discovery_callback("discovery_paused", mode.key)
+                return self._render_discovery_extension()
         except Exception as exc:
-            self.session.last_discovery = DiscoveryResult(
-                mode=mode_key,
-                delegated_task=task,
-                final_message=f"Discovery failed: {exc}",
-                reason=request.reason if request else "",
-                ok=False,
+            result = DiscoveryResult(
+                mode=mode_key, delegated_task=task,
+                final_message=(previous.final_message + "\n\n" if previous else "") + f"Discovery failed: {exc}",
+                reason=request.reason, prompt=request.prompt, ok=False, outcome="failed",
+                extension_requests=deepcopy(previous.extension_requests) if previous else [],
+                ambiguities=list(previous.ambiguities) if previous else [],
             )
-            self.session.pending_discovery = None
-            self.session.discovery_phase = "complete"
-            self.session.active_discovery_mode = ""
-            self._fire_discovery_callback("discovery_finish", mode_key)
+            self._complete_discovery(result)
             return f"Discovery failed before planning could continue: {exc}"
+        return self._complete_discovery(result)
 
-        if not result.ok:
-            self.session.last_discovery = result
-            self.session.pending_discovery = None
-            self.session.discovery_phase = "complete"
-            self.session.active_discovery_mode = ""
-            self._fire_discovery_callback("discovery_finish", result.mode)
-            return self._render_discovery_result(result)
-
+    def _complete_discovery(self, result: DiscoveryResult) -> str:
         self.session.last_discovery = result
         self.session.pending_discovery = None
+        self.session.pending_discovery_extension = None
         self.session.discovery_phase = "complete"
         self.session.active_discovery_mode = ""
         self._fire_discovery_callback("discovery_finish", result.mode)
+        if not result.ok:
+            return self._render_discovery_result(result)
         self._rehydrate_active_issue_context()
-
         plan_response = self._handle_intake_turn()
         if self.session.pending_plan is None and not self.continuous_state.enabled:
             continuation = self._continue_manual_planning_after_discovery()
             if continuation:
                 plan_response = "\n\n".join([plan_response, continuation])
-        discovery_summary = self._render_discovery_result(result)
-        return "\n\n".join([discovery_summary, plan_response])
+        return "\n\n".join([self._render_discovery_result(result), plan_response])
+
+    def decide_discovery_extension(self, request_id: str, *, accept: bool) -> str:
+        pending = self.session.pending_discovery_extension
+        result = self.session.last_discovery
+        budget = getattr(self.worker, "discovery_budget", None)
+        if (pending is None or pending["request_id"] != request_id or result is None
+                or self.session.discovery_phase != "awaiting_extension"):
+            raise ValueError("This discovery extension is no longer pending. Review the current request.")
+        if accept:
+            if budget is None or not getattr(budget, "pending_extension", None) or budget.pending_extension["request_id"] != request_id:
+                raise ValueError("The paused discovery context is unavailable. Decline to plan with the saved findings.")
+            budget.accept_extension(request_id)
+            result.extension_requests[-1]["decision"] = "approved"
+            self.session.pending_discovery_extension = None
+            return self.execute_discovery(result.mode, resume=True)
+        result.extension_requests[-1]["decision"] = "declined"
+        result.outcome = "partial"
+        # The pass ended by user choice; ambiguity resolution is not claimed.
+        result.ok = True
+        result.task_satisfied = False
+        result.final_message = pending["findings"] + "\n\nUnresolved ambiguities (extension declined):\n" + "\n".join("- " + item for item in pending["ambiguities"])
+        self.session.pending_discovery_extension = None
+        self.worker.clear_discovery_budget()
+        self.session.intake_messages.append({"role": "user", "content":
+            "I declined the discovery budget extension. Proceed to a goal plan using the collected findings. "
+            "Do not restart discovery or treat these questions as resolved. State assumptions, planning risks, "
+            "and any necessary validation or user decision in the goals and delegation notes.\n"
+            + json.dumps({"ambiguities": pending["ambiguities"], "unperformed_proposal": pending["proposal"]}, ensure_ascii=False)})
+        return self._complete_discovery(result)
+
+    def _render_discovery_extension(self) -> str:
+        pending = self.session.pending_discovery_extension
+        if pending is None:
+            return "No pending discovery extension."
+        return "\n".join([
+            "Discovery Extension Requested",
+            f"- Additional turns: {pending['additional_turns']} (plus {pending['additional_tool_calls']} tool-action slots)",
+            f"- Budget used: {pending['turns_used']}/{pending['turns_max']} turns; {pending['tool_calls_used']}/{pending['tool_calls_max']} tool actions",
+            "- Reason: " + pending["reason"], "- Proposal: " + pending["proposal"],
+            "", "Findings so far", pending["findings"], "", "Unresolved ambiguities",
+            *("- " + item for item in pending["ambiguities"]), "",
+            "Reply 'approve' to continue the same discovery, or 'no' to plan with these ambiguities.",
+        ])
+
+    def _discard_discovery_extension(self) -> None:
+        if self.session.pending_discovery_extension is not None:
+            self.session.pending_discovery_extension = None
+            self.worker.clear_discovery_budget()
+            self.session.last_discovery = None
+            self.session.discovery_phase = "idle"
+            self.session.active_discovery_mode = ""
 
     def _continue_manual_planning_after_discovery(self) -> str:
         discovery = self.session.last_discovery
-        if discovery is None or not discovery.ok or self.session.pending_plan is not None:
+        if self.session.pending_discovery_extension is not None or discovery is None or not discovery.ok or self.session.pending_plan is not None:
             return ""
         # The selected discovery pass is evidence for the current request, not
         # a terminal handoff. Clear any redundant second offer and explicitly
@@ -1554,6 +1633,8 @@ class PlannerAgent:
         self.session.active_discovery_mode = ""
 
     def execute_pending_plan(self) -> str:
+        if self.session.pending_discovery_extension is not None:
+            return self._render_discovery_extension()
         plan = self.session.pending_plan
         if plan is None:
             return "No pending plan to execute."
@@ -2092,7 +2173,7 @@ class PlannerAgent:
 
     def _continue_auto_planning_after_discovery(self) -> str:
         discovery = self.session.last_discovery
-        if discovery is None or not discovery.ok or self.session.pending_plan is not None:
+        if self.session.pending_discovery_extension is not None or discovery is None or not discovery.ok or self.session.pending_plan is not None:
             return ""
         run_prompt = str(self.continuous_state.run_prompt or "").strip()
         completed_context = self._continuous_completed_context()
@@ -2182,6 +2263,8 @@ class PlannerAgent:
         return created
 
     def start_continuous(self, *, max_cycles: int = 1, prompt: str = "") -> str:
+        if self.session.pending_discovery_extension is not None:
+            return self._render_discovery_extension()
         run_prompt = str(prompt or "").strip()
         self.continuous_config = ContinuousModeConfig(enabled=True, max_cycles=max(1, int(max_cycles or 1)))
         self.continuous_state = ContinuousRunState(
@@ -2254,6 +2337,10 @@ class PlannerAgent:
                             if continuation:
                                 output.append(f"Cycle {cycle}: continued planning after discovery.")
                                 plan_response = "\n\n".join([plan_response, continuation])
+                if self.session.pending_discovery_extension is not None:
+                    self.continuous_state.stop_reason = "discovery_extension_pending"
+                    output.append(plan_response)
+                    break
                 if self.session.pending_plan is None:
                     failures += 1
                     output.append(f"Cycle {cycle}: stopped before execution. {plan_response}")
@@ -2305,6 +2392,10 @@ class PlannerAgent:
                                 if continuation:
                                     output.append(f"Cycle {cycle}: continued planning after revision discovery.")
                                     plan_response = "\n\n".join([plan_response, continuation])
+                    if self.session.pending_discovery_extension is not None:
+                        self.continuous_state.stop_reason = "discovery_extension_pending"
+                        output.append(plan_response)
+                        break
                     if self.session.pending_plan is None:
                         failures += 1
                         output.append(f"Cycle {cycle}: stopped before execution after revision. {plan_response}")
@@ -2411,6 +2502,8 @@ class PlannerAgent:
         return f"Continuous mode stopped: {self.continuous_state.stop_reason}."
 
     def _handle_intake_turn(self, *, strict: bool = False) -> str:
+        if self.session.pending_discovery_extension is not None:
+            return self._render_discovery_extension()
         prompt = self._build_planner_prompt()
         system = self._planner_system_prompt()
         parsed = None
@@ -2607,6 +2700,7 @@ class PlannerAgent:
             "follow_up_context": self._follow_up_context_payload(),
             "revision_context": self._revision_context_payload(),
             "pending_discovery": self._discovery_request_payload(self.session.pending_discovery),
+            "pending_discovery_extension": deepcopy(self.session.pending_discovery_extension),
             "last_discovery": self._discovery_result_payload(self.session.last_discovery),
             "last_discovery_findings": discovery_findings,
             "completed_results": [self._result_payload(result) for result in self.session.completed_results[-5:]],
@@ -2750,11 +2844,16 @@ class PlannerAgent:
 
     def _render_discovery_result(self, result: DiscoveryResult) -> str:
         mode = DISCOVERY_MODES[result.mode]
+        title = {
+            "awaiting_extension": "Discovery Paused",
+            "partial": "Discovery Complete with Ambiguities",
+        }.get(result.outcome, "Discovery Complete" if result.ok else "Discovery Failed")
         lines = [
-            "Discovery Complete" if result.ok else "Discovery Failed",
+            title,
             f"- Mode: {mode.label}",
             f"- Worker result: {result.final_message}",
-            f"- Status: {'completed' if result.ok else 'failed'}",
+            f"- Status: {result.outcome or ('completed' if result.ok else 'failed')}",
+            f"- Turn budget: {result.turns_used}/{result.turns_max}",
             f"- Tool budget: {result.tool_calls_used}/{result.tool_calls_max}",
             f"- Duration: {result.duration_s:.3f}s",
         ]
@@ -2774,7 +2873,7 @@ class PlannerAgent:
                 f"Discovery mode: {mode.label}",
                 f"Reason: {request.reason}",
                 f"Expectation: {mode.scan_expectation}",
-                f"Discovery budget: at most {mode.max_tool_calls} tool-backed actions, then finish manually.",
+                f"Discovery budget: at most {mode.max_tool_calls} tool-backed actions, then finish or request a bounded discovery extension if material ambiguities remain.",
                 "Before normal repo exploration, inspect available skills once and load any directly relevant skill or skill mode.",
                 "Prefer starting with `skill` to inspect the catalog, then use `skill <name>` or `skill <name> mode=<mode>` when the contract matches the discovery job.",
                 "Do not modify files. Focus on discovery, constraints, likely edit locations, and planning risks.",
@@ -2796,7 +2895,7 @@ class PlannerAgent:
             "- what constraints or ambiguities materially affect planning",
             "- what implementation shape is most likely",
             "- what risks or dependencies the planner should account for",
-            "Keep a running budget in mind and finish manually with a concise discovery summary for the planner before or when you hit the limit.",
+            "Track the host turn and action budgets. At the limit, finish with a discovery summary or request a bounded extension with unresolved ambiguities, findings so far, reason, and a quick proposal. Only the user can grant more budget.",
         ]
         if self.session.last_discovery is not None:
             sections.append("Previous discovery summary:\n- " + self.session.last_discovery.final_message)
@@ -2905,11 +3004,19 @@ class PlannerAgent:
         if evidence_summary:
             if plan.clarification_summary:
                 if evidence_summary not in plan.clarification_summary:
-                    plan.clarification_summary = f"{plan.clarification_summary} Discovery established: {evidence_summary}".strip()
+                    plan.clarification_summary = f"{plan.clarification_summary} Discovery findings: {evidence_summary}".strip()
             else:
-                plan.clarification_summary = f"Discovery established: {evidence_summary}"
+                plan.clarification_summary = f"Discovery findings: {evidence_summary}"
+
+        open_questions = ["Unresolved discovery question: " + item for item in discovery.ambiguities]
+        if open_questions:
+            plan.clarification_summary += "\n" + "\n".join(open_questions)
 
         for goal in plan.goals:
+            for question in open_questions:
+                note = question + " Do not assume it is resolved; validate before relying on it or ask for the required user decision."
+                if note not in goal.delegation_notes:
+                    goal.delegation_notes.append(note)
             if touched_paths and not any("/" in note or "." in note for note in goal.delegation_notes):
                 goal.delegation_notes.append("Primary discovered files: " + ", ".join(touched_paths))
             if discovery_findings:
@@ -3451,6 +3558,11 @@ class PlannerAgent:
             "prompt": result.prompt,
             "delegated_task": result.delegated_task,
             "final_message": result.final_message,
+            "outcome": result.outcome,
+            "ambiguities": list(result.ambiguities),
+            "extension_requests": deepcopy(result.extension_requests),
+            "turns_used": result.turns_used,
+            "turns_max": result.turns_max,
             "ok": result.ok,
             "task_satisfied": result.task_satisfied,
             "validation_ran": result.validation_ran,
@@ -3551,6 +3663,8 @@ class PlannerAgent:
         return text.lower() in {"reject", "rejected", "no", "n", "/reject", "/cancel"}
 
     def _session_status(self) -> str:
+        if self.session.pending_discovery_extension is not None:
+            return "awaiting_discovery_extension"
         if self.session.executing:
             return "executing"
         if self.session.discovery_phase == "running":
@@ -3571,6 +3685,12 @@ class PlannerAgent:
 
     def _suggested_next_actions_payload(self) -> List[Dict[str, Any]]:
         actions: List[Dict[str, Any]] = []
+        pending_extension = self.session.pending_discovery_extension
+        if pending_extension is not None:
+            return [
+                {"type": "approve_discovery_extension", "label": f"Allow {pending_extension['additional_turns']} more turns", "request_id": pending_extension["request_id"], "payload": {"request_id": pending_extension["request_id"]}, "style": "primary"},
+                {"type": "decline_discovery_extension", "label": "Plan with current findings", "request_id": pending_extension["request_id"], "payload": {"request_id": pending_extension["request_id"]}, "style": "secondary"},
+            ]
         if self.session.execution_paused and self.session.paused_plan is not None:
             checkpoint = self._resume_checkpoint_payload()
             if self.session.paused_plan.dependency_errors:
@@ -3813,6 +3933,7 @@ class PlannerAgent:
             "resume_checkpoint": self._resume_checkpoint_payload(),
             "last_presented_plan": self._plan_payload(self.session.last_presented_plan),
             "pending_discovery": self._discovery_request_payload(self.session.pending_discovery),
+            "pending_discovery_extension": deepcopy(self.session.pending_discovery_extension),
             "last_discovery": self._discovery_result_payload(self.session.last_discovery),
             "last_completed_plan": self._plan_payload(self.session.last_completed_plan),
             "last_completed_results": [self._result_payload(result) for result in self.session.last_completed_results[-5:]],

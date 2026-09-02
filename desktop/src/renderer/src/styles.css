@@ -330,3 +330,9 @@ kbd { min-width: 20px; height: 20px; display: grid; place-items: center; border:
 .git-setup .git-setup-hint { font-size: 11px; }
 .git-setup button { min-height: 32px; }
 .git-setup button:disabled { opacity: .55; cursor: default; }
+
+/* Discovery decisions retain readable findings without pushing controls out of the panel. */
+.discovery-extension .decision-content { max-height: 55vh; overflow-y: auto; overflow-wrap: anywhere; }
+.discovery-extension .decision-content > p { margin: 4px 0; }
+.discovery-extension .decision-content > ul { margin: 4px 0 8px; padding-left: 20px; }
+.discovery-extension .discovery-findings { white-space: pre-wrap; }

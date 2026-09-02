@@ -147,7 +147,27 @@ export interface PlannerPlan extends JsonMap {
   dependency_errors?: string[];
 }
 
+export interface DiscoveryExtensionRequest {
+  request_id: string;
+  additional_turns: number;
+  additional_tool_calls: number;
+  reason: string;
+  proposal: string;
+  findings: string;
+  ambiguities: string[];
+  mode: string;
+  turns_used: number;
+  turns_max: number;
+  tool_calls_used: number;
+  tool_calls_max: number;
+}
+
 export interface DiscoveryResult extends JsonMap {
+  outcome?: string;
+  ambiguities?: string[];
+  extension_requests?: Array<DiscoveryExtensionRequest & { decision: 'pending' | 'approved' | 'declined' }>;
+  turns_used?: number;
+  turns_max?: number;
   mode?: string;
   reason?: string;
   prompt?: string;
@@ -210,6 +230,7 @@ export interface PlannerState extends JsonMap {
   discovery_phase?: string;
   active_discovery_mode?: string;
   pending_discovery?: { reason?: string; prompt?: string; recommended_mode?: string } | null;
+  pending_discovery_extension?: DiscoveryExtensionRequest | null;
   last_discovery?: DiscoveryResult | null;
   pending_plan?: PlannerPlan | null;
   last_presented_plan?: PlannerPlan | null;

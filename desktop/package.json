@@ -10,7 +10,7 @@
     "test:issues": "node --test scripts/issues.test.cjs scripts/issue-proposals.test.cjs",
     "test:layout": "node --test scripts/workspace-view.test.cjs",
     "test:timeline": "node --test scripts/agent-timeline.test.cjs",
-    "test:plans": "node --test scripts/plan-review.test.cjs",
+    "test:plans": "node --test scripts/plan-review.test.cjs scripts/discovery-extension.test.cjs",
     "test:layout:preview": "vite --config scripts/fixtures/vite.config.mjs --open /scripts/fixtures/workspace-view.html",
     "predev": "node scripts/ensure-electron.cjs",
     "dev": "electron-vite dev",

@@ -113,6 +113,7 @@ export function AgentWorkspaceProvider({ children }: { children: React.ReactNode
   const runSuggestedAction = useCallback(async (action: SuggestedAction): Promise<boolean> => {
     if (action.requires_confirmation && !window.confirm(action.confirmation_prompt || 'Proceed with this action?')) return false;
     const payload = isMap(action.payload) ? { ...action.payload } : {};
+    if (action.request_id) payload.request_id = action.request_id;
     if (action.mode) payload.mode = action.mode;
     if (action.issue_id) payload.issue_id = action.issue_id;
     if (action.max_cycles) payload.max_cycles = action.max_cycles;
