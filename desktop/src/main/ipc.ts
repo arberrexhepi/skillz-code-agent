@@ -1,4 +1,5 @@
-import { ipcMain, type BrowserWindow, type IpcMainEvent, type IpcMainInvokeEvent } from 'electron';
+import { dialog, ipcMain, shell, type BrowserWindow, type IpcMainEvent, type IpcMainInvokeEvent } from 'electron';
+import { isUntracked } from '../shared/gitStatus';
 import { z } from 'zod';
 import type { AgentService } from './services/agent';
 import type { GitService } from './services/git';
@@ -19,7 +20,7 @@ const terminalId = z.string().uuid();
 export function registerIpc(window: BrowserWindow, services: Services): void {
   for (const channel of [
     'workspace:current', 'workspace:choose', 'workspace:open', 'workspace:list', 'workspace:read', 'workspace:write',
-    'git:status', 'git:history', 'git:file-diff', 'git:stage', 'git:stage-all', 'git:unstage', 'git:commit', 'git:push',
+    'git:status', 'git:history', 'git:file-diff', 'git:stage', 'git:stage-all', 'git:unstage', 'git:discard', 'git:commit', 'git:push',
     'terminal:create', 'agent:start', 'agent:submit', 'agent:planner-action', 'agent:worker-action',
     'agent:reconfigure-runtime', 'agent:configure-backoff', 'agent:runtime-options',
     'agent:codex-subscription-status', 'agent:codex-subscription-login', 'agent:stop',
@@ -67,6 +68,26 @@ export function registerIpc(window: BrowserWindow, services: Services): void {
   handle('git:stage', (_event, values: unknown) => services.git.stage(paths.parse(values)));
   handle('git:stage-all', () => services.git.stageAll());
   handle('git:unstage', (_event, values: unknown) => services.git.unstage(paths.parse(values)));
+  handle('git:discard', (_event, value: unknown) => services.git.discard(
+    relativePath.parse(value),
+    async (file) => {
+      const untracked = isUntracked(file);
+      const result = await dialog.showMessageBox(window, {
+        type: 'warning',
+        title: untracked ? 'Move untracked file to Trash?' : 'Discard unstaged changes?',
+        message: file.path,
+        detail: untracked
+          ? 'This file is not tracked by Git. It will be moved to Trash, where you can recover it.'
+          : 'Restore this file to its staged version. Staged changes will be kept. Unstaged changes will be lost and cannot be undone.',
+        buttons: ['Cancel', untracked ? 'Move to Trash' : 'Discard Changes'],
+        defaultId: 0,
+        cancelId: 0,
+        noLink: true,
+      });
+      return result.response === 1;
+    },
+    (path) => shell.trashItem(path),
+  ));
   handle('git:commit', (_event, message: unknown) => services.git.commit(z.string().min(1).max(2000).parse(message)));
   handle('git:push', () => services.git.push());
 

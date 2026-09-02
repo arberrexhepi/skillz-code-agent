@@ -38,6 +38,11 @@ export interface GitFileDiff {
   language: string;
 }
 
+export interface GitDiscardResult {
+  status: GitStatus;
+  discarded: boolean;
+}
+
 export interface GitCommit {
   hash: string;
   shortHash: string;
@@ -100,6 +105,7 @@ export interface WorkbenchApi {
     stage(paths: string[]): Promise<GitStatus>;
     stageAll(): Promise<GitStatus>;
     unstage(paths: string[]): Promise<GitStatus>;
+    discard(path: string): Promise<GitDiscardResult>;
     commit(message: string): Promise<GitStatus>;
     push(): Promise<GitStatus>;
   };

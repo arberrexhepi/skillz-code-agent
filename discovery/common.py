@@ -95,12 +95,15 @@ def iter_files(root: Path, include_hidden: bool = False) -> Iterable[Path]:
         dirnames[:] = [
             name for name in dirnames
             if name not in SKIP_DIRS and (include_hidden or not is_hidden_name(name))
+            and not (current_path / name).is_symlink()
         ]
         if should_skip_relative_parts(rel_dir.parts, include_hidden):
             dirnames[:] = []
             continue
         for filename in filenames:
             if not include_hidden and is_hidden_name(filename):
+                continue
+            if (current_path / filename).is_symlink():
                 continue
             yield current_path / filename
 
@@ -113,6 +116,7 @@ def iter_tree(base: Path, include_hidden: bool, max_depth: int) -> Iterator[Path
         dirnames[:] = [
             name for name in dirnames
             if name not in SKIP_DIRS and (include_hidden or not is_hidden_name(name))
+            and not (current_path / name).is_symlink()
         ]
         if depth >= max_depth:
             dirnames[:] = []
@@ -120,6 +124,8 @@ def iter_tree(base: Path, include_hidden: bool, max_depth: int) -> Iterator[Path
             yield current_path / dirname
         for filename in sorted(filenames, key=str.lower):
             if not include_hidden and is_hidden_name(filename):
+                continue
+            if (current_path / filename).is_symlink():
                 continue
             yield current_path / filename
 
@@ -260,12 +266,15 @@ def iter_files(root: Path, include_hidden: bool = False) -> Iterable[Path]:
         dirnames[:] = [
             name for name in dirnames
             if name not in SKIP_DIRS and (include_hidden or not is_hidden_name(name))
+            and not (current_path / name).is_symlink()
         ]
         if should_skip_relative_parts(rel_dir.parts, include_hidden):
             dirnames[:] = []
             continue
         for filename in filenames:
             if not include_hidden and is_hidden_name(filename):
+                continue
+            if (current_path / filename).is_symlink():
                 continue
             yield current_path / filename
 
@@ -278,6 +287,7 @@ def iter_tree(base: Path, include_hidden: bool, max_depth: int) -> Iterator[Path
         dirnames[:] = [
             name for name in dirnames
             if name not in SKIP_DIRS and (include_hidden or not is_hidden_name(name))
+            and not (current_path / name).is_symlink()
         ]
         if depth >= max_depth:
             dirnames[:] = []
@@ -285,6 +295,8 @@ def iter_tree(base: Path, include_hidden: bool, max_depth: int) -> Iterator[Path
             yield current_path / dirname
         for filename in sorted(filenames, key=str.lower):
             if not include_hidden and is_hidden_name(filename):
+                continue
+            if (current_path / filename).is_symlink():
                 continue
             yield current_path / filename
 

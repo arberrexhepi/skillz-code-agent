@@ -5,6 +5,12 @@
   "description": "Agent-first desktop coding workbench.",
   "main": "./out/main/index.js",
   "scripts": {
+    "test:git": "node --test scripts/git.test.cjs",
+    "test:issues": "node --test scripts/issues.test.cjs scripts/issue-proposals.test.cjs",
+    "test:layout": "node --test scripts/workspace-view.test.cjs",
+    "test:timeline": "node --test scripts/agent-timeline.test.cjs",
+    "test:plans": "node --test scripts/plan-review.test.cjs",
+    "test:layout:preview": "vite --config scripts/fixtures/vite.config.mjs --open /scripts/fixtures/workspace-view.html",
     "predev": "node scripts/ensure-electron.cjs",
     "dev": "electron-vite dev",
     "build": "npm run typecheck && electron-vite build",
@@ -78,6 +84,7 @@
     "electron": "^44.0.0",
     "electron-builder": "^26.15.3",
     "electron-vite": "^5.0.0",
+    "esbuild": "^0.25.12",
     "typescript": "^7.0.2",
     "vite": "^7.3.6"
   }

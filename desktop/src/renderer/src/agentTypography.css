@@ -1,0 +1,46 @@
+/* Readable chat defaults, scoped away from the compact editor/sidebar chrome. */
+.agent-panel {
+  --chat-body-size: 14px;
+  --chat-detail-size: 13px;
+  --chat-label-size: 11px;
+  font-size: var(--chat-body-size);
+}
+
+.agent-panel .message > div,
+.agent-panel .markdown-message,
+.agent-panel .prompt-box textarea,
+.agent-panel .agent-empty p {
+  font-size: var(--chat-body-size);
+  line-height: 1.6;
+}
+.agent-panel .message { margin-bottom: 22px; }
+.agent-panel .message header { font-size: var(--chat-label-size); margin-bottom: 7px; }
+.agent-panel .markdown-message h1 { font-size: 20px; }
+.agent-panel .markdown-message h2 { font-size: 18px; }
+.agent-panel .markdown-message h3, .agent-panel .markdown-message h4 { font-size: 16px; }
+.agent-panel .markdown-message code { font-size: var(--chat-detail-size); line-height: 1.55; }
+.agent-panel .markdown-message table { font-size: var(--chat-detail-size); }
+.agent-panel .markdown-message th, .agent-panel .markdown-message td { padding: 6px 8px; }
+.agent-panel .agent-empty h3 { font-size: 16px; }
+.agent-panel .agent-empty p { max-width: 330px; }
+.agent-panel .prompt-box textarea { min-height: 100px; padding-bottom: 30px; }
+.agent-panel .composer-heading span, .agent-panel .composer-heading small, .agent-panel .composer-meta,
+.agent-panel .eyebrow, .agent-panel .status-pill, .agent-panel .agent-context-strip,
+.agent-panel .agent-context-strip strong { font-size: var(--chat-label-size); }
+.agent-panel .composer-heading small, .agent-panel .composer-meta { color: #87929e; }
+
+.agent-panel .agent-working, .agent-panel .agent-notice { font-size: var(--chat-detail-size); line-height: 1.5; }
+.agent-panel .agent-working small, .agent-panel .agent-working time { font-size: var(--chat-label-size); }
+.agent-panel .agent-notice { max-height: 88px; overflow: auto; }
+.agent-panel .agent-decision > header strong, .agent-panel .agent-handoff > header strong { font-size: var(--chat-body-size); }
+.agent-panel .agent-decision > header span, .agent-panel .agent-handoff > header span,
+.agent-panel .handoff-section h4, .agent-panel .handoff-meta span,
+.agent-panel .handoff-expand, .agent-panel .agent-handoff > footer > span,
+.agent-panel .agent-handoff > footer button { font-size: var(--chat-label-size); }
+.agent-panel .agent-decision > p, .agent-panel .decision-goal,
+.agent-panel .decision-running, .agent-panel .decision-buttons button,
+.agent-panel .handoff-section ol { font-size: var(--chat-detail-size); line-height: 1.5; }
+.agent-panel .agent-decision > p { max-height: 78px; overflow: auto; }
+.agent-panel .decision-goal span, .agent-panel .decision-running small { font-size: var(--chat-label-size); }
+.agent-panel .handoff-copy { max-height: 92px; line-height: 1.6; }
+.agent-panel .handoff-copy.expanded { max-height: none; }

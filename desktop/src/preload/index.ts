@@ -18,6 +18,7 @@ const api: WorkbenchApi = {
     stage: (paths) => ipcRenderer.invoke('git:stage', paths),
     stageAll: () => ipcRenderer.invoke('git:stage-all'),
     unstage: (paths) => ipcRenderer.invoke('git:unstage', paths),
+    discard: (path) => ipcRenderer.invoke('git:discard', path),
     commit: (message) => ipcRenderer.invoke('git:commit', message),
     push: () => ipcRenderer.invoke('git:push'),
   },

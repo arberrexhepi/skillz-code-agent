@@ -24,11 +24,13 @@ import json
 import os
 import re
 import time
-import ast
 from json import JSONDecoder
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
+
+from discovery.analysis import collect_symbols_for_file
+from discovery.common import try_read_text
 
 _CAT_MAX_FULL_LINES = 200
 _CAT_MAX_FULL_CHARS = 20000
@@ -78,7 +80,7 @@ def _assign_stable_run_issue_ids(issues: Sequence[Dict[str, Any]]) -> List[Dict[
 
 
 def _run_issue_sort_key(issue: Dict[str, Any]) -> Tuple[int, int, str, int, str]:
-    status_rank = 1 if str(issue.get("status", "open") or "open") == "resolved" else 0
+    status_rank = 1 if str(issue.get("status", "open") or "open") in {"resolved", "deferred"} else 0
     try:
         severity_rank = -int(issue.get("severity", 0) or 0)
     except (TypeError, ValueError):
@@ -128,6 +130,7 @@ class FileNode(TreeNode):
     """Leaf node — may lazily load content."""
     _content: Optional[str] = field(default=None, repr=False)
     _loader: Optional[Callable[[], str]] = field(default=None, repr=False)
+    _disk_signature: Optional[Tuple[int, int, int]] = field(default=None, repr=False)
     size: int = 0
     lines: int = 0
 
@@ -292,6 +295,18 @@ class ContextTree:
 
         # Caches
         self._repo_indexed = False
+        self._repo_exclude_dirs = {
+            ".git",
+            "__pycache__",
+            "node_modules",
+            ".venv",
+            "venv",
+            "dist",
+            "build",
+            ".tox",
+            ".mypy_cache",
+            ".pytest_cache",
+        }
         self._content_cache: Dict[str, str] = {}  # rel_path → content
 
     LOG_ISSUES_ROOT = "log-issues"
@@ -322,7 +337,10 @@ class ContextTree:
         File content is lazy-loaded on first access.
         Returns the number of files indexed."""
         if exclude_dirs is None:
-            exclude_dirs = {".git", "__pycache__", "node_modules", ".venv", "venv", "dist", "build", ".tox", ".mypy_cache", ".pytest_cache"}
+            exclude_dirs = set(self._repo_exclude_dirs)
+        else:
+            exclude_dirs = set(exclude_dirs)
+        self._repo_exclude_dirs = exclude_dirs
 
         count = 0
         root_str = str(self.workspace_root)
@@ -344,6 +362,8 @@ class ContextTree:
                     break
                 full = os.path.join(dirpath, fname)
                 rel = os.path.relpath(full, root_str)
+                if self._safe_repo_target(rel) is None:
+                    continue
                 file_size, line_count = self._probe_repo_file(Path(full))
 
                 # Lazy content loader closure
@@ -378,11 +398,144 @@ class ContextTree:
         self._repo_indexed = True
         return count
 
+    def _repo_relative_path(self, path: str) -> Optional[str]:
+        """Translate only virtual /repo paths into workspace-relative paths."""
+        normalized = str(path or "").strip().rstrip("/")
+        if normalized in {"/repo", "repo"}:
+            return ""
+        if normalized.startswith("/repo/"):
+            return normalized.removeprefix("/repo/")
+        if normalized.startswith("repo/"):
+            return normalized.removeprefix("repo/")
+        return None
+
+    def _safe_repo_target(self, rel_path: str) -> Optional[Path]:
+        """Resolve a workspace-relative target without allowing system access."""
+        relative = Path(rel_path)
+        if relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts):
+            return None
+        if any(part in self._repo_exclude_dirs for part in relative.parts):
+            return None
+        try:
+            target = (self.workspace_root / relative).resolve()
+            resolved_relative = target.relative_to(self.workspace_root)
+        except (ValueError, OSError, RuntimeError):
+            return None
+        if any(part in self._repo_exclude_dirs for part in resolved_relative.parts):
+            return None
+        return target
+
+    def _ensure_repo_dir(self, rel_path: str) -> DirNode:
+        directory = self._repo
+        for part in Path(rel_path).parts:
+            directory = directory.add_dir(part)
+        return directory
+
+    def _hydrate_repo_file(self, rel_path: str, target: Path) -> FileNode:
+        parent = self._ensure_repo_parent_dir(rel_path)
+        filename = Path(rel_path).name
+        existing = parent.get(filename)
+        info = target.stat()
+        signature = (info.st_mtime_ns, info.st_size, info.st_ino)
+        if isinstance(existing, FileNode) and existing._disk_signature == signature:
+            return existing
+        size, line_count = self._probe_repo_file(target)
+        if isinstance(existing, FileNode):
+            existing._loader = self._make_repo_loader(target)
+            existing._content = None
+            existing.size = size
+            existing.lines = line_count
+            existing._disk_signature = signature
+            return existing
+        node = parent.add_file(
+            filename,
+            loader=self._make_repo_loader(target),
+            size=size,
+            lines=line_count,
+        )
+        node._disk_signature = signature
+        return node
+
+    def _hydrate_repo_directory(self, rel_path: str, target: Path, *, depth: int) -> DirNode:
+        directory = self._ensure_repo_dir(rel_path)
+        if depth <= 0:
+            return directory
+
+        try:
+            children = sorted(target.iterdir(), key=lambda item: item.name.lower())
+        except OSError:
+            return directory
+
+        visible_names: set[str] = set()
+        for child in children:
+            child_rel = str(Path(rel_path) / child.name)
+            safe_child = self._safe_repo_target(child_rel)
+            if safe_child is None:
+                continue
+            if safe_child.is_dir():
+                visible_names.add(child.name)
+                directory.add_dir(child.name)
+                if depth > 1:
+                    self._hydrate_repo_directory(child_rel, safe_child, depth=depth - 1)
+            elif safe_child.is_file():
+                visible_names.add(child.name)
+                self._hydrate_repo_file(child_rel, safe_child)
+        for stale_name in set(directory.children) - visible_names:
+            directory.children.pop(stale_name, None)
+        return directory
+
+    def _resolve_repo_path(self, path: str, *, directory_depth: int = 0) -> Optional[TreeNode]:
+        """Resolve a virtual path, hydrating capped /repo entries on demand."""
+        node = _resolve(self._root, path)
+        rel_path = self._repo_relative_path(path)
+        if rel_path is None:
+            return node
+
+        target = self.workspace_root if not rel_path else self._safe_repo_target(rel_path)
+        if target is None or not target.exists():
+            return None
+        if target.is_dir():
+            return self._hydrate_repo_directory(rel_path, target, depth=directory_depth)
+        if target.is_file():
+            return self._hydrate_repo_file(rel_path, target)
+        return node
+
+    def _iter_repo_entries(self, path: str, *, include_dirs: bool = False) -> Iterator[Tuple[str, Path]]:
+        """Scan disk under /repo without populating or depending on the metadata index."""
+        rel_path = self._repo_relative_path(path)
+        if rel_path is None:
+            return
+        target = self.workspace_root if not rel_path else self._safe_repo_target(rel_path)
+        if target is None or not target.exists():
+            return
+        if target.is_file():
+            yield rel_path, target
+            return
+        for dirpath, dirnames, filenames in os.walk(target, followlinks=False):
+            current = Path(dirpath)
+            current_rel = current.relative_to(self.workspace_root)
+            safe_dirs: List[str] = []
+            for dirname in sorted(dirnames):
+                candidate_rel = str(current_rel / dirname)
+                candidate = self._safe_repo_target(candidate_rel)
+                if candidate is None or (current / dirname).is_symlink():
+                    continue
+                safe_dirs.append(dirname)
+                if include_dirs:
+                    yield candidate_rel, candidate
+            dirnames[:] = safe_dirs
+            for filename in sorted(filenames):
+                candidate_rel = str(current_rel / filename)
+                candidate = self._safe_repo_target(candidate_rel)
+                if candidate is not None and candidate.is_file():
+                    yield candidate_rel, candidate
+
     def preload_files(self, rel_paths: Sequence[str]) -> int:
         """Eagerly load content for specific files (e.g., planner-selected hot files)."""
         loaded = 0
         for rp in rel_paths:
-            node = _resolve(self._repo, rp)
+            normalized = str(rp or "").strip().removeprefix("/repo/").removeprefix("repo/")
+            node = self._resolve_repo_path(f"/repo/{normalized}")
             if isinstance(node, FileNode) and not node.content_loaded():
                 _ = node.content  # trigger lazy load
                 loaded += 1
@@ -447,92 +600,44 @@ class ContextTree:
     # Symbol indexing / lookup
     # ------------------------------------------------------------------
 
-    def _extract_python_symbols(self, content: str) -> List[Dict[str, Any]]:
-        try:
-            tree = ast.parse(content)
-        except SyntaxError:
-            return []
-
-        symbols: List[Dict[str, Any]] = []
-        for node in ast.walk(tree):
-            if isinstance(node, ast.ClassDef):
-                symbols.append({
-                    "name": node.name,
-                    "kind": "class",
-                    "line": int(getattr(node, "lineno", 0) or 0),
-                    "end_line": int(getattr(node, "end_lineno", getattr(node, "lineno", 0)) or 0),
-                })
-            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                symbols.append({
-                    "name": node.name,
-                    "kind": "function",
-                    "line": int(getattr(node, "lineno", 0) or 0),
-                    "end_line": int(getattr(node, "end_lineno", getattr(node, "lineno", 0)) or 0),
-                })
-            elif isinstance(node, ast.Assign):
-                for target in node.targets:
-                    if isinstance(target, ast.Name):
-                        symbols.append({
-                            "name": target.id,
-                            "kind": "variable",
-                            "line": int(getattr(target, "lineno", getattr(node, "lineno", 0)) or 0),
-                            "end_line": int(getattr(target, "end_lineno", getattr(node, "lineno", 0)) or 0),
-                        })
-            elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
-                symbols.append({
-                    "name": node.target.id,
-                    "kind": "variable",
-                    "line": int(getattr(node.target, "lineno", getattr(node, "lineno", 0)) or 0),
-                    "end_line": int(getattr(node.target, "end_lineno", getattr(node, "lineno", 0)) or 0),
-                })
-        return sorted(symbols, key=lambda item: (item["line"], item["name"], item["kind"]))
-
-    def _extract_jsts_symbols(self, content: str) -> List[Dict[str, Any]]:
-        patterns: List[Tuple[str, re.Pattern[str]]] = [
-            ("class", re.compile(r"^\s*export\s+default\s+class\s+([A-Za-z_$][\w$]*)\b|^\s*(?:export\s+)?class\s+([A-Za-z_$][\w$]*)\b")),
-            ("function", re.compile(r"^\s*(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(")),
-            ("function", re.compile(r"^\s*(?:export\s+)?const\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?\(")),
-            ("function", re.compile(r"^\s*(?:export\s+)?const\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s+)?function\b")),
-            ("function", re.compile(r"^\s*(?:export\s+)?const\s+([A-Za-z_$][\w$]*)\s*=\s*<[^>]+>\s*\(")),
-            ("interface", re.compile(r"^\s*export\s+interface\s+([A-Za-z_$][\w$]*)\b|^\s*interface\s+([A-Za-z_$][\w$]*)\b")),
-            ("type", re.compile(r"^\s*export\s+type\s+([A-Za-z_$][\w$]*)\b|^\s*type\s+([A-Za-z_$][\w$]*)\b")),
-            ("enum", re.compile(r"^\s*export\s+enum\s+([A-Za-z_$][\w$]*)\b|^\s*enum\s+([A-Za-z_$][\w$]*)\b")),
-            ("variable", re.compile(r"^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=")),
+    def _symbols_from_content(self, path: str, content: str) -> List[Dict[str, Any]]:
+        return [
+            {
+                "name": symbol["name"],
+                "kind": str(symbol["kind"]).removeprefix("exported_"),
+                "line": symbol["line"],
+                "end_line": symbol["end_line"],
+            }
+            for symbol in collect_symbols_for_file(Path(path), content)
         ]
 
-        symbols: List[Dict[str, Any]] = []
-        for idx, line in enumerate(content.splitlines(), start=1):
-            for kind, pattern in patterns:
-                match = pattern.search(line)
-                if not match:
-                    continue
-                name = next((group for group in match.groups() if group), "")
-                if not name:
-                    continue
-                symbols.append({
-                    "name": name,
-                    "kind": kind,
-                    "line": idx,
-                    "end_line": idx,
-                })
-                break
-        return symbols
-
     def extract_symbols(self, path: str) -> List[Dict[str, Any]]:
-        node = _resolve(self._root, path)
+        node = self._resolve_repo_path(path)
         if not isinstance(node, FileNode):
             return []
 
-        content = node.content
-        suffix = Path(path).suffix.lower()
-        if suffix == ".py":
-            return self._extract_python_symbols(content)
-        if suffix in {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"}:
-            return self._extract_jsts_symbols(content)
-        return []
+        return self._symbols_from_content(path, node.content)
 
     def find_symbols(self, path: str, name: str, limit: int = 20) -> List[Dict[str, Any]]:
-        node = _resolve(self._root, path)
+        rel_path = self._repo_relative_path(path)
+        if rel_path is not None:
+            if limit <= 0 or not name.strip():
+                return []
+            matches: List[Dict[str, Any]] = []
+            for file_path, target in self._iter_repo_entries(path):
+                if target.suffix.lower() not in {".py", ".pyi", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"}:
+                    continue
+                content, _ = try_read_text(target)
+                if content is None or name.lower() not in content.lower():
+                    continue
+                for symbol in self._symbols_from_content(file_path, content):
+                    if symbol["name"].lower() == name.strip().lower():
+                        matches.append({**symbol, "path": f"/repo/{file_path}"})
+                        if len(matches) >= limit:
+                            return matches
+            return matches
+
+        node = self._resolve_repo_path(path, directory_depth=1)
         if node is None:
             return []
 
@@ -617,7 +722,7 @@ class ContextTree:
 
     def ingest_log_issues(self, path: str) -> List[Dict[str, Any]]:
         """Parse a log file and materialize distinct issues under /facts."""
-        node = _resolve(self._root, path)
+        node = self._resolve_repo_path(path)
         if not isinstance(node, FileNode):
             return []
         content = node.content
@@ -773,6 +878,9 @@ class ContextTree:
                 if isinstance(entry, FileNode):
                     issue[entry.name] = entry.content
             issues.append(issue)
+        disposition = getattr(self, "diagnostic_disposition", None)
+        if callable(disposition):
+            issues = disposition(issues)
         return sorted(issues, key=_run_issue_sort_key)
 
     def show_log_issue(self, issue_id: str) -> Optional[Dict[str, Any]]:
@@ -836,6 +944,9 @@ class ContextTree:
             lines.append(" ".join(header_bits))
             if summary:
                 lines.append(f"  summary: {summary}")
+            if status == "deferred":
+                lines.append(f"  deferred to {issue.get('proposal_id', 'agent suggestion')}; not a current-goal gate, no further inspection required")
+                continue
             next_reads = self.log_issue_read_commands(issue)
             next_steps = next_reads or [f"show-run-issue {issue_id}"]
             lines.append(f"  next: {'; '.join(next_steps)}")
@@ -868,7 +979,9 @@ class ContextTree:
             if text:
                 lines.append(f"{key}: {text}")
 
-        next_reads = self.log_issue_read_commands(issue)
+        if status == "deferred":
+            lines.append(f"deferred to: {issue.get('proposal_id', 'agent suggestion')}; not a current-goal gate, no further inspection required")
+        next_reads = [] if status == "deferred" else self.log_issue_read_commands(issue)
         if next_reads:
             lines.append("next_reads:")
             lines.extend(f"- {command}" for command in next_reads)
@@ -1304,10 +1417,10 @@ class ContextTree:
     # ------------------------------------------------------------------
 
     def resolve(self, path: str) -> Optional[TreeNode]:
-        return _resolve(self._root, path)
+        return self._resolve_repo_path(path)
 
     def ls(self, path: str = "/", depth: int = 1) -> List[Dict[str, Any]]:
-        node = _resolve(self._root, path)
+        node = self._resolve_repo_path(path, directory_depth=max(1, depth))
         if isinstance(node, DirNode):
             return node.ls(depth=depth)
         if isinstance(node, FileNode):
@@ -1322,7 +1435,7 @@ class ContextTree:
         *,
         include_line_numbers: bool = True,
     ) -> str:
-        node = _resolve(self._root, path)
+        node = self._resolve_repo_path(path)
         if not isinstance(node, FileNode):
             if isinstance(node, DirNode):
                 return f"[directory: {path} — {len(node.children)} entries]"
@@ -1347,7 +1460,7 @@ class ContextTree:
         return "\n".join(f"{line_no:>{width}} | {text}" for line_no, text in zip(range(start, end + 1), selected))
 
     def cat(self, path: str, start_line: int = 0, end_line: int = 0) -> str:
-        node = _resolve(self._root, path)
+        node = self._resolve_repo_path(path)
         if isinstance(node, FileNode):
             if start_line > 0 or end_line > 0:
                 return self.read_line_range(path, start_line, end_line, include_line_numbers=True)
@@ -1371,7 +1484,7 @@ class ContextTree:
         return f"[not found: {path}]"
 
     def stat(self, path: str) -> Dict[str, Any]:
-        node = _resolve(self._root, path)
+        node = self._resolve_repo_path(path, directory_depth=1)
         if node is None:
             return {"error": f"not found: {path}"}
         if isinstance(node, DirNode):
@@ -1381,7 +1494,19 @@ class ContextTree:
         return {"error": "unknown node type"}
 
     def find(self, path: str = "/", glob_pattern: str = "*", limit: int = 100) -> List[str]:
-        node = _resolve(self._root, path)
+        rel_path = self._repo_relative_path(path)
+        if rel_path is not None:
+            if limit <= 0:
+                return []
+            results: List[str] = []
+            for candidate_rel, _ in self._iter_repo_entries(path, include_dirs=True):
+                if fnmatch.fnmatch(Path(candidate_rel).name, glob_pattern):
+                    results.append(f"repo/{candidate_rel}")
+                    if len(results) >= limit:
+                        return results
+            return results
+
+        node = self._resolve_repo_path(path, directory_depth=1)
         if not isinstance(node, DirNode):
             return []
         results: List[str] = []
@@ -1393,25 +1518,37 @@ class ContextTree:
         return results
 
     def grep(self, path: str, pattern: str, limit: int = 50) -> List[Dict[str, Any]]:
-        """Search file contents within the tree. Only searches already-loaded files
-        unless the path is under /facts, /memory, or /status (always loaded)."""
-        node = _resolve(self._root, path)
-        if node is None:
+        """Search /repo on disk; other mounts remain virtual in-memory data."""
+        if limit <= 0 or not pattern:
             return []
-
         try:
             regex = re.compile(pattern, re.IGNORECASE)
         except re.error:
             regex = re.compile(re.escape(pattern), re.IGNORECASE)
 
         results: List[Dict[str, Any]] = []
+        if self._repo_relative_path(path) is not None:
+            for rel_path, target in self._iter_repo_entries(path):
+                content, _ = try_read_text(target)
+                if content is None:
+                    continue
+                for line_no, line in enumerate(content.splitlines(), 1):
+                    if regex.search(line):
+                        results.append({"path": f"repo/{rel_path}", "line": line_no, "text": line.strip()[:200]})
+                        if len(results) >= limit:
+                            return results
+            return results
+
+        node = _resolve(self._root, path)
+        if node is None:
+            return []
         nodes = [node] if isinstance(node, FileNode) else list(node.walk()) if isinstance(node, DirNode) else []
 
         for n in nodes:
             if not isinstance(n, FileNode):
                 continue
-            # For /repo, only search loaded content (don't trigger lazy IO)
-            if n.path().startswith("repo/") and not n.content_loaded():
+            # The virtual root does not implicitly search workspace content.
+            if n.path().startswith("repo/"):
                 continue
             content = n._content or ""
             for i, line in enumerate(content.splitlines(), 1):
@@ -1442,7 +1579,7 @@ class ContextTree:
         repo_listing = self._repo.ls(depth=repo_depth)
         repo_lines = [f"  {e['name']}" + (f"  ({e.get('lines', '?')} lines)" if e.get("type") == "file" else f"  ({e.get('children', '?')} items)")
                        for e in repo_listing[:200]]
-        sections.append("WORKSPACE TREE (/repo):\n" + "\n".join(repo_lines))
+        sections.append("WORKSPACE TREE (/repo):\n[Bounded metadata preview; /repo discovery searches disk, not this listing.]\n" + "\n".join(repo_lines))
 
         # /facts
         if include_facts:

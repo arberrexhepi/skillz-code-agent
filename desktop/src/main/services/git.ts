@@ -1,6 +1,8 @@
 import { execFile } from 'node:child_process';
 import { promises as fs } from 'node:fs';
-import type { GitCommit, GitFileDiff, GitFileStatus, GitStatus } from '../../shared/contracts';
+import type { GitCommit, GitDiscardResult, GitFileDiff, GitFileStatus, GitStatus } from '../../shared/contracts';
+import { canDiscard, isUntracked } from '../../shared/gitStatus';
+import { discardFileFingerprint } from './gitDiscardSafety';
 import { languageForPath, type WorkspaceService } from './workspace';
 
 interface GitResult {
@@ -12,7 +14,7 @@ export class GitService {
   constructor(private readonly workspace: WorkspaceService) {}
 
   async status(): Promise<GitStatus> {
-    const output = await this.run(['status', '--porcelain=v1', '-z', '--branch']);
+    const output = await this.run(['status', '--porcelain=v1', '-z', '--branch', '--untracked-files=all']);
     const records = output.stdout.split('\0').filter(Boolean);
     const header = records.shift() || '## HEAD';
     const branch = parseBranch(header);
@@ -25,7 +27,7 @@ export class GitService {
       const workTreeStatus = record[1];
       const filePath = record.slice(3);
       const item: GitFileStatus = { path: filePath, indexStatus, workTreeStatus };
-      if (indexStatus === 'R' || indexStatus === 'C') {
+      if (indexStatus === 'R' || indexStatus === 'C' || workTreeStatus === 'R' || workTreeStatus === 'C') {
         item.originalPath = records[index + 1];
         index += 1;
       }
@@ -39,7 +41,7 @@ export class GitService {
     const modified = staged
       ? await this.tryGitShow(`:${relativePath}`)
       : await fs.readFile(target, 'utf8').catch(() => '');
-    const original = await this.tryGitShow(`HEAD:${relativePath}`);
+    const original = await this.tryGitShow(staged ? `HEAD:${relativePath}` : `:${relativePath}`);
     return { path: relativePath, original, modified, language: languageForPath(relativePath) };
   }
 
@@ -88,6 +90,38 @@ export class GitService {
       await this.run(['reset', '--', ...safePaths]);
     }
     return this.status();
+  }
+
+  async discard(
+    relativePath: string,
+    confirm: (file: GitFileStatus) => Promise<boolean>,
+    trash: (absolutePath: string) => Promise<void>,
+  ): Promise<GitDiscardResult> {
+    const root = this.workspace.requireRoot();
+    const target = this.workspace.resolve(relativePath);
+    const snapshot = async (): Promise<{ file: GitFileStatus; fingerprint: string }> => {
+      if (this.workspace.requireRoot() !== root) throw new Error('Workspace changed. Refresh Git status before discarding.');
+      const status = await this.status();
+      const file = status.files.find((item) => item.path === relativePath);
+      if (!file || !canDiscard(file)) throw new Error('This file has no discardable unstaged changes. Unstage staged changes first; resolve conflicts separately.');
+      const disk = await discardFileFingerprint(root, target);
+      const index = (await this.run(['--literal-pathspecs', 'ls-files', '--stage', '-z', '--', relativePath], 0, root)).stdout;
+      return { file, fingerprint: JSON.stringify([file, disk, index]) };
+    };
+    const before = await snapshot();
+    if (!(await confirm(before.file))) return { status: await this.status(), discarded: false };
+    const after = await snapshot();
+    if (before.fingerprint !== after.fingerprint || this.workspace.requireRoot() !== root) {
+      throw new Error('The file or its staged changes changed while confirmation was open. Review the diff and try again.');
+    }
+    if (isUntracked(after.file)) {
+      await trash(target);
+    } else {
+      // Restore from the index, not HEAD: keep staged changes intact. Literal
+      // pathspecs prevent names such as [draft].md from targeting other files.
+      await this.run(['--literal-pathspecs', 'restore', '--worktree', '--', relativePath], 0, root);
+    }
+    return { status: await this.status(), discarded: true };
   }
 
   async commit(message: string): Promise<GitStatus> {
@@ -141,10 +175,10 @@ export class GitService {
     }
   }
 
-  private run(args: string[], timeout = 0): Promise<GitResult> {
+  private run(args: string[], timeout = 0, root = this.workspace.requireRoot()): Promise<GitResult> {
     return new Promise((resolve, reject) => {
       execFile('git', args, {
-        cwd: this.workspace.requireRoot(),
+        cwd: root,
         encoding: 'utf8',
         maxBuffer: 20 * 1024 * 1024,
         timeout: timeout || undefined,

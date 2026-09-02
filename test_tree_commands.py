@@ -63,6 +63,80 @@ class PlaceholderTransformTests(unittest.TestCase):
         self.assertEqual(value, "call foo)")
 
 
+class ContextTreeHydrationTests(unittest.TestCase):
+    def test_beta_reads_hydrate_workspace_paths_omitted_by_index_cap(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "README.md").write_text("# Workspace\n", encoding="utf-8")
+            target = root / "packages" / "chat" / "src" / "index.ts"
+            target.parent.mkdir(parents=True)
+            target.write_text("export const chat = true;\n", encoding="utf-8")
+
+            tree = ContextTree(root)
+            tree.index_repo(max_files=1)
+            parser = TreeCommandParser(tree)
+
+            listing = parser.parse_and_execute("ls /repo/packages depth=1")
+            symbols = parser.parse_and_execute("symbols /repo/packages/chat/src/index.ts")
+            content = parser.parse_and_execute("cat /repo/packages/chat/src/index.ts:1-50")
+            metadata = parser.parse_and_execute("stat /repo/packages/chat/src/index.ts")
+
+            self.assertIn('"name": "chat/"', listing.output)
+            self.assertIn('"name": "chat"', symbols.output)
+            self.assertIn("export const chat = true", content.output)
+            self.assertIn('"type": "file"', metadata.output)
+
+    def test_repo_hydration_rejects_paths_outside_workspace(self):
+        with tempfile.TemporaryDirectory() as tmpdir, tempfile.TemporaryDirectory() as outside_dir:
+            root = Path(tmpdir)
+            (root / "README.md").write_text("# Workspace\n", encoding="utf-8")
+            outside = Path(outside_dir) / "secret.txt"
+            outside.write_text("system secret\n", encoding="utf-8")
+            (root / "external.txt").symlink_to(outside)
+
+            tree = ContextTree(root)
+            tree.index_repo(max_files=1)
+
+            self.assertEqual(tree.cat("/repo/external.txt"), "[not found: /repo/external.txt]")
+            self.assertEqual(tree.cat("/repo/../secret.txt"), "[not found: /repo/../secret.txt]")
+
+    def test_find_accepts_familiar_name_form_without_treating_name_as_glob(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "README.md").write_text("# Workspace\n", encoding="utf-8")
+            source = root / "src" / "assistant"
+            source.mkdir(parents=True)
+            (source / "useAssistantConversation.ts").write_text("export default {};\n", encoding="utf-8")
+            tree = ContextTree(root)
+            tree.index_repo(max_files=1)
+            parser = TreeCommandParser(tree)
+
+            result = parser.parse_and_execute('find /repo -name "useAssistantConversation*" limit=20')
+
+            self.assertTrue(result.ok)
+            self.assertIn("repo/src/assistant/useAssistantConversation.ts", result.output)
+
+    def test_find_symbol_scans_nested_repo_files_beyond_index_cap(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "README.md").write_text("# Workspace\n", encoding="utf-8")
+            component = root / "src" / "components" / "VariationsPanel.tsx"
+            component.parent.mkdir(parents=True)
+            component.write_text(
+                "export function VariationsPanel() { return null; }\n",
+                encoding="utf-8",
+            )
+            tree = ContextTree(root)
+            tree.index_repo(max_files=1)
+            parser = TreeCommandParser(tree)
+
+            result = parser.parse_and_execute("find-symbol /repo VariationsPanel")
+
+            self.assertTrue(result.ok)
+            self.assertIn('"name": "VariationsPanel"', result.output)
+            self.assertIn('"path": "/repo/src/components/VariationsPanel.tsx"', result.output)
+
+
 class IssueListCommandTests(unittest.TestCase):
     def _parse_git(self, command: str) -> CommandResult:
         parser = TreeCommandParser(ContextTree(Path.cwd()))

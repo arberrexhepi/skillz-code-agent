@@ -1,13 +1,17 @@
 import { useCallback, useEffect, useState } from 'react';
-import type { GitCommit, GitFileStatus, GitStatus } from '../../../shared/contracts';
+import type { GitCommit, GitStatus } from '../../../shared/contracts';
+import { isStaged, isUnstaged } from '../../../shared/gitStatus';
+import { GitChangeRow } from './GitChangeRow';
 
 interface GitPanelProps {
   revision: number;
   onOpenDiff: (path: string, staged: boolean) => void;
   onStatus: (status: GitStatus | null) => void;
+  onBeforeDiscard: (path: string) => boolean;
+  onDiscard: (path: string) => Promise<void>;
 }
 
-export function GitPanel({ revision, onOpenDiff, onStatus }: GitPanelProps): React.JSX.Element {
+export function GitPanel({ revision, onOpenDiff, onStatus, onBeforeDiscard, onDiscard }: GitPanelProps): React.JSX.Element {
   const [status, setStatus] = useState<GitStatus | null>(null);
   const [history, setHistory] = useState<GitCommit[]>([]);
   const [mode, setMode] = useState<'changes' | 'history'>('changes');
@@ -59,6 +63,18 @@ export function GitPanel({ revision, onOpenDiff, onStatus }: GitPanelProps): Rea
     try { setHistory(await window.workbench.git.history(75)); } catch { /* Status errors remain the primary Git signal. */ }
   };
 
+  const discard = async (path: string): Promise<void> => {
+    if (!onBeforeDiscard(path)) {
+      setError('This file has unsaved editor changes. Save or close its editor tab before discarding disk changes.');
+      return;
+    }
+    await mutate(path, async () => {
+      const result = await window.workbench.git.discard(path);
+      if (result.discarded) await onDiscard(path);
+      return result.status;
+    });
+  };
+
   const stagedCount = status?.files.filter(isStaged).length || 0;
   const unstagedCount = status?.files.filter(isUnstaged).length || 0;
   const sync = syncState(status, history.length > 0, busyPath);
@@ -93,13 +109,14 @@ export function GitPanel({ revision, onOpenDiff, onStatus }: GitPanelProps): Rea
       <div className="git-files">
         {status?.files.length === 0 && <div className="panel-message">Working tree is clean.</div>}
         {status?.files.map((file) => (
-          <GitFile
+          <GitChangeRow
             key={`${file.path}:${file.indexStatus}:${file.workTreeStatus}`}
             file={file}
-            busy={busyPath === file.path}
+            busy={Boolean(busyPath)}
             onDiff={onOpenDiff}
             onStage={(path) => void mutate(path, () => window.workbench.git.stage([path]))}
             onUnstage={(path) => void mutate(path, () => window.workbench.git.unstage([path]))}
+            onDiscard={(path) => void discard(path)}
           />
         ))}
       </div>
@@ -126,36 +143,6 @@ function GitHistory({ commits }: { commits: GitCommit[] }): React.JSX.Element {
       </div>}
     </article>;
   })}</div>;
-}
-
-function GitFile({ file, busy, onDiff, onStage, onUnstage }: {
-  file: GitFileStatus;
-  busy: boolean;
-  onDiff: (path: string, staged: boolean) => void;
-  onStage: (path: string) => void;
-  onUnstage: (path: string) => void;
-}): React.JSX.Element {
-  const staged = isStaged(file);
-  const unstaged = isUnstaged(file);
-  return (
-    <div className="git-file-row">
-      <button type="button" className="git-file-name" title={file.path} onClick={() => onDiff(file.path, staged && !unstaged)}>
-        <span>{file.path.split('/').at(-1)}</span>
-        <small>{file.path.includes('/') ? file.path.slice(0, file.path.lastIndexOf('/')) : ''}</small>
-      </button>
-      <span className="git-code">{file.indexStatus}{file.workTreeStatus}</span>
-      {staged && <button type="button" className="icon-button" disabled={busy} onClick={() => onUnstage(file.path)} title="Unstage">−</button>}
-      {unstaged && <button type="button" className="icon-button" disabled={busy} onClick={() => onStage(file.path)} title="Stage">＋</button>}
-    </div>
-  );
-}
-
-function isStaged(file: GitFileStatus): boolean {
-  return file.indexStatus !== ' ' && file.indexStatus !== '?';
-}
-
-function isUnstaged(file: GitFileStatus): boolean {
-  return file.workTreeStatus !== ' ' || file.indexStatus === '?';
 }
 
 function cleanError(error: unknown): string {
