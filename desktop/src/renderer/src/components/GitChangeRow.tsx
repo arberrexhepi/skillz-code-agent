@@ -1,3 +1,4 @@
+import { PathChip } from './PathText';
 import type { GitFileStatus } from '../../../shared/contracts';
 import { canDiscard, gitStatusLabel, isStaged, isUnstaged, isUntracked } from '../../../shared/gitStatus';
 
@@ -16,10 +17,8 @@ export function GitChangeRow({ file, busy, onDiff, onStage, onUnstage, onDiscard
   const status = gitStatusLabel(file);
   const discardLabel = isUntracked(file) ? 'Move untracked file to Trash' : 'Discard unstaged changes';
   return <div className="git-file-row">
-    <button type="button" className="git-file-name" title={file.path} onClick={() => onDiff(file.path, staged && !unstaged)}>
-      <span>{file.path.split('/').at(-1)}</span>
-      <small>{file.path.includes('/') ? file.path.slice(0, file.path.lastIndexOf('/')) : ''}</small>
-    </button>
+    <div className="git-file-reference"><PathChip path={file.path} /></div>
+    <button type="button" className="icon-button" title="Open diff" aria-label={`Open diff: ${file.path}`} onClick={() => onDiff(file.path, staged && !unstaged)}>Δ</button>
     <span className="git-code" data-status={status.code} title={status.title} aria-label={status.title}>{status.code}</span>
     {canDiscard(file) && <button
       type="button" className="icon-button git-discard" disabled={busy}

@@ -5,12 +5,14 @@ Electron desktop shell for the Python planner/worker. The application is intenti
 ## Included vertical slice
 
 - local workspace selection and lazy file explorer
+- an Issues tab for saved issue management, suggestions, lifecycle details, and completed-goal history
+- a Repo Facts tab for architecture/goal facts and provenance
 - Monaco file tabs, dirty-state tracking, save shortcuts, and Git diff views
 - real PTY terminal through xterm.js and node-pty
 - Git branch/status, stage, unstage, diff, and commit controls
 - exact Python bridge parity for planner actions, worker actions, runtime discovery/switching, backoff, and lifecycle progress
 - Runtime settings for the additive `codex-subscription` provider, including local ChatGPT authentication, plan, CLI, and live-model status while preserving the existing OpenAI API provider
-- workspace-native agent UI: calm conversation rail, pinned lifecycle decisions, durable issues/run facts, and continuous-mode status
+- workspace-native agent UI: calm conversation rail, pinned lifecycle decisions, durable issue management and repository facts, and continuous-mode status
 - bottom workspace dock for Terminal, Activity, Problems, and Review; diagnostics also become Monaco markers
 - per-workspace view preferences: hide/show the editor and resize the agent panel without losing tabs, drafts, or terminal sessions
 - sandboxed renderer with a narrow, validated preload API
@@ -36,6 +38,38 @@ Agent chat uses 14px body/composer text, 13px code, and 11px supporting labels a
 Discovery choices, plan approvals/results, and issue lifecycle actions appear in collapsed workflow report cards, in conversation order. Expand a card for selections, outcomes, and original workflow text. New bridge messages carry explicit presentation boundaries so conversational replies appended to reports remain in the chat. The original bridge transcript is unchanged; older bridge messages use conservative format recognition.
 
 Operator-facing turn thoughts appear above the composer while work runs (collapsible when space is tight). Full thoughts remain readable, and Activity retains tool-level history. The beta loop forwards explicit `>>th` annotations; provider-internal reasoning is not displayed.
+
+## Issues and repository facts
+
+**Issues** and **Repo Facts** are separate views of the same saved `repo_facts.md` ledger. Both load without starting Python or connecting a model, refresh when workspace files change, and reject late reads after a folder switch.
+
+### Issues
+
+Use **Issues** to manage suggested, open, and closed work. Saved issues remain visible with the agent stopped; the connected runtime supplies current status while it runs. Search and status filters cover the entire saved backlog, including older closed records. Repository-wide architecture records are excluded from the issue list.
+
+**Continue**, **Close**, and **Reopen** remain visible on each issue card. Expand **Details** for the request, plan, lifecycle notes, blocked reason, parent/source information, and completed-goal history with validation results. These actions use the existing structured planner commands and start the configured runtime when needed. Failed actions retain the issue's state and show an error. Lifecycle actions are disabled during execution; adding an issue and accepting/ignoring suggestions can still queue behind the current action.
+
+Pending agent suggestions are loaded from `.agent-issue-proposals.json`. **Accept** creates an issue without replacing the active task; **Ignore** removes the proposal from the pending list. Reading either file does not modify it. A malformed ledger does not hide readable suggestions, and a suggestion-storage error does not hide readable issues.
+
+Run `npm run test:issues` for projection, saved-file, workspace-boundary, IPC, and management tests. `/scripts/fixtures/workspace-view.html?issues=1` previews the complete workbench; `/scripts/fixtures/issues-interactions.html` exercises saved issues, lifecycle actions, proposal decisions, failures, duplicate clicks, and folder switches.
+
+### Repository facts
+
+Use **Repo Facts** to browse architecture and goal facts. Search fact keys, values, and source actions; filter by type or recording scope. Expand **Provenance** for the source action, run, and step. The related issue link opens that issue's management view and details. Counts reflect retained facts; closed issues with no facts do not appear as empty fact cards.
+
+**Open source** opens the original Markdown in the editor. Missing files, invalid JSON, unsupported schemas, and read errors are shown separately. Current schema 2 and legacy flat fact lists are supported; viewing a legacy file does not migrate or modify it.
+
+Run `npm run test:facts` for parser, file-reader, workspace-boundary, IPC, and rendering checks. `/scripts/fixtures/workspace-view.html?facts=1` previews the facts tab; `/scripts/fixtures/repo-facts-interactions.html` checks filtering, refresh races, switching repositories, source opening, and retry.
+
+## File reference chips
+
+File references in conversation, Repo Facts, issue details, plans, reports, activity, diagnostics, and runtime messages share a compact chip with the filename emphasized and the full path in its tooltip. Click or focus a chip and press Enter to open it in the editor. Git file chips open the source; the adjacent **Δ** button opens its diff.
+
+The viewer recognizes common source/configuration filenames, relative paths, `/repo/...` references, absolute paths within the selected workspace, and quoted paths containing spaces or Unicode. `/repo/` means the selected workspace root. References such as `src/app.ts:12:3`, `src/app.ts#L12C3`, and compiler-style `src/app.ts(12,3)` jump to the recorded location. Reopening an editor tab retains unsaved edits. Paths outside the workspace are shown as inactive chips; missing files report an error when opened.
+
+Terminal output has clickable file links and a **Files** strip with up to eight recent references. Terminal and editor source text stay intact, as do fenced code samples and web links in Markdown. New prose surfaces can use `PathText`, and structured file fields can use `PathChip`, with navigation supplied by the workbench context.
+
+Run `npm run test:paths` for detection, Windows/Unix resolution, terminal cell ranges, and editor navigation tests. Preview all panels with `/scripts/fixtures/workspace-view.html?paths=1`; `/scripts/fixtures/path-chip-interactions.html` exercises Markdown, metadata chips, workspace switches, and sanitization.
 
 ## Starting a Git repository
 

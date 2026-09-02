@@ -19,7 +19,7 @@ const terminalId = z.string().uuid();
 
 export function registerIpc(window: BrowserWindow, services: Services): void {
   for (const channel of [
-    'workspace:current', 'workspace:choose', 'workspace:open', 'workspace:list', 'workspace:read', 'workspace:write',
+    'workspace:current', 'workspace:choose', 'workspace:open', 'workspace:list', 'workspace:read', 'workspace:write', 'workspace:repo-facts', 'workspace:issues',
     'git:status', 'git:initialize', 'git:history', 'git:file-diff', 'git:stage', 'git:stage-all', 'git:unstage', 'git:discard', 'git:commit', 'git:push',
     'terminal:create', 'agent:start', 'agent:submit', 'agent:planner-action', 'agent:worker-action',
     'agent:reconfigure-runtime', 'agent:configure-backoff', 'agent:runtime-options',
@@ -57,6 +57,8 @@ export function registerIpc(window: BrowserWindow, services: Services): void {
   });
   handle('workspace:list', (_event, path: unknown = '') => services.workspace.list(z.string().max(4096).parse(path)));
   handle('workspace:read', (_event, path: unknown) => services.workspace.read(relativePath.parse(path)));
+  handle('workspace:issues', (_event, root: unknown) => services.workspace.issues(z.string().min(1).max(4096).parse(root)));
+  handle('workspace:repo-facts', (_event, root: unknown) => services.workspace.repoFacts(z.string().min(1).max(4096).parse(root)));
   handle('workspace:write', (_event, path: unknown, content: unknown) => (
     services.workspace.write(relativePath.parse(path), z.string().max(10 * 1024 * 1024).parse(content))
   ));

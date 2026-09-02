@@ -8,6 +8,8 @@ const api: WorkbenchApi = {
     open: (root) => ipcRenderer.invoke('workspace:open', root),
     list: (path = '') => ipcRenderer.invoke('workspace:list', path),
     read: (path) => ipcRenderer.invoke('workspace:read', path),
+    issues: (root) => ipcRenderer.invoke('workspace:issues', root),
+    repoFacts: (root) => ipcRenderer.invoke('workspace:repo-facts', root),
     write: (path, content) => ipcRenderer.invoke('workspace:write', path, content),
     onChange: (listener) => subscribe('workspace:changed', listener),
   },

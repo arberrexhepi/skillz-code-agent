@@ -7,7 +7,9 @@
   "scripts": {
     "test:runtime": "node --test scripts/python.test.cjs scripts/agent-runtime.test.cjs scripts/terminal.test.cjs scripts/terminal-panel.test.cjs scripts/runtime-settings.test.cjs scripts/runtime-settings-ipc.test.cjs",
     "test:git": "node --test scripts/git.test.cjs scripts/git-initialize.test.cjs",
-    "test:issues": "node --test scripts/issues.test.cjs scripts/issue-proposals.test.cjs",
+    "test:issues": "node --test scripts/issues.test.cjs scripts/issue-proposals.test.cjs scripts/workspace-issues.test.cjs",
+    "test:paths": "node --test scripts/file-references.test.cjs",
+    "test:facts": "node --test scripts/repo-facts.test.cjs",
     "test:layout": "node --test scripts/workspace-view.test.cjs",
     "test:timeline": "node --test scripts/agent-timeline.test.cjs",
     "test:plans": "node --test scripts/plan-review.test.cjs scripts/discovery-extension.test.cjs",

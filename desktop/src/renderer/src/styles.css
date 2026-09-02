@@ -82,9 +82,9 @@ button { color: inherit; }
   contain: layout paint;
   border-right: 1px solid var(--border);
 }
-.sidebar-tabs { height: 39px; display: flex; border-bottom: 1px solid var(--border); padding: 0 8px; }
+.sidebar-tabs { height: 39px; flex-shrink: 0; display: flex; overflow-x: auto; overflow-y: hidden; border-bottom: 1px solid var(--border); padding: 0 8px; }
 .sidebar-tabs button {
-  position: relative; border: 0; background: transparent; padding: 0 12px; color: var(--muted); font-size: 11px; cursor: pointer;
+  position: relative; border: 0; background: transparent; padding: 0 9px; flex-shrink: 0; color: var(--muted); font-size: 11px; cursor: pointer;
 }
 .sidebar-tabs button.active { color: var(--bright); }
 .sidebar-tabs button.active::after { content: ""; position: absolute; height: 2px; left: 10px; right: 10px; bottom: -1px; background: var(--accent); }

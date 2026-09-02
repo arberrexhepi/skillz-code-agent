@@ -1,3 +1,4 @@
+import { PathText } from './PathText';
 interface IssueCreateFormProps {
   summary: string;
   creating: boolean;
@@ -19,6 +20,6 @@ export function IssueCreateForm({ summary, creating, executionBusy, error, onCha
     {creating && <div className="issue-create-feedback" role="status">{executionBusy
       ? 'Queued for creation. Waiting for the current agent action to finish…'
       : 'Creating issue…'}</div>}
-    {error && <div className="issue-create-feedback error-text" role="alert">{error}</div>}
+    {error && <div className="issue-create-feedback error-text" role="alert"><PathText>{error}</PathText></div>}
   </div>;
 }

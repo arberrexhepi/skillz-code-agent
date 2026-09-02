@@ -22,6 +22,10 @@ Common planner commands: `/reset`, `/start-auto 3 optional prompt`, `/stop-auto`
 
 ## Latest Development Update
 
+File paths throughout the desktop workbench now render as clickable chips, with full-path tooltips and editor navigation to optional line/column references. This includes chat, facts, issues, plans, reports, activity, diagnostics, Git, and terminal shortcuts. Windows paths and quoted Unicode filenames are supported. See [file reference chips](desktop/README.md#file-reference-chips).
+
+The desktop **Issues** and **Repo Facts** tabs extract different views from the saved ledger. **Issues** keeps saved issues and pending suggestions visible with the agent stopped, with Accept, Ignore, Continue, Close, Reopen, lifecycle details, and completed-goal history. **Repo Facts** focuses on architecture/goal facts and provenance, with links back to the related issue. Both refresh on file changes. See the [issues and repository facts guide](desktop/README.md#issues-and-repository-facts).
+
 Discovery can now pause at its action limit or on its last allotted turn to request **1–10 additional turns** when material ambiguity remains. The request shows the turn count, reason, a short investigation proposal, unresolved questions, and findings collected so far.
 
 - **Allow more turns** resumes the same discovery conversation, retaining its history, context, and cumulative budget. Each approved turn also adds one tool-action slot; discovery stays read-only.

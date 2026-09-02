@@ -1,13 +1,21 @@
+import { applyIssueAction, issuesBridge, issuesSnapshot } from './workspace-issues';
+import type { AgentEvent } from '../../src/shared/contracts';
 // Browser-only integration fixture. No Python process, real files, or PTY is used.
 import type { WorkbenchApi } from '../../src/shared/contracts';
 import { timelineFixture, thoughtFixture } from './agent-timeline';
 import { reviewFixture } from './plan-review';
 import { proposalsFixture } from './issue-proposals';
+import { repoFactsMarkdown, repoFactsSnapshot } from './repo-facts';
 
 let root = '/layout-fixture/alpha';
 let terminalCount = 0;
 const noop = () => {};
 const response = async () => ({ ok: true, state: { planner: {}, transcript: [] } });
+const issuesPreview = new URLSearchParams(window.location.search).has('issues');
+let persistedIssues = issuesSnapshot(root);
+let emitAgent: ((event: AgentEvent) => void) | undefined;
+const pathsPreview = new URLSearchParams(window.location.search).has('paths');
+const factsPreview = new URLSearchParams(window.location.search).has('facts') || pathsPreview || issuesPreview;
 const planPreview = new URLSearchParams(window.location.search).has('plan');
 let planState = structuredClone(reviewFixture);
 let failRevision = new URLSearchParams(window.location.search).has('failRevision');
@@ -16,15 +24,17 @@ let suggestionsState = structuredClone(proposalsFixture);
 let failDecision = new URLSearchParams(window.location.search).has('failDecision');
 const status = async () => ({ isRepository: true, branch: 'layout-preview', ahead: 0, behind: 0, files: [{ path: 'example.ts', indexStatus: ' ', workTreeStatus: 'M' }] });
 const info = () => ({ root, name: root.split('/').at(-1)! });
-const document = (path: string, content = '// Unsaved edits stay here when the editor is hidden.\nconst greeting = "Hello";\n') => ({ path, content, language: 'typescript', modifiedAt: 0 });
+const document = (path: string, content = Array.from({ length: pathsPreview ? 80 : 2 }, (_, i) => `// Line ${i + 1} in ${path}`).join('\n')) => ({ path, content, language: 'typescript', modifiedAt: 0 });
 
 window.workbench = {
   workspace: {
     current: async () => info(),
-    choose: async () => { root = root.endsWith('alpha') ? '/layout-fixture/beta' : '/layout-fixture/alpha'; return info(); },
+    choose: async () => { emitAgent?.({ type: 'status', status: 'stopped' }); root = root.endsWith('alpha') ? '/layout-fixture/beta' : '/layout-fixture/alpha'; return info(); },
     open: async (next) => { root = next; return info(); },
     list: async () => [{ name: 'example.ts', path: 'example.ts', kind: 'file' }],
-    read: async (path) => document(path), write: async (path, content) => document(path, content), onChange: () => noop,
+    issues: async (workspaceRoot) => factsPreview && workspaceRoot.endsWith('alpha') ? { ...structuredClone(persistedIssues), workspaceRoot } : { workspaceRoot, status: 'missing', activeIssueId: '', issues: [], proposals: [], warnings: [] },
+    repoFacts: async (workspaceRoot) => factsPreview && workspaceRoot.endsWith('alpha') ? repoFactsSnapshot(workspaceRoot) : { workspaceRoot, path: 'repo_facts.md', status: 'missing' },
+    read: async (path) => { if (path.includes('missing')) throw new Error(`File not found: ${path}`); return factsPreview && path === 'repo_facts.md' ? { ...document(path, repoFactsMarkdown), language: 'markdown' } : document(path); }, write: async (path, content) => document(path, content), onChange: () => noop,
   },
   git: {
     status, initialize: async () => status(), history: async () => [], fileDiff: async (path) => ({ path, original: 'const greeting = "Before";', modified: 'const greeting = "After";', language: 'typescript' }),
@@ -32,11 +42,12 @@ window.workbench = {
   },
   terminal: {
     create: async () => `fixture-terminal-${++terminalCount}`, write: noop, resize: noop, dispose: noop,
-    onEvent: (listener) => { const timer = setTimeout(() => listener({ type: 'data', sessionId: `fixture-terminal-${terminalCount}`, data: '\r\nLayout fixture terminal — no shell connected.\r\n' }), 100); return () => clearTimeout(timer); },
+    onEvent: (listener) => { const timer = setTimeout(() => listener({ type: 'data', sessionId: `fixture-terminal-${terminalCount}`, data: pathsPreview ? '\r\nError /repo/src/app.ts:12:3 — inspect `docs/My kërkesë.md`\r\n' : '\r\nLayout fixture terminal — no shell connected.\r\n' }), 100); return () => clearTimeout(timer); },
   },
   agent: {
-    start: async () => suggestionsPreview ? { ok: true, state: suggestionsState } : planPreview ? { ok: true, state: planState } : response(), submit: response,
+    start: async () => issuesPreview ? (emitAgent?.({ type: 'status', status: 'running' }), { ok: true, state: issuesBridge(persistedIssues) }) : suggestionsPreview ? { ok: true, state: suggestionsState } : planPreview ? { ok: true, state: planState } : response(), submit: response,
     plannerAction: async (action, extras) => {
+      if (issuesPreview) { applyIssueAction(persistedIssues, action, extras); return { ok: true, state: issuesBridge(persistedIssues) }; }
       if (suggestionsPreview) {
         if (failDecision) { failDecision = false; return { ok: false, message: 'Fixture storage is unavailable. Retry your decision.', state: suggestionsState }; }
         const proposals = suggestionsState.planner.worker_state!.issue_proposals!.proposals!;
@@ -59,6 +70,15 @@ window.workbench = {
     chooseCodexCli: async () => null, setCodexCliPath: async () => ({}),
     codexSubscriptionStatus: async () => ({}), codexSubscriptionLogin: async () => ({}), stop: async () => {},
     onEvent: (listener) => {
+      emitAgent = listener;
+      if (issuesPreview) return () => { emitAgent = undefined; };
+      if (pathsPreview) {
+        const timer = setTimeout(() => {
+          listener({ type: 'state', state: { planner: { issue_state: { active_issue: { issue_id: 'issue-paths', status: 'open', request_summary: 'Inspect /repo/src/app.ts:12:3 and docs/guide.md' }, issues: [] }, worker_state: { latest_diagnostics: { diagnostics: [{ file: 'src/app.ts', path: 'src/app.ts', message: 'Check /repo/src/app.ts:12:3', line: 12, column: 3 }] }, current_run_facts: [{ key: 'layout', value: 'Read /repo/src/app.ts:12:3 for the surrounding implementation.' }], issue_context: { run_diagnostics: [{ issue_id: 'diag-path', summary: 'Fix src/app.ts', file: 'src/app.ts', line: 12 }] } } }, transcript: [{ role: 'assistant', content: 'Read `/repo/src/app.ts:12:3` to understand the handler. The surrounding explanation stays readable. Compare [the guide](docs/guide.md#L8) and `docs/My kërkesë.md`. Missing file: src/missing.ts.\n\n```ts\nconst path = "src/app.ts"; // literal code stays intact\n```\n\n[External documentation](https://example.com/src/app.ts)' }] } });
+          listener({ type: 'progress', payload: { type: 'progress', domain: 'worker', action_type: 'cat', path: 'src/app.ts', summary: 'Read /repo/src/app.ts:12:3 and docs/guide.md.' } });
+        }, 100);
+        return () => clearTimeout(timer);
+      }
       if (suggestionsPreview) {
         const timer = setTimeout(() => { listener({ type: 'status', status: 'running' }); listener({ type: 'state', state: suggestionsState }); }, 100);
         return () => clearTimeout(timer);

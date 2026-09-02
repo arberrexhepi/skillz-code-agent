@@ -1,5 +1,9 @@
+import { readWorkspaceIssues } from './workspaceIssues';
+import type { WorkspaceIssuesSnapshot } from '../../shared/workspaceIssues';
 import { promises as fs, watch, type FSWatcher } from 'node:fs';
 import path from 'node:path';
+import { readRepoFacts } from './repoFacts';
+import type { RepoFactsSnapshot } from '../../shared/repoFacts';
 import { dialog, type BrowserWindow } from 'electron';
 import type { FileDocument, FileEntry, WorkspaceInfo } from '../../shared/contracts';
 
@@ -69,6 +73,22 @@ export class WorkspaceService {
         if (left.kind !== right.kind) return left.kind === 'directory' ? -1 : 1;
         return left.name.localeCompare(right.name, undefined, { sensitivity: 'base' });
       });
+  }
+
+  async repoFacts(expectedRoot: string): Promise<RepoFactsSnapshot> {
+    const root = this.requireRoot();
+    if (root !== expectedRoot) throw new Error('Workspace changed. Refresh Repo Facts in the intended folder.');
+    const snapshot = await readRepoFacts(root);
+    if (this.requireRoot() !== root) throw new Error('Workspace changed while reading repo facts.');
+    return snapshot;
+  }
+
+  async issues(expectedRoot: string): Promise<WorkspaceIssuesSnapshot> {
+    const root = this.requireRoot();
+    if (root !== expectedRoot) throw new Error('Workspace changed. Refresh Issues in the intended folder.');
+    const snapshot = await readWorkspaceIssues(root);
+    if (this.requireRoot() !== root) throw new Error('Workspace changed while reading issues.');
+    return snapshot;
   }
 
   async read(relativePath: string): Promise<FileDocument> {

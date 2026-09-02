@@ -1,3 +1,4 @@
+import { PathText } from '../PathText';
 import { useRef, useState } from 'react';
 import { combineSuggestedActions, continuousIsActive } from '../../../../shared/agentCore';
 import type { DiscoveryExtensionRequest, SuggestedAction } from '../../../../shared/agentTypes';
@@ -49,7 +50,7 @@ function ActionButtons({ actions }: { actions: SuggestedAction[] }): React.JSX.E
 }
 
 function Decision({ title, meta, tone = '', children }: { title: string; meta?: string; tone?: string; children: React.ReactNode }): React.JSX.Element {
-  return <section className={`agent-decision ${tone}`}><header><span>DECISION</span><strong>{title}</strong></header>{meta && <p>{meta}</p>}<div className="decision-content">{children}</div></section>;
+  return <section className={`agent-decision ${tone}`}><header><span>DECISION</span><strong>{title}</strong></header>{meta && <p><PathText>{meta}</PathText></p>}<div className="decision-content">{children}</div></section>;
 }
 function humanize(value: string): string { return value.replaceAll('_', ' ').replace(/^./, (letter) => letter.toUpperCase()); }
 
@@ -77,12 +78,12 @@ export function DiscoveryExtensionDecisionCard({ extension, busy, onDecision }: 
   };
   return <Decision title="Continue discovery?" meta={extension.reason} tone="discovery-extension">
       <p>{extension.turns_used}/{extension.turns_max} turns and {extension.tool_calls_used}/{extension.tool_calls_max} tool actions used. Requesting {extension.additional_turns} more {extension.additional_turns === 1 ? 'turn' : 'turns'} and {extension.additional_tool_calls} additional tool actions.</p>
-      <p><strong>Proposal</strong><br />{extension.proposal}</p>
+      <p><strong>Proposal</strong><br /><PathText>{extension.proposal}</PathText></p>
       <p><strong>Unresolved questions</strong></p>
-      <ul>{extension.ambiguities.map((question, index) => <li key={index}>{question}</li>)}</ul>
-      <details><summary>Findings so far</summary><p className="discovery-findings">{extension.findings}</p></details>
+      <ul>{extension.ambiguities.map((question, index) => <li key={index}><PathText>{question}</PathText></li>)}</ul>
+      <details><summary>Findings so far</summary><p className="discovery-findings"><PathText>{extension.findings}</PathText></p></details>
       <p>Continue this discovery with its existing context, or let the planner proceed with these questions still open.</p>
-      {error && <p role="alert">{error}</p>}
+      {error && <p role="alert"><PathText>{error}</PathText></p>}
       <div className="decision-buttons">
         <button type="button" className="primary-button" disabled={busy || sending} onClick={() => void decide(true)}>Allow {extension.additional_turns} more {extension.additional_turns === 1 ? 'turn' : 'turns'}</button>
         <button type="button" disabled={busy || sending} onClick={() => void decide(false)}>Plan with current findings</button>

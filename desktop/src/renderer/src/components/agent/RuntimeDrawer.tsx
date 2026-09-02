@@ -1,3 +1,4 @@
+import { PathChip, PathText } from '../PathText';
 import { useEffect, useMemo, useState } from 'react';
 import { useAgentWorkspace } from '../../agent/agentWorkspace';
 import type { CodexSubscriptionStatus } from '../../../../shared/agentTypes';
@@ -94,7 +95,7 @@ export function RuntimeDrawer({ onClose }: { onClose: () => void }): React.JSX.E
       onPathChange={(value) => { setCliPath(value); setCliError(''); setCliNotice(''); }}
       onChoose={chooseCli} onSave={() => saveCli(cliPath.trim())} onReset={() => saveCli(null)}
     />}
-    {providerOption?.notes && provider !== CODEX_SUBSCRIPTION_PROVIDER && <p className="runtime-provider-note">{String(providerOption.notes)}</p>}
+    {providerOption?.notes && provider !== CODEX_SUBSCRIPTION_PROVIDER && <p className="runtime-provider-note"><PathText>{String(providerOption.notes)}</PathText></p>}
     <button className="primary-button compact" disabled={!provider || !model || Boolean(agent.state.pendingAction) || (provider === CODEX_SUBSCRIPTION_PROVIDER && (!codexStatus?.authenticated || codexStatus?.restart_required))} onClick={() => void agent.switchRuntime(provider, model)}>Apply runtime</button>
     <label>Backend<select value={agent.runtime.backendScript} disabled={agent.state.status === 'running'} onChange={(event) => agent.setRuntime({ backendScript: event.target.value })}><option value="main.py">Stable runtime</option><option value="main_v2.py">Beta TreeLoop</option><option value="live_test_loop.py">Live TreeLoop</option></select></label>
     <div className="runtime-backoff"><label>Token backoff (K)<input type="number" min="0" value={limit} onChange={(event) => setLimit(Math.max(0, Number(event.target.value)))} /></label><button onClick={() => void agent.setBackoff(limit > 0, limit)}>{limit > 0 ? 'Enable' : 'Disable'}</button></div>
@@ -135,9 +136,9 @@ export function CodexSubscriptionCard({
   return <div className={`runtime-subscription ${status?.authenticated ? 'connected' : ''}`}>
     <div><span>LOCAL SESSION</span><strong>{state}</strong></div>
     <p>Uses your local Codex ChatGPT subscription allowance. OpenAI API-key invocation remains a separate provider.</p>
-    {status?.error && <small className="runtime-cli-message" role="alert">{status.error}</small>}
+    {status?.error && <small className="runtime-cli-message" role="alert"><PathText>{status.error}</PathText></small>}
     {status?.cli_version && <small>{status.cli_version}</small>}
-    {status?.cli_path && <small className="runtime-cli-message">Using {status.cli_path_source === 'settings' ? 'saved path' : status.cli_path_source === 'environment' ? 'environment override' : 'detected path'}: {status.cli_path}</small>}
+    {status?.cli_path && <small className="runtime-cli-message">Using {status.cli_path_source === 'settings' ? 'saved path' : status.cli_path_source === 'environment' ? 'environment override' : 'detected path'}: <PathChip path={status.cli_path} /></small>}
     <fieldset className="runtime-cli-location" disabled={busy}>
       <legend>Locate Codex CLI</legend>
       <p>Choose an executable if automatic discovery fails. Saved only on this computer.</p>
@@ -154,8 +155,8 @@ export function CodexSubscriptionCard({
         <p>macOS / Linux: run <code>command -v codex</code> in Terminal and paste the path. Choose the <code>codex</code> executable, without command arguments.</p>
       </details>
     </fieldset>
-    {cliError && <small className="runtime-cli-message runtime-cli-error" role="alert">{cliError}</small>}
-    {cliNotice && <small className="runtime-cli-message" role="status">{cliNotice}</small>}
+    {cliError && <small className="runtime-cli-message runtime-cli-error" role="alert"><PathText>{cliError}</PathText></small>}
+    {cliNotice && <small className="runtime-cli-message" role="status"><PathText>{cliNotice}</PathText></small>}
     {status?.restart_required && <p role="status">Stop and start the agent to use this CLI path for model turns. Status and sign-in already use the new setting.</p>}
     <footer>
       <button disabled={busy} onClick={() => void onRefresh()}>Refresh</button>

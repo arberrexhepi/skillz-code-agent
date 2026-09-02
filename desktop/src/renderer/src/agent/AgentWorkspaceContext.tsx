@@ -21,7 +21,10 @@ export function AgentWorkspaceProvider({ children }: { children: React.ReactNode
   useEffect(() => window.workbench.agent.onEvent((event: AgentEvent) => {
     if (event.type === 'state') dispatch({ type: 'bridge-state', state: event.state });
     if (event.type === 'progress') dispatch({ type: 'progress', progress: event.payload });
-    if (event.type === 'status') dispatch({ type: 'status', status: event.status, message: event.message });
+    if (event.type === 'status') {
+      if (event.status === 'stopped') dispatch({ type: 'reset' });
+      else dispatch({ type: 'status', status: event.status, message: event.message });
+    }
     if (event.type === 'stderr') dispatch({ type: 'notice', message: event.message });
   }), []);
 

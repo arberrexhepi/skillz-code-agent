@@ -1,3 +1,6 @@
+import type { WorkspaceIssuesSnapshot } from './workspaceIssues';
+import type { RepoFactsSnapshot } from './repoFacts';
+
 export interface WorkspaceInfo {
   root: string;
   name: string;
@@ -96,6 +99,8 @@ export interface WorkbenchApi {
     open(root: string): Promise<WorkspaceInfo>;
     list(path?: string): Promise<FileEntry[]>;
     read(path: string): Promise<FileDocument>;
+    repoFacts(workspaceRoot: string): Promise<RepoFactsSnapshot>;
+    issues(workspaceRoot: string): Promise<WorkspaceIssuesSnapshot>;
     write(path: string, content: string): Promise<FileDocument>;
     onChange(listener: (paths: string[]) => void): () => void;
   };

@@ -37,6 +37,7 @@ function fixture(t) {
   });
   const fakeReact = {
     ...React,
+    useContext: () => null,
     useRef: () => ({ current: {} }),
     useState: (initial) => [initial, (value) => labels.push(value)],
     useEffect: (effect) => effects.push(effect),

@@ -1,3 +1,4 @@
+import { PathText } from './PathText';
 import { useRef, useState } from 'react';
 import type { IssueProposal } from '../../../shared/agentTypes';
 
@@ -9,7 +10,7 @@ export function AgentSuggestions({ proposals, error, busy, onDecide }: {
   return <section className="agent-suggestions" aria-label="Agent suggestions">
     <header>AGENT SUGGESTIONS <span>{proposals.length}</span></header>
     <p>Outside the current goal. Already deferred—not waiting on your decision to continue.</p>
-    {error && <p role="alert">{error}</p>}
+    {error && <p role="alert"><PathText>{error}</PathText></p>}
     {proposals.map((proposal) => <Suggestion key={proposal.proposal_id} proposal={proposal} busy={busy} onDecide={onDecide} />)}
   </section>;
 }
@@ -28,13 +29,13 @@ function Suggestion({ proposal, busy, onDecide }: { proposal: IssueProposal; bus
     finally { inFlight.current = false; setPending(''); }
   };
   return <article className="agent-suggestion">
-    <details><summary>{proposal.summary}<small>Agent-authored · Deferred</small></summary>
-      <h4>Why separate</h4><p>{proposal.reason}</p><h4>Evidence</h4><p>{proposal.evidence}</p>
-      {!!proposal.paths.length && <p className="suggestion-paths">{proposal.paths.join('\n')}</p>}
+    <details><summary><PathText>{proposal.summary}</PathText><small>Agent-authored · Deferred</small></summary>
+      <h4>Why separate</h4><p><PathText>{proposal.reason}</PathText></p><h4>Evidence</h4><p><PathText>{proposal.evidence}</PathText></p>
+      {!!proposal.paths.length && <p className="suggestion-paths"><PathText>{proposal.paths.join('\n')}</PathText></p>}
       {proposal.parent_issue_id && <small>Found while working on {proposal.parent_issue_id}</small>}
     </details>
     <div className="suggestion-actions"><button type="button" disabled={!!pending} onClick={() => void decide('accept')}>Accept</button><button type="button" disabled={!!pending} onClick={() => void decide('ignore')}>Ignore</button></div>
     {pending && <p role="status">{busy ? 'Decision queued after the current agent action.' : 'Saving decision…'}</p>}
-    {error && <p role="alert">{error}</p>}
+    {error && <p role="alert"><PathText>{error}</PathText></p>}
   </article>;
 }

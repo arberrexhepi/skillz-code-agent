@@ -1,3 +1,4 @@
+import { PathText } from './PathText';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { GitCommit, GitStatus } from '../../../shared/contracts';
 import { isStaged, isUnstaged } from '../../../shared/gitStatus';
@@ -109,7 +110,7 @@ export function GitPanel({ workspaceRoot, revision, onOpenDiff, onStatus, onBefo
     onInitialize={initialize} onRefresh={refresh}
   />;
   if (error && !status) return <div className="git-setup">
-    <p className="error-text" role="alert">{error}</p>
+    <p className="error-text" role="alert"><PathText>{error}</PathText></p>
     <button type="button" onClick={() => void refresh()}>Retry</button>
   </div>;
   if (!status) return <div className="panel-message" role="status">Checking repository…</div>;
@@ -138,7 +139,7 @@ export function GitPanel({ workspaceRoot, revision, onOpenDiff, onStatus, onBefo
           <button type="button" className={`sync-button ${sync.pending ? 'pending' : ''}`} disabled={sync.disabled} title={sync.title} onClick={() => void mutate('__push__', () => window.workbench.git.push())}>{sync.label}</button>
         </div>
       </div>
-      {error && <div className="inline-error">{error}</div>}
+      {error && <div className="inline-error"><PathText>{error}</PathText></div>}
       <div className="git-files">
         {status?.files.length === 0 && <div className="panel-message">Working tree is clean.</div>}
         {status?.files.map((file) => (
@@ -172,7 +173,7 @@ export function GitRepositorySetup({ workspaceRoot, busy, error, onInitialize, o
     <p>This folder isn’t a Git repository yet. Create a local repository to review changes and save commits.</p>
     <code className="git-setup-path">{workspaceRoot}</code>
     <p className="git-setup-hint">After setup, choose which files to stage for your first commit.</p>
-    {error && <p className="error-text" role="alert">{error}</p>}
+    {error && <p className="error-text" role="alert"><PathText>{error}</PathText></p>}
     <button type="button" className="primary-button" disabled={busy} onClick={() => void onInitialize()}>
       {busy ? 'Initializing…' : 'Initialize repository'}
     </button>
@@ -188,11 +189,12 @@ function GitHistory({ commits }: { commits: GitCommit[] }): React.JSX.Element {
     return <article className={`git-commit ${expanded ? 'expanded' : ''}`} key={commit.hash}>
       <button type="button" className="git-commit-toggle" aria-expanded={expanded} onClick={() => setExpandedHash((current) => current === commit.hash ? '' : commit.hash)}>
         <span className={`commit-node ${commit.parents.length > 1 ? 'merge' : ''}`} />
-        <span className="commit-copy"><strong>{commit.subject || 'Untitled commit'}</strong><small>{commit.authorName} · {relativeDate(commit.authoredAt)}</small></span>
+        <span className="commit-copy"><small>{commit.authorName} · {relativeDate(commit.authoredAt)}</small></span>
         <code>{commit.shortHash}</code>
       </button>
+      <p className="git-commit-subject"><PathText>{commit.subject || 'Untitled commit'}</PathText></p>
       {expanded && <div className="git-commit-details">
-        {commit.body && <p>{commit.body}</p>}
+        {commit.body && <p><PathText>{commit.body}</PathText></p>}
         <dl><div><dt>Commit</dt><dd>{commit.hash}</dd></div><div><dt>Author</dt><dd>{commit.authorName} &lt;{commit.authorEmail}&gt;</dd></div><div><dt>Date</dt><dd>{formatDate(commit.authoredAt)}</dd></div>{commit.parents.length > 1 && <div><dt>Parents</dt><dd>{commit.parents.map((parent) => parent.slice(0, 8)).join(', ')}</dd></div>}</dl>
       </div>}
     </article>;

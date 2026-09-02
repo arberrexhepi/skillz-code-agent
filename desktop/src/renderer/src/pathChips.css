@@ -1,0 +1,40 @@
+/* Shared file references in prose, metadata and terminal file shortcuts. */
+.path-chip, .markdown-message .path-chip {
+  display: inline-flex; align-items: baseline; vertical-align: baseline; gap: 0;
+  max-width: min(100%, 42ch); min-width: 0; padding: 1px 5px; margin: 1px 2px;
+  border: 1px solid #34504b; border-radius: 5px; background: #14231f;
+  color: #b1dfca; font-family: 'Cascadia Code', 'SFMono-Regular', monospace;
+  font-size: max(11px, .9em); line-height: 1.4; text-decoration: none; text-transform: none;
+  letter-spacing: normal; font-weight: 400; white-space: nowrap; cursor: pointer;
+}
+.path-chip-directory { overflow: hidden; text-overflow: ellipsis; color: #82a99c; flex: 0 1 auto; min-width: 0; }
+.path-chip-name { overflow: hidden; text-overflow: ellipsis; flex: 0 1 auto; min-width: 0; font-weight: 550; }
+.path-chip-directory + .path-chip-name { flex-shrink: 0; max-width: 29ch; }
+.path-chip-icon { margin-right: 4px; flex: 0 0 auto; color: #83c9a9; }
+a.path-chip:hover { color: #e0ffef; background: #203a30; border-color: #69a388; }
+a.path-chip:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.path-chip.unavailable { color: #b5bac0; background: #1b2026; border-color: #3c444d; cursor: default; }
+.path-chip.unavailable :is(.path-chip-icon, .path-chip-directory) { color: #929ba5; }
+code:has(> .path-chip) { background: transparent; padding: 0; }
+.terminal-file-paths { display: flex; align-items: center; gap: 4px; padding: 3px 8px; overflow-x: auto; flex: 0 0 auto; font-size: 11px; }
+.terminal-file-paths > span { color: var(--muted); white-space: nowrap; }
+.terminal-file-paths .path-chip { flex-shrink: 0; max-width: 32ch; }
+.git-file-reference { flex: 1; min-width: 0; }
+.git-file-reference .path-chip { max-width: 100%; font-size: 10px; }
+.issue-path-summary, .repo-facts-path-summary { margin: 0; padding: 0 9px 8px; font-size: 11px; color: #a8b2bd; }
+
+.global-error > button, .agent-notice > button { flex: 0 0 auto; margin-left: auto; border: 0; background: transparent; color: inherit; cursor: pointer; }
+.activity-row, .problem-row { text-align: left; }
+
+.path-chip > span { display: inline; margin: 0; font-size: inherit; line-height: inherit; white-space: nowrap; }
+.path-chip > .path-chip-icon { margin-right: 4px; color: #83c9a9; }
+.path-chip > .path-chip-directory { color: #82a99c; }
+.path-chip > .path-chip-name { color: inherit; }
+.activity-row strong, .problem-row strong, .run-diagnostic strong { white-space: normal; overflow-wrap: anywhere; }
+.activity-row > div > span { white-space: normal; }
+.activity-row .path-chip, .problem-row .path-chip { align-self: flex-start; }
+.global-error, .agent-notice { cursor: default; align-items: flex-start; }
+.global-error > .error-copy, .agent-notice > .notice-copy { min-width: 0; overflow-wrap: anywhere; }
+.agent-notice { max-height: 110px; overflow-y: auto; }
+
+.git-commit-subject { margin: 0 10px 9px 29px; font-size: 11px; color: #b2bec9; overflow-wrap: anywhere; }
