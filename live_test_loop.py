@@ -26,7 +26,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 # Load .env without overriding existing variables.
 env_path = Path(__file__).parent / ".env"
 if env_path.exists():
-    for line in env_path.read_text().splitlines():
+    for line in env_path.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if line and not line.startswith("#") and "=" in line:
             key, _, val = line.partition("=")
@@ -2765,6 +2765,8 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
             cwd=str(self.root),
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            env={**os.environ, "PYTHONIOENCODING": "utf-8"},
             timeout=60,
         )
         raw = completed.stdout.strip() or completed.stderr.strip()
@@ -3167,6 +3169,8 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
                 cwd=str(self.root),
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=timeout,
             )
         except subprocess.TimeoutExpired:

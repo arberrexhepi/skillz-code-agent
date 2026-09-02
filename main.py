@@ -560,9 +560,12 @@ class ToolbeltRunner:
 
     def call(self, subcommand: str, *args: str) -> Dict[str, Any]:
         cmd = [sys.executable, str(self.tool_script), subcommand, "--root", str(self.root), *args]
+        # Toolbelt JSON is UTF-8 on both sides, including outside the desktop bridge.
         result = subprocess.run(
             cmd,
             text=True,
+            encoding="utf-8",
+            env={**os.environ, "PYTHONIOENCODING": "utf-8"},
             capture_output=True,
             timeout=self.timeout,
         )
@@ -814,7 +817,10 @@ def run_shell(root: Path, command: str, timeout: int = 60) -> Dict[str, Any]:
         command,
         cwd=str(root),
         shell=True,
+        env={**os.environ, "PYTHONIOENCODING": "utf-8"},
         text=True,
+        encoding="utf-8",
+        errors="replace",
         capture_output=True,
         timeout=timeout,
     )

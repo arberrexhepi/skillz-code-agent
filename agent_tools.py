@@ -1095,6 +1095,7 @@ def cmd_grep(args: argparse.Namespace) -> None:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
         )
         matches: List[Dict[str, Any]] = []
         limit_reached = False
@@ -1205,7 +1206,7 @@ def cmd_find(args: argparse.Namespace) -> None:
         for skip_dir in sorted(SKIP_DIRS):
             cmd.extend(["-g", f"!**/{skip_dir}/**"])
         cmd.extend(["-g", args.glob, str(base)])
-        result = subprocess.run(cmd, cwd=str(root), text=True, capture_output=True, timeout=20)
+        result = subprocess.run(cmd, cwd=str(root), text=True, encoding="utf-8", errors="replace", capture_output=True, timeout=20)
         if result.returncode not in {0, 1}:
             err(tool, "FIND_FAILED", result.stderr.strip() or "rg --files failed")
         files = [line.strip() for line in result.stdout.splitlines() if line.strip()][: args.limit]
@@ -1260,7 +1261,10 @@ def cmd_run(args: argparse.Namespace) -> None:
         result = subprocess.run(
             args.command,
             cwd=str(root),
+            env={**os.environ, "PYTHONIOENCODING": "utf-8"},
             text=True,
+            encoding="utf-8",
+            errors="replace",
             capture_output=True,
             timeout=args.timeout,
         )
@@ -1288,6 +1292,8 @@ def git_diff(root: Path) -> str:
             ["git", "diff", "--", "."],
             cwd=str(root),
             text=True,
+            encoding="utf-8",
+            errors="replace",
             capture_output=True,
             timeout=20,
         )
@@ -1303,6 +1309,8 @@ def run_git(root: Path, args: List[str], timeout: int = 20) -> subprocess.Comple
         ["git", *args],
         cwd=str(root),
         text=True,
+        encoding="utf-8",
+        errors="replace",
         capture_output=True,
         timeout=timeout,
     )

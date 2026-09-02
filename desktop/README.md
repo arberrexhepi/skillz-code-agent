@@ -19,7 +19,9 @@ Electron desktop shell for the Python planner/worker. The application is intenti
 
 The workbench now discovers Python through the Windows launcher as well as executable paths and repository virtual environments. Codex discovery also checks the Windows desktop application's versioned runtimes. Runtime settings provide a native file picker, a pasted-path fallback, validation before saving, and restart guidance when a running agent still uses the previous CLI selection.
 
-Python bridge streams and Codex subprocess pipes explicitly use UTF-8, including streaming and non-streaming model turns, account/login responses, version checks, and app-server traffic. This fixes invalid UTF-8 stdin failures after successful authentication. The Windows terminal uses native node-pty encoding, avoiding the unsupported encoding warning.
+Python bridge streams, toolbelt results, and Codex subprocess pipes explicitly use UTF-8, including streaming and non-streaming model turns, account/login responses, version checks, and app-server traffic. This fixes invalid UTF-8 stdin failures after successful authentication. Git and diagnostic output also use UTF-8, and repository reads and edits preserve Unicode instead of using the Windows code page. The Windows terminal uses native node-pty encoding, avoiding the unsupported encoding warning.
+
+Repository discovery returns forward-slash virtual paths consistently across platforms, and directory scans skip Windows junctions as well as symlinks. Run `py -3 -m unittest test_repository_discovery test_tree_commands test_discovery_remediation` from the repository root for these checks. Only file-symlink cases skip when Windows lacks the necessary privileges; junction and other workspace-boundary checks still run.
 
 Source Control now offers local repository initialization for a new project folder. See [Starting a Git repository](#starting-a-git-repository), [Runtime boundaries](#runtime-boundaries), and [Python resolution](#python-resolution) for the corresponding setup details.
 
@@ -135,7 +137,7 @@ npm run dev
 
 For an existing interpreter, set `$env:PYTHON_AGENT_PYTHON = 'C:\Path With Spaces\Python\python.exe'` before `npm run dev`. The `py` launcher also works without a virtual environment. If Python is not installed, install Python 3 with its Windows launcher and restart your terminal before setup. Packaged apps can use the same environment override.
 
-Runtime and terminal regression checks: `npm run test:runtime`. From the repository root, run `py -3 -m unittest test_codex_subscription test_codex_discovery test_codex_utf8` (or use the repository virtual environment) for Codex discovery and Unicode subprocess regressions. These checks use local fixtures without authenticating or making model calls.
+Runtime and terminal regression checks: `npm run test:runtime`. From the repository root, run `py -3 -m unittest test_codex_subscription test_codex_discovery test_codex_utf8 test_windows_text_encoding` (or use the repository virtual environment) for Codex discovery and Unicode subprocess regressions. These checks use local fixtures without authenticating or making model calls.
 
 Packaged builds include the Python agent source, but they do not yet embed a Python interpreter or provider wheels. A distributable release should ship a frozen, platform-specific Python sidecar so end users do not need to configure Python themselves.
 

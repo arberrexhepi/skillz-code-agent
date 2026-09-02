@@ -26,9 +26,10 @@ The desktop workbench now handles common Windows setup failures, provides a manu
 
 - **Windows Python discovery:** agent startup, runtime options, and Codex status/login share interpreter detection. The workbench checks an explicit override and the repository virtual environment, then tries `python`, the Windows `py -3` launcher, and `python3`. This fixes `spawn python ENOENT` when Python is installed through the launcher but absent from `PATH`.
 - **Codex discovery and manual setup:** Windows discovery recognizes the local Codex desktop application's versioned runtime directories. In Runtime settings, users can browse or paste a CLI executable, validate it with **Save and check**, and keep the selection on their computer. **Use automatic discovery** restores normal lookup; changing a running agent's CLI path displays restart guidance.
-- **UTF-8 message handling:** Python bridge streams and Codex subprocess pipes use explicit UTF-8. Prompts, responses, account status, and model discovery handle accented text, multilingual content, and emoji without Windows code-page conversion. This fixes the invalid UTF-8 stdin error that could occur even after successful Codex authentication.
+- **UTF-8 message handling:** Python bridge streams, toolbelt results, Codex subprocess pipes, Git output, and diagnostic commands use explicit UTF-8. Repository text reads and edits also specify UTF-8. Prompts, responses, account status, and model discovery handle accented text, multilingual content, and emoji without Windows code-page conversion. This fixes the invalid UTF-8 stdin error that could occur even after successful Codex authentication.
 - **Windows terminal compatibility:** the embedded terminal uses node-pty's native Windows encoding behavior, removing the unsupported encoding warning.
 - **New repository setup:** Source Control offers **Initialize repository** for folders without Git metadata, then shows files ready for staging and a first commit. It recognizes existing repositories and worktrees, preserves actionable errors, and rejects initialization requests for a folder the user has already switched away from.
+- **Consistent repository discovery:** file, directory, and symbol searches return forward-slash virtual paths on Windows, macOS, and Linux. Directory scans skip symlinks and Windows junctions, keeping searches within the workspace and avoiding linked-directory traversal errors.
 - **Regression coverage:** focused Python and desktop tests cover discovery, saved CLI settings, UTF-8 subprocess traffic, terminal options, and Git initialization. Browser fixtures exercise setup, retry, and concurrent refresh behavior; Git fixtures account for Windows line endings and symlink privileges.
 
 See [Windows quick start](#windows-quick-start) and the [desktop guide](desktop/README.md) for setup and verification commands. Packaged builds still require a separately installed Python interpreter and provider dependencies.
@@ -131,14 +132,15 @@ For a local ChatGPT subscription, select **Codex / ChatGPT subscription** in Run
 Run the focused checks from the repository root:
 
 ```powershell
-.\.venv\Scripts\python.exe -m unittest test_codex_subscription test_codex_discovery test_codex_utf8
+.\.venv\Scripts\python.exe -m unittest test_codex_subscription test_codex_discovery test_codex_utf8 test_windows_text_encoding
+.\.venv\Scripts\python.exe -m unittest test_repository_discovery test_tree_commands test_discovery_remediation
 cd desktop
 npm run test:runtime
 npm run test:git
 npm run build
 ```
 
-The file-symlink Git test reports a skip on Windows when Developer Mode or symlink privileges are unavailable; the remaining Git checks still run.
+File-symlink tests report a skip on Windows when Developer Mode or symlink privileges are unavailable. Directory-junction, excluded-directory, and parent-traversal checks still run without those privileges.
 
 ## Run
 

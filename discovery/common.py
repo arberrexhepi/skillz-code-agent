@@ -4,6 +4,7 @@ import fnmatch
 import hashlib
 import os
 import re
+import stat
 import subprocess
 from pathlib import Path, PurePosixPath
 from typing import Iterable, Iterator, Optional, Sequence
@@ -88,6 +89,18 @@ def matches_glob(rel_path: str, pattern: str) -> bool:
     return False
 
 
+def is_directory_link(path: Path) -> bool:
+    """Do not recurse into symlinks or Windows junctions (including on Python 3.11)."""
+    try:
+        info = path.lstat()
+    except OSError:
+        return True  # Missing or inaccessible entries cannot be scanned safely.
+    return stat.S_ISLNK(info.st_mode) or (
+        getattr(info, "st_reparse_tag", None)
+        == getattr(stat, "IO_REPARSE_TAG_MOUNT_POINT", 0xA0000003)
+    )
+
+
 def iter_files(root: Path, include_hidden: bool = False) -> Iterable[Path]:
     for current_root, dirnames, filenames in os.walk(root):
         current_path = Path(current_root)
@@ -95,7 +108,7 @@ def iter_files(root: Path, include_hidden: bool = False) -> Iterable[Path]:
         dirnames[:] = [
             name for name in dirnames
             if name not in SKIP_DIRS and (include_hidden or not is_hidden_name(name))
-            and not (current_path / name).is_symlink()
+            and not is_directory_link(current_path / name)
         ]
         if should_skip_relative_parts(rel_dir.parts, include_hidden):
             dirnames[:] = []
@@ -116,7 +129,7 @@ def iter_tree(base: Path, include_hidden: bool, max_depth: int) -> Iterator[Path
         dirnames[:] = [
             name for name in dirnames
             if name not in SKIP_DIRS and (include_hidden or not is_hidden_name(name))
-            and not (current_path / name).is_symlink()
+            and not is_directory_link(current_path / name)
         ]
         if depth >= max_depth:
             dirnames[:] = []
@@ -202,7 +215,7 @@ def tokenise_query(value: str) -> list[str]:
 
 
 def run_git(root: Path, args: list[str], timeout: int = 20) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(["git", *args], cwd=str(root), text=True, capture_output=True, timeout=timeout)
+    return subprocess.run(["git", *args], cwd=str(root), text=True, encoding="utf-8", errors="replace", capture_output=True, timeout=timeout)
 
 
 def ensure_git_repo(root: Path) -> bool:
@@ -266,7 +279,7 @@ def iter_files(root: Path, include_hidden: bool = False) -> Iterable[Path]:
         dirnames[:] = [
             name for name in dirnames
             if name not in SKIP_DIRS and (include_hidden or not is_hidden_name(name))
-            and not (current_path / name).is_symlink()
+            and not is_directory_link(current_path / name)
         ]
         if should_skip_relative_parts(rel_dir.parts, include_hidden):
             dirnames[:] = []
@@ -287,7 +300,7 @@ def iter_tree(base: Path, include_hidden: bool, max_depth: int) -> Iterator[Path
         dirnames[:] = [
             name for name in dirnames
             if name not in SKIP_DIRS and (include_hidden or not is_hidden_name(name))
-            and not (current_path / name).is_symlink()
+            and not is_directory_link(current_path / name)
         ]
         if depth >= max_depth:
             dirnames[:] = []
@@ -373,7 +386,7 @@ def tokenise_query(value: str) -> list[str]:
 
 
 def run_git(root: Path, args: list[str], timeout: int = 20) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(["git", *args], cwd=str(root), text=True, capture_output=True, timeout=timeout)
+    return subprocess.run(["git", *args], cwd=str(root), text=True, encoding="utf-8", errors="replace", capture_output=True, timeout=timeout)
 
 
 def ensure_git_repo(root: Path) -> bool:
