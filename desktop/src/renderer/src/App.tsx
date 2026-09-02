@@ -40,6 +40,7 @@ function WorkbenchApp(): React.JSX.Element {
       const selected = await window.workbench.workspace.choose();
       if (!selected) return;
       setWorkspace(selected);
+      setGitStatus(null);
       setTabs([]);
       setActiveId('');
       setRevision((value) => value + 1);
@@ -165,7 +166,7 @@ function WorkbenchApp(): React.JSX.Element {
           <div className="sidebar-content">
             {!workspace && <div className="panel-message">Open a repository to begin.</div>}
             {workspace && sidebarMode === 'files' && <FileExplorer revision={revision} onOpenFile={(path) => void openFile(path)} />}
-            {workspace && sidebarMode === 'git' && <GitPanel key={workspace.root} revision={revision} onOpenDiff={(path, staged) => void openDiff(path, staged)} onStatus={setGitStatus} onBeforeDiscard={canDiscardPath} onDiscard={refreshDiscardedPath} />}
+            {workspace && sidebarMode === 'git' && <GitPanel key={workspace.root} workspaceRoot={workspace.root} revision={revision} onOpenDiff={(path, staged) => void openDiff(path, staged)} onStatus={setGitStatus} onBeforeDiscard={canDiscardPath} onDiscard={refreshDiscardedPath} />}
             {workspace && sidebarMode === 'issues' && <AgentIssues onOpenPath={(path) => void openFile(path)} />}
           </div>
         </aside>

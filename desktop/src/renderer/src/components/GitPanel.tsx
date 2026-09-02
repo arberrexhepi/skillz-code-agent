@@ -1,9 +1,10 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import type { GitCommit, GitStatus } from '../../../shared/contracts';
 import { isStaged, isUnstaged } from '../../../shared/gitStatus';
 import { GitChangeRow } from './GitChangeRow';
 
 interface GitPanelProps {
+  workspaceRoot: string;
   revision: number;
   onOpenDiff: (path: string, staged: boolean) => void;
   onStatus: (status: GitStatus | null) => void;
@@ -11,23 +12,36 @@ interface GitPanelProps {
   onDiscard: (path: string) => Promise<void>;
 }
 
-export function GitPanel({ revision, onOpenDiff, onStatus, onBeforeDiscard, onDiscard }: GitPanelProps): React.JSX.Element {
+export function GitPanel({ workspaceRoot, revision, onOpenDiff, onStatus, onBeforeDiscard, onDiscard }: GitPanelProps): React.JSX.Element {
   const [status, setStatus] = useState<GitStatus | null>(null);
   const [history, setHistory] = useState<GitCommit[]>([]);
   const [mode, setMode] = useState<'changes' | 'history'>('changes');
   const [commitMessage, setCommitMessage] = useState('');
   const [error, setError] = useState('');
   const [busyPath, setBusyPath] = useState('');
+  const mutationPending = useRef(false);
+  const refreshVersion = useRef(0);
+  const mounted = useRef(true);
+  useEffect(() => {
+    mounted.current = true;
+    return () => { mounted.current = false; refreshVersion.current += 1; };
+  }, []);
 
   const refresh = useCallback(async (): Promise<void> => {
+    if (mutationPending.current) return;
+    const request = ++refreshVersion.current;
     try {
-      const [next, commits] = await Promise.all([window.workbench.git.status(), window.workbench.git.history(75)]);
+      const next = await window.workbench.git.status();
+      const commits = next.isRepository ? await window.workbench.git.history(75) : [];
+      if (!mounted.current || request !== refreshVersion.current) return;
       setStatus(next);
       setHistory(commits);
-      onStatus(next);
+      onStatus(next.isRepository ? next : null);
       setError('');
     } catch (cause) {
+      if (!mounted.current || request !== refreshVersion.current) return;
       setStatus(null);
+      setHistory([]);
       onStatus(null);
       setError(cleanError(cause));
     }
@@ -36,19 +50,30 @@ export function GitPanel({ revision, onOpenDiff, onStatus, onBeforeDiscard, onDi
   useEffect(() => { void refresh(); }, [refresh, revision]);
 
   const mutate = async (path: string, operation: () => Promise<GitStatus>): Promise<boolean> => {
+    if (mutationPending.current) return false;
+    mutationPending.current = true;
+    refreshVersion.current += 1;
     setBusyPath(path);
     try {
       const next = await operation();
+      if (!mounted.current) return false;
       setStatus(next);
-      onStatus(next);
+      onStatus(next.isRepository ? next : null);
       setError('');
       return true;
     } catch (cause) {
-      setError(cleanError(cause));
+      if (mounted.current) setError(cleanError(cause));
       return false;
     } finally {
-      setBusyPath('');
+      mutationPending.current = false;
+      if (mounted.current) setBusyPath('');
     }
+  };
+
+  const initialize = async (): Promise<void> => {
+    if (!(await mutate('__initialize__', () => window.workbench.git.initialize(workspaceRoot)))) return;
+    setMode('changes');
+    await refresh();
   };
 
   const commit = async (): Promise<void> => {
@@ -79,13 +104,21 @@ export function GitPanel({ revision, onOpenDiff, onStatus, onBeforeDiscard, onDi
   const unstagedCount = status?.files.filter(isUnstaged).length || 0;
   const sync = syncState(status, history.length > 0, busyPath);
 
-  if (error && !status) return <div className="panel-message error-text">{error}</div>;
+  if (status?.isRepository === false) return <GitRepositorySetup
+    workspaceRoot={workspaceRoot} busy={Boolean(busyPath)} error={error}
+    onInitialize={initialize} onRefresh={refresh}
+  />;
+  if (error && !status) return <div className="git-setup">
+    <p className="error-text" role="alert">{error}</p>
+    <button type="button" onClick={() => void refresh()}>Retry</button>
+  </div>;
+  if (!status) return <div className="panel-message" role="status">Checking repository…</div>;
   return (
     <div className="git-panel">
       <div className="git-summary">
         <span className="branch-mark">⑂</span>
         <span>{status?.branch || 'Repository'}</span>
-        <button type="button" className="icon-button push-right" onClick={() => void refresh()} title="Refresh Git status">↻</button>
+        <button type="button" className="icon-button push-right" disabled={Boolean(busyPath)} onClick={() => void refresh()} title="Refresh Git status">↻</button>
       </div>
       <div className="git-view-tabs">
         <button type="button" className={mode === 'changes' ? 'active' : ''} onClick={() => setMode('changes')}>Changes{status?.files.length ? <span>{status.files.length}</span> : null}</button>
@@ -124,6 +157,27 @@ export function GitPanel({ revision, onOpenDiff, onStatus, onBeforeDiscard, onDi
       {mode === 'history' && <GitHistory commits={history} />}
     </div>
   );
+}
+
+export function GitRepositorySetup({ workspaceRoot, busy, error, onInitialize, onRefresh }: {
+  workspaceRoot: string;
+  busy: boolean;
+  error: string;
+  onInitialize: () => Promise<void>;
+  onRefresh: () => Promise<void>;
+}): React.JSX.Element {
+  return <section className="git-setup" aria-labelledby="git-setup-title" aria-busy={busy}>
+    <span className="git-setup-icon" aria-hidden="true">⑂</span>
+    <h3 id="git-setup-title">Start tracking your project</h3>
+    <p>This folder isn’t a Git repository yet. Create a local repository to review changes and save commits.</p>
+    <code className="git-setup-path">{workspaceRoot}</code>
+    <p className="git-setup-hint">After setup, choose which files to stage for your first commit.</p>
+    {error && <p className="error-text" role="alert">{error}</p>}
+    <button type="button" className="primary-button" disabled={busy} onClick={() => void onInitialize()}>
+      {busy ? 'Initializing…' : 'Initialize repository'}
+    </button>
+    <button type="button" className="ghost-button" disabled={busy} onClick={() => void onRefresh()}>Check again</button>
+  </section>;
 }
 
 function GitHistory({ commits }: { commits: GitCommit[] }): React.JSX.Element {

@@ -15,6 +15,14 @@ Electron desktop shell for the Python planner/worker. The application is intenti
 - per-workspace view preferences: hide/show the editor and resize the agent panel without losing tabs, drafts, or terminal sessions
 - sandboxed renderer with a narrow, validated preload API
 
+## Windows compatibility improvements
+
+The workbench now discovers Python through the Windows launcher as well as executable paths and repository virtual environments. Codex discovery also checks the Windows desktop application's versioned runtimes. Runtime settings provide a native file picker, a pasted-path fallback, validation before saving, and restart guidance when a running agent still uses the previous CLI selection.
+
+Python bridge streams and Codex subprocess pipes explicitly use UTF-8, including streaming and non-streaming model turns, account/login responses, version checks, and app-server traffic. This fixes invalid UTF-8 stdin failures after successful authentication. The Windows terminal uses native node-pty encoding, avoiding the unsupported encoding warning.
+
+Source Control now offers local repository initialization for a new project folder. See [Starting a Git repository](#starting-a-git-repository), [Runtime boundaries](#runtime-boundaries), and [Python resolution](#python-resolution) for the corresponding setup details.
+
 ## Workspace views
 
 Use **Hide editor / Show editor** in the title bar to switch between the split layout and an agent-focused view. The terminal/activity dock stays available, and hidden editor tabs retain unsaved changes. Opening a file or diff shows the editor automatically.
@@ -26,6 +34,14 @@ Agent chat uses 14px body/composer text, 13px code, and 11px supporting labels a
 Discovery choices, plan approvals/results, and issue lifecycle actions appear in collapsed workflow report cards, in conversation order. Expand a card for selections, outcomes, and original workflow text. New bridge messages carry explicit presentation boundaries so conversational replies appended to reports remain in the chat. The original bridge transcript is unchanged; older bridge messages use conservative format recognition.
 
 Operator-facing turn thoughts appear above the composer while work runs (collapsible when space is tight). Full thoughts remain readable, and Activity retains tool-level history. The beta loop forwards explicit `>>th` annotations; provider-internal reasoning is not displayed.
+
+## Starting a Git repository
+
+For an opened folder without Git, Source Control shows **Start tracking your project** with the folder path and an **Initialize repository** action. Clicking it runs local `git init` using Git's configured default branch, then displays the files ready for staging. Users choose what to stage and create their first commit; initialization does not stage files, commit, or publish a remote.
+
+Existing repositories, parent repositories, and linked worktrees are detected normally. Git installation, permission, and damaged local metadata errors remain visible with a retry action. Initialization is tied to the displayed folder and is rejected if the workspace changes before it starts.
+
+Run `npm run test:git` for Git regressions. Test repositories disable automatic line-ending conversion locally, independent of the user's Git configuration. Directory traversal checks use junctions on Windows; the file-symlink case reports a skip if Windows requires additional symlink privileges. With the fixture server running, `/scripts/fixtures/git-initialize.html` previews setup without touching Git. Add `?failInit=1` to test retry, `?gitError=1` for an unavailable Git executable, or `?slowRefresh=1` for a refresh arriving during initialization.
 
 ## Agent-authored issue suggestions
 
@@ -87,15 +103,39 @@ The desktop process reuses the same `--extension-bridge` protocol as the VS Code
 
 The Codex subscription controls use a narrow helper boundary: Electron requests account/login state from the local Codex app-server, while Python model turns run ephemerally and read-only through the same local ChatGPT-managed session. No OAuth token is exposed to the renderer or copied into Skillz configuration.
 
+On Windows, the subscription helper also discovers the CLI in `%LOCALAPPDATA%\OpenAI\Codex\bin`, including versioned runtime directories, when it is absent from the app's `PATH`.
+
+If discovery fails, open **Runtime → Codex / ChatGPT subscription → Locate Codex CLI**. Browse for the executable or paste its full path, then choose **Save and check**. The expandable help includes Windows and macOS/Linux lookup instructions. Windows selections must be native `codex.exe` executables; macOS/Linux selections should point to `codex`. The app checks `--version` before saving, and a failed check preserves the previous selection.
+
+The selection is stored in `runtime-settings.json` inside Electron's per-user application-data directory, outside the repository. A saved selection overrides `CODEX_CLI_PATH`; **Use automatic discovery** clears it and restores the environment/PATH/bundle lookup. A missing saved executable is reported rather than silently selecting another installation. Status and sign-in use changes immediately; the dialog requests an agent restart when model turns are still using an older path.
+
+Reopen Runtime settings to refresh status after installing or updating Codex; restart a running agent to load helper changes. With the fixture server running, `/scripts/fixtures/runtime-settings.html?running=1` provides a browser-only recovery preview with a mock picker and CLI status. It covers browse/cancel, pasted paths (`invalid` simulates a failed check), save, reopen, reset, and agent restart guidance.
+
 Agent protocol types and UI derivation live in `src/shared/agentTypes.ts` and `src/shared/agentCore.ts`. The reducer/selectors have no React or Electron dependency, keeping the bridge payload authoritative while allowing the desktop and VS Code shells to present it differently.
 
 ## Python resolution
 
-In development, the workbench prefers `../.venv/bin/python` (or the Windows equivalent). Otherwise it uses `python3`/`python` from `PATH`. Override this explicitly when needed:
+The workbench uses `PYTHON_AGENT_PYTHON` when set, then the repository's `.venv/bin/python` on macOS/Linux or `.venv/Scripts/python.exe` on Windows. Otherwise it checks `python`, `py -3`, then `python3` on Windows, and `python3` then `python` on macOS/Linux. Each candidate must run Python 3; an unusable explicit override or repository virtual environment produces a setup error instead of silently using a different environment. This resolution applies to agent startup, runtime discovery, and subscription status/login.
+
+Override the executable when needed (use an executable path, without command arguments or embedded quotes):
 
 ```bash
 PYTHON_AGENT_PYTHON=/absolute/path/to/python npm run dev
 ```
+
+Windows PowerShell setup, starting from the repository root:
+
+```powershell
+py -3 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install openai google-genai anthropic
+cd desktop
+npm install
+npm run dev
+```
+
+For an existing interpreter, set `$env:PYTHON_AGENT_PYTHON = 'C:\Path With Spaces\Python\python.exe'` before `npm run dev`. The `py` launcher also works without a virtual environment. If Python is not installed, install Python 3 with its Windows launcher and restart your terminal before setup. Packaged apps can use the same environment override.
+
+Runtime and terminal regression checks: `npm run test:runtime`. From the repository root, run `py -3 -m unittest test_codex_subscription test_codex_discovery test_codex_utf8` (or use the repository virtual environment) for Codex discovery and Unicode subprocess regressions. These checks use local fixtures without authenticating or making model calls.
 
 Packaged builds include the Python agent source, but they do not yet embed a Python interpreter or provider wheels. A distributable release should ship a frozen, platform-specific Python sidecar so end users do not need to configure Python themselves.
 

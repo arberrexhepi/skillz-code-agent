@@ -5,7 +5,8 @@
   "description": "Agent-first desktop coding workbench.",
   "main": "./out/main/index.js",
   "scripts": {
-    "test:git": "node --test scripts/git.test.cjs",
+    "test:runtime": "node --test scripts/python.test.cjs scripts/agent-runtime.test.cjs scripts/terminal.test.cjs scripts/runtime-settings.test.cjs scripts/runtime-settings-ipc.test.cjs",
+    "test:git": "node --test scripts/git.test.cjs scripts/git-initialize.test.cjs",
     "test:issues": "node --test scripts/issues.test.cjs scripts/issue-proposals.test.cjs",
     "test:layout": "node --test scripts/workspace-view.test.cjs",
     "test:timeline": "node --test scripts/agent-timeline.test.cjs",

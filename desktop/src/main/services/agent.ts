@@ -10,6 +10,8 @@ import type {
 } from '../../shared/contracts';
 import type { CodexSubscriptionStatus, JsonMap, RuntimeOptionsPayload } from '../../shared/agentTypes';
 import type { WorkspaceService } from './workspace';
+import { pythonEnvironment, resolvePythonCommand } from './python';
+import type { RuntimeSettingsService } from './runtimeSettings';
 
 interface PendingRequest {
   resolve: (response: AgentResponse) => void;
@@ -21,6 +23,7 @@ const BACKEND_SCRIPTS = new Set(['main.py', 'main_v2.py', 'live_test_loop.py']);
 export class AgentService {
   private process: ChildProcessWithoutNullStreams | null = null;
   private buffer = '';
+  private processCodexPath = '';
   private stopping = false;
   private readonly pending = new Map<string, PendingRequest>();
   private state: AgentBridgeState = { planner: {}, transcript: [] };
@@ -28,6 +31,7 @@ export class AgentService {
   constructor(
     private readonly workspace: WorkspaceService,
     private readonly emit: (event: AgentEvent) => void,
+    private readonly runtimeSettings?: RuntimeSettingsService,
   ) {}
 
   async start(options: AgentStartOptions): Promise<AgentResponse> {
@@ -41,11 +45,14 @@ export class AgentService {
       throw new Error(`Python agent resources were not found at ${agentRoot}.`);
     }
 
+    const { env } = await this.launchEnvironment();
+    const python = await resolvePythonCommand(agentRoot, process.platform, env);
     this.stopping = false;
     this.buffer = '';
     this.state = { planner: {}, transcript: [] };
     this.emit({ type: 'status', status: 'starting' });
-    const child = spawn(this.pythonExecutable(agentRoot), [
+    const child = spawn(python.executable, [
+      ...python.args,
       script,
       '--provider', options.provider,
       '--model', options.model,
@@ -54,9 +61,11 @@ export class AgentService {
       '--extension-bridge',
     ], {
       cwd: agentRoot,
-      env: process.env,
+      env,
+      windowsHide: true,
     });
     this.process = child;
+    this.processCodexPath = env.CODEX_CLI_PATH || '';
 
     child.stdout.setEncoding('utf8');
     child.stdout.on('data', (chunk: string) => this.handleStdout(chunk));
@@ -102,15 +111,18 @@ export class AgentService {
       return response.runtime_options || {};
     }
     const agentRoot = this.agentRoot();
+    const { env } = await this.launchEnvironment();
+    const python = await resolvePythonCommand(agentRoot, process.platform, env);
     const script = [
       'import json, sys',
       'from runtime_catalog import runtime_options_payload',
       'print(json.dumps(runtime_options_payload(current_provider=sys.argv[1], current_model=sys.argv[2])))',
     ].join('; ');
     return new Promise<RuntimeOptionsPayload>((resolve, reject) => {
-      execFile(this.pythonExecutable(agentRoot), ['-c', script, provider, model], {
+      execFile(python.executable, [...python.args, '-c', script, provider, model], {
         cwd: agentRoot,
-        env: process.env,
+        env,
+        windowsHide: true,
         encoding: 'utf8',
         maxBuffer: 2 * 1024 * 1024,
       }, (error, stdout, stderr) => {
@@ -133,6 +145,29 @@ export class AgentService {
 
   codexSubscriptionLogin(): Promise<CodexSubscriptionStatus> {
     return this.runCodexSubscriptionCommand('login', 5 * 60_000);
+  }
+
+  async setCodexCliPath(candidate: string | null): Promise<CodexSubscriptionStatus> {
+    if (!this.runtimeSettings) throw new Error('Runtime settings storage is unavailable.');
+    await this.runtimeSettings.setCodexCliPath(candidate);
+    try {
+      return await this.codexSubscriptionStatus();
+    } catch (error) {
+      const { env, savedPath } = await this.launchEnvironment();
+      return {
+        available: false, authenticated: false, configured_cli_path: savedPath,
+        cli_path_source: savedPath ? 'settings' : env.CODEX_CLI_PATH ? 'environment' : 'discovery',
+        restart_required: Boolean(this.process && this.processCodexPath !== (env.CODEX_CLI_PATH || '')),
+        error: `The path setting was saved, but status could not be checked: ${String(error)}`,
+      };
+    }
+  }
+
+  private async launchEnvironment(): Promise<{ env: NodeJS.ProcessEnv; savedPath: string }> {
+    const savedPath = await this.runtimeSettings?.codexCliPath() || '';
+    const env = pythonEnvironment();
+    if (savedPath) env.CODEX_CLI_PATH = savedPath;
+    return { env, savedPath };
   }
 
   async stop(): Promise<void> {
@@ -206,27 +241,20 @@ export class AgentService {
       : path.resolve(app.getAppPath(), '..');
   }
 
-  private pythonExecutable(agentRoot: string): string {
-    const configured = process.env.PYTHON_AGENT_PYTHON?.trim();
-    if (configured) return configured;
-    const localPython = process.platform === 'win32'
-      ? path.join(agentRoot, '.venv', 'Scripts', 'python.exe')
-      : path.join(agentRoot, '.venv', 'bin', 'python');
-    if (existsSync(localPython)) return localPython;
-    return process.platform === 'win32' ? 'python' : 'python3';
-  }
-
-  private runCodexSubscriptionCommand(
+  private async runCodexSubscriptionCommand(
     command: 'status' | 'login',
     timeout: number,
   ): Promise<CodexSubscriptionStatus> {
     const agentRoot = this.agentRoot();
     const helper = path.join(agentRoot, 'codex_subscription.py');
     if (!existsSync(helper)) return Promise.reject(new Error('Codex subscription helper is missing.'));
+    const { env, savedPath } = await this.launchEnvironment();
+    const python = await resolvePythonCommand(agentRoot, process.platform, env);
     return new Promise<CodexSubscriptionStatus>((resolve, reject) => {
-      execFile(this.pythonExecutable(agentRoot), [helper, command], {
+      execFile(python.executable, [...python.args, helper, command], {
         cwd: agentRoot,
-        env: process.env,
+        env,
+        windowsHide: true,
         encoding: 'utf8',
         timeout,
         maxBuffer: 2 * 1024 * 1024,
@@ -238,7 +266,12 @@ export class AgentService {
           // The process error below carries the useful diagnostic.
         }
         if (payload) {
-          resolve(payload);
+          resolve({
+            ...payload,
+            configured_cli_path: savedPath,
+            cli_path_source: savedPath ? 'settings' : env.CODEX_CLI_PATH ? 'environment' : 'discovery',
+            restart_required: Boolean(this.process && this.processCodexPath !== (env.CODEX_CLI_PATH || '')),
+          });
           return;
         }
         const detail = String(stderr || error?.message || 'Codex subscription helper returned invalid JSON.').trim();

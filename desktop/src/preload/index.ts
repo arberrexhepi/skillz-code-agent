@@ -13,6 +13,7 @@ const api: WorkbenchApi = {
   },
   git: {
     status: () => ipcRenderer.invoke('git:status'),
+    initialize: (workspaceRoot) => ipcRenderer.invoke('git:initialize', workspaceRoot),
     history: (limit = 50) => ipcRenderer.invoke('git:history', limit),
     fileDiff: (path, staged = false) => ipcRenderer.invoke('git:file-diff', path, staged),
     stage: (paths) => ipcRenderer.invoke('git:stage', paths),
@@ -39,6 +40,8 @@ const api: WorkbenchApi = {
     runtimeOptions: (provider = '', model = '') => ipcRenderer.invoke('agent:runtime-options', provider, model),
     codexSubscriptionStatus: () => ipcRenderer.invoke('agent:codex-subscription-status'),
     codexSubscriptionLogin: () => ipcRenderer.invoke('agent:codex-subscription-login'),
+    chooseCodexCli: () => ipcRenderer.invoke('agent:choose-codex-cli'),
+    setCodexCliPath: (path) => ipcRenderer.invoke('agent:set-codex-cli-path', path),
     stop: () => ipcRenderer.invoke('agent:stop'),
     onEvent: (listener) => subscribe<AgentEvent>('agent:event', listener),
   },

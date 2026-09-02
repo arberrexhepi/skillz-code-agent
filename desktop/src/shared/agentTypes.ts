@@ -281,6 +281,9 @@ export interface CodexSubscriptionStatus extends JsonMap {
   plan_type?: string | null;
   cli_path?: string;
   cli_version?: string;
+  configured_cli_path?: string;
+  cli_path_source?: 'settings' | 'environment' | 'discovery';
+  restart_required?: boolean;
   models?: string[];
   error?: string;
   status_text?: string;

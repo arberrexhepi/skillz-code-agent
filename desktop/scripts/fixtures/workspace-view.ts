@@ -14,7 +14,7 @@ let failRevision = new URLSearchParams(window.location.search).has('failRevision
 const suggestionsPreview = new URLSearchParams(window.location.search).has('suggestions');
 let suggestionsState = structuredClone(proposalsFixture);
 let failDecision = new URLSearchParams(window.location.search).has('failDecision');
-const status = async () => ({ branch: 'layout-preview', ahead: 0, behind: 0, files: [{ path: 'example.ts', indexStatus: ' ', workTreeStatus: 'M' }] });
+const status = async () => ({ isRepository: true, branch: 'layout-preview', ahead: 0, behind: 0, files: [{ path: 'example.ts', indexStatus: ' ', workTreeStatus: 'M' }] });
 const info = () => ({ root, name: root.split('/').at(-1)! });
 const document = (path: string, content = '// Unsaved edits stay here when the editor is hidden.\nconst greeting = "Hello";\n') => ({ path, content, language: 'typescript', modifiedAt: 0 });
 
@@ -27,7 +27,7 @@ window.workbench = {
     read: async (path) => document(path), write: async (path, content) => document(path, content), onChange: () => noop,
   },
   git: {
-    status, history: async () => [], fileDiff: async (path) => ({ path, original: 'const greeting = "Before";', modified: 'const greeting = "After";', language: 'typescript' }),
+    status, initialize: async () => status(), history: async () => [], fileDiff: async (path) => ({ path, original: 'const greeting = "Before";', modified: 'const greeting = "After";', language: 'typescript' }),
     stage: status, stageAll: status, unstage: status, discard: async () => ({ discarded: false, status: await status() }), commit: status, push: status,
   },
   terminal: {
@@ -56,6 +56,7 @@ window.workbench = {
       return { ok: true, state: planState };
     }, workerAction: response, reconfigureRuntime: response, configureBackoff: response,
     runtimeOptions: async () => ({ current_provider: 'gemini', current_model: 'preview', providers: [] }),
+    chooseCodexCli: async () => null, setCodexCliPath: async () => ({}),
     codexSubscriptionStatus: async () => ({}), codexSubscriptionLogin: async () => ({}), stop: async () => {},
     onEvent: (listener) => {
       if (suggestionsPreview) {

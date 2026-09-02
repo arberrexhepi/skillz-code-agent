@@ -1,5 +1,6 @@
 import { execFile } from 'node:child_process';
 import { promises as fs } from 'node:fs';
+import path from 'node:path';
 import type { GitCommit, GitDiscardResult, GitFileDiff, GitFileStatus, GitStatus } from '../../shared/contracts';
 import { canDiscard, isUntracked } from '../../shared/gitStatus';
 import { discardFileFingerprint } from './gitDiscardSafety';
@@ -14,7 +15,30 @@ export class GitService {
   constructor(private readonly workspace: WorkspaceService) {}
 
   async status(): Promise<GitStatus> {
-    const output = await this.run(['status', '--porcelain=v1', '-z', '--branch', '--untracked-files=all']);
+    return this.statusAt(this.workspace.requireRoot());
+  }
+
+  async initialize(expectedRoot: string): Promise<GitStatus> {
+    const root = this.workspace.requireRoot();
+    if (root !== expectedRoot) throw new Error('Workspace changed. Open Source Control in the intended folder and try again.');
+    const status = await this.statusAt(root);
+    if (this.workspace.requireRoot() !== root) throw new Error('Workspace changed. Refresh Source Control before initializing.');
+    // Existing repositories (including parent repositories and worktrees) need no init.
+    if (status.isRepository) return status;
+    await this.run(['init'], 0, root);
+    return this.statusAt(root);
+  }
+
+  private async statusAt(root: string): Promise<GitStatus> {
+    let output: GitResult;
+    try {
+      output = await this.run(['status', '--porcelain=v1', '-z', '--branch', '--untracked-files=all'], 0, root);
+    } catch (error) {
+      if (/^Error: fatal: not a git repository(?:[ :\(]|$)/i.test(String(error)) && !(await hasLocalGitMetadata(root))) {
+        return { isRepository: false, branch: '', ahead: 0, behind: 0, files: [] };
+      }
+      throw error;
+    }
     const records = output.stdout.split('\0').filter(Boolean);
     const header = records.shift() || '## HEAD';
     const branch = parseBranch(header);
@@ -33,7 +57,7 @@ export class GitService {
       }
       files.push(item);
     }
-    return { ...branch, files };
+    return { isRepository: true, ...branch, files };
   }
 
   async fileDiff(relativePath: string, staged = false): Promise<GitFileDiff> {
@@ -176,13 +200,19 @@ export class GitService {
   }
 
   private run(args: string[], timeout = 0, root = this.workspace.requireRoot()): Promise<GitResult> {
+    const env: NodeJS.ProcessEnv = { ...process.env, LC_ALL: 'C', LANG: 'C' };
+    // Git commands must target the opened folder, even when the app was started
+    // from a shell or hook with repository-location overrides.
+    for (const name of ['GIT_DIR', 'GIT_COMMON_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES']) delete env[name];
+    if (timeout) env.GIT_TERMINAL_PROMPT = '0';
     return new Promise((resolve, reject) => {
       execFile('git', args, {
         cwd: root,
         encoding: 'utf8',
         maxBuffer: 20 * 1024 * 1024,
         timeout: timeout || undefined,
-        env: timeout ? { ...process.env, GIT_TERMINAL_PROMPT: '0' } : process.env,
+        env,
+        windowsHide: true,
       }, (error, stdout, stderr) => {
         if (error) {
           reject(new Error(String(stderr || error.message).trim()));
@@ -194,7 +224,18 @@ export class GitService {
   }
 }
 
-function parseBranch(header: string): Omit<GitStatus, 'files'> {
+async function hasLocalGitMetadata(root: string): Promise<boolean> {
+  // Never turn a damaged local .git directory/file into an initialization offer.
+  try {
+    await fs.lstat(path.join(root, '.git'));
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    throw error;
+  }
+}
+
+function parseBranch(header: string): Omit<GitStatus, 'files' | 'isRepository'> {
   const value = header.replace(/^##\s*/, '');
   if (value.startsWith('Initial commit on ')) {
     return { branch: value.slice('Initial commit on '.length), ahead: 0, behind: 0 };

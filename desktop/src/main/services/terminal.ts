@@ -25,7 +25,7 @@ export class TerminalService {
       rows: Math.max(1, options.rows),
       cwd: this.workspace.requireRoot(),
       env: { ...environment, TERM: 'xterm-256color', COLORTERM: 'truecolor' },
-      encoding: 'utf8',
+      ...(process.platform === 'win32' ? {} : { encoding: 'utf8' as const }),
     });
     this.sessions.set(sessionId, session);
     session.onData((data) => this.emit({ type: 'data', sessionId, data }));

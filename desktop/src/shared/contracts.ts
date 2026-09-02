@@ -24,6 +24,7 @@ export interface GitFileStatus {
 }
 
 export interface GitStatus {
+  isRepository: boolean;
   branch: string;
   upstream?: string;
   ahead: number;
@@ -100,6 +101,7 @@ export interface WorkbenchApi {
   };
   git: {
     status(): Promise<GitStatus>;
+    initialize(workspaceRoot: string): Promise<GitStatus>;
     history(limit?: number): Promise<GitCommit[]>;
     fileDiff(path: string, staged?: boolean): Promise<GitFileDiff>;
     stage(paths: string[]): Promise<GitStatus>;
@@ -126,6 +128,8 @@ export interface WorkbenchApi {
     runtimeOptions(provider?: string, model?: string): Promise<RuntimeOptionsPayload>;
     codexSubscriptionStatus(): Promise<CodexSubscriptionStatus>;
     codexSubscriptionLogin(): Promise<CodexSubscriptionStatus>;
+    chooseCodexCli(): Promise<string | null>;
+    setCodexCliPath(path: string | null): Promise<CodexSubscriptionStatus>;
     stop(): Promise<void>;
     onEvent(listener: (event: AgentEvent) => void): () => void;
   };

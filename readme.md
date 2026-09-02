@@ -22,7 +22,20 @@ Common planner commands: `/reset`, `/start-auto 3 optional prompt`, `/stop-auto`
 
 ## Latest Development Update
 
-The current development work tightens the full planner/worker loop, from provider selection through recovery and continuation:
+The desktop workbench now handles common Windows setup failures, provides a manual Codex location fallback, and helps users start version control in a new project folder:
+
+- **Windows Python discovery:** agent startup, runtime options, and Codex status/login share interpreter detection. The workbench checks an explicit override and the repository virtual environment, then tries `python`, the Windows `py -3` launcher, and `python3`. This fixes `spawn python ENOENT` when Python is installed through the launcher but absent from `PATH`.
+- **Codex discovery and manual setup:** Windows discovery recognizes the local Codex desktop application's versioned runtime directories. In Runtime settings, users can browse or paste a CLI executable, validate it with **Save and check**, and keep the selection on their computer. **Use automatic discovery** restores normal lookup; changing a running agent's CLI path displays restart guidance.
+- **UTF-8 message handling:** Python bridge streams and Codex subprocess pipes use explicit UTF-8. Prompts, responses, account status, and model discovery handle accented text, multilingual content, and emoji without Windows code-page conversion. This fixes the invalid UTF-8 stdin error that could occur even after successful Codex authentication.
+- **Windows terminal compatibility:** the embedded terminal uses node-pty's native Windows encoding behavior, removing the unsupported encoding warning.
+- **New repository setup:** Source Control offers **Initialize repository** for folders without Git metadata, then shows files ready for staging and a first commit. It recognizes existing repositories and worktrees, preserves actionable errors, and rejects initialization requests for a folder the user has already switched away from.
+- **Regression coverage:** focused Python and desktop tests cover discovery, saved CLI settings, UTF-8 subprocess traffic, terminal options, and Git initialization. Browser fixtures exercise setup, retry, and concurrent refresh behavior; Git fixtures account for Windows line endings and symlink privileges.
+
+See [Windows quick start](#windows-quick-start) and the [desktop guide](desktop/README.md) for setup and verification commands. Packaged builds still require a separately installed Python interpreter and provider dependencies.
+
+### Earlier development highlights
+
+The planner/worker improvements below remain part of the current workbench:
 
 - **Smaller model turns:** stable and beta workers now keep provider-native message transcripts after the first turn instead of rebuilding the full prompt every time. OpenAI prompt-cache keys, cached-token accounting, explicit context drops, and compact fresh-context final retries reduce repeated context without losing current repository state.
 - **Resilient provider calls:** transient 408/409/425/429 and 5xx failures receive bounded retries, `Retry-After` is honored, repeated 500s receive a longer cooldown, and request IDs plus retry timing are retained for observability. Terminal provider failures pause execution with partial edits preserved so retry starts by inspecting and repairing the current diff.
@@ -70,7 +83,7 @@ Requirements:
 - Python 3.13 is the current development target.
 - Git must be available for status, diff, review, and repository mutation flows.
 - Node.js and npm are required for the Electron workbench or VS Code extension.
-- The Codex CLI, or the Codex executable bundled with the macOS ChatGPT app, is required only for `codex-subscription`.
+- The Codex CLI, or a discovered desktop-bundled Codex executable on Windows or macOS, is required only for `codex-subscription`.
 
 Install Python provider dependencies:
 
@@ -97,7 +110,35 @@ npm install
 npm run dev
 ```
 
-Then open a repository, open Runtime settings, choose a provider/model and one of the stable, beta, or live backends, and select **Start agent**.
+Then open a project folder, open Runtime settings, choose a provider/model and one of the stable, beta, or live backends, and select **Start agent**. If the folder has no Git repository, Source Control offers **Initialize repository**; afterward, choose files to stage and make the first commit.
+
+### Windows quick start
+
+Install Python 3 with the Windows launcher, Git, and Node.js/npm. From the repository root in PowerShell:
+
+```powershell
+py -3 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install openai google-genai anthropic
+cd desktop
+npm install
+npm run dev
+```
+
+The workbench uses `.venv\Scripts\python.exe` automatically. To use another installation, set `$env:PYTHON_AGENT_PYTHON = 'C:\Path With Spaces\Python\python.exe'` before launching it. Use only the executable path, without arguments or embedded quotes. Without an override or repository virtual environment, Windows lookup tries `python`, `py -3`, then `python3`; macOS/Linux lookup tries `python3`, then `python`. An invalid explicit selection produces a setup error so the workbench does not silently use a different environment.
+
+For a local ChatGPT subscription, select **Codex / ChatGPT subscription** in Runtime settings. If automatic discovery fails, expand **Locate Codex CLI**, browse or paste the native `codex.exe` path, and choose **Save and check**. Use **Sign in with ChatGPT** if needed. After changing the executable for a running agent, stop and start the agent to use it for model calls. See [Codex / ChatGPT subscription runtime](#codex--chatgpt-subscription-runtime) for discovery paths and environment overrides.
+
+Run the focused checks from the repository root:
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest test_codex_subscription test_codex_discovery test_codex_utf8
+cd desktop
+npm run test:runtime
+npm run test:git
+npm run build
+```
+
+The file-symlink Git test reports a skip on Windows when Developer Mode or symlink privileges are unavailable; the remaining Git checks still run.
 
 ## Run
 
@@ -145,7 +186,7 @@ Live runtime switching in the CLI:
 
 The `codex-subscription` provider is an additive alternative to `openai`; it does not replace or modify API-key invocation.
 
-1. Install the Codex CLI, or use the Codex executable bundled with the macOS ChatGPT app.
+1. Install the Codex CLI, or use a discovered desktop-bundled executable on Windows or macOS.
 2. Run `codex login` and complete the browser flow. Confirm the active method with `codex login status`; it must report ChatGPT authentication rather than API-key authentication.
 3. In the Electron Workbench Runtime drawer, choose **Codex / ChatGPT subscription**. The drawer shows the detected account, subscription plan, CLI version, and live model catalog. If needed, use **Sign in with ChatGPT**.
 4. Select one of the models advertised by the local Codex catalog and apply the runtime.
@@ -157,11 +198,15 @@ python codex_subscription.py status
 python main.py --provider codex-subscription --model gpt-5.6-terra --root /your/project
 ```
 
-Skillz discovers the executable in this order: `CODEX_CLI_PATH`, `codex` on `PATH`, then the Codex binary bundled with `/Applications/ChatGPT.app` on macOS. Override discovery when needed:
+Skillz discovers the executable in this order: `CODEX_CLI_PATH`, `codex` on `PATH`, then the local desktop bundle. On macOS this is `/Applications/ChatGPT.app`. On Windows it checks `%LOCALAPPDATA%\OpenAI\Codex\bin\<runtime>\codex.exe` (newest binary first), then the older `bin\codex.exe` layout. Windows discovery works even when the desktop app was launched without Codex on `PATH`. Override discovery when needed:
 
 ```bash
 export CODEX_CLI_PATH=/absolute/path/to/codex
 ```
+
+Desktop users can also choose **Runtime → Locate Codex CLI**, browse or paste the executable path, and select **Save and check**. This validated, per-computer selection takes precedence over `CODEX_CLI_PATH`; **Use automatic discovery** removes it. A missing explicit path is reported instead of silently switching installations.
+
+In Windows PowerShell, set `$env:CODEX_CLI_PATH = 'C:\Path With Spaces\codex.exe'` before launching Skillz. Use the executable path only, without command arguments. Inspect discovery and session status with `py -3 codex_subscription.py status` from the repository root.
 
 Each model turn runs through `codex exec --ephemeral` in a temporary, read-only workspace. Skillz removes `OPENAI_API_KEY`, OpenAI base-URL overrides, and Codex API/access-token variables from the child process, preventing this provider from silently falling back to usage-based API authentication. Repository reads, writes, and validation remain controlled by the Skillz host.
 
@@ -228,11 +273,11 @@ Current workspace capabilities:
 
 - lazy repository tree, Monaco tabs, dirty-state tracking, save shortcuts, and file/Git diffs
 - real PTY terminals through xterm.js and `node-pty`
-- branch/status inspection, staging, unstaging, diff review, and commits
+- repository initialization for new project folders, branch/status inspection, staging, unstaging, diff review, and commits
 - Activity, Problems, Review, and Terminal dock surfaces, with diagnostics mirrored into Monaco markers
 - planner conversation, bounded discovery choices, plan approval, continuous execution, durable issues, run diagnostics, work handoffs, and per-goal reports
 - live model-call and tool-action feedback so long subscription-backed turns do not appear frozen
-- Runtime settings for provider, live model catalog, stable/beta/live backend, token backoff, agent start/stop, and Codex subscription account status
+- Runtime settings for provider, live model catalog, stable/beta/live backend, token backoff, agent start/stop, Codex subscription account status, and a saved CLI executable fallback
 
 The renderer is sandboxed and has no direct Node, filesystem, shell, or credential access. Workspace, Git, terminal, Codex status/login, and Python bridge operations run in Electron's main process behind a narrow validated preload API.
 
