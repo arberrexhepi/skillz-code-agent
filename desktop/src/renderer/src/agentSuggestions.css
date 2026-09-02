@@ -1,0 +1,14 @@
+.agent-suggestions { padding: 10px 8px; border-bottom: 1px solid var(--border); }
+.agent-suggestions > header { display: flex; justify-content: space-between; color: #acbcb2; font-size: 10px; letter-spacing: .06em; }
+.agent-suggestions > p { color: #8a9790; font-size: 11px; line-height: 1.5; }
+.agent-suggestion { border: 1px solid #303c35; border-radius: 8px; background: #131b17; padding: 10px; margin-top: 8px; font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
+.agent-suggestion summary { cursor: pointer; color: #d2dcd6; }
+.agent-suggestion small { display: block; color: #8aa694; font-size: 10px; margin-top: 4px; }
+.agent-suggestion h4 { margin: 12px 0 4px; font-size: 11px; color: #9baca2; }
+.agent-suggestion p { white-space: pre-wrap; margin: 4px 0 8px; color: #aab7af; }
+.suggestion-paths { font-family: ui-monospace, monospace; font-size: 11px; }
+.suggestion-actions { display: flex; gap: 8px; margin-top: 10px; }
+.suggestion-actions button { border: 1px solid #3b4b40; border-radius: 5px; padding: 4px 9px; background: #1e3025; color: #bdd8c7; cursor: pointer; font-size: 12px; }
+.suggestion-actions button + button { background: transparent; color: #a2afa8; }
+.suggestion-actions button:disabled { opacity: .5; cursor: wait; }
+.agent-suggestion [role="alert"] { color: #f0a5a5; }

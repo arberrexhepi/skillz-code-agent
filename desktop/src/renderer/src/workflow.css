@@ -1,0 +1,33 @@
+.workflow-report { margin: 10px 0 16px; border: 1px solid #293a31; border-radius: 7px; background: #101814; overflow: hidden; }
+.workflow-report > summary { display: flex; align-items: center; gap: 8px; padding: 10px; cursor: pointer; list-style: none; font-size: 12px; }
+.workflow-report > summary::-webkit-details-marker { display: none; }
+.workflow-chevron { color: #86b59a; font-size: 18px; line-height: 1; }
+.workflow-report[open] .workflow-chevron { transform: rotate(90deg); }
+.workflow-title { min-width: 0; color: #c6d3cb; overflow-wrap: anywhere; }
+.workflow-choice { color: #a7dabb; font-size: 11px; }
+.workflow-status { margin-left: auto; color: #8f9f94; font-size: 11px; text-transform: capitalize; }
+.workflow-report.failed { border-color: #754447; background: #201416; }
+.workflow-report.failed .workflow-status { color: #eda0a0; }
+.workflow-overview { margin: 0; padding: 0 10px 10px; font-size: 12px; color: #9baaa0; line-height: 1.5; }
+.workflow-report-body { border-top: 1px solid #26372c; padding: 10px 12px; font-size: 13px; line-height: 1.55; }
+.workflow-report-body h4 { margin: 10px 0 6px; font-size: 12px; color: #bdd0c3; }
+.workflow-report-body ol, .workflow-report-body ul { padding-left: 20px; }
+.workflow-events { margin: 0; color: #97a79c; font-size: 12px; }
+.workflow-events strong { margin-right: 8px; color: #c3cfc7; font-weight: 500; }
+.workflow-paths { color: #8f9f94; overflow-wrap: anywhere; font-size: 12px; }
+.workflow-original { margin-top: 10px; border-top: 1px solid #26372c; padding-top: 8px; }
+.workflow-original > summary { color: #9fbaaa; cursor: pointer; font-size: 12px; }
+.workflow-report summary:focus-visible, .turn-thought summary:focus-visible { outline: 1px solid var(--accent); outline-offset: -2px; }
+.turn-thought { flex: 0 0 auto; min-width: 0; margin: 0 10px 8px; padding: 10px 12px; border: 1px solid #365a46; border-left: 3px solid #80d9ab; border-radius: 6px; background: #121e17; }
+.turn-thought header { display: flex; align-items: center; gap: 8px; color: #b3ddc4; font-size: 12px; }
+.turn-thought header i { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); animation: pulse 1.3s infinite; }
+.turn-thought header strong { font-weight: 550; }
+.turn-thought header button { border: 0; border-radius: 3px; background: transparent; color: #b3ddc4; cursor: pointer; padding: 1px 5px; }
+.turn-thought header button:hover, .turn-thought header button:focus-visible { background: #273d2e; outline: 1px solid #80d9ab; }
+.turn-thought header span, .turn-thought time { color: #91ac9a; font-size: 11px; }
+.turn-thought time { margin-left: auto; font-variant-numeric: tabular-nums; }
+.turn-thought p { margin: 8px 0 0; color: #d1e0d7; font-size: 14px; line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; }
+.turn-thought-copy, .last-thought p { max-height: 140px; overflow: auto; }
+.turn-thought > small { display: block; margin-top: 6px; color: #91ac9a; font-size: 11px; overflow-wrap: anywhere; }
+.last-thought { padding: 7px 10px; border-color: #2b3a31; background: #111914; }
+.last-thought > summary { color: #9db6a6; cursor: pointer; font-size: 12px; }

@@ -28,11 +28,15 @@ import time
 import subprocess
 import json
 import tempfile
+import hashlib
+from issue_proposals import IssueProposalStore, PROPOSAL_GUIDANCE
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Protocol, Sequence, Tuple, TypedDict
 
 from context_tree_bridge import ContextTreeBridge
+from discovery.dispatch import DISCOVERY_ACTION_TYPES, execute_discovery_action
+from mutation_text import is_text_mutation
 from mutations import (
     append_block,
     batch_mutate,
@@ -62,6 +66,7 @@ from tree_commands import (
     is_annotation,
     is_strategy,
     parse_multi_command,
+    parse_annotation,
     parse_strategy,
 )
 
@@ -243,16 +248,16 @@ def _strip_leading_control_preamble(raw: str) -> str:
 
 def _normalize_command_candidate(line: str) -> str:
     """Recover executable command lines wrapped in common Markdown prose syntax."""
-    candidate = str(line or "").strip()
+    candidate = str(line or "").lstrip()
     if candidate.startswith("> "):
         candidate = candidate[2:].lstrip()
-    candidate = _MARKDOWN_COMMAND_PREFIX_RE.sub("", candidate, count=1).strip()
-    if len(candidate) >= 2 and candidate.startswith("`") and candidate.endswith("`"):
-        candidate = candidate[1:-1].strip()
+    candidate = _MARKDOWN_COMMAND_PREFIX_RE.sub("", candidate, count=1).lstrip()
+    if len(candidate.rstrip()) >= 2 and candidate.startswith("`") and candidate.rstrip().endswith("`"):
+        candidate = candidate.rstrip()[1:-1].lstrip()
     command_label = re.match(r"^(?:command|action)\s*:\s*(.+)$", candidate, re.IGNORECASE)
     if command_label:
-        candidate = command_label.group(1).strip()
-    return candidate
+        candidate = command_label.group(1).lstrip()
+    return candidate if is_text_mutation(candidate) or is_strategy(candidate) else candidate.rstrip()
 
 
 def _has_executable_command(command_block: str) -> bool:
@@ -323,8 +328,9 @@ ANNOTATIONS (>> feed-forward metadata — free, no tool call):
   - Do not use >>dg: as a generic note. Use it only for a real if/then branch.
 
 RULES:
-1. READ commands (ls, cat, read-line-range, repo-map, symbols, find-symbol, stat, find, grep, read-diagnostics) are FREE — they resolve instantly
-    from the in-context tree. Use them liberally. They do NOT count as tool calls.
+1. READ commands (ls, cat, read-line-range, repo-map, symbols, find-symbol, stat, find, grep, read-diagnostics) run locally without tool dispatch.
+    /repo reads and discovery use the real mounted workspace, independent of the bounded metadata preview or loaded file cache.
+    Other mounts remain in-memory. Keep all reads focused and bounded even though they do NOT count as tool calls.
 1c. For broad or unfamiliar codebase work, start with `repo-map /repo topic="<task topic>" limit=20` before line-by-line reads.
     Treat it as the structural layer of a retrieval funnel: use the ranked files, symbols, imports, and drill-down suggestions to
     choose targeted `symbols`, `find-symbol`, `grep`, `cat`, or `read-line-range` commands.
@@ -355,7 +361,8 @@ RULES:
 6. Annotate your output with >> lines. They cost nothing and make your
    reasoning visible. Always start with >>th: to explain your approach.
 7. When your task is complete, use: finish <summary message>
-8. You may issue multiple commands per turn (one per line) or a strategy block.
+8. You may issue multiple commands per turn (one per line) or a strategy block. Prefer at most 8 focused reads. A hard safety
+   limit rejects any turn containing more than 32 executable commands before any command in that batch runs.
 9. Do NOT wrap commands in code fences or JSON. Just emit them directly.
 10. IMPORTANT: When writing files with heredoc, the ENTIRE file content goes
     between <<< and >>>. Do NOT try to use shell-style variable substitution
@@ -369,6 +376,9 @@ RULES:
 11a. When line ranges feel unstable or a file has many nearby definitions, use `repo-map`, `symbols`, or `find-symbol` first to anchor on the right function, class, or variable before editing.
 12. Prefer `replace-lines` for bounded edits. Prefer `write` when replacing most of a file or rebuilding a corrupted region wholesale.
 12a. Use inline `replace-lines` only for short single-line replacements. If the replacement spans multiple lines or is longer than a short import/function call, use heredoc.
+12b. Write/replace content is literal. Exactly one separator follows the path/range header; additional spaces are payload indentation. Heredocs preserve first-line indentation, trailing spaces, and blank lines. Always close them with >>>.
+12c. For patch, prefer two JSON-quoted string operands separated by ` -> `. Escapes decode exactly once, and arrows within quoted source are not separators. Include enough source context for exactly one match; never copy displayed line numbers into search text. Missing or ambiguous matches make no changes.
+12d. Put each text mutation in its own strategy step. Use left-side dependencies such as `s1 -> s2: patch ...`; mutation payload commas and trailing arrows are literal content, not strategy wiring.
 13. Avoid rereading an entire large file after a localized edit unless you need whole-file structure. Verify the edited range first.
 14. If a bounded edit fails twice or keeps duplicating content, stop stretching the same range edit. Re-read the surrounding region, widen the inspected range, and either do one clean `replace-lines` pass or rewrite the full file with `write`.
 15. Strategy placeholders like `{{s1}}` are raw upstream text plus a few safe text transforms. You may use `.stdout`, `.trim()`, `.replace("old", "new")`, `.split('\n').filter(line => ...).join('\n')`, numeric indexing like `.split('\n')[0]`, and regex capture extraction like `.match(/pattern/)[1]`, but do not invent arbitrary code execution inside placeholders.
@@ -556,7 +566,7 @@ def extract_commands(raw: str) -> str:
 
     Free-form prose is ignored rather than being sent to the command parser.
     """
-    lines = _strip_leading_control_preamble(raw).strip().splitlines()
+    lines = _strip_leading_control_preamble(raw).splitlines()
     extracted: List[str] = []
     pending_annotations: List[str] = []
     collecting_heredoc = False
@@ -564,19 +574,19 @@ def extract_commands(raw: str) -> str:
     for line in lines:
         stripped = line.strip()
 
-        if stripped.startswith("```"):
-            continue
-
         if collecting_heredoc:
             extracted.append(line)
             if stripped == ">>>":
                 collecting_heredoc = False
             continue
 
+        if stripped.startswith("```"):
+            continue
+
         if not stripped:
             continue
 
-        candidate = _normalize_command_candidate(stripped)
+        candidate = _normalize_command_candidate(line)
 
         if is_annotation(candidate):
             pending_annotations.append(candidate)
@@ -587,12 +597,12 @@ def extract_commands(raw: str) -> str:
                 extracted.extend(pending_annotations)
                 pending_annotations = []
             extracted.append(candidate)
-            if candidate.endswith("<<<"):
+            if candidate.rstrip().endswith("<<<"):
                 collecting_heredoc = True
             continue
 
     if extracted:
-        return "\n".join(extracted).strip()
+        return "\n".join(extracted)
     if pending_annotations:
         return "\n".join(pending_annotations).strip()
     return ""
@@ -628,8 +638,19 @@ class RecentRead:
 
 
 MAX_MUTATION_COMMANDS_PER_TURN = 4
+MAX_EXECUTABLE_COMMANDS_PER_TURN = 32
 MAX_CONSECUTIVE_COMMANDLESS_TURNS = 2
 MAX_MODEL_OUTPUT_REPAIR_ATTEMPTS = 1
+
+
+def _executable_command_count(command_block: str) -> int:
+    """Count commands before execution so one model turn cannot fan out unboundedly."""
+    if is_strategy(command_block):
+        plan = parse_strategy(command_block)
+        if plan is None:
+            return 0
+        return sum(len(step.commands) for label, step in plan.steps.items() if label != "error")
+    return sum(1 for command in parse_multi_command(command_block) if not is_annotation(command))
 
 
 class TreeLoop:
@@ -692,6 +713,8 @@ class TreeLoop:
         self._recent_reads: List[RecentRead] = []
         self._conversation_messages: List[ChatMessage] = []
         self._conversation_task = ""
+        self.bridge.tree.diagnostic_disposition = lambda diagnostics: IssueProposalStore(self.workspace_root).apply_deferrals(
+            diagnostics, scope='task:' + hashlib.sha256(getattr(self, '_proposal_task', self._conversation_task).encode()).hexdigest())
         self._conversation_compaction_count = 0
         self._conversation_char_budget = int(os.getenv("TREELOOP_MESSAGE_CONTEXT_CHARS", "120000") or "120000")
         self._total_reads = 0
@@ -716,6 +739,7 @@ class TreeLoop:
 
     def run(self, task: str) -> LoopResult:
         """Run the agent loop until finish or max turns."""
+        self._proposal_task = str(task or "").strip()
         if not self.bridge._indexed:
             self.setup()
 
@@ -863,20 +887,50 @@ class TreeLoop:
                 repair_suffix = f", repaired after {repair_attempts} format retry" if repair_attempts else ""
                 _log(f"LLM responded ({time.time() - t0:.1f}s, {len(raw_output)} chars{repair_suffix})")
 
+            # Publish only explicit operator-facing annotations, never provider
+            # reasoning or source text inside a write/patch/heredoc payload.
+            if self.model_event_observer is not None:
+                thoughts = []
+                for command in parse_multi_command(command_block or ""):
+                    annotation = parse_annotation(command)
+                    if annotation is not None and annotation.tag == "th":
+                        thoughts.append(annotation.content)
+                if thoughts:
+                    try:
+                        self.model_event_observer({"event": "turn_thought", "turn": turn_num, "thought": "\n".join(thoughts)})
+                    except Exception:
+                        pass
+
             # Extract and execute commands
             commands_issued: List[str] = []
             results: List[CommandResult] = []
             turn_annotations: List[Annotation] = []
 
             if command_block:
-                if is_strategy(command_block):
+                executable_command_count = _executable_command_count(command_block)
+                if executable_command_count > MAX_EXECUTABLE_COMMANDS_PER_TURN:
+                    commands_issued = ["command_batch_rejected"]
+                    results = [CommandResult(
+                        ok=False,
+                        output=(
+                            f"command batch limit exceeded: received {executable_command_count} executable commands; "
+                            f"at most {MAX_EXECUTABLE_COMMANDS_PER_TURN} are allowed in one turn. "
+                            "No commands from this batch were executed. Emit one focused command or a small bounded group."
+                        ),
+                        command_type="error",
+                    )]
+                    self._recovery_steering = (
+                        "[RECOVERY] Your previous command batch was rejected before execution because it was unbounded. "
+                        "Do not enumerate speculative filenames. Use one repo-map, find, grep, cat, or finish command, "
+                        "or a small bounded group of directly relevant reads."
+                    )
+                elif is_strategy(command_block):
                     # Execute as strategy DAG
                     # First extract any annotations from the block
                     strategy_plan = parse_strategy(command_block)
                     for line in command_block.splitlines():
                         stripped = line.strip()
                         if is_annotation(stripped):
-                            from tree_commands import parse_annotation
                             ann = parse_annotation(stripped)
                             if ann:
                                 turn_annotations.append(ann)
@@ -995,7 +1049,7 @@ class TreeLoop:
 
                 if r.command_type == "read":
                     self._total_reads += 1
-                elif r.needs_tool:
+                if r.needs_tool:
                     if self._is_bounded_mutation_result(r):
                         bounded_mutation_count += 1
                         if bounded_mutation_count > MAX_MUTATION_COMMANDS_PER_TURN:
@@ -1006,7 +1060,8 @@ class TreeLoop:
                             )
                             blocked_reason = r.output
                             continue
-                    self._total_writes += 1
+                    if r.command_type != "read":
+                        self._total_writes += 1
                     executed = self._execute_tool(r)
                     if executed:
                         r.output = executed  # feed back into history
@@ -1324,7 +1379,7 @@ class TreeLoop:
     def _system_prompt(self) -> str:
         grammar = self.bridge.render_command_grammar()
         shell_note = "\nSHELL ACCESS POLICY: SHELL_ACCESS=false. Do not emit `shell <command>` or any action that dispatches to `run_shell`. Prefer structured file, git, and diagnostics commands.\n" if not self.allow_shell else ""
-        return (_SYSTEM_PROMPT_TEMPLATE + shell_note).format(command_grammar=grammar)
+        return (_SYSTEM_PROMPT_TEMPLATE + shell_note).format(command_grammar=grammar) + "\n" + PROPOSAL_GUIDANCE
 
     def _combined_status(self) -> Dict[str, Any]:
         status = {
@@ -1353,11 +1408,11 @@ class TreeLoop:
         issues = self.bridge.tree.list_log_issues()
         status_map = {str(issue.get("id", "")): str(issue.get("status", "open")) for issue in issues if issue.get("id")}
         previous_map = dict(self._signal_state.get("issue_status_map", {}))
-        unresolved = [issue for issue in issues if str(issue.get("status", "open")) != "resolved"]
+        unresolved = [issue for issue in issues if str(issue.get("status", "open")) not in {"resolved", "deferred"}]
         resolved = [issue for issue in issues if str(issue.get("status", "open")) == "resolved"]
 
         raw_signals: List[str] = []
-        previous_unresolved = [issue_id for issue_id, status in previous_map.items() if status != "resolved"]
+        previous_unresolved = [issue_id for issue_id, status in previous_map.items() if status not in {"resolved", "deferred"}]
         changed_to_resolved = [
             issue_id
             for issue_id, status in status_map.items()
@@ -1365,7 +1420,7 @@ class TreeLoop:
         ]
         newly_added = [issue_id for issue_id in status_map if issue_id not in previous_map]
         for issue_id in newly_added:
-            if status_map.get(issue_id) != "resolved":
+            if status_map.get(issue_id) not in {"resolved", "deferred"}:
                 raw_signals.append(f"issue_ingested:{issue_id}")
         for issue_id in changed_to_resolved:
             raw_signals.append(f"issue_resolved:{issue_id}")
@@ -1382,7 +1437,7 @@ class TreeLoop:
 
         meta_signal = ""
         if previous_unresolved and not unresolved:
-            meta_signal = "all_issues_resolved"
+            meta_signal = "no_blocking_issues" if any(issue.get("status") == "deferred" for issue in issues) else "all_issues_resolved"
         elif len(unresolved) > 1:
             meta_signal = "issue_batch_ready"
         elif len(unresolved) == 1:
@@ -1426,7 +1481,7 @@ class TreeLoop:
                     f"[RUN DIAGNOSTIC FOCUS] Current focus: {current_focus} — {focus_summary}",
                     "Run diagnostics are transient and separate from the active durable planner issue.",
                     f"Inspect the referenced files directly in parallel, for example: {strategy_example}.",
-                    "After inspection, pick one diagnostic to fix, verify it, and only then use `resolve-run-issue <id>`.",
+                    "Triage relevance using existing evidence. For unrelated findings, use propose-issue with run_issue_ids; do not investigate them further. Fix and verify only in-scope diagnostics before resolve-run-issue.",
                 ])
             else:
                 if focus_inspected:
@@ -1446,15 +1501,15 @@ class TreeLoop:
                     f"[RUN DIAGNOSTIC FOCUS] Current focus: {current_focus} — {focus_summary}",
                     "Run diagnostics are transient and separate from the active durable planner issue.",
                     inspection_guidance,
-                    "Fix one diagnostic at a time and only use `resolve-run-issue <id>` after verification.",
+                    "For unrelated findings, use propose-issue with run_issue_ids and existing evidence; no further inspection is needed. Fix only in-scope diagnostics and use resolve-run-issue after verification.",
                 ])
             return
 
         if issues:
             self._signal_steering = "\n".join([
-                f"[SIGNAL {meta_signal or 'all_issues_resolved'}] All parsed log issues are resolved.",
+                f"[SIGNAL {meta_signal or 'no_blocking_issues'}] No blocking run diagnostics remain; findings may be resolved or deferred to agent suggestions.",
                 f"[RAW SIGNALS] {', '.join(raw_signals[:6]) if raw_signals else 'resolved_issue_set'}",
-                "Verify the workspace end-to-end, then use `finish` with a concise summary if the trace-driven work is complete.",
+                "Validate the current goal only, then finish. Deferred findings must not trigger more reads, validation gates, or remediation; mention them separately without claiming broader checks passed.",
             ])
             self._signal_state["current_focus_issue_id"] = ""
             self._signal_state["current_focus_issue_namespace"] = ""
@@ -1496,6 +1551,20 @@ class TreeLoop:
 
         action_type = action.get("type", "")
 
+        if action_type in DISCOVERY_ACTION_TYPES:
+            payload = execute_discovery_action(action, root=self.workspace_root)
+            r.ok = bool(payload.get("ok", True))
+            return json.dumps(payload, indent=2)
+        if action_type == "propose_issue":
+            store = IssueProposalStore(self.workspace_root)
+            scope = 'task:' + hashlib.sha256(self._conversation_task.encode()).hexdigest()
+            try:
+                proposal = store.propose(action, diagnostics=self.bridge.tree.list_log_issues(), scope=scope, parent_issue_id='', goal=self._conversation_task)
+                self._refresh_log_issue_signals()
+                return f"Recorded {proposal['proposal_id']}; linked diagnostics no longer gate this task."
+            except Exception as exc:
+                r.ok = False
+                return f"propose_issue failed: {exc}"
         if action_type == "write_file":
             message = self._exec_write_file(action)
         elif action_type == "replace_lines":
@@ -1662,8 +1731,15 @@ class TreeLoop:
             return f"patch_file: file not found: {rel_path}"
 
         original = target.read_text()
-        if search not in original:
-            return f"patch_file: search text not found in {rel_path}"
+        occurrences = original.count(search)
+        if occurrences == 0:
+            return (
+                f"patch_file: search text not found in {rel_path}; no changes made. "
+                "Re-read the target and use exact source text (without displayed line numbers). "
+                "Use JSON-quoted operands for multiline text, quotes, or backslashes."
+            )
+        if occurrences > 1:
+            return f"patch_file: ambiguous search text in {rel_path}: {occurrences} matches; no changes made. Include unique surrounding context."
 
         updated = original.replace(search, replace, 1)
         target.write_text(updated)

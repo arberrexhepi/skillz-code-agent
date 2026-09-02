@@ -1,4 +1,5 @@
 import type { AgentBridgeState, AgentProgressMessage, AgentTranscriptEntry, DiagnosticItem, DiscoveryResult, GoalExecutionResult, IssueSummary, LatestReview, PlannerPlan, RuntimeOptionsPayload, SuggestedAction } from './agentTypes';
+import { conversationTimeline, latestTurnThought } from './agentTimeline';
 
 export type AgentStatus = 'stopped' | 'starting' | 'running' | 'error';
 
@@ -9,6 +10,7 @@ export interface AgentUiState {
   runtimeOptions?: RuntimeOptionsPayload;
   notice: string;
   pendingAction: string;
+  turnThought?: AgentProgressMessage;
 }
 
 export const initialAgentUiState: AgentUiState = {
@@ -33,11 +35,12 @@ export function reduceAgentUi(state: AgentUiState, action: AgentUiAction): Agent
     case 'bridge-state': return { ...state, bridge: action.state };
     case 'progress': {
       const bridge = action.progress.state || state.bridge;
-      return { ...state, bridge, activity: [...state.activity, action.progress].slice(-250) };
+      const turnThought = latestTurnThought([...(state.turnThought ? [state.turnThought] : []), action.progress]);
+      return { ...state, bridge, turnThought, activity: [...state.activity, action.progress].slice(-250) };
     }
     case 'status': return { ...state, status: action.status, notice: action.message || (action.status === 'running' ? '' : state.notice) };
     case 'notice': return { ...state, notice: action.message };
-    case 'pending': return { ...state, pendingAction: action.action };
+    case 'pending': return { ...state, pendingAction: action.action, turnThought: action.action ? undefined : state.turnThought };
     case 'runtime-options': return { ...state, runtimeOptions: action.options };
     case 'reset': return initialAgentUiState;
   }
@@ -148,42 +151,7 @@ export function agentHandoff(state: AgentBridgeState): AgentHandoff {
 }
 
 export function presentationTranscript(state: AgentBridgeState): AgentTranscriptEntry[] {
-  const handoff = agentHandoff(state);
-  let replacedExecutionReport = false;
-
-  const entries = state.transcript.flatMap((entry): AgentTranscriptEntry[] => {
-    if (entry.role !== 'assistant') return [entry];
-    const content = String(entry.content || '').trim();
-    if (isDiscoveryReport(content, handoff.discovery)) return [];
-    if (isGoalReport(content, handoff)) {
-      if (replacedExecutionReport || !handoff.executionSummary) return [];
-      replacedExecutionReport = true;
-      return [{ role: 'assistant', content: handoff.executionSummary }];
-    }
-    return [entry];
-  });
-
-  const hasSummary = entries.some((entry) => entry.role === 'assistant' && entry.content.trim() === handoff.executionSummary);
-  if (handoff.executionSummary && handoff.goalResults.length && !hasSummary) {
-    entries.push({ role: 'assistant', content: handoff.executionSummary });
-  }
-  return entries;
-}
-
-function isDiscoveryReport(content: string, discovery: DiscoveryResult | null): boolean {
-  if (!/(?:^|\n\n)Discovery (?:Complete|Failed)\b/i.test(content)) return false;
-  const finalMessage = String(discovery?.final_message || '').trim();
-  return !finalMessage || content.includes(finalMessage);
-}
-
-function isGoalReport(content: string, handoff: AgentHandoff): boolean {
-  if (!/(?:^|\n\n)Goal \d+\/\d+ (?:Completed|Failed)\n- Title:/i.test(content)) return false;
-  if (!/\n- Worker result:/i.test(content)) return false;
-  if (!handoff.goalResults.length) return true;
-  return handoff.goalResults.some((result) => {
-    const message = String(result.final_message || '').trim();
-    return !message || content.includes(message);
-  });
+  return conversationTimeline(state).flatMap((item) => item.kind === 'message' ? [item.entry] : []);
 }
 
 export function describeProgress(item: AgentProgressMessage): { title: string; detail: string; tone: 'good' | 'bad' | 'neutral' } {

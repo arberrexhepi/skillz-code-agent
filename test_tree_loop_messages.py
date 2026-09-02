@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Dict, List, Sequence
 
 from tree_commands import CommandResult
-from tree_loop import TreeLoop, Turn, extract_commands
+from tree_loop import MAX_EXECUTABLE_COMMANDS_PER_TURN, TreeLoop, Turn, extract_commands
 
 
 class RecordingMessageModel:
@@ -29,6 +29,48 @@ class RecordingMessageModel:
 
 
 class TreeLoopMessageTranscriptTests(unittest.TestCase):
+    def test_discover_read_actions_execute_in_raw_and_planner_backed_loops(self) -> None:
+        from live_test_loop import TreeLoopPlannerWorker
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "real.txt").write_text("actual workspace content", encoding="utf-8")
+            worker = TreeLoopPlannerWorker.__new__(TreeLoopPlannerWorker)
+            worker.root = root
+            worker.discovery_budget = None
+            worker._patch_resolution_blocks_action = lambda action_type: None
+            worker._discovery_remediation_blocks_action = lambda action_type: None
+            for dispatcher in (None, worker._dispatch_tool_action):
+                with self.subTest(planner_backed=dispatcher is not None):
+                    model = RecordingMessageModel([
+                        'discover {"type":"search_in_files","path":"/repo","query":"actual workspace content"}'
+                    ])
+                    loop = TreeLoop(
+                        model=model, workspace_root=root, max_turns=1, verbose=False,
+                        tool_dispatcher=dispatcher,
+                    )
+                    result = loop.run("Find the text")
+                    self.assertTrue(result.turns[0].results[0].ok)
+                    self.assertIn('"file_path": "real.txt"', result.turns[0].results[0].output)
+                    self.assertEqual(loop._total_reads, 1)
+                    self.assertEqual(loop._total_writes, 0)
+
+    def test_oversized_command_batch_is_rejected_before_any_reads_execute(self) -> None:
+        oversized_batch = "\n".join(
+            f'find /repo -name "missing-{index}.tsx"'
+            for index in range(MAX_EXECUTABLE_COMMANDS_PER_TURN + 1)
+        )
+        model = RecordingMessageModel([oversized_batch, "finish recovered"])
+        with tempfile.TemporaryDirectory() as tmp:
+            loop = TreeLoop(model=model, workspace_root=Path(tmp), max_turns=2, verbose=False)
+
+            result = loop.run("Find the relevant frontend file")
+
+        self.assertTrue(result.finished)
+        self.assertEqual(result.turns[0].commands_issued, ["command_batch_rejected"])
+        self.assertIn("No commands from this batch were executed", result.turns[0].results[0].output)
+        self.assertEqual(loop._total_reads, 0)
+
     def test_issue_lifecycle_commands_are_extracted_as_executable(self) -> None:
         output = "\n".join([
             ">>th: the diagnostic is now clean",

@@ -1,6 +1,8 @@
 .env
 .changes.md
 repo_facts.md
+.agent-issue-proposals.json
+.agent-issue-proposals.lock
 __pycache__/main.cpython-313.pyc
 __pycache__
 __pycache__/*

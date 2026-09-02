@@ -36,6 +36,9 @@ from runtime_catalog import (
 )
 from skill_loader import MarkdownSkill, load_markdown_skills_from_dir
 from codex_subscription import run_codex_subscription_completion
+from bridge_presentation import bridge_exchange
+from proposal_runtime import ProposalRuntimeMixin
+from issue_proposals import PROPOSAL_GUIDANCE
 
 # Simple helpers used by memory integration. These are intentionally small
 # and defensive: if you replace them with more sophisticated implementations
@@ -2234,7 +2237,7 @@ class WorkerRunResult:
 # Agent
 # -----------------------------
 
-class WorkingFolderAgent:
+class WorkingFolderAgent(ProposalRuntimeMixin):
     def __init__(self, model_client: BaseModelClient, config: AgentConfig) -> None:
         self.model = model_client
         self.config = config
@@ -2551,6 +2554,8 @@ class WorkingFolderAgent:
             },
             "selected_goal_fact_keys": list(self.selected_goal_fact_keys),
             "issue_state": self._issue_state_payload(),
+            "issue_proposals": self.proposal_state(),
+            "proposal_diagnostics": self._apply_proposal_deferrals(self._proposal_diagnostics()),
             "current_run_facts": [record.to_dict() for record in current_run_records],
             "previous_turn_facts": [record.to_dict() for record in previous_run_records],
             "repo_facts_status_lines": self.repo_facts_status_lines(),
@@ -2615,7 +2620,8 @@ class WorkingFolderAgent:
             issue.closed_at = ""
             self.issue_ledger.active_issue_id = issue.issue_id
         self._persist_repo_facts()
-        self._clear_facts()
+        if activate:
+            self._clear_facts()
         return issue.summary()
 
     def close_active_issue(self, *, note: str = "") -> Optional[Dict[str, Any]]:
@@ -3979,6 +3985,7 @@ class WorkingFolderAgent:
         steps = self._current_run_steps()
         touched_paths = self._collect_touched_paths_for_steps(steps)
         validation = self._validation_result_for_run(steps)
+        validation = WorkerValidationResult(kind=validation.kind, passed=validation.passed, summary=validation.summary + self._proposal_deferral_summary())
         has_mutations = any(
             step.result.ok and self._is_mutating_action(str(step.action.get("type", "") or ""))
             for step in steps
@@ -4378,6 +4385,14 @@ class WorkingFolderAgent:
         if not message:
             message = str(payload.get("message", "") or payload.get("summary", "") or result.name or "Action failed")
 
+        diagnostics = [dict(item) for item in payload.get("diagnostics", []) if isinstance(item, dict)]
+        if diagnostics:
+            from issue_proposals import diagnostic_fingerprint
+            diagnostics = [{**item, "id": "run-" + diagnostic_fingerprint(item)[:16]} for item in diagnostics]
+            actionable = [item for item in self._apply_proposal_deferrals(diagnostics) if item.get("status") != "deferred"]
+            if not actionable:
+                return
+            diagnostics = actionable
         self._clear_active_error()
         self.active_error = ActiveErrorState(
             task=self._current_task,
@@ -4387,7 +4402,7 @@ class WorkingFolderAgent:
             path=path,
             step=len(self.history) + 1,
             diagnostic_engine=str(payload.get("diagnostic_engine", "") or "") or None,
-            diagnostics=[dict(item) for item in payload.get("diagnostics", []) if isinstance(item, dict)],
+            diagnostics=diagnostics,
             suggested_next_actions=[dict(item) for item in payload.get("suggested_next_actions", []) if isinstance(item, dict)],
         )
         try:
@@ -4408,6 +4423,18 @@ class WorkingFolderAgent:
             )
         except Exception:
             pass
+
+    def _refresh_proposal_deferrals(self) -> None:
+        if self.active_error is None or not self.active_error.diagnostics:
+            return
+        remaining = [item for item in self._apply_proposal_deferrals(self._proposal_diagnostics()) if item.get("status") != "deferred"]
+        if remaining:
+            self.active_error.diagnostics = remaining
+            self.active_error.suggested_next_actions = []
+            self._set_active_context_item({"active_error": True, "diagnostics": remaining}, self.active_error.label())
+        else:
+            self._clear_active_error()
+        self._add_active_note("Officially proposed diagnostics are deferred, not resolved. Do not inspect or validate them again for this goal; validate only the requested change.")
 
     def _clear_active_error(self) -> None:
         if self.active_error is not None:
@@ -5168,6 +5195,8 @@ class WorkingFolderAgent:
                 "path": self.active_error.path,
                 "step": self.active_error.step,
             } if self.active_error is not None else None,
+            "proposal_diagnostics": self._proposal_diagnostics(),
+            "deferred_findings": self._proposal_deferral_summary(),
             "output_format_recovery": self.output_format_recovery,
             "fulfillment_readiness": self._fulfillment_readiness(task),
             "discovery_budget": {
@@ -5763,8 +5792,10 @@ class WorkingFolderAgent:
         )
         self._set_active_error(host_action, result)
         try:
+            actionable = [item for item in self._apply_proposal_deferrals(diagnostics) if item.get("status") != "deferred"]
             self._add_active_note(
-                f"Automatic {run.engine} diagnostics found {len(diagnostics)} issue(s) for {path}; address them before continuing."
+                f"Automatic {run.engine} diagnostics found {len(actionable)} actionable issue(s) for {path}. "
+                + ("Triage scope; propose unrelated findings using existing evidence, and address in-scope failures." if actionable else "All findings are already deferred; they do not gate this goal.")
             )
         except Exception:
             pass
@@ -5803,6 +5834,10 @@ class WorkingFolderAgent:
         }
 
         if diagnostics:
+            payload["diagnostics"] = self._apply_proposal_deferrals(diagnostics)
+            if all(item.get("status") == "deferred" for item in payload["diagnostics"]):
+                payload.update(code="DIAGNOSTICS_DEFERRED", message="Broader check still fails; all findings are officially deferred and do not gate this goal.", suggested_next_actions=[])
+                return ActionResult(ok=False, name="diagnose", payload=payload)
             payload.update(
                 {
                     "code": "DIAGNOSTICS_FOUND",
@@ -6571,6 +6606,8 @@ class WorkingFolderAgent:
                 Collect Facts, correct stale facts. Do not force unstale fact verification, they are there to help you make better decisions, chase goal.
                 Do not chase things you've already verified. Mark as finish: done.
                 {shell_note}
+                {PROPOSAL_GUIDANCE}
+                For this JSON runtime emit action.type="propose_issue" with summary, reason, evidence, run_issue_ids, and optional paths.
                                        
                 Rules:
                 1. You may ONLY act within the root path provided by the user.
@@ -9049,6 +9086,9 @@ class WorkingFolderAgent:
         action_type = str(t or "")
 
         try:
+            if action_type == "propose_issue":
+                proposal = self.propose_issue(action)
+                return ActionResult(ok=True, name=action_type, payload={"proposal": proposal, "message": f"Recorded {proposal['proposal_id']}; linked findings no longer gate the current goal."})
             blocked_payload = self._post_satisfaction_block_payload(action)
             if blocked_payload is not None:
                 return self._error_action_result(action_type, blocked_payload)
@@ -9531,12 +9571,29 @@ def _emit_bridge_message(payload: Dict[str, Any]) -> None:
 def _handle_bridge_planner_action(
     *,
     planner: Any,
-    transcript: List[Dict[str, str]],
+    transcript: List[Dict[str, Any]],
     request: Dict[str, Any],
     add_exchange: Callable[[str, str], None],
     emit_progress: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> str:
     action_name = str(request.get("action", "") or "").strip()
+    if action_name in {"accept_issue_proposal", "ignore_issue_proposal"}:
+        proposal_id = str(request.get("proposal_id") or "").strip()
+        decision = "accept" if action_name == "accept_issue_proposal" else "ignore"
+        proposal = planner.worker.decide_issue_proposal(proposal_id, decision)
+        return f"Suggestion {proposal_id} {proposal['status']}." + (f" Created {proposal['accepted_issue_id']} without changing the active task." if decision == "accept" else "")
+    if action_name in {"approve_plan", "reject_plan", "continue_issue", "revise_plan"} and ("expected_plan" in request or action_name == "revise_plan"):
+        current = planner.session.pending_plan or (planner.session.paused_plan if planner.session.execution_paused else None)
+        if current is None or planner.session.executing or request.get("expected_plan") != planner._plan_payload(current):
+            raise ValueError("The plan changed. Review the current plan before deciding.")
+    if action_name == "revise_plan":
+        feedback = str(request.get("feedback") or "").strip()
+        if not feedback:
+            raise ValueError("Describe what should change in the plan.")
+        add_exchange("user", "Suggest plan changes:\n" + feedback)
+        message = planner.request_plan_revision(feedback)
+        add_exchange("assistant", message)
+        return message
     if action_name == "approve_plan":
         add_exchange("user", "approve")
         message = planner.execute_pending_plan()
@@ -9670,14 +9727,20 @@ def _handle_bridge_planner_action(
     if action_name == "create_issue":
         summary = str(request.get("summary", "") or request.get("request_summary", "") or "").strip()
         payload = request.get("payload")
+        activate = request.get("activate", True)
         if isinstance(payload, dict):
             summary = summary or str(payload.get("summary", "") or payload.get("request_summary", "") or "").strip()
+            activate = request.get("activate", payload.get("activate", True))
         if not summary:
             raise ValueError("create_issue requires issue details")
+        if not isinstance(activate, bool):
+            raise ValueError("create_issue activate must be a boolean")
         creator = getattr(planner, "create_manual_issue", None)
         if not callable(creator):
             raise ValueError("Planner does not support issue creation")
-        message = creator(summary)
+        message = creator(summary, activate=activate)
+        if message.startswith(("Issue creation failed:", "Worker does not support issue creation")):
+            raise ValueError(message)
         add_exchange("assistant", message)
         return message
     if action_name == "close_issue":
@@ -9713,7 +9776,7 @@ def _run_extension_bridge(args: argparse.Namespace) -> int:
     config = build_agent_config(args, root, tool_path)
 
     from planner import PlannerAgent
-    transcript: List[Dict[str, str]] = []
+    transcript: List[Dict[str, Any]] = []
     last_bridge_state: Dict[str, Any] | None = None
 
     def bridge_state(last_message: str = "") -> Dict[str, Any]:
@@ -9731,7 +9794,7 @@ def _run_extension_bridge(args: argparse.Namespace) -> int:
             return state
         except Exception as exc:
             fallback_planner: Dict[str, Any] = {}
-            fallback_transcript: List[Dict[str, str]] = transcript[-40:]
+            fallback_transcript: List[Dict[str, Any]] = transcript[-40:]
             if isinstance(last_bridge_state, dict):
                 cached_planner = last_bridge_state.get("planner")
                 cached_transcript = last_bridge_state.get("transcript")
@@ -9886,7 +9949,7 @@ def _run_extension_bridge(args: argparse.Namespace) -> int:
             "path": path,
             "ok": step.result.ok,
             "elapsed_s": round(step.elapsed_s, 2),
-            "thought": thought[:200] if thought else "",
+            "thought": thought if thought else "",
             "summary": summary[:200] if summary else "",
             "skill_name": skill_name,
             "skill_mode": skill_mode,
@@ -9999,7 +10062,7 @@ def _run_extension_bridge(args: argparse.Namespace) -> int:
         text = str(content or "").strip()
         if not text:
             return
-        transcript.append({"role": role, "content": text})
+        transcript.append(bridge_exchange(planner, role, text))
 
     def summarize_bridge_action_result(action: Dict[str, Any], result: ActionResult) -> str:
         action_type = str(action.get("type", "") or result.name or "action")

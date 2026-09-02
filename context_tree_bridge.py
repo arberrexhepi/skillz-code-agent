@@ -158,16 +158,23 @@ READ (free, no tool call — use these instead of tool actions for exploration):
   find-symbol /repo/src useTodo     Find a symbol by name in a file or directory
   stat /repo/src/main.py            File metadata (size, lines)
   find /repo *.py limit=50          Glob search for files
-  grep /repo/src "pattern"          Search loaded file contents
+  find /repo/src -name "*.tsx"      Familiar find-name form
+  grep /repo/src "pattern"          Search workspace text on disk recursively
   grep /facts "keyword"             Search facts
   read-diagnostics [path]           Ingest a local diagnostics snapshot
     diagnose <path> [limit=N]         Run backend diagnostics for one file and ingest issues
   run-route-check <route-or-url> [base=<url>]  Visit a route and ingest browser/runtime errors
   list-run-issues                   List transient run diagnostics (`run-*` ids)
   show-run-issue <run-id>           Show one transient run diagnostic
+  propose-issue <json>             Persist an unrelated finding; linked run_issue_ids stop gating this goal immediately
   list-issues                       List run diagnostics + durable planner issues
   show-issue <issue-id>             Show a durable planner issue (`issue-*` id)
   reopen-run-issue <run-id>         Mark one transient run diagnostic open again
+
+DISCOVERY (read-only host dispatch, counts toward the discovery tool budget):
+  discover {"type":"find_files","path":"/repo","patterns":["*Panel*"]}
+  discover {"type":"read_symbol","path":"/repo/src/Panel.tsx","symbol_name":"Panel"}
+  The codebase-discovery skill lists the other supported discovery actions. Root is always the mounted workspace.
 
 WRITE (dispatches to real tools):
   write <path> <content>            Write file (single line content)
@@ -180,6 +187,11 @@ WRITE (dispatches to real tools):
     replacement lines here
   >>>
   patch <path> <search> -> <replace>  Search/replace edit
+    Prefer JSON-quoted patch operands; escapes decode once. Quote arrows inside operands.
+    Patch requires exactly one source match; missing/ambiguous matches leave the file unchanged.
+    Write/replace payloads stay literal: one separator follows the header; extra spaces are content.
+    Heredocs preserve indentation and blank lines; an unterminated block rejects the batch.
+    Put each text mutation in its own strategy step. Use left-side dependencies (s1 -> s2: ...).
     show-diff [path]                  Show git diff for the workspace or one path
     review-changes [path] [limit=N]   Review changed files and risk summary
   shell <command>                   Run shell command
@@ -239,7 +251,8 @@ ANNOTATIONS (>> feed-forward, free):
 
 Notes:
 - Multiple read commands can be chained (one per line) in a single turn.
-- Read commands resolve from the in-context tree — zero cost, no tool dispatch.
+- /repo reads and discovery use the actual mounted workspace; the bounded tree is only a metadata preview.
+- Other mounts (/facts, /memory, /status, /skills) remain in-memory. Reads need no tool dispatch.
 - Write/context commands dispatch to the host and count as tool calls.
 - Facts are addressable at /facts/<issue>/<type>/<key> — use cat to read them.
 - Memory items live at /memory/recent/<id> — use ls/cat to browse.
@@ -293,7 +306,7 @@ STRATEGIES (multi-step DAG pipelines):
             "ls", "cat", "read-line-range", "read_line_range", "symbols", "find-symbol", "find_symbol", "stat", "find", "grep",
             "read-diagnostics", "run-route-check", "run_route_check", "ingest-log", "list-run-issues", "list_run_issues", "list-issues", "show-run-issue", "show_run_issue", "show-issue", "resolve-run-issue", "resolve_run_issue", "resolve-issue", "reopen-run-issue", "reopen_run_issue", "reopen-issue", "run-check",
             "write", "replace-lines", "replace_lines", "patch", "show-diff", "show_diff", "review-changes", "review_changes", "shell", "git",
-            "fact", "expand", "drop", "batch", "finish",
+            "fact", "expand", "drop", "batch", "finish", "propose-issue",
             "skill", "#",
         }
 

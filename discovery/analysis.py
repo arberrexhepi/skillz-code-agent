@@ -24,11 +24,18 @@ def scan_frontend_symbols(text: str) -> list[tuple[re.Pattern[str], str]]:
         (re.compile(r"^\s*function\s+([A-Za-z_][A-Za-z0-9_]*)\b\s*\((.*?)\)"), "function"),
         (re.compile(r"^\s*export\s+(?:const|let|var)\s+([A-Za-z_][A-Za-z0-9_]*)\b\s*=\s*(?:async\s*)?\((.*?)\)\s*=>"), "exported_variable"),
         (re.compile(r"^\s*(?:const|let|var)\s+([A-Za-z_][A-Za-z0-9_]*)\b\s*=\s*(?:async\s*)?\((.*?)\)\s*=>"), "variable"),
+        # Also recognize typed, wrapped, generic and multiline variable initializers.
+        (re.compile(r"^\s*export\s+(?:declare\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)(?=\s*(?:[:=]|$))"), "exported_variable"),
+        (re.compile(r"^\s*(?:declare\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)(?=\s*(?:[:=]|$))"), "variable"),
+        (re.compile(r"^\s*(?:export\s+(?:default\s+)?)?async\s+function\s+([A-Za-z_$][\w$]*)\b"), "async_function"),
         (re.compile(r"^\s*export\s+class\s+([A-Za-z_][A-Za-z0-9_]*)\b(?:\s+extends\s+([^\s{]+))?"), "exported_class"),
         (re.compile(r"^\s*class\s+([A-Za-z_][A-Za-z0-9_]*)\b(?:\s+extends\s+([^\s{]+))?"), "class"),
         (re.compile(r"^\s*export\s+interface\s+([A-Za-z_][A-Za-z0-9_]*)\b"), "interface"),
         (re.compile(r"^\s*export\s+type\s+([A-Za-z_][A-Za-z0-9_]*)\b\s*="), "type"),
         (re.compile(r"^\s*export\s+enum\s+([A-Za-z_][A-Za-z0-9_]*)\b"), "enum"),
+        (re.compile(r"^\s*interface\s+([A-Za-z_$][\w$]*)\b"), "interface"),
+        (re.compile(r"^\s*type\s+([A-Za-z_$][\w$]*)\b"), "type"),
+        (re.compile(r"^\s*enum\s+([A-Za-z_$][\w$]*)\b"), "enum"),
     ]
 
 

@@ -1,9 +1,10 @@
 import { useEffect, useRef, useState } from 'react';
-import { agentHandoff, continuousIsActive, presentationTranscript } from '../../../shared/agentCore';
+import { agentHandoff, continuousIsActive } from '../../../shared/agentCore';
+import { conversationTimeline } from '../../../shared/agentTimeline';
 import { useAgentWorkspace } from '../agent/agentWorkspace';
 import { AgentDecisionCard } from './agent/AgentDecisionCard';
-import { AgentHandoffCard } from './agent/AgentHandoffCard';
-import { GoalReportDialog } from './agent/GoalReportDialog';
+import { WorkflowReportCard } from './agent/WorkflowReportCard';
+import { TurnThought } from './agent/TurnThought';
 import { MarkdownMessage } from './agent/MarkdownMessage';
 import { RuntimeDrawer } from './agent/RuntimeDrawer';
 
@@ -11,21 +12,14 @@ export function AgentPanel(): React.JSX.Element {
   const agent = useAgentWorkspace();
   const [prompt, setPrompt] = useState('');
   const [showRuntime, setShowRuntime] = useState(false);
-  const [showGoalReport, setShowGoalReport] = useState(false);
   const transcriptRef = useRef<HTMLDivElement>(null);
   const { bridge, pendingAction, status, notice } = agent.state;
   const continuous = bridge.planner.continuous_mode;
-  const transcript = presentationTranscript(bridge);
+  const timeline = conversationTimeline(bridge);
   const handoff = agentHandoff(bridge);
   const workingLabel = bridge.planner.executing
     ? `Goal ${bridge.planner.executing_goal_index || handoff.completedGoalCount + 1}/${bridge.planner.executing_goal_count || handoff.totalGoalCount || '?'}: ${bridge.planner.executing_goal_title || 'Executing plan'}`
     : pendingAction;
-  const liveDetail = pendingAction
-    ? (() => {
-        const latest = [...agent.state.activity].reverse().find((item) => ['model', 'discovery', 'worker', 'plan'].includes(String(item.domain || '')));
-        return latest?.summary || latest?.thought;
-      })()
-    : undefined;
 
   useEffect(() => {
     transcriptRef.current?.scrollTo({ top: transcriptRef.current.scrollHeight, behavior: 'smooth' });
@@ -53,15 +47,14 @@ export function AgentPanel(): React.JSX.Element {
       {showRuntime && <RuntimeDrawer onClose={() => setShowRuntime(false)} />}
       <div className="agent-main">
         <div className="transcript" ref={transcriptRef}>
-          {transcript.length === 0 && !handoff.discovery && (
+          {timeline.length === 0 && !handoff.discovery && (
             <div className="agent-empty"><span>✦</span><h3>Work from intent.</h3><p>Ask for a change, investigation, or plan. Decisions stay here; execution detail moves into the workspace dock.</p></div>
           )}
-          {transcript.map((entry, index) => (
-            <article className={`message ${entry.role}`} key={`${entry.role}-${index}`}><header>{entry.role === 'user' ? 'You' : 'Agent'}</header><MarkdownMessage content={entry.content} /></article>
-          ))}
-          <AgentHandoffCard handoff={handoff} onViewGoalReport={() => setShowGoalReport(true)} />
-          {pendingAction && <AgentWorking action={workingLabel} detail={liveDetail} />}
+          {timeline.map((item) => item.kind === 'workflow'
+            ? <WorkflowReportCard key={item.id} report={item} />
+            : <article className={`message ${item.entry.role}`} key={item.id}><header>{item.entry.role === 'user' ? 'You' : 'Agent'}</header><MarkdownMessage content={item.entry.content} /></article>)}
         </div>
+        <TurnThought active={Boolean(pendingAction || bridge.planner.executing)} action={workingLabel} thought={agent.state.turnThought} />
         <AgentDecisionCard />
       </div>
       {notice && <button type="button" className="agent-notice" title={notice} onClick={agent.clearNotice}>{notice}<span>×</span></button>}
@@ -75,20 +68,6 @@ export function AgentPanel(): React.JSX.Element {
         <button type="button" className="send-button" disabled={!prompt.trim() || Boolean(pendingAction)} onClick={() => void submit()}>↑</button>
         </div>
       </div>
-      {showGoalReport && <GoalReportDialog handoff={handoff} onClose={() => setShowGoalReport(false)} />}
     </aside>
   );
-}
-
-function humanize(value: string): string { return value.replaceAll('_', ' ').replace(/^./, (letter) => letter.toUpperCase()); }
-
-function AgentWorking({ action, detail }: { action: string; detail?: string }): React.JSX.Element {
-  const [elapsed, setElapsed] = useState(0);
-  useEffect(() => {
-    const started = Date.now();
-    setElapsed(0);
-    const timer = window.setInterval(() => setElapsed(Math.floor((Date.now() - started) / 1000)), 1000);
-    return () => window.clearInterval(timer);
-  }, [action]);
-  return <div className="agent-working"><i /><div><span>{humanize(action)}</span>{detail && <small>{detail}</small>}</div><time>{elapsed}s</time></div>;
 }
