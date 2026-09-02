@@ -59,6 +59,8 @@ from runtime_catalog import runtime_options_payload  # noqa: E402
 from skill_loader import load_markdown_skills_from_dir  # noqa: E402
 from tree_commands import CommandResult  # noqa: E402
 from tree_loop import TreeLoop, Turn  # noqa: E402
+from discovery.dispatch import DISCOVERY_ACTION_TYPES, execute_discovery_action  # noqa: E402
+from execution_evidence import repository_observation  # noqa: E402
 
 
 REPO_FACTS_FILENAME = "repo_facts.md"
@@ -67,7 +69,6 @@ DISCOVERY_REMEDIATION_READ_SATISFIERS = {"read_file", "read_line_range", "read-l
 EXECUTION_EXPLORATION_ACTION_LIMIT = 14
 EXECUTION_EMPTY_SEARCH_LIMIT = 3
 EXECUTION_RECOVERY_FOCUSED_READ_LIMIT = 1
-EXECUTION_SEARCH_COMMANDS = {"find", "find-symbol", "find_symbol", "grep", "repo-map", "repo_map", "symbols"}
 GIT_MUTATION_ACTION_TYPES = {
     "git_add",
     "git_restore",
@@ -245,6 +246,7 @@ class TreeLoopPlannerWorker:
         self._validation_after_mutation = False
         self._execution_non_mutating_actions = 0
         self._execution_empty_searches = 0
+        self._execution_seen_evidence: Set[str] = set()
         self._execution_stagnation: Optional[Dict[str, Any]] = None
         self._run_sequence = 0
         self._active_run_id = 0
@@ -497,6 +499,7 @@ class TreeLoopPlannerWorker:
         self._validation_after_mutation = False
         self._execution_non_mutating_actions = 0
         self._execution_empty_searches = 0
+        self._execution_seen_evidence = set()
         self._execution_stagnation = None
         self._run_sequence = 0
         self._active_run_id = 0
@@ -920,9 +923,10 @@ class TreeLoopPlannerWorker:
             return {
                 "mode": "execution_recovery",
                 "steps": [
-                    "Stop broad repository searches; the current evidence is sufficient to choose a direction.",
-                    "Use at most one focused read of an already identified target, then make the narrow mutation the goal requires.",
-                    "If no mutation is appropriate, run one targeted validation and finish with the result or an explicit blocker.",
+                    "Stop repeating empty searches or already inspected evidence.",
+                    "Read the identified source or a new line range needed for a safe edit; new evidence resumes normal execution.",
+                    "Preserve failed-edit diagnostics and inspect the affected file before retrying. Never mutate just to satisfy recovery.",
+                    "If no edit is appropriate, validate and finish with the result or an explicit blocker.",
                 ],
             }
         return None
@@ -1745,10 +1749,10 @@ class TreeLoopPlannerWorker:
             parts.append(
                 "EXECUTION RECOVERY MODE is active because "
                 + reason
-                + ". Stop repo-map, find, grep, symbol searches, broad listings, repeated diagnostics, and fact gathering. "
-                "The next useful action must be one narrow repository mutation, one targeted validation proving no edit is needed, "
-                "or `finish <explicit blocker>` if the goal cannot be completed. You may use at most one final cat/read-line-range "
-                "on an already identified target before that action."
+                + ". Stop repeating empty searches and unchanged evidence. Inspect identified source or a new line range "
+                "needed for a safe edit; new repository evidence resumes execution. A failed patch's affected file remains "
+                "readable for repair. One repeated focused read is also allowed to restore context. "
+                "Do not make a mutation merely to escape recovery. Validate or `finish <explicit blocker>` if appropriate."
             )
         if self._completion_check_pending and self._completion_check_reason:
             parts.append(self._completion_check_reason)
@@ -1927,6 +1931,7 @@ class TreeLoopPlannerWorker:
         self._validation_after_mutation = False
         self._execution_non_mutating_actions = 0
         self._execution_empty_searches = 0
+        self._execution_seen_evidence = set()
         self._execution_stagnation = None
         self._last_validation = WorkerValidationResult(kind="none", passed=True, summary="No mutating actions required validation.")
         self._latest_review = None
@@ -2187,22 +2192,17 @@ class TreeLoopPlannerWorker:
             "write_file",
         } | GIT_MUTATION_ACTION_TYPES
 
-    def _reset_execution_stagnation(self) -> None:
+    def _reset_execution_stagnation(self, *, clear_evidence: bool = False) -> None:
         self._execution_non_mutating_actions = 0
         self._execution_empty_searches = 0
+        if clear_evidence:
+            self._execution_seen_evidence = set()
         self._execution_stagnation = None
         self._refresh_loop_steering()
 
-    def _execution_result_is_empty_search(self, command: str, result: CommandResult) -> bool:
-        if self._execution_command_verb(command) not in EXECUTION_SEARCH_COMMANDS:
-            return False
-        output = " ".join(str(result.output or "").strip().lower().split())
-        return output in {
-            "(empty)",
-            "(no matches)",
-            "(no symbol matches)",
-            "(no symbols found)",
-        }
+    def _execution_read_resolves_patch(self, source_path: str) -> bool:
+        resolution = getattr(self, "_patch_resolution", None)
+        return bool(source_path and isinstance(resolution, dict) and source_path == resolution.get("path"))
 
     def _execution_target_paths(self) -> List[str]:
         targets: List[str] = []
@@ -2223,18 +2223,23 @@ class TreeLoopPlannerWorker:
         if getattr(self, "discovery_budget", None) is not None:
             return
         if self._is_successful_execution_mutation(result):
-            self._reset_execution_stagnation()
+            self._reset_execution_stagnation(clear_evidence=True)
             return
-        if not result.ok or result.command_type in {"annotation", "finish"}:
+        observation = repository_observation(command, result)
+        if observation is None:
             return
 
-        verb = self._execution_command_verb(command)
-        action_type = str((result.tool_action or {}).get("type", "") or "").strip()
-        if verb in {"batch", "finish"} or action_type in {"begin_edit_batch", "end_edit_batch"}:
+        seen = getattr(self, "_execution_seen_evidence", set())
+        self._execution_seen_evidence = seen
+        if self._execution_read_resolves_patch(observation.source_path) or (
+            not observation.empty_search and observation.fingerprint not in seen
+        ):
+            seen.add(observation.fingerprint)
+            self._reset_execution_stagnation()
             return
 
         self._execution_non_mutating_actions = int(getattr(self, "_execution_non_mutating_actions", 0) or 0) + 1
-        if self._execution_result_is_empty_search(command, result):
+        if observation.empty_search:
             self._execution_empty_searches = int(getattr(self, "_execution_empty_searches", 0) or 0) + 1
 
         if getattr(self, "_execution_stagnation", None) is not None:
@@ -2245,10 +2250,10 @@ class TreeLoopPlannerWorker:
         reason = ""
         trigger = ""
         if empty_count >= EXECUTION_EMPTY_SEARCH_LIMIT:
-            reason = f"{empty_count} repository searches returned no matches without a mutation"
+            reason = f"{empty_count} repository searches returned no matches without new evidence"
             trigger = "empty_searches"
         elif action_count >= EXECUTION_EXPLORATION_ACTION_LIMIT:
-            reason = f"{action_count} actions completed without a repository mutation"
+            reason = f"{action_count} repository observations repeated or returned empty without new evidence"
             trigger = "non_mutating_actions"
         if not reason:
             return
@@ -2269,12 +2274,22 @@ class TreeLoopPlannerWorker:
         state = getattr(self, "_execution_stagnation", None)
         if not isinstance(state, dict) or getattr(self, "discovery_budget", None) is not None:
             return False
+        # This observer runs after execution. Never hide an actual failure (notably
+        # a patch mismatch), which the repair/validation handlers below must see.
+        if not result.ok:
+            return False
         if self._is_successful_execution_mutation(result) or result.command_type in {"annotation", "finish"}:
             return False
 
+        observation = repository_observation(command, result)
+        if observation is not None and (
+            self._execution_read_resolves_patch(observation.source_path)
+            or (not observation.empty_search and observation.fingerprint not in getattr(self, "_execution_seen_evidence", set()))
+        ):
+            return False
         verb = self._execution_command_verb(command)
         action_type = str((result.tool_action or {}).get("type", "") or "").strip()
-        focused_read = verb in {"cat", "read-line-range", "read_line_range"}
+        focused_read = observation is not None and bool(observation.source_path)
         validation_actions = {
             "review_changes",
             "run_check",
@@ -2285,17 +2300,20 @@ class TreeLoopPlannerWorker:
         validation = action_type in validation_actions
         if focused_read and int(state.get("focused_reads_used", 0) or 0) < EXECUTION_RECOVERY_FOCUSED_READ_LIMIT:
             state["focused_reads_used"] = int(state.get("focused_reads_used", 0) or 0) + 1
-            self._request_same_turn_halt("execution recovery: focused read consumed; mutate, validate, finish, or report a blocker next")
+            self._refresh_loop_steering()
             return False
         if validation or verb in {"drop", "finish"} or action_type in {"drop_context", "begin_edit_batch", "end_edit_batch"}:
             self._request_same_turn_halt("execution recovery: targeted action completed; finish or make the required mutation next")
+            return False
+        if observation is None:
             return False
 
         state["blocked_actions"] = int(state.get("blocked_actions", 0) or 0) + 1
         result.ok = False
         result.output = (
-            "execution recovery blocked more exploration after sustained no-progress activity. "
-            "Use a narrow write/patch/replace action, one targeted validation, or finish with an explicit blocker."
+            "execution recovery blocked repeated or empty exploration after sustained no-progress activity. "
+            "Read identified source or a new line range, repair the failed edit using its diagnostic, "
+            "run a targeted validation, or finish with an explicit blocker."
         )
         self._refresh_loop_steering()
         self._request_same_turn_halt("execution recovery blocked another exploratory action")
@@ -2304,7 +2322,7 @@ class TreeLoopPlannerWorker:
             if callable(request_stop):
                 request_stop(
                     "execution recovery exhausted after three additional exploratory actions; "
-                    "the goal made no repository mutation"
+                    "no new repository evidence was obtained"
                 )
         return True
 
@@ -2461,6 +2479,11 @@ class TreeLoopPlannerWorker:
             self._refresh_loop_steering()
             return ""
 
+        if action_type in DISCOVERY_ACTION_TYPES:
+            payload = execute_discovery_action(action, root=self.root)
+            result.ok = bool(payload.get("ok", True))
+            return json.dumps(payload, indent=2)
+
         executor = getattr(self, f"_exec_{action_type}", None)
         if not callable(executor):
             result.ok = False
@@ -2558,7 +2581,8 @@ class TreeLoopPlannerWorker:
             normalized_command = str(command or "").strip()
             if normalized_command.startswith("[") and "] " in normalized_command:
                 normalized_command = normalized_command.split("] ", 1)[1].strip()
-            read_path = self._extract_read_path(command)
+            observation = repository_observation(command, result)
+            read_path = (observation.source_path if observation is not None else "") or self._extract_read_path(command)
             shown_issue_id = self._extract_shown_issue_id(command)
             pending_path = str((self._pending_verification or {}).get("path", "") or "")
             if read_path and pending_path and read_path == pending_path:

@@ -12,7 +12,16 @@ Electron desktop shell for the Python planner/worker. The application is intenti
 - Runtime settings for the additive `codex-subscription` provider, including local ChatGPT authentication, plan, CLI, and live-model status while preserving the existing OpenAI API provider
 - workspace-native agent UI: calm conversation rail, pinned lifecycle decisions, durable issues/run facts, and continuous-mode status
 - bottom workspace dock for Terminal, Activity, Problems, and Review; diagnostics also become Monaco markers
+- per-workspace view preferences: hide/show the editor and resize the agent panel without losing tabs, drafts, or terminal sessions
 - sandboxed renderer with a narrow, validated preload API
+
+## Workspace views
+
+Use **Hide editor / Show editor** in the title bar to switch between the split layout and an agent-focused view. The terminal/activity dock stays available, and hidden editor tabs retain unsaved changes. Opening a file or diff shows the editor automatically.
+
+Drag the divider to the left of the agent to adjust its width. The divider also supports arrow keys (Shift for larger steps), Home/End for the width limits, and double-click to reset its width. The title-bar reset button restores both editor visibility and the default width. Preferences are saved locally per workspace and adapt to smaller windows without overwriting the preferred width.
+
+Agent chat uses 14px body/composer text, 13px code, and 11px supporting labels at normal zoom; editor and sidebar typography remain independent.
 
 ## Development
 
@@ -24,6 +33,8 @@ npm run dev
 ```
 
 The `predev` check resolves Electron before electron-vite starts. Electron 44 can restore a missing local runtime lazily, while electron-vite otherwise fails early with `Error: Electron uninstall` when `path.txt` is absent.
+
+Layout regression checks: `npm run test:layout`. For browser interaction checks, `npm run test:layout:preview` serves `/scripts/fixtures/workspace-view.html` with the real renderer and a mock bridge (no real files, shell, or Python process). The workspace switcher alternates two fixture repositories for checking preference isolation.
 
 Production checks and local packaging:
 

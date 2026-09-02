@@ -1014,7 +1014,7 @@ class PlannerAgent:
             self.session.active_issue_id = issue_id
         if issue_id:
             return f"Created issue {issue_id}: {normalized}"
-        return f"Created issue: {normalized}"
+        return "Issue creation failed: worker returned no issue identifier."
 
     def close_issue(self, issue_id: str) -> str:
         normalized_issue_id = str(issue_id or "").strip()

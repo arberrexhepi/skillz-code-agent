@@ -15,8 +15,9 @@ READ (free, in-context — no tool call):
   repo-map /repo/src topic="billing"  Structural map ranked before line reads
   stat /repo/src/main.py           File metadata
   find /repo *.py                  Glob search
+  find /repo/src -name "*.tsx"     Familiar find-name form
   grep /facts "pattern"            Search content
-  grep /repo/src "TODO"            Search loaded files
+  grep /repo/src "TODO"            Search workspace text on disk recursively
   read-diagnostics [path]          Ingest a local diagnostics snapshot
     diagnose <path> [limit=N]        Run backend diagnostics for one file and ingest issues
   run-route-check <route-or-url> [base=<url>]  Visit a route with Playwright and ingest runtime errors
@@ -78,6 +79,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from context_tree import ContextTree
 from discovery import repo_map
+from discovery.dispatch import DISCOVERY_ACTION_TYPES
+from mutation_text import PARSE_ERROR_PREFIX, is_text_mutation, parse_patch_payload, parse_range_payload, split_path_payload
 from issue_facts import (
     format_issue_not_found,
     format_issue_summary_detail,
@@ -245,7 +248,9 @@ class TreeCommandParser:
         Returns a CommandResult. If needs_tool is True, the caller
         must dispatch tool_action to ToolbeltRunner."""
 
-        raw = raw.strip()
+        raw = raw.lstrip()
+        if raw.startswith(PARSE_ERROR_PREFIX):
+            return CommandResult(ok=False, output=raw.removeprefix(PARSE_ERROR_PREFIX), command_type="error")
         if not raw:
             return CommandResult(ok=False, output="Empty command", command_type="error")
 
@@ -457,48 +462,60 @@ class TreeCommandParser:
         return CommandResult(ok=True, output=json.dumps(info, indent=2), command_type="read")
 
     def _cmd_find(self, rest: str) -> CommandResult:
-        parts = rest.split()
+        try:
+            parts = shlex.split(rest)
+        except ValueError as exc:
+            return CommandResult(ok=False, output=f"find parse error: {exc}", command_type="error")
+
         path = parts[0] if parts else "/"
-        pattern = parts[1] if len(parts) > 1 else "*"
+        remaining = parts[1:]
+        pattern = "*"
+        if remaining:
+            if remaining[0] == "-name":
+                if len(remaining) < 2:
+                    return CommandResult(ok=False, output="find -name requires a pattern", command_type="error")
+                pattern = remaining[1]
+                remaining = remaining[2:]
+            elif remaining[0].startswith("-"):
+                return CommandResult(
+                    ok=False,
+                    output="find supports either `find <path> <glob>` or `find <path> -name <glob>`",
+                    command_type="error",
+                )
+            else:
+                pattern = remaining[0]
+                remaining = remaining[1:]
+
         limit = 100
-        for p in parts[2:]:
+        for p in remaining:
             if p.startswith("limit="):
                 try:
                     limit = int(p.split("=", 1)[1])
                 except ValueError:
-                    pass
+                    return CommandResult(ok=False, output="find limit must be an integer", command_type="error")
+            else:
+                return CommandResult(ok=False, output=f"find received an unsupported argument: {p}", command_type="error")
 
         results = self.tree.find(path, glob_pattern=pattern, limit=limit)
         output = "\n".join(results) if results else "(no matches)"
         return CommandResult(ok=True, output=output, command_type="read")
 
     def _cmd_grep(self, rest: str) -> CommandResult:
-        # grep /path "pattern" [limit=N]
-        parts = rest.split(None, 1)
-        path = parts[0] if parts else "/"
-        remainder = parts[1] if len(parts) > 1 else ""
-
-        # Extract quoted pattern
-        pattern = remainder
+        try:
+            parts = shlex.split(rest)
+        except ValueError as exc:
+            return CommandResult(ok=False, output=f"grep parse error: {exc}", command_type="error")
+        if len(parts) < 2:
+            return CommandResult(ok=False, output='Usage: grep <path> "pattern" [limit=N]', command_type="error")
+        path, pattern = parts[:2]
         limit = 50
-        quote_match = re.match(r'"([^"]*)"(.*)', remainder)
-        if quote_match:
-            pattern = quote_match.group(1)
-            for token in quote_match.group(2).split():
-                if token.startswith("limit="):
-                    try:
-                        limit = int(token.split("=", 1)[1])
-                    except ValueError:
-                        pass
-        else:
-            tokens = remainder.split()
-            pattern = tokens[0] if tokens else ""
-            for t in tokens[1:]:
-                if t.startswith("limit="):
-                    try:
-                        limit = int(t.split("=", 1)[1])
-                    except ValueError:
-                        pass
+        for token in parts[2:]:
+            if not token.startswith("limit="):
+                return CommandResult(ok=False, output=f"grep received an unsupported argument: {token}", command_type="error")
+            try:
+                limit = int(token.split("=", 1)[1])
+            except ValueError:
+                return CommandResult(ok=False, output="grep limit must be an integer", command_type="error")
 
         results = self.tree.grep(path, pattern, limit=limit)
         if results:
@@ -682,10 +699,7 @@ class TreeCommandParser:
 
     def _cmd_write(self, rest: str) -> CommandResult:
         # write <path> <content>
-        parts = rest.split(None, 1)
-        if len(parts) < 2:
-            return CommandResult(ok=False, output="Usage: write <path> <content>", command_type="error")
-        path, content = parts
+        path, content = split_path_payload(rest)
         # Strip /repo/ prefix if present for real tool dispatch
         rel_path = path.removeprefix("/repo/").removeprefix("repo/")
         return CommandResult(
@@ -697,51 +711,7 @@ class TreeCommandParser:
         )
 
     def _cmd_replace_lines(self, rest: str) -> CommandResult:
-        rest = rest.lstrip()
-        if not rest:
-            return CommandResult(
-                ok=False,
-                output="Usage: replace-lines <path>:<start>-<end> <content> or replace-lines <path> <start>-<end> <content>",
-                command_type="error",
-            )
-
-        match = re.match(
-            r"^(?P<path>\S+):(?P<start>\d+)-(?P<end>\d+)(?:\s+(?P<content>.*))?$",
-            rest,
-            re.DOTALL,
-        )
-        if match is not None:
-            path = match.group("path")
-            start_line = int(match.group("start"))
-            end_line = int(match.group("end"))
-            content = match.group("content") or ""
-        else:
-            match = re.match(
-                r"^(?P<path>\S+)\s+(?P<start>\d+)-(?P<end>\d+)(?:\s+(?P<content>.*))?$",
-                rest,
-                re.DOTALL,
-            )
-            if match is not None:
-                path = match.group("path")
-                start_line = int(match.group("start"))
-                end_line = int(match.group("end"))
-                content = match.group("content") or ""
-            else:
-                match = re.match(
-                    r"^(?P<path>\S+)\s+(?P<start>\d+)\s+(?P<end>\d+)(?:\s+(?P<content>.*))?$",
-                    rest,
-                    re.DOTALL,
-                )
-                if match is None:
-                    return CommandResult(
-                        ok=False,
-                        output="replace-lines requires a <start>-<end> range",
-                        command_type="error",
-                    )
-                path = match.group("path")
-                start_line = int(match.group("start"))
-                end_line = int(match.group("end"))
-                content = match.group("content") or ""
+        path, start_line, end_line, content = parse_range_payload(rest)
 
         rel_path = path.removeprefix("/repo/").removeprefix("repo/")
         return CommandResult(
@@ -759,19 +729,7 @@ class TreeCommandParser:
         )
 
     def _cmd_patch(self, rest: str) -> CommandResult:
-        # patch <path> <search> -> <replace>
-        # Find the path (first token), then split on ' -> '
-        parts = rest.split(None, 1)
-        if len(parts) < 2:
-            return CommandResult(ok=False, output="Usage: patch <path> <search> -> <replace>", command_type="error")
-        path = parts[0]
-        remainder = parts[1]
-
-        arrow_split = remainder.split(" -> ", 1)
-        if len(arrow_split) < 2:
-            return CommandResult(ok=False, output="Missing ' -> ' separator", command_type="error")
-
-        search, replace = arrow_split
+        path, search, replace = parse_patch_payload(rest)
         rel_path = path.removeprefix("/repo/").removeprefix("repo/")
         return CommandResult(
             ok=True,
@@ -845,6 +803,12 @@ class TreeCommandParser:
             return CommandResult(
                 ok=False,
                 output="discover payload requires a non-empty type",
+                command_type="error",
+            )
+        if action_type not in DISCOVERY_ACTION_TYPES:
+            return CommandResult(
+                ok=False,
+                output=f"discover supports read-only discovery actions, not {action_type}",
                 command_type="error",
             )
         return CommandResult(
@@ -1404,14 +1368,20 @@ def collapse_heredocs(lines: List[str]) -> List[str]:
             prefix = stripped[:-3].rstrip()
             content_parts: List[str] = []
             i += 1
+            closed = False
             while i < len(lines):
                 if lines[i].strip() == ">>>":
                     i += 1
+                    closed = True
                     break
                 content_parts.append(lines[i])
                 i += 1
+            if not closed:
+                return [PARSE_ERROR_PREFIX + "Unterminated heredoc: missing >>>; no commands dispatched"]
             content = "\n".join(content_parts)
-            result.append(f"{prefix} {content}" if prefix else content)
+            # Keep a newline boundary even for a one-line/empty heredoc, so
+            # strategy parsing never treats payload commas as command separators.
+            result.append(f"{prefix}\n{content}" if prefix else content)
         else:
             result.append(lines[i])
             i += 1
@@ -1430,13 +1400,17 @@ def parse_multi_command(raw: str) -> List[str]:
     These are collapsed into a single command with the content joined.
     Heredoc works on ANY prefix (write, s2: write, >>th:, etc.).
     """
-    logical_lines = collapse_heredocs(raw.strip().splitlines())
+    logical_lines = collapse_heredocs(raw.splitlines())
     commands: List[str] = []
     i = 0
     while i < len(logical_lines):
         line = logical_lines[i]
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#") or stripped == ">>>":
+        stripped = line.lstrip()
+        if not stripped or stripped.startswith("#") or stripped.rstrip() == ">>>":
+            i += 1
+            continue
+        if "\n" in stripped:
+            commands.append(stripped)
             i += 1
             continue
         if _starts_inline_multiline_command(stripped):
@@ -1453,9 +1427,9 @@ def parse_multi_command(raw: str) -> List[str]:
                     break
                 content_lines.append(continuation)
                 i += 1
-            commands.append("\n".join(content_lines).strip())
+            commands.append("\n".join(content_lines))
             continue
-        commands.append(stripped)
+        commands.append(stripped if is_text_mutation(stripped) else stripped.rstrip())
         i += 1
     return commands
 
@@ -1549,6 +1523,8 @@ _STRATEGY_LINE_RE = re.compile(
 
 
 def _split_strategy_commands(body: str) -> List[str]:
+    if is_text_mutation(body):
+        return [body.lstrip()]
     commands: List[str] = []
     current: List[str] = []
     quote: str = ""
@@ -1594,12 +1570,12 @@ def _split_strategy_commands(body: str) -> List[str]:
             continue
         if char == "," and not (quote or paren_depth or brace_depth or bracket_depth):
             current.pop()
-            command = "".join(current).strip()
+            command = "".join(current).lstrip()
             if command:
                 commands.append(command)
             current = []
 
-    tail = "".join(current).strip()
+    tail = "".join(current).lstrip()
     if tail:
         commands.append(tail)
     return commands
@@ -1641,9 +1617,16 @@ def parse_strategy(raw: str) -> Optional[StrategyPlan]:
     multi-line file content appears as a single command body.
     """
     # Pre-collapse any heredoc blocks before strategy parsing
-    raw_lines = [l for l in raw.strip().splitlines()]
+    raw_lines = raw.splitlines()
     logical_lines = collapse_heredocs(raw_lines)
-    lines = [l.strip() for l in logical_lines if l.strip() and not l.strip().startswith("#")]
+    if logical_lines and logical_lines[0].startswith(PARSE_ERROR_PREFIX):
+        return StrategyPlan(
+            steps={"error": StrategyStep(label="error", commands=[], results=[CommandResult(
+                ok=False, output=logical_lines[0].removeprefix(PARSE_ERROR_PREFIX), command_type="error",
+            )])},
+            execution_order=[["error"]],
+        )
+    lines = [l.lstrip() for l in logical_lines if l.strip() and not l.strip().startswith("#")]
     if not lines:
         return None
 
@@ -1652,14 +1635,21 @@ def parse_strategy(raw: str) -> Optional[StrategyPlan]:
     forward_targets: Dict[str, List[str]] = {}  # source_label -> [target_labels]
 
     for line in lines:
-        m = _STRATEGY_LINE_RE.match(line)
+        # Text payloads are opaque. Use left-side dependencies on mutation
+        # steps so a literal trailing ` -> s2` cannot be consumed as an edge.
+        header = re.match(
+            rf"^(?:(?P<deps>[\w.\s,]+)->\s*)?(?P<label>{_STRATEGY_LABEL_RE})\s*:[ \t]*(?P<body>.+)\Z",
+            line, re.IGNORECASE | re.DOTALL,
+        )
+        literal_body = header is not None and (is_text_mutation(header.group("body")) or "\n" in header.group("body"))
+        m = header if literal_body else _STRATEGY_LINE_RE.match(line)
         if m is None:
             continue
 
         label = m.group("label").strip().lower()
-        body = m.group("body").strip()
+        body = m.group("body").lstrip()
         deps_str = (m.group("deps") or "").strip()
-        targets_str = (m.group("targets") or "").strip()
+        targets_str = "" if literal_body else (m.group("targets") or "").strip()
 
         # Parse top-level comma-separated commands, but keep commas that are
         # part of inline code payloads, strings, or structured literals.
@@ -1973,11 +1963,17 @@ def _resolve_strategy_placeholders(command: str, steps: Dict[str, StrategyStep])
 
 def is_strategy(raw: str) -> bool:
     """Quick check if the input looks like a strategy block."""
-    logical_lines = collapse_heredocs(raw.strip().splitlines())
-    for line in logical_lines:
+    in_heredoc = False
+    for line in raw.splitlines():
         line = line.strip()
+        if in_heredoc:
+            if line == ">>>":
+                in_heredoc = False
+            continue
         if line and not line.startswith("#") and _STRATEGY_LINE_RE.match(line):
             return True
+        if line.endswith("<<<"):
+            in_heredoc = True
     return False
 
 

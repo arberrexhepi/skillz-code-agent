@@ -2615,7 +2615,8 @@ class WorkingFolderAgent:
             issue.closed_at = ""
             self.issue_ledger.active_issue_id = issue.issue_id
         self._persist_repo_facts()
-        self._clear_facts()
+        if activate:
+            self._clear_facts()
         return issue.summary()
 
     def close_active_issue(self, *, note: str = "") -> Optional[Dict[str, Any]]:
@@ -9670,14 +9671,20 @@ def _handle_bridge_planner_action(
     if action_name == "create_issue":
         summary = str(request.get("summary", "") or request.get("request_summary", "") or "").strip()
         payload = request.get("payload")
+        activate = request.get("activate", True)
         if isinstance(payload, dict):
             summary = summary or str(payload.get("summary", "") or payload.get("request_summary", "") or "").strip()
+            activate = request.get("activate", payload.get("activate", True))
         if not summary:
             raise ValueError("create_issue requires issue details")
+        if not isinstance(activate, bool):
+            raise ValueError("create_issue activate must be a boolean")
         creator = getattr(planner, "create_manual_issue", None)
         if not callable(creator):
             raise ValueError("Planner does not support issue creation")
-        message = creator(summary)
+        message = creator(summary, activate=activate)
+        if message.startswith(("Issue creation failed:", "Worker does not support issue creation")):
+            raise ValueError(message)
         add_exchange("assistant", message)
         return message
     if action_name == "close_issue":

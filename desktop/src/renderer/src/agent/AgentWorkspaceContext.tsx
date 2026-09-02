@@ -1,5 +1,6 @@
-import { useCallback, useEffect, useMemo, useReducer, useState } from 'react';
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import { initialAgentUiState, reduceAgentUi } from '../../../shared/agentCore';
+import { createInactiveIssue } from '../../../shared/issueCreation';
 import type { AgentEvent, AgentResponse } from '../../../shared/contracts';
 import type { AgentBackoff, JsonMap, SuggestedAction } from '../../../shared/agentTypes';
 import { AgentWorkspaceContext, type AgentWorkspaceValue, type RuntimeSelection } from './agentWorkspace';
@@ -14,6 +15,7 @@ export function AgentWorkspaceProvider({ children }: { children: React.ReactNode
   const [state, dispatch] = useReducer(reduceAgentUi, initialAgentUiState);
   const [runtime, setRuntimeState] = useState(defaultRuntime);
   const [backoff, setBackoffState] = useState<AgentBackoff>();
+  const starting = useRef<Promise<boolean> | null>(null);
 
   useEffect(() => window.workbench.agent.onEvent((event: AgentEvent) => {
     if (event.type === 'state') dispatch({ type: 'bridge-state', state: event.state });
@@ -73,7 +75,11 @@ export function AgentWorkspaceProvider({ children }: { children: React.ReactNode
     }
   }, [accept, loadRuntimeOptions, runtime]);
 
-  const ensureRunning = useCallback(async (): Promise<boolean> => state.status === 'running' || start(), [start, state.status]);
+  const ensureRunning = useCallback(async (): Promise<boolean> => {
+    if (state.status === 'running') return true;
+    if (!starting.current) starting.current = start().finally(() => { starting.current = null; });
+    return starting.current;
+  }, [start, state.status]);
 
   const submit = useCallback(async (text: string): Promise<boolean> => {
     if (!(await ensureRunning())) return false;
@@ -84,6 +90,13 @@ export function AgentWorkspaceProvider({ children }: { children: React.ReactNode
     if (!(await ensureRunning())) return false;
     return run(action, () => window.workbench.agent.plannerAction(action, extras));
   }, [ensureRunning, run]);
+
+  const createIssue = useCallback(async (summary: string): Promise<void> => {
+    if (!(await ensureRunning())) throw new Error('Could not start the agent. Check the runtime settings and retry; your issue details have been kept.');
+    // The bridge queues this behind any running action. Do not use run(): its
+    // pending/finally updates would overwrite the execution action's UI state.
+    accept(await createInactiveIssue(window.workbench.agent, summary));
+  }, [accept, ensureRunning]);
 
   const workerAction = useCallback(async (action: JsonMap): Promise<boolean> => {
     if (!(await ensureRunning())) return false;
@@ -135,12 +148,13 @@ export function AgentWorkspaceProvider({ children }: { children: React.ReactNode
     stop: async () => { await window.workbench.agent.stop(); dispatch({ type: 'reset' }); },
     submit,
     plannerAction,
+    createIssue,
     workerAction,
     runSuggestedAction,
     switchRuntime,
     setBackoff,
     clearNotice: () => dispatch({ type: 'notice', message: '' }),
-  }), [backoff, plannerAction, runSuggestedAction, setBackoff, start, state, submit, switchRuntime, workerAction, runtime]);
+  }), [backoff, createIssue, plannerAction, runSuggestedAction, setBackoff, start, state, submit, switchRuntime, workerAction, runtime]);
 
   return <AgentWorkspaceContext.Provider value={value}>{children}</AgentWorkspaceContext.Provider>;
 }

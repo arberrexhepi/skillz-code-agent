@@ -10,7 +10,10 @@ import { EditorPane, isFileTab } from './components/EditorPane';
 import { FileExplorer } from './components/FileExplorer';
 import { GitPanel } from './components/GitPanel';
 import { WorkspaceDock } from './components/WorkspaceDock';
+import { WorkspaceLayout } from './components/WorkspaceLayout';
+import { WorkspaceViewControls } from './components/WorkspaceViewControls';
 import type { EditorTab } from './editorTypes';
+import { useWorkspaceView } from './useWorkspaceView';
 
 export default function App(): React.JSX.Element {
   return <AgentWorkspaceProvider><WorkbenchApp /></AgentWorkspaceProvider>;
@@ -19,6 +22,7 @@ export default function App(): React.JSX.Element {
 function WorkbenchApp(): React.JSX.Element {
   const agent = useAgentWorkspace();
   const [workspace, setWorkspace] = useState<WorkspaceInfo | null>(null);
+  const { view, showEditor, toggleEditor, setAgentWidth, reset: resetView } = useWorkspaceView(workspace?.root || '');
   const [tabs, setTabs] = useState<EditorTab[]>([]);
   const [activeId, setActiveId] = useState('');
   const [sidebarMode, setSidebarMode] = useState<'files' | 'git' | 'issues'>('files');
@@ -49,6 +53,7 @@ function WorkbenchApp(): React.JSX.Element {
     const id = `file:${path}`;
     if (tabs.some((tab) => tab.id === id)) {
       setActiveId(id);
+      showEditor();
       return;
     }
     try {
@@ -57,26 +62,29 @@ function WorkbenchApp(): React.JSX.Element {
         id, kind: 'file', title: path.split('/').at(-1) || path, document, content: document.content, dirty: false,
       }]);
       setActiveId(id);
+      showEditor();
     } catch (cause) {
       setError(cleanError(cause));
     }
-  }, [tabs]);
+  }, [showEditor, tabs]);
 
   const openDiff = useCallback(async (path: string, staged: boolean): Promise<void> => {
     const id = `diff:${staged ? 'staged' : 'working'}:${path}`;
     const existing = tabs.some((tab) => tab.id === id);
     if (existing) {
       setActiveId(id);
+      showEditor();
       return;
     }
     try {
       const diff = await window.workbench.git.fileDiff(path, staged);
       setTabs((current) => [...current, { id, kind: 'diff', title: `${path.split('/').at(-1)} (diff)`, diff }]);
       setActiveId(id);
+      showEditor();
     } catch (cause) {
       setError(cleanError(cause));
     }
-  }, [tabs]);
+  }, [showEditor, tabs]);
 
   const updateTab = (id: string, content: string): void => {
     setTabs((current) => current.map((tab) => tab.id === id && tab.kind === 'file'
@@ -106,6 +114,24 @@ function WorkbenchApp(): React.JSX.Element {
     if (activeId === id) setActiveId(next[Math.min(index, next.length - 1)]?.id || '');
   };
 
+  const canDiscardPath = (path: string): boolean => !tabs.some((tab) => (
+    tab.kind === 'file' && tab.document.path === path && tab.dirty
+  ));
+
+  const refreshDiscardedPath = async (path: string): Promise<void> => {
+    const document = await window.workbench.workspace.read(path).catch(() => null);
+    setTabs((current) => current.flatMap((tab): EditorTab[] => {
+      if (tab.kind === 'diff' && tab.diff.path === path) return [];
+      if (tab.kind !== 'file' || tab.document.path !== path || tab.dirty) return [tab];
+      return document ? [{ ...tab, document, content: document.content, dirty: false }] : [];
+    }));
+    setActiveId((id) => {
+      if (id === `diff:working:${path}` || id === `diff:staged:${path}` || (!document && id === `file:${path}`)) return '';
+      return id;
+    });
+    setRevision((value) => value + 1);
+  };
+
   const dirtyCount = useMemo(() => tabs.filter((tab) => tab.kind === 'file' && tab.dirty).length, [tabs]);
 
   return (
@@ -120,9 +146,10 @@ function WorkbenchApp(): React.JSX.Element {
         {gitStatus && <div className="topbar-branch">⑂ {gitStatus.branch}{gitStatus.ahead ? ` ↑${gitStatus.ahead}` : ''}{gitStatus.behind ? ` ↓${gitStatus.behind}` : ''}</div>}
         {dirtyCount > 0 && <div className="unsaved-label">{dirtyCount} unsaved</div>}
         {workspace && <AgentTopStatus />}
+        {workspace && <WorkspaceViewControls editorVisible={view.editorVisible} onToggleEditor={toggleEditor} onReset={resetView} />}
       </header>
 
-      <div className="workbench">
+      <WorkspaceLayout view={view} onAgentResize={setAgentWidth} sidebar={
         <aside className="sidebar">
           <div className="sidebar-tabs">
             <button type="button" className={sidebarMode === 'files' ? 'active' : ''} onClick={() => setSidebarMode('files')}>Files</button>
@@ -138,20 +165,17 @@ function WorkbenchApp(): React.JSX.Element {
           <div className="sidebar-content">
             {!workspace && <div className="panel-message">Open a repository to begin.</div>}
             {workspace && sidebarMode === 'files' && <FileExplorer revision={revision} onOpenFile={(path) => void openFile(path)} />}
-            {workspace && sidebarMode === 'git' && <GitPanel revision={revision} onOpenDiff={(path, staged) => void openDiff(path, staged)} onStatus={setGitStatus} />}
+            {workspace && sidebarMode === 'git' && <GitPanel key={workspace.root} revision={revision} onOpenDiff={(path, staged) => void openDiff(path, staged)} onStatus={setGitStatus} onBeforeDiscard={canDiscardPath} onDiscard={refreshDiscardedPath} />}
             {workspace && sidebarMode === 'issues' && <AgentIssues onOpenPath={(path) => void openFile(path)} />}
           </div>
         </aside>
-
-        <main className="center-stack">
-          <EditorPane diagnostics={groupDiagnostics(agent.state.bridge)} tabs={tabs} activeId={activeId} onActivate={setActiveId} onClose={closeTab} onChange={updateTab} onSave={(id) => void saveTab(id)} />
-          {workspace && <WorkspaceDock key={workspace.root} onOpenPath={(path) => void openFile(path)} onOpenDiff={(path, staged) => void openDiff(path, staged)} />}
-        </main>
-
-        {workspace ? <AgentPanel key={workspace.root} /> : (
-          <aside className="agent-panel empty-right"><span>✦</span><p>The agent becomes available when a workspace is open.</p></aside>
-        )}
-      </div>
+      } editor={
+        <EditorPane diagnostics={groupDiagnostics(agent.state.bridge)} tabs={tabs} activeId={activeId} onActivate={setActiveId} onClose={closeTab} onChange={updateTab} onSave={(id) => void saveTab(id)} />
+      } dock={
+        workspace && <WorkspaceDock key={workspace.root} onOpenPath={(path) => void openFile(path)} onOpenDiff={(path, staged) => void openDiff(path, staged)} />
+      } agent={workspace ? <AgentPanel key={workspace.root} /> : (
+        <aside className="agent-panel empty-right"><span>✦</span><p>The agent becomes available when a workspace is open.</p></aside>
+      )} />
 
       {error && <button type="button" className="global-error" onClick={() => setError('')}>{error}<span>×</span></button>}
       {!workspace && (

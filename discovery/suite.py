@@ -52,6 +52,8 @@ def list_files(
     )
     hits: list[DiscoveryHit] = []
     for item in iterator:
+        if item.is_symlink():
+            continue
         rel = normalize_relpath(workspace_root, item)
         hits.append(
             {

@@ -1,12 +1,16 @@
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import { issueState } from '../../../shared/agentCore';
 import type { IssueSummary } from '../../../shared/agentTypes';
 import { useAgentWorkspace } from '../agent/agentWorkspace';
+import { IssueCreateForm } from './IssueCreateForm';
 
 export function AgentIssues({ onOpenPath }: { onOpenPath: (path: string) => void }): React.JSX.Element {
   const agent = useAgentWorkspace();
   const [summary, setSummary] = useState('');
   const [expandedIssueId, setExpandedIssueId] = useState('');
+  const [creating, setCreating] = useState(false);
+  const [createError, setCreateError] = useState('');
+  const creatingRef = useRef(false);
   const issues = issueState(agent.state.bridge);
   const worker = agent.state.bridge.planner.worker_state;
   const diagnostics = worker?.issue_context?.run_diagnostics || [];
@@ -15,11 +19,23 @@ export function AgentIssues({ onOpenPath }: { onOpenPath: (path: string) => void
   const toggleIssue = (issueId: string): void => setExpandedIssueId((current) => current === issueId ? '' : issueId);
   const create = async (): Promise<void> => {
     const value = summary.trim();
-    if (value && await agent.plannerAction('create_issue', { summary: value })) setSummary('');
+    if (!value || creatingRef.current) return;
+    creatingRef.current = true;
+    setCreating(true);
+    setCreateError('');
+    try {
+      await agent.createIssue(value);
+      setSummary('');
+    } catch (cause) {
+      setCreateError(String(cause).replace(/^Error:\s*/, '').replace(/^Error invoking remote method '[^']+': Error:\s*/, ''));
+    } finally {
+      creatingRef.current = false;
+      setCreating(false);
+    }
   };
 
   return <div className="issues-panel">
-    <form className="issue-create" onSubmit={(event) => { event.preventDefault(); void create(); }}><input value={summary} onChange={(event) => setSummary(event.target.value)} placeholder="Create a durable issue…" /><button className="primary-button" disabled={!summary.trim() || busy}>＋</button></form>
+    <IssueCreateForm summary={summary} creating={creating} executionBusy={busy || Boolean(agent.state.bridge.planner.executing)} error={createError} onChange={setSummary} onCreate={() => void create()} />
     <div className="issue-summary"><span>{issues.open.length + (issues.active ? 1 : 0)} open</span><span>{issues.totalFacts} facts</span><span>{diagnostics.length} run findings</span></div>
 
     {issues.active && <IssueCard
