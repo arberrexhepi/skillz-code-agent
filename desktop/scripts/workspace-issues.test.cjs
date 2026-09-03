@@ -7,7 +7,7 @@ const Module = require('node:module');
 const React = require('react');
 const { renderToStaticMarkup } = require('react-dom/server');
 const load = require('./load-ts.cjs');
-const { issuesFromLedger, issueManagementView, parseIssueProposals, readWorkspaceIssues, ManagedIssueCard, RepoFactsView, issuesSnapshot, issuesBridge, savedProposals, repoFactsSnapshot, repoFactsMarkdown } = load(() => ({
+const { issuesFromLedger, issueManagementView, parseIssueProposals, readWorkspaceIssues, mutateWorkspaceIssue, ManagedIssueCard, RepoFactsView, issuesSnapshot, issuesBridge, savedProposals, repoFactsSnapshot, repoFactsMarkdown } = load(() => ({
   ...require('../src/shared/workspaceIssues.ts'), ...require('../src/main/services/workspaceIssues.ts'), ...require('../src/renderer/src/components/AgentIssues.tsx'), ...require('../src/renderer/src/components/RepoFactsPanel.tsx'), ...require('./fixtures/workspace-issues.ts'), ...require('./fixtures/repo-facts.ts'),
 }));
 function fixture(t) {
@@ -64,6 +64,17 @@ test('saved issue/suggestion reads work without starting an agent and never modi
   const badLedger=await readWorkspaceIssues(root);
   assert.equal(badLedger.status,'invalid');assert.equal(badLedger.issues.length,0);assert.equal(badLedger.proposals.length,2);
 });
+test('native issue mutations create, close, and reopen durable issues without an agent process',async(t)=>{
+  const root=fixture(t), ledger=path.join(root,'repo_facts.md');
+  const wrapped=`Before ledger\n\n${repoFactsMarkdown}\nAfter ledger\n`;fs.writeFileSync(ledger,wrapped,'utf8');
+  await mutateWorkspaceIssue(root,'create_issue',{summary:'Offline backlog item'});
+  let snapshot=await readWorkspaceIssues(root);
+  const created=snapshot.issues.find(issue=>issue.request==='Offline backlog item');assert.ok(created);assert.equal(created.status,'open');assert.equal(snapshot.activeIssueId,'issue-042');
+  let source=fs.readFileSync(ledger,'utf8');assert.match(source,/Before ledger/);assert.match(source,/After ledger/);
+  await mutateWorkspaceIssue(root,'close_issue',{issue_id:'issue-042'});snapshot=await readWorkspaceIssues(root);assert.equal(snapshot.issues.find(issue=>issue.id==='issue-042').status,'closed');assert.equal(snapshot.activeIssueId,'');
+  await mutateWorkspaceIssue(root,'reopen_issue',{issue_id:'issue-042'});snapshot=await readWorkspaceIssues(root);assert.equal(snapshot.issues.find(issue=>issue.id==='issue-042').status,'open');assert.equal(snapshot.activeIssueId,'issue-042');assert.equal(snapshot.issues.find(issue=>issue.id==='issue-042').reopenCount,1);
+  const empty=fixture(t);await mutateWorkspaceIssue(empty,'create_issue',{summary:'First issue'});const first=await readWorkspaceIssues(empty);assert.equal(first.status,'ready');assert.equal(first.issues[0].id,'issue-001');assert.equal(first.activeIssueId,'');
+});
 test('issue cards keep lifecycle actions outside disclosure; facts display no issue workflow/history',()=>{
   const issue=issuesSnapshot('alpha').issues[0];
   const html=renderToStaticMarkup(React.createElement(ManagedIssueCard,{issue,active:true,expanded:false,busy:false,pending:false,onToggle(){},onAction(){}}));
@@ -84,6 +95,8 @@ test('issues IPC checks the sender and root; service rejects a read completed af
   let current=root;service.requireRoot=()=>current;
   registerIpc({webContents:{id:42}},{workspace:service});
   const handler=handlers.get('workspace:issues');assert.throws(()=>handler({sender:{id:99}},root),/Untrusted/);assert.throws(()=>handler({sender:{id:42}},''));
+  const mutate=handlers.get('workspace:issue-action');assert.throws(()=>mutate({sender:{id:99}},root,'close_issue',{issue_id:'issue-042'}),/Untrusted/);
+  const changed=await mutate({sender:{id:42}},root,'close_issue',{issue_id:'issue-042'});assert.equal(changed.issues.find(issue=>issue.id==='issue-042').status,'closed');
   await assert.rejects(service.issues(root+'-other'),/Workspace changed/);
   const originalRead=fs.promises.readFile;let began,release;const entered=new Promise(r=>began=r);
   t.mock.method(fs.promises,'readFile',async(...args)=>{began();await new Promise(r=>release=r);return originalRead(...args);});

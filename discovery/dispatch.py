@@ -6,6 +6,8 @@ import inspect
 from pathlib import Path
 from typing import Any
 
+from file_access import read_scope, qualify_read_paths
+
 from . import suite
 from .common import read_text, safe_join
 
@@ -55,24 +57,29 @@ def execute_discovery_action(action: dict[str, Any], *, root: Path) -> dict[str,
             kwargs["target"] = kwargs.pop("path")
         if "file_path" in parameters and "path" not in parameters and "path" in kwargs:
             kwargs["file_path"] = kwargs.pop("path")
+        original_root = root
         for key in ("path", "file_path", "query_file", "target"):
             value = kwargs.get(key)
             if not isinstance(value, str):
                 continue
-            if value in {"/repo", "repo", "/repo/"}:
+            if value == "repo":
                 value = "."
-            elif value.startswith("/repo/"):
-                value = value.removeprefix("/repo/")
             elif value.startswith("repo/"):
                 value = value.removeprefix("repo/")
-            if Path(value).is_absolute():
-                raise ValueError(f"{key} must be relative to /repo")
+            selected, value = read_scope(original_root, value or ".")
+            if root != original_root and selected != root:
+                raise ValueError("A read action must use a single granted folder")
+            root = selected
             if key != "target" or action_type == "find_ownership":
                 safe_join(root.resolve(), value or ".")
             kwargs[key] = value
         if "limit" in kwargs:
             kwargs["limit"] = max(1, min(200, int(kwargs["limit"])))
         inspect.signature(handler).bind(**kwargs, root=root)
-        return dict(handler(**kwargs, root=root))
+        result = dict(handler(**kwargs, root=root))
+        if root != original_root:
+            result = qualify_read_paths(result, root)
+            result["read_only_root"] = str(root)
+        return result
     except (ValueError, TypeError, OSError, RuntimeError) as exc:
         return {"ok": False, "action": action_type, "error": str(exc)}

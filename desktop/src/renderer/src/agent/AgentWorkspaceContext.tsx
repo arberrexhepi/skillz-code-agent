@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'r
 import { initialAgentUiState, reduceAgentUi } from '../../../shared/agentCore';
 import { createInactiveIssue } from '../../../shared/issueCreation';
 import { decideIssueProposal as sendProposalDecision } from '../../../shared/issueProposals';
-import type { AgentEvent, AgentResponse } from '../../../shared/contracts';
+import type { WorkbenchApi, AgentEvent, AgentResponse } from '../../../shared/contracts';
 import type { AgentBackoff, JsonMap, SuggestedAction } from '../../../shared/agentTypes';
 import { AgentWorkspaceContext, type AgentWorkspaceValue, type RuntimeSelection } from './agentWorkspace';
 
@@ -12,13 +12,14 @@ const defaultRuntime: RuntimeSelection = {
   backendScript: 'main.py',
 };
 
-export function AgentWorkspaceProvider({ children }: { children: React.ReactNode }): React.JSX.Element {
+export function AgentWorkspaceProvider({ children, api = window.workbench.agent, initialRuntime = defaultRuntime }: { children: React.ReactNode; api?: WorkbenchApi['agent']; initialRuntime?: RuntimeSelection }): React.JSX.Element {
   const [state, dispatch] = useReducer(reduceAgentUi, initialAgentUiState);
-  const [runtime, setRuntimeState] = useState(defaultRuntime);
+  const [runtime, setRuntimeState] = useState(initialRuntime);
   const [backoff, setBackoffState] = useState<AgentBackoff>();
   const starting = useRef<Promise<boolean> | null>(null);
+  const runtimeOptionsRequest = useRef(0);
 
-  useEffect(() => window.workbench.agent.onEvent((event: AgentEvent) => {
+  useEffect(() => api.onEvent((event: AgentEvent) => {
     if (event.type === 'state') dispatch({ type: 'bridge-state', state: event.state });
     if (event.type === 'progress') dispatch({ type: 'progress', progress: event.payload });
     if (event.type === 'status') {
@@ -26,7 +27,7 @@ export function AgentWorkspaceProvider({ children }: { children: React.ReactNode
       else dispatch({ type: 'status', status: event.status, message: event.message });
     }
     if (event.type === 'stderr') dispatch({ type: 'notice', message: event.message });
-  }), []);
+  }), [api]);
 
   const accept = useCallback((response: AgentResponse): boolean => {
     dispatch({ type: 'bridge-state', state: response.state });
@@ -49,26 +50,28 @@ export function AgentWorkspaceProvider({ children }: { children: React.ReactNode
   }, [accept]);
 
   const loadRuntimeOptions = useCallback(async (provider: string, model: string): Promise<void> => {
+    const request = ++runtimeOptionsRequest.current;
     try {
-      const options = await window.workbench.agent.runtimeOptions(provider, model);
+      const options = await api.runtimeOptions(provider, model);
+      if (request !== runtimeOptionsRequest.current) return;
       dispatch({ type: 'runtime-options', options });
-      setRuntimeState((current) => ({
-        ...current,
-        provider: options.current_provider || current.provider,
-        model: options.current_model || current.model,
-      }));
+      // Discovery supplies choices, not the user's selection. A delayed response
+      // must never replace a newly selected provider/model or a successful switch.
     } catch {
       // Some older bridge builds do not expose runtime discovery; manual controls remain usable.
     }
-  }, []);
+  }, [api]);
 
-  useEffect(() => { void loadRuntimeOptions(defaultRuntime.provider, defaultRuntime.model); }, [loadRuntimeOptions]);
+  useEffect(() => {
+    void loadRuntimeOptions(initialRuntime.provider, initialRuntime.model);
+    return () => { runtimeOptionsRequest.current++; };
+  }, [loadRuntimeOptions]);
 
   const start = useCallback(async (): Promise<boolean> => {
     dispatch({ type: 'pending', action: 'start' });
     dispatch({ type: 'notice', message: '' });
     try {
-      const ok = accept(await window.workbench.agent.start(runtime));
+      const ok = accept(await api.start(runtime));
       if (ok) await loadRuntimeOptions(runtime.provider, runtime.model);
       return ok;
     } catch (cause) {
@@ -77,7 +80,7 @@ export function AgentWorkspaceProvider({ children }: { children: React.ReactNode
     } finally {
       dispatch({ type: 'pending', action: '' });
     }
-  }, [accept, loadRuntimeOptions, runtime]);
+  }, [accept, loadRuntimeOptions, runtime, api]);
 
   const ensureRunning = useCallback(async (): Promise<boolean> => {
     if (state.status === 'running') return true;
@@ -87,31 +90,31 @@ export function AgentWorkspaceProvider({ children }: { children: React.ReactNode
 
   const submit = useCallback(async (text: string): Promise<boolean> => {
     if (!(await ensureRunning())) return false;
-    return run('submit', () => window.workbench.agent.submit(text));
-  }, [ensureRunning, run]);
+    return run('submit', () => api.submit(text));
+  }, [ensureRunning, run, api]);
 
   const plannerAction = useCallback(async (action: string, extras: JsonMap = {}): Promise<boolean> => {
     if (!(await ensureRunning())) return false;
-    return run(action, () => window.workbench.agent.plannerAction(action, extras));
-  }, [ensureRunning, run]);
+    return run(action, () => api.plannerAction(action, extras));
+  }, [ensureRunning, run, api]);
 
   const createIssue = useCallback(async (summary: string): Promise<void> => {
     if (!(await ensureRunning())) throw new Error('Could not start the agent. Check the runtime settings and retry; your issue details have been kept.');
     // The bridge queues this behind any running action. Do not use run(): its
     // pending/finally updates would overwrite the execution action's UI state.
-    accept(await createInactiveIssue(window.workbench.agent, summary));
-  }, [accept, ensureRunning]);
+    accept(await createInactiveIssue(api, summary));
+  }, [accept, ensureRunning, api]);
 
   const workerAction = useCallback(async (action: JsonMap): Promise<boolean> => {
     if (!(await ensureRunning())) return false;
-    return run(String(action.type || 'worker_action'), () => window.workbench.agent.workerAction(action));
-  }, [ensureRunning, run]);
+    return run(String(action.type || 'worker_action'), () => api.workerAction(action));
+  }, [ensureRunning, run, api]);
 
   const decideIssueProposal = useCallback(async (proposalId: string, decision: 'accept' | 'ignore'): Promise<void> => {
     if (!(await ensureRunning())) throw new Error('Could not start the agent. Your suggestion is unchanged.');
     // Queue without overwriting a running action's UI state.
-    accept(await sendProposalDecision(window.workbench.agent, proposalId, decision));
-  }, [accept, ensureRunning]);
+    accept(await sendProposalDecision(api, proposalId, decision));
+  }, [accept, ensureRunning, api]);
 
   const runSuggestedAction = useCallback(async (action: SuggestedAction): Promise<boolean> => {
     if (action.requires_confirmation && !window.confirm(action.confirmation_prompt || 'Proceed with this action?')) return false;
@@ -132,23 +135,23 @@ export function AgentWorkspaceProvider({ children }: { children: React.ReactNode
       setRuntimeState((current) => ({ ...current, provider, model }));
       return true;
     }
-    const ok = await run('runtime_switch', () => window.workbench.agent.reconfigureRuntime(provider, model));
+    const ok = await run('runtime_switch', () => api.reconfigureRuntime(provider, model));
     if (ok) {
       setRuntimeState((current) => ({ ...current, provider, model }));
       await loadRuntimeOptions(provider, model);
     }
     return ok;
-  }, [loadRuntimeOptions, run, state.status]);
+  }, [loadRuntimeOptions, run, state.status, api]);
 
   const setBackoff = useCallback(async (enabled: boolean, tokenLimitK: number): Promise<boolean> => {
     if (!(await ensureRunning())) return false;
     const ok = await run('configure_backoff', async () => {
-      const response = await window.workbench.agent.configureBackoff(enabled, tokenLimitK);
+      const response = await api.configureBackoff(enabled, tokenLimitK);
       setBackoffState(response.backoff || { enabled, token_limit_k: tokenLimitK, window_tokens_used: 0 });
       return response;
     });
     return ok;
-  }, [ensureRunning, run]);
+  }, [ensureRunning, run, api]);
 
   const value = useMemo<AgentWorkspaceValue>(() => ({
     state,
@@ -156,7 +159,7 @@ export function AgentWorkspaceProvider({ children }: { children: React.ReactNode
     backoff,
     setRuntime: (next) => setRuntimeState((current) => ({ ...current, ...next })),
     start,
-    stop: async () => { await window.workbench.agent.stop(); dispatch({ type: 'reset' }); },
+    stop: async () => { await api.stop(); dispatch({ type: 'reset' }); },
     submit,
     plannerAction,
     createIssue,
@@ -166,7 +169,7 @@ export function AgentWorkspaceProvider({ children }: { children: React.ReactNode
     switchRuntime,
     setBackoff,
     clearNotice: () => dispatch({ type: 'notice', message: '' }),
-  }), [backoff, createIssue, decideIssueProposal, plannerAction, runSuggestedAction, setBackoff, start, state, submit, switchRuntime, workerAction, runtime]);
+  }), [backoff, createIssue, decideIssueProposal, plannerAction, runSuggestedAction, setBackoff, start, state, submit, switchRuntime, workerAction, runtime, api]);
 
   return <AgentWorkspaceContext.Provider value={value}>{children}</AgentWorkspaceContext.Provider>;
 }

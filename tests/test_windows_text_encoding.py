@@ -20,7 +20,7 @@ from main import ToolbeltRunner, run_shell
 from tree_loop import TreeLoop
 
 LABEL = 'P\u00ebrsh\u00ebndetje \u010d \u2014 \u4e16\u754c \U0001f680'
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1]
 
 
 class WindowsTextEncodingTests(unittest.TestCase):

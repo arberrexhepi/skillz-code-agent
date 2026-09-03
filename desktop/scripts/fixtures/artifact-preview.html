@@ -1,0 +1,12 @@
+<!doctype html>
+<html lang="en"><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Live artifact fixture</title>
+<style>
+*{box-sizing:border-box}body{margin:0;padding:32px;background:#101b22;color:#d9e8ee;font:15px system-ui}h1{font-size:clamp(24px,4vw,40px);margin:12px 0}p{line-height:1.6;color:#91adbd}label{display:block;font-size:13px;color:#a9cdbb}input{display:block;width:100%;padding:13px;margin:10px 0 24px;border:1px solid #3c5a60;background:#0b131a;border-radius:8px;color:#d9e8ee;font:inherit}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:14px}.cards article{padding:20px;border:1px solid #35544d;border-radius:10px;background:#172c29}.cards p{font-size:12px;margin-bottom:0}button{margin-top:24px;padding:12px 16px;border:1px solid #4d816b;border-radius:7px;background:#294e3f;color:#d9eee3;cursor:pointer}
+</style>
+<p>LIVE PREVIEW · <span id="size"></span></p><h1>Imports explorer</h1><p>Native text and controls, rendered at the current panel size.</p>
+<label>Filter imports<input placeholder="Try an import name…"></label><div class="cards"><article>App.tsx<p>3 imports</p></article><article>graph.ts<p>6 imports</p></article><article>files.ts<p>2 imports</p></article></div>
+<button>Expand graph</button><p id="count">0 nodes expanded</p>
+<script>
+let count=0;document.querySelector('button').onclick=()=>document.getElementById('count').textContent=`${++count} nodes expanded`;
+const size=()=>document.getElementById('size').textContent=`${innerWidth} × ${innerHeight}`;addEventListener('resize',size);size();
+</script></html>

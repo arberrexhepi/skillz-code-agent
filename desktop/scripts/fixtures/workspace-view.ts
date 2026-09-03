@@ -33,6 +33,7 @@ window.workbench = {
     open: async (next) => { root = next; return info(); },
     list: async () => [{ name: 'example.ts', path: 'example.ts', kind: 'file' }],
     issues: async (workspaceRoot) => factsPreview && workspaceRoot.endsWith('alpha') ? { ...structuredClone(persistedIssues), workspaceRoot } : { workspaceRoot, status: 'missing', activeIssueId: '', issues: [], proposals: [], warnings: [] },
+    issueAction: async (workspaceRoot, action, extras) => { applyIssueAction(persistedIssues, action, extras); return { ...structuredClone(persistedIssues), workspaceRoot }; },
     repoFacts: async (workspaceRoot) => factsPreview && workspaceRoot.endsWith('alpha') ? repoFactsSnapshot(workspaceRoot) : { workspaceRoot, path: 'repo_facts.md', status: 'missing' },
     read: async (path) => { if (path.includes('missing')) throw new Error(`File not found: ${path}`); return factsPreview && path === 'repo_facts.md' ? { ...document(path, repoFactsMarkdown), language: 'markdown' } : document(path); }, write: async (path, content) => document(path, content), onChange: () => noop,
   },
@@ -104,4 +105,5 @@ window.workbench = {
   },
 } as WorkbenchApi;
 
+if (new URLSearchParams(window.location.search).has('artifacts')) await import('./artifacts-fixture');
 void import('../../src/renderer/src/main');

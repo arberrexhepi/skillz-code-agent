@@ -62,7 +62,15 @@ export function AgentIssues({ workspaceRoot, revision, focusedIssueId, onOpenPat
   const create = async (): Promise<void> => {
     if (!summary.trim() || creatingRef.current) return;
     creatingRef.current = true; setCreating(true); setCreateError('');
-    try { await agent.createIssue(summary.trim()); if (mounted.current) { setSummary(''); reload(); } }
+    try {
+      if (agent.state.status === 'running') await agent.createIssue(summary.trim());
+      else {
+        if (!window.workbench.workspace.issueAction) throw new Error('Restart the desktop app to enable offline issue changes.');
+        const next = await window.workbench.workspace.issueAction(workspaceRoot, 'create_issue', { summary: summary.trim() });
+        if (mounted.current) setSaved(next);
+      }
+      if (mounted.current) { setSummary(''); reload(); }
+    }
     catch (error) { if (mounted.current) setCreateError(cleanError(error)); }
     finally { creatingRef.current = false; if (mounted.current) setCreating(false); }
   };
@@ -70,7 +78,13 @@ export function AgentIssues({ workspaceRoot, revision, focusedIssueId, onOpenPat
     if (actingRef.current || busy) return;
     actingRef.current = true; setActionId(issue.id); setActionError('');
     try {
-      if (!(await agent.plannerAction(action, { issue_id: issue.id }))) throw new Error(`Could not update ${issue.id}. Check the agent notice or runtime settings and retry.`);
+      if (action === 'continue_issue' || agent.state.status === 'running') {
+        if (!(await agent.plannerAction(action, { issue_id: issue.id }))) throw new Error(`Could not update ${issue.id}. Check the agent notice or runtime settings and retry.`);
+      } else {
+        if (!window.workbench.workspace.issueAction) throw new Error('Restart the desktop app to enable offline issue changes.');
+        const next = await window.workbench.workspace.issueAction(workspaceRoot, action, { issue_id: issue.id });
+        if (mounted.current) setSaved(next);
+      }
       reload();
     } catch (error) { if (mounted.current) setActionError(cleanError(error)); }
     finally { actingRef.current = false; if (mounted.current) setActionId(''); }
@@ -79,7 +93,7 @@ export function AgentIssues({ workspaceRoot, revision, focusedIssueId, onOpenPat
     <p className="issues-intro">Manage suggested, open, and closed work.</p>
     <IssueCreateForm summary={summary} creating={creating} executionBusy={executionBusy} error={createError} onChange={setSummary} onCreate={() => void create()} />
     <div className="issue-summary"><span>{view.issues.filter(issue => issue.status === 'open').length} open</span><span>{view.issues.filter(issue => issue.status === 'closed').length} closed</span><span>{view.proposals.length} suggestions</span></div>
-    <p className="issues-load-state" role="status">{loading ? 'Loading saved issues…' : agent.state.status === 'running' ? 'Saved issues · Runtime connected' : 'Saved issues · Actions start the agent when needed'}</p>
+    <p className="issues-load-state" role="status">{loading ? 'Loading saved issues…' : agent.state.status === 'running' ? 'Saved issues · Runtime connected' : 'Saved issues · Create, close, and reopen work offline'}</p>
     {(readError || snapshot?.error) && <div className="issues-error" role="alert"><PathText>{readError || snapshot?.error}</PathText><button type="button" onClick={reload}>Retry loading issues</button><button type="button" onClick={() => onOpenPath('repo_facts.md')}>Inspect saved ledger</button></div>}
     {snapshot?.warnings.map(warning => <p className="issues-error" role="status" key={warning}><PathText>{warning}</PathText></p>)}
     <AgentSuggestions proposals={view.proposals} error={view.proposalError} busy={executionBusy} onDecide={async (id, decision) => { await agent.decideIssueProposal(id, decision); reload(); }} />

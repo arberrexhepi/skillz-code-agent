@@ -22,9 +22,11 @@ Common planner commands: `/reset`, `/start-auto 3 optional prompt`, `/stop-auto`
 
 ## Latest Development Update
 
+The desktop workbench now includes **Artifacts** for ad hoc visualizations, code explorers, dashboards, and tools. It also offers an optional ready-made repository issue manager: select repository folders, explicitly grant write access, and manage their durable Skillz issues without starting an agent. Configure a library folder, describe an artifact, and work with its own agent conversation and live iframe preview tab. Playwright is retained separately for browser inspection tooling. Each React/Vite/TypeScript + Express project has an independent Git history as a submodule in the library, a selectable agent runtime, Docker-enforced folder grants that default to read only, optional active-repository reads and source context snapshots, dynamic ports, and named HTTP/WebSocket API connections with JSON Schema validation. Artifact agents and previews require a running Linux Docker engine; permissions are managed in the workbench and apply to both. Clone with `--recurse-submodules`, or run `npm --prefix desktop run submodules:init` in an existing checkout. See the [Artifacts guide](desktop/README.md#artifacts).
+
 File paths throughout the desktop workbench now render as clickable chips, with full-path tooltips and editor navigation to optional line/column references. This includes chat, facts, issues, plans, reports, activity, diagnostics, Git, and terminal shortcuts. Windows paths and quoted Unicode filenames are supported. See [file reference chips](desktop/README.md#file-reference-chips).
 
-The desktop **Issues** and **Repo Facts** tabs extract different views from the saved ledger. **Issues** keeps saved issues and pending suggestions visible with the agent stopped, with Accept, Ignore, Continue, Close, Reopen, lifecycle details, and completed-goal history. **Repo Facts** focuses on architecture/goal facts and provenance, with links back to the related issue. Both refresh on file changes. See the [issues and repository facts guide](desktop/README.md#issues-and-repository-facts).
+The desktop **Issues** and **Repo Facts** tabs extract different views from the saved ledger. **Issues** keeps saved issues and pending suggestions visible with the agent stopped; creating, closing, and reopening issues works directly against the saved ledger without starting Python or a model. Continue resumes work through the agent. **Repo Facts** focuses on architecture/goal facts and provenance, with links back to the related issue. Both refresh on file changes. See the [issues and repository facts guide](desktop/README.md#issues-and-repository-facts).
 
 Discovery can now pause at its action limit or on its last allotted turn to request **1–10 additional turns** when material ambiguity remains. The request shows the turn count, reason, a short investigation proposal, unresolved questions, and findings collected so far.
 
@@ -101,7 +103,7 @@ Requirements:
 Install Python provider dependencies:
 
 ```bash
-pip install openai google-genai anthropic
+pip install openai google-genai anthropic pytest
 ```
 
 Set an API key with environment variables or a local `.env` file:
@@ -131,7 +133,7 @@ Install Python 3 with the Windows launcher, Git, and Node.js/npm. From the repos
 
 ```powershell
 py -3 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install openai google-genai anthropic
+.\.venv\Scripts\python.exe -m pip install openai google-genai anthropic pytest
 cd desktop
 npm install
 npm run dev
@@ -144,8 +146,9 @@ For a local ChatGPT subscription, select **Codex / ChatGPT subscription** in Run
 Run the focused checks from the repository root:
 
 ```powershell
-.\.venv\Scripts\python.exe -m unittest test_codex_subscription test_codex_discovery test_codex_utf8 test_windows_text_encoding
-.\.venv\Scripts\python.exe -m unittest test_repository_discovery test_tree_commands test_discovery_remediation
+.\.venv\Scripts\python.exe -m pytest -q tests
+.\.venv\Scripts\python.exe -m unittest tests.test_codex_subscription tests.test_codex_discovery tests.test_codex_utf8 tests.test_windows_text_encoding
+.\.venv\Scripts\python.exe -m unittest tests.test_repository_discovery tests.test_tree_commands tests.test_discovery_remediation
 cd desktop
 npm run test:runtime
 npm run test:git

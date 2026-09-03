@@ -2,7 +2,7 @@
 """
 Interactive test drive for the ContextTree system.
 
-Run:  python3 test_drive_tree.py
+Run from the repository root:  python -m tests.test_drive_tree
 
 This indexes your actual workspace and drops you into a REPL
 where you can type tree commands and see results — exactly
@@ -17,7 +17,7 @@ from tree_commands import is_strategy, format_strategy_results
 
 
 def main():
-    root = Path(__file__).parent.resolve()
+    root = Path(__file__).resolve().parents[1]
 
     # Fake callbacks — in real integration these come from WorkingFolderAgent
     bridge = ContextTreeBridge(

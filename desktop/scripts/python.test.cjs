@@ -35,7 +35,7 @@ test('Windows skips broken aliases, Python 2, and an unavailable launcher', asyn
   const calls = probes(t, (exe) => exe === 'python3' ? null : 'Command failed with code 1');
   assert.deepEqual(await resolvePythonCommand('C:\\repo', 'win32', {}), { executable: 'python3', args: [] });
   assert.deepEqual(calls.map((call) => call.executable), ['python', 'py', 'python3']);
-  assert.match(calls[0].args.at(-1), /sys.version_info\[0\] == 3/);
+  assert.match(calls[0].args.at(-1), /sys.version_info >= \(3, 10\)/);
 });
 
 test('an explicit executable path with spaces takes precedence and stays one argument', async (t) => {
@@ -88,3 +88,12 @@ test('missing Python gives Windows setup instructions and attempted commands', a
     return true;
   });
 });
+
+for (const executable of ['/opt/homebrew/bin/python3', '/usr/local/bin/python3']) {
+  test(`macOS falls back to ${executable} when system Python is too old`, async (t) => {
+    const calls = probes(t, candidate => candidate === executable ? null : 'Python is too old');
+    assert.deepEqual(await resolvePythonCommand('/repo', 'darwin', { PATH: '/usr/bin:/bin' }), { executable, args: [] });
+    assert.match(calls.at(-1).options.env.PATH, /\/opt\/homebrew\/bin/);
+    assert.match(calls.at(-1).args.at(-1), /sys.version_info >= \(3, 10\)/);
+  });
+}

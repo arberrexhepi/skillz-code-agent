@@ -1,3 +1,4 @@
+import { ArtifactsWorkbench } from './components/ArtifactsWorkbench';
 import { FileNavigationContext, PathText } from './components/PathText';
 import { resolveFileReference, type FileReference } from '../../shared/fileReferences';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
@@ -24,6 +25,8 @@ export default function App(): React.JSX.Element {
 
 function WorkbenchApp(): React.JSX.Element {
   const agent = useAgentWorkspace();
+  const [artifactsVisible, setArtifactsVisible] = useState(false);
+  const [artifactsLoaded, setArtifactsLoaded] = useState(false);
   const [workspace, setWorkspace] = useState<WorkspaceInfo | null>(null);
   const { view, showEditor, toggleEditor, setAgentWidth, reset: resetView } = useWorkspaceView(workspace?.root || '');
   const [tabs, setTabs] = useState<EditorTab[]>([]);
@@ -159,10 +162,11 @@ function WorkbenchApp(): React.JSX.Element {
         {gitStatus && <div className="topbar-branch">⑂ {gitStatus.branch}{gitStatus.ahead ? ` ↑${gitStatus.ahead}` : ''}{gitStatus.behind ? ` ↓${gitStatus.behind}` : ''}</div>}
         {dirtyCount > 0 && <div className="unsaved-label">{dirtyCount} unsaved</div>}
         {workspace && <AgentTopStatus />}
+        <button type="button" className="artifacts-header-button" aria-pressed={artifactsVisible} onClick={() => { setArtifactsLoaded(true); setArtifactsVisible((value) => !value); }}><span aria-hidden="true">◇</span> Artifacts</button>
         {workspace && <WorkspaceViewControls editorVisible={view.editorVisible} onToggleEditor={toggleEditor} onReset={resetView} />}
       </header>
 
-      <WorkspaceLayout view={view} onAgentResize={setAgentWidth} sidebar={
+      <WorkspaceLayout inert={artifactsVisible} view={view} onAgentResize={setAgentWidth} sidebar={
         <aside className="sidebar">
           <div className="sidebar-tabs">
             <button type="button" className={sidebarMode === 'files' ? 'active' : ''} onClick={() => setSidebarMode('files')}>Files</button>
@@ -192,8 +196,9 @@ function WorkbenchApp(): React.JSX.Element {
         <aside className="agent-panel empty-right"><span>✦</span><p>The agent becomes available when a workspace is open.</p></aside>
       )} />
 
+      {artifactsLoaded && <ArtifactsWorkbench visible={artifactsVisible} sourceRoot={workspace?.root || ''} onClose={() => setArtifactsVisible(false)} />}
       {error && <div className="global-error" role="alert"><div className="error-copy"><PathText>{error}</PathText></div><button type="button" aria-label="Dismiss error" onClick={() => setError('')}>×</button></div>}
-      {!workspace && (
+      {!workspace && !artifactsVisible && (
         <div className="workspace-overlay">
           <div className="overlay-card">
             <span className="overlay-mark">S</span>
