@@ -1,0 +1,7 @@
+{
+  "version": 1,
+  "id": "repo-issue-manager",
+  "title": "Repository issue manager",
+  "prompt": "Review, create, activate, close, and reopen Skillz issues in explicitly shared repositories.",
+  "createdAt": "2026-09-03T00:00:00.000Z"
+}
