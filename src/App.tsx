@@ -1,22 +1,10 @@
 import { useEffect, useMemo, useState } from 'react';
 import { files, type SharedFolder } from './files';
+import { createIssue, newLedger, parseLedgerDocument, serializeLedger, transitionIssue, type Issue, type LedgerDocument } from './issues';
 
-type Raw = Record<string, unknown>;
-type Issue = Raw & { issue_id: string; status?: string; request_summary?: string; plan_summary?: string; opened_at?: string; closed_at?: string; priority?: number; reopen_count?: number };
-interface DocumentState { root: SharedFolder; source: string; hash: string; before: string; after: string; ledger: Raw & { issues: Issue[]; active_issue_id?: string } }
+interface DocumentState extends LedgerDocument { root: SharedFolder; source: string; hash: string }
 const emptyHash = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
-const timestamp = () => new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
 async function sha256(value: string): Promise<string> { return [...new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value)))].map(byte => byte.toString(16).padStart(2, '0')).join(''); }
-function parse(source: string): Omit<DocumentState, 'root' | 'hash' | 'source'> {
-  const block = /```json\s*([\s\S]*?)\s*```/.exec(source);
-  if (!block) throw new Error('repo_facts.md must contain a fenced JSON ledger.');
-  const ledger = JSON.parse(block[1]) as Raw & { issues: Issue[]; active_issue_id?: string };
-  if (ledger.schema_version !== 2 || !Array.isArray(ledger.issues)) throw new Error('Expected a schema-version-2 issue ledger.');
-  if (ledger.issues.some(issue => !issue || typeof issue.issue_id !== 'string')) throw new Error('Every issue needs an issue_id.');
-  return { before: source.slice(0, block.index) + `\`\`\`json\n`, after: `\n\`\`\`` + source.slice(block.index + block[0].length), ledger };
-}
-function serialize(document: DocumentState, ledger: DocumentState['ledger']): string { return document.before + JSON.stringify(ledger, null, 2) + document.after; }
-function newLedger(): string { return `# Repository Facts\n\n\`\`\`json\n${JSON.stringify({ schema_version: 2, active_issue_id: '', migration: { legacy_flat_list_migrated: false }, issues: [] }, null, 2)}\n\`\`\`\n`; }
 export default function App() {
   const [roots, setRoots] = useState<SharedFolder[]>([]); const [selected, setSelected] = useState('');
   const [document, setDocument] = useState<DocumentState>(); const [filter, setFilter] = useState<'open' | 'closed' | 'all'>('open');
@@ -34,7 +22,7 @@ export default function App() {
         if (root.readOnly || !String(cause).includes('ENOENT')) throw cause;
         source = newLedger(); hash = emptyHash;
       }
-      setDocument({ root, source, hash, ...parse(source) });
+      setDocument({ root, source, hash, ...parseLedgerDocument(source) });
     } catch (cause) { setDocument(undefined); setError(String(cause)); }
     finally { setBusy(false); }
   }
@@ -44,7 +32,7 @@ export default function App() {
     setBusy(true); setError(''); setMessage('');
     try {
       const ledger = structuredClone(document.ledger); change(ledger);
-      const source = serialize(document, ledger);
+      const source = serializeLedger(document, ledger);
       const result = await files.writeText(document.root.id, 'repo_facts.md', source, document.hash);
       setDocument({ ...document, source, hash: result.sha256, ledger }); setMessage(success); return true;
     } catch (cause) { setError(String(cause)); return false; }
@@ -52,19 +40,13 @@ export default function App() {
   }
   function issue(id: string, action: 'activate' | 'close' | 'reopen') {
     void update(ledger => {
-      const item = ledger.issues.find(issue => issue.issue_id === id); if (!item) throw new Error('Issue no longer exists.');
-      if (action === 'close') { item.status = 'closed'; item.closed_at ||= timestamp(); if (ledger.active_issue_id === id) ledger.active_issue_id = ''; }
-      if (action === 'reopen') { item.status = 'open'; item.closed_at = ''; item.reopen_count = Number(item.reopen_count || 0) + 1; ledger.active_issue_id = id; }
-      if (action === 'activate') { if (item.status !== 'open') throw new Error('Reopen this issue first.'); ledger.active_issue_id = id; }
+      transitionIssue(ledger, id, action);
     }, action === 'activate' ? `${id} is now active.` : `${id} ${action === 'close' ? 'closed' : 'reopened'}.`);
   }
   function create(event: React.FormEvent) {
     event.preventDefault(); const request = summary.trim(); if (!request) return;
     void update(ledger => {
-      const numbers = ledger.issues.map(issue => /^issue-(\d+)$/.exec(issue.issue_id)?.[1]).filter(Boolean).map(Number);
-      const id = `issue-${String(Math.max(0, ...numbers) + 1).padStart(3, '0')}`;
-      ledger.issues.push({ issue_id: id, status: 'open', request_summary: request, plan_summary: plan.trim() || request, opened_at: timestamp(), source: 'artifact', priority: 0, facts: [], completed_goals: [], lifecycle_notes: [] });
-      ledger.active_issue_id = id;
+      createIssue(ledger, request, plan);
     }, 'Issue created and activated.').then(saved => { if (saved) { setSummary(''); setPlan(''); } });
   }
   const issues = useMemo(() => (document?.ledger.issues || []).filter(item => !['global-architecture', 'legacy-architecture'].includes(item.issue_id)).filter(item => filter === 'all' || (item.status === 'open' ? 'open' : 'closed') === filter).filter(item => [item.issue_id, item.request_summary, item.plan_summary].join(' ').toLocaleLowerCase().includes(query.toLocaleLowerCase())).sort((a, b) => Number(b.issue_id === document?.ledger.active_issue_id) - Number(a.issue_id === document?.ledger.active_issue_id) || Number(b.status === 'open') - Number(a.status === 'open') || b.issue_id.localeCompare(a.issue_id, undefined, { numeric: true })), [document, filter, query]);
