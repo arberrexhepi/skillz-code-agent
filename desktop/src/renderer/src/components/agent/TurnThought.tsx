@@ -1,3 +1,4 @@
+import { PathText } from '../PathText';
 import { useEffect, useState } from 'react';
 import type { AgentProgressMessage } from '../../../../shared/agentTypes';
 
@@ -14,10 +15,10 @@ export function TurnThought({ active, action, thought }: { active: boolean; acti
   }, [active, action]);
   const content = thought?.thought?.trim();
   if (!active && !content) return null;
-  if (!active) return <details className="turn-thought last-thought"><summary>Last turn thought{thought?.turn ? ` · Turn ${thought.turn}` : ''}</summary><p>{content}</p></details>;
+  if (!active) return <details className="turn-thought last-thought"><summary>Last turn thought{thought?.turn ? ` · Turn ${thought.turn}` : ''}</summary><p><PathText>{content}</PathText></p></details>;
   return <section className="turn-thought live-thought" aria-label="Current turn thought">
     <header><i aria-hidden="true" /><strong>{content ? 'Turn thought' : 'Working'}</strong>{thought?.turn ? <span>Turn {thought.turn}</span> : null}<time>{elapsed}s</time><button type="button" aria-label={collapsed ? 'Expand turn thought' : 'Collapse turn thought'} aria-expanded={!collapsed} onClick={() => setCollapsed((value) => !value)}>{collapsed ? '⌄' : '⌃'}</button></header>
-    {!collapsed && <><div className="turn-thought-copy" aria-live="polite" aria-atomic="true">{content ? <p>{content}</p> : <p>{action.replaceAll('_', ' ') || 'Waiting for the agent’s next update…'}</p>}</div>
-      {content && <small>{action.replaceAll('_', ' ')}</small>}</>}
+    {!collapsed && <><div className="turn-thought-copy" aria-live="polite" aria-atomic="true">{content ? <p><PathText>{content}</PathText></p> : <p><PathText>{action.replaceAll('_', ' ') || 'Waiting for the agent’s next update…'}</PathText></p>}</div>
+      {content && <small><PathText>{action.replaceAll('_', ' ')}</PathText></small>}</>}
   </section>;
 }

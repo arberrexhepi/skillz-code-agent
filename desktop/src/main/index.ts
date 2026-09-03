@@ -2,6 +2,7 @@ import path from 'node:path';
 import { app, BrowserWindow, screen } from 'electron';
 import { registerIpc } from './ipc';
 import { AgentService } from './services/agent';
+import { RuntimeSettingsService } from './services/runtimeSettings';
 import { GitService } from './services/git';
 import { TerminalService } from './services/terminal';
 import { WorkspaceService } from './services/workspace';
@@ -32,7 +33,8 @@ function createWindow(): void {
   const workspace = new WorkspaceService((paths) => send('workspace:changed', paths));
   const git = new GitService(workspace);
   const terminal = new TerminalService(workspace, (event) => send('terminal:event', event));
-  const agent = new AgentService(workspace, (event) => send('agent:event', event));
+  const runtimeSettings = new RuntimeSettingsService(path.join(app.getPath('userData'), 'runtime-settings.json'));
+  const agent = new AgentService(workspace, (event) => send('agent:event', event), runtimeSettings);
   registerIpc(window, { workspace, git, terminal, agent });
 
   window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));

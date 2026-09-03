@@ -22,6 +22,8 @@ async function fixture(t) {
   fs.mkdirSync(root);
   const git = (...args) => execFileSync('git', args, { cwd: root, encoding: 'utf8' });
   git('init', '-q');
+  // Keep byte comparisons independent of the user's Windows checkout settings.
+  git('config', 'core.autocrlf', 'false');
   fs.writeFileSync(path.join(root, 'notes.md'), 'committed\n');
   git('add', '--', 'notes.md');
   git('-c', 'user.name=Workbench Test', '-c', 'user.email=workbench@example.invalid', 'commit', '-qm', 'Initial');
@@ -30,6 +32,8 @@ async function fixture(t) {
   await workspace.open(root);
   t.after(() => {
     workspace.dispose();
+    assert.equal(fs.realpathSync(path.dirname(container)), fs.realpathSync(os.tmpdir()));
+    assert.ok(path.basename(container).startsWith('workbench-git-test-'));
     fs.rmSync(container, { recursive: true, force: true });
   });
   return { root, container, git, workspace, service: new GitService(workspace) };
@@ -153,21 +157,38 @@ test('discard rejects tracked files behind an external parent symlink', async (t
   git('-c', 'user.name=Workbench Test', '-c', 'user.email=workbench@example.invalid', 'commit', '-qm', 'Nested file');
   const outside = path.join(container, 'outside-docs');
   fs.renameSync(directory, outside);
-  fs.symlinkSync(outside, directory);
+  fs.writeFileSync(path.join(outside, 'note.md'), 'outside change');
+  fs.symlinkSync(outside, directory, process.platform === 'win32' ? 'junction' : 'dir');
   await assert.rejects(service.discard('docs/note.md', async () => assert.fail('Unsafe path reached confirmation'), async () => assert.fail('No trash')), /outside the workspace/);
-  assert.equal(fs.readFileSync(path.join(outside, 'note.md'), 'utf8'), 'committed');
+  assert.equal(fs.readFileSync(path.join(outside, 'note.md'), 'utf8'), 'outside change');
 });
 
-test('broad, outside, symlink, and staged-only targets are rejected before confirmation', async (t) => {
+test('broad, outside, and staged-only targets are rejected before confirmation', async (t) => {
   const { root, container, service, git } = await fixture(t);
   fs.writeFileSync(path.join(root, 'notes.md'), 'staged');
   git('add', '--', 'notes.md');
   const outside = path.join(container, 'outside.md');
   fs.writeFileSync(outside, 'outside');
-  fs.symlinkSync(outside, path.join(root, 'link.md'));
-  for (const target of ['.', '../outside.md', root, 'notes.md', 'link.md']) {
+  for (const target of ['.', '../outside.md', root, 'notes.md']) {
     await assert.rejects(service.discard(target, async () => assert.fail('Unsafe target reached confirmation'), async () => assert.fail('No trash')));
   }
+  assert.equal(fs.readFileSync(outside, 'utf8'), 'outside');
+});
+
+test('external file symlinks are rejected before discard confirmation', async (t) => {
+  const { root, container, service } = await fixture(t);
+  const outside = path.join(container, 'outside.md');
+  fs.writeFileSync(outside, 'outside');
+  try {
+    fs.symlinkSync(outside, path.join(root, 'link.md'), 'file');
+  } catch (error) {
+    if (process.platform === 'win32' && error.code === 'EPERM') {
+      t.skip('Windows requires Developer Mode or symlink privileges for file symlinks');
+      return;
+    }
+    throw error;
+  }
+  await assert.rejects(service.discard('link.md', async () => assert.fail('Symlink reached confirmation'), async () => assert.fail('No trash')));
   assert.equal(fs.readFileSync(outside, 'utf8'), 'outside');
 });
 

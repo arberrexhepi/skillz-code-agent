@@ -6,6 +6,9 @@ The module intentionally keeps subscription-backed Codex invocation separate
 from the OpenAI API client. Authentication is owned by the locally installed
 Codex CLI and its ChatGPT-managed OAuth session; no token is read or copied by
 Skillz.
+
+Codex stdio is UTF-8. Subprocess pipe encodings must be explicit: setting
+PYTHONIOENCODING only configures this Python process's own standard streams.
 """
 
 import json
@@ -26,11 +29,38 @@ CODEX_SUBSCRIPTION_PROVIDER = "codex-subscription"
 _MACOS_BUNDLED_CODEX = Path("/Applications/ChatGPT.app/Contents/Resources/codex")
 
 
+def _windows_bundled_codex_candidates() -> List[str]:
+    # Desktop-launched processes may not inherit Codex's session-only PATH.
+    local_app_data = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+    bin_dir = Path(local_app_data) / "OpenAI" / "Codex" / "bin"
+    versioned: List[Tuple[float, str]] = []
+    try:
+        for candidate in bin_dir.glob("*/codex.exe"):
+            try:
+                if candidate.is_file():
+                    versioned.append((candidate.stat().st_mtime, str(candidate)))
+            except OSError:
+                # An update may remove an old runtime while discovery is running.
+                continue
+    except OSError:
+        pass
+    # Hash directory names aren't versions. Prefer the newest installed binary,
+    # then the legacy unversioned layout; don't persist a path across app updates.
+    versioned.sort(reverse=True)
+    return [candidate for _mtime, candidate in versioned] + [str(bin_dir / "codex.exe")]
+
+
 def resolve_codex_executable() -> str:
     configured = str(os.environ.get("CODEX_CLI_PATH", "") or "").strip()
-    candidates = [configured, shutil.which("codex") or ""]
+    if configured:
+        if Path(configured).is_file():
+            return configured
+        raise RuntimeError("The configured Codex CLI was not found at " + configured + ". Choose another executable or use automatic discovery.")
+    candidates = [shutil.which("codex") or ""]
     if sys.platform == "darwin":
         candidates.append(str(_MACOS_BUNDLED_CODEX))
+    elif sys.platform == "win32":
+        candidates.extend(_windows_bundled_codex_candidates())
     for candidate in candidates:
         if candidate and Path(candidate).is_file():
             return candidate
@@ -59,6 +89,7 @@ def quick_chatgpt_auth_status(executable: Optional[str] = None) -> Dict[str, Any
         [cli, "login", "status"],
         capture_output=True,
         text=True,
+        encoding="utf-8",
         timeout=10,
         env=_clean_cli_environment(),
         check=False,
@@ -87,6 +118,7 @@ class CodexAppServerSession:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
             bufsize=1,
             env=_clean_cli_environment(),
         )
@@ -243,6 +275,7 @@ def _cli_version(executable: str) -> str:
             [executable, "--version"],
             capture_output=True,
             text=True,
+            encoding="utf-8",
             timeout=5,
             env=_clean_cli_environment(),
             check=False,
@@ -437,6 +470,7 @@ def _run_codex_exec_streaming(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        encoding="utf-8",
         bufsize=1,
         env=dict(env),
     )
@@ -561,6 +595,7 @@ def run_codex_subscription_completion(
                 input=prompt,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
                 timeout=effective_timeout,
                 env=cli_env,
                 check=False,

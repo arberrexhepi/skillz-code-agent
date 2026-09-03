@@ -1,0 +1,52 @@
+.repo-facts-panel { padding: 0 10px 16px; font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
+.repo-facts-intro { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; }
+.repo-facts-intro p { color: #a3adb9; margin: 0; }
+.repo-facts-panel button:not(.repo-facts-group-toggle) { border: 1px solid var(--border); border-radius: 4px; background: var(--surface-raised); padding: 4px 8px; font-size: 11px; cursor: pointer; }
+.repo-facts-panel button:hover:not(:disabled) { background: var(--surface-soft); color: var(--bright); }
+.repo-facts-panel button:disabled { opacity: .5; cursor: default; }
+.repo-facts-panel :is(button, input, select, summary):focus-visible { outline: 1px solid var(--accent); outline-offset: 2px; }
+.repo-facts-file { display: flex; flex-direction: column; gap: 2px; color: #929daa; font-size: 10px; margin: 10px 0; }
+.repo-facts-counts { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 5px; margin: 12px 0; }
+.repo-facts-counts > div { padding: 7px 4px; border: 1px solid var(--border); border-radius: 5px; text-align: center; background: var(--surface-raised); }
+.repo-facts-counts dt { font-size: 9px; color: #9ca7b4; }
+.repo-facts-counts dd { margin: 3px 0 0; font-size: 19px; color: var(--bright); font-variant-numeric: tabular-nums; }
+.repo-facts-filters { display: grid; gap: 8px; margin: 12px 0; }
+.repo-facts-filters label { display: flex; flex-direction: column; gap: 4px; color: #a3adb9; font-size: 10px; }
+.repo-facts-filters input, .repo-facts-filters select { width: 100%; min-width: 0; padding: 6px 7px; border: 1px solid #303944; border-radius: 4px; background: #11161c; color: var(--text); font-size: 11px; }
+.repo-facts-match-count { font-size: 10px; color: #8f9ba8; }
+.repo-facts-group { border: 1px solid var(--border); border-radius: 5px; margin: 10px 0; overflow: hidden; }
+.repo-facts-group.active { border-color: #335344; }
+.repo-facts-group-toggle { display: flex; gap: 6px; width: 100%; padding: 9px 7px; border: 0; background: var(--surface-raised); text-align: left; cursor: pointer; }
+.repo-facts-group-toggle > span:last-child { display: flex; flex-direction: column; min-width: 0; gap: 3px; }
+.repo-facts-group-toggle strong { color: #d4dce5; font-size: 12px; font-weight: 600; }
+.repo-facts-group-title { font-size: 11px; color: #a8b2bd; }
+.repo-facts-group-toggle small { color: #909ba7; font-size: 10px; }
+.repo-facts-scope { color: var(--accent); text-transform: uppercase; font-size: 9px; letter-spacing: .06em; }
+.repo-facts-group-body { padding: 0 8px 9px; }
+.repo-fact-record { padding: 11px 0; border-bottom: 1px solid var(--border-soft); }
+.repo-fact-kind { color: #a5bdd9; font-size: 9px; text-transform: uppercase; letter-spacing: .04em; }
+.repo-fact-kind.goal { color: #d3bd8e; }
+.repo-fact-record.checkpoint > .repo-fact-kind { color: var(--accent); }
+.repo-fact-record h4 { margin: 5px 0; font-size: 12px; color: #e0e6ed; font-weight: 550; }
+.repo-fact-value, .repo-fact-validation p { white-space: pre-wrap; margin: 5px 0 9px; }
+.repo-fact-validation { font-size: 11px; color: #a9cbb7; padding-left: 7px; border-left: 2px solid #315541; }
+.repo-fact-validation strong { font-size: 10px; font-weight: 550; }
+.repo-facts-panel summary { cursor: pointer; color: #9ca9b8; font-size: 10px; padding: 4px 0; }
+.repo-facts-panel details[open] > summary { color: #d4dce5; }
+.repo-facts-metadata { margin: 5px 0; font-size: 11px; }
+.repo-facts-metadata > div { margin: 8px 0; }
+.repo-facts-metadata dt { color: #939faf; font-size: 10px; }
+.repo-facts-metadata dd { margin: 2px 0 0; white-space: pre-wrap; }
+.repo-facts-panel pre { white-space: pre-wrap; font-size: 10px; }
+.repo-facts-issue-details, .repo-facts-file-details { margin-top: 9px; }
+.repo-facts-issue-details ul { padding-left: 17px; }
+.repo-facts-note, .repo-facts-file-details > p { color: #9aa6b4; font-size: 11px; }
+.repo-facts-empty { border: 1px dashed var(--border); padding: 10px; border-radius: 5px; margin: 10px 0; color: #9ba8b6; }
+.repo-facts-panel h3 { font-size: 12px; color: var(--text); margin: 0 0 6px; }
+.repo-facts-error, .repo-facts-warning { padding: 9px; margin: 10px 0; border: 1px solid #594345; border-radius: 4px; color: #e6adb1; font-size: 11px; }
+.repo-facts-error p { margin: 4px 0 8px; }
+.repo-facts-more { width: 100%; margin: 8px 0; }
+
+.facts-only-counts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.repo-fact-record.standalone { border: 1px solid var(--border); border-radius: 5px; padding: 10px; margin: 10px 0; }
+.repo-fact-owner { color: #99a8b6; font-size: 10px; margin: 7px 0; }

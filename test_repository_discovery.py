@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -145,22 +146,13 @@ class WorkspaceDiscoveryTests(unittest.TestCase):
         self.assertEqual(tree.find_symbols("/repo/src/assistant", "VariationsPanel"), [])
         self.assertEqual(tree.grep("/repo/src/assistant", "VariationsPanel"), [])
 
-    def test_workspace_searches_do_not_read_excluded_or_external_files(self) -> None:
-        outside = tempfile.TemporaryDirectory()
-        self.addCleanup(outside.cleanup)
-        external = Path(outside.name) / "secret.py"
-        external.write_text("def HiddenMarker(): pass\n", encoding="utf-8")
-        (self.root / "secret.py").symlink_to(external)
-        for folder in ("node_modules", ".git"):
-            excluded = self.root / folder
-            excluded.mkdir()
-            (excluded / "secret.py").write_text("def HiddenMarker(): pass\n", encoding="utf-8")
+    def assert_marker_is_inaccessible(self, virtual_path: str) -> None:
         tree = ContextTree(self.root)
-        tree.index_repo()  # The boundary must hold even when a path could be indexed.
+        tree.index_repo()  # Indexing must respect the same boundary as live discovery.
         self.assertEqual(tree.find("/repo", "secret.py"), [])
         self.assertEqual(tree.grep("/repo", "HiddenMarker"), [])
         self.assertEqual(tree.find_symbols("/repo", "HiddenMarker"), [])
-        self.assertIn("not found", tree.cat("/repo/secret.py"))
+        self.assertIn("not found", tree.cat(virtual_path))
         self.assertEqual(tree.grep("/repo/../", "HiddenMarker"), [])
         for action in [
             {"type": "find_files", "patterns": ["secret.py"]},
@@ -171,6 +163,58 @@ class WorkspaceDiscoveryTests(unittest.TestCase):
                 result = execute_discovery_action(action, root=self.root)
                 self.assertTrue(result["ok"], result)
                 self.assertEqual(result["hits"], [])
+
+    def test_workspace_searches_skip_excluded_directories(self) -> None:
+        for folder in ("node_modules", ".git"):
+            excluded = self.root / folder
+            excluded.mkdir()
+            (excluded / "secret.py").write_text("def HiddenMarker(): pass\n", encoding="utf-8")
+        self.assert_marker_is_inaccessible("/repo/node_modules/secret.py")
+
+    def test_workspace_searches_do_not_follow_external_file_symlinks(self) -> None:
+        outside = tempfile.TemporaryDirectory()
+        self.addCleanup(outside.cleanup)
+        external = Path(outside.name) / "secret.py"
+        external.write_text("def HiddenMarker(): pass\n", encoding="utf-8")
+        try:
+            (self.root / "secret.py").symlink_to(external)
+        except OSError as error:
+            if os.name == "nt" and error.winerror == 1314:
+                self.skipTest("Windows file symlinks require Developer Mode or symlink privileges")
+            raise
+        self.assert_marker_is_inaccessible("/repo/secret.py")
+
+    def test_workspace_searches_do_not_follow_external_directory_links(self) -> None:
+        outside = tempfile.TemporaryDirectory()
+        self.addCleanup(outside.cleanup)
+        external = Path(outside.name)
+        (external / "secret.py").write_text("def HiddenMarker(): pass\n", encoding="utf-8")
+        link = self.root / "linked"
+        if os.name == "nt":
+            # Junctions exercise real Windows traversal without symlink privileges.
+            import _winapi
+            _winapi.CreateJunction(str(external), str(link))
+            self.addCleanup(link.rmdir)
+        else:
+            link.symlink_to(external, target_is_directory=True)
+            self.addCleanup(link.unlink)
+        self.assert_marker_is_inaccessible("/repo/linked/secret.py")
+        self.assertEqual((external / "secret.py").read_text(encoding="utf-8"), "def HiddenMarker(): pass\n")
+
+    def test_discovery_returns_reusable_forward_slash_paths(self) -> None:
+        relative = "src/nested/p\u00ebrsh\u00ebndetje.py"
+        target = self.root / relative
+        target.parent.mkdir(parents=True)
+        target.write_text("def UnicodeMarker(): pass\n", encoding="utf-8")
+        tree = self.cold_tree()
+        expected = "repo/" + relative
+        self.assertEqual(tree.find("/repo/src", target.name), [expected])
+        self.assertEqual(tree.find("/repo/" + relative, target.name), [expected])
+        self.assertEqual(tree.find("/repo", "nested"), ["repo/src/nested"])
+        self.assertEqual(tree.grep("/repo/src", "UnicodeMarker")[0]["path"], expected)
+        self.assertEqual(tree.find_symbols("/repo/src", "UnicodeMarker")[0]["path"], "/" + expected)
+        self.assertIn("UnicodeMarker", tree.cat("/" + expected))
+        self.assertEqual(tree.stat("/" + expected)["type"], "file")
 
     def test_other_virtual_mounts_stay_in_memory(self) -> None:
         tree = self.cold_tree()

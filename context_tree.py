@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
 
 from discovery.analysis import collect_symbols_for_file
-from discovery.common import try_read_text
+from discovery.common import is_directory_link, try_read_text
 
 _CAT_MAX_FULL_LINES = 200
 _CAT_MAX_FULL_CHARS = 20000
@@ -347,7 +347,7 @@ class ContextTree:
 
         for dirpath, dirnames, filenames in os.walk(root_str):
             # Prune excluded dirs in-place
-            dirnames[:] = [d for d in dirnames if d not in exclude_dirs]
+            dirnames[:] = [d for d in dirnames if d not in exclude_dirs and not is_directory_link(Path(dirpath) / d)]
 
             rel_dir = os.path.relpath(dirpath, root_str)
             if rel_dir == ".":
@@ -371,7 +371,7 @@ class ContextTree:
                 def _make_loader(p: str) -> Callable[[], str]:
                     def _load() -> str:
                         try:
-                            return Path(p).read_text(errors="replace")
+                            return Path(p).read_text(encoding="utf-8", errors="replace")
                         except Exception:
                             return ""
                     return _load
@@ -501,7 +501,7 @@ class ContextTree:
         return node
 
     def _iter_repo_entries(self, path: str, *, include_dirs: bool = False) -> Iterator[Tuple[str, Path]]:
-        """Scan disk under /repo without populating or depending on the metadata index."""
+        """Yield forward-slash virtual paths while scanning disk independently of the index."""
         rel_path = self._repo_relative_path(path)
         if rel_path is None:
             return
@@ -509,23 +509,23 @@ class ContextTree:
         if target is None or not target.exists():
             return
         if target.is_file():
-            yield rel_path, target
+            yield Path(rel_path).as_posix(), target
             return
         for dirpath, dirnames, filenames in os.walk(target, followlinks=False):
             current = Path(dirpath)
             current_rel = current.relative_to(self.workspace_root)
             safe_dirs: List[str] = []
             for dirname in sorted(dirnames):
-                candidate_rel = str(current_rel / dirname)
+                candidate_rel = (current_rel / dirname).as_posix()
                 candidate = self._safe_repo_target(candidate_rel)
-                if candidate is None or (current / dirname).is_symlink():
+                if candidate is None or is_directory_link(current / dirname):
                     continue
                 safe_dirs.append(dirname)
                 if include_dirs:
                     yield candidate_rel, candidate
             dirnames[:] = safe_dirs
             for filename in sorted(filenames):
-                candidate_rel = str(current_rel / filename)
+                candidate_rel = (current_rel / filename).as_posix()
                 candidate = self._safe_repo_target(candidate_rel)
                 if candidate is not None and candidate.is_file():
                     yield candidate_rel, candidate
@@ -553,7 +553,7 @@ class ContextTree:
     def _make_repo_loader(self, full_path: Path) -> Callable[[], str]:
         def _load() -> str:
             try:
-                return full_path.read_text(errors="replace")
+                return full_path.read_text(encoding="utf-8", errors="replace")
             except Exception:
                 return ""
         return _load

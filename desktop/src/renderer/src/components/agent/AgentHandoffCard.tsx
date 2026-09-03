@@ -1,3 +1,4 @@
+import { PathText } from '../PathText';
 import { useEffect, useState } from 'react';
 import type { AgentHandoff } from '../../../../shared/agentCore';
 import { MarkdownMessage } from './MarkdownMessage';
@@ -20,11 +21,11 @@ export function AgentHandoffCard({ handoff, onViewGoalReport }: AgentHandoffCard
 
   return (
     <section className="agent-handoff">
-      <header><span>{inProgress ? 'WORK IN PROGRESS' : paused ? 'WORK PAUSED' : 'WORK HANDOFF'}</span><strong>{handoff.plan?.summary || 'Workspace update'}</strong></header>
+      <header><span>{inProgress ? 'WORK IN PROGRESS' : paused ? 'WORK PAUSED' : 'WORK HANDOFF'}</span><strong><PathText>{handoff.plan?.summary || 'Workspace update'}</PathText></strong></header>
       {inProgress && (
         <div className="handoff-section">
           <h4>Execution progress</h4>
-          <div className="handoff-copy"><p>{handoff.completedGoalCount} of {handoff.totalGoalCount || '?'} goals completed. {handoff.currentGoalTitle ? `Now working on ${handoff.currentGoalTitle}.` : 'Preparing the next goal.'}</p></div>
+          <div className="handoff-copy"><p>{handoff.completedGoalCount} of {handoff.totalGoalCount || '?'} goals completed. <PathText>{handoff.currentGoalTitle ? `Now working on ${handoff.currentGoalTitle}.` : 'Preparing the next goal.'}</PathText></p></div>
           <div className="handoff-meta"><span>Live plan</span><span>{handoff.totalGoalCount - handoff.completedGoalCount} remaining</span></div>
         </div>
       )}
@@ -42,7 +43,7 @@ export function AgentHandoffCard({ handoff, onViewGoalReport }: AgentHandoffCard
       {handoff.nextSteps.length > 0 && (
         <div className="handoff-section">
           <h4>Planner's next suggested steps</h4>
-          <ol>{handoff.nextSteps.map((step, index) => <li key={`${step}-${index}`}>{step}</li>)}</ol>
+          <ol>{handoff.nextSteps.map((step, index) => <li key={`${step}-${index}`}><PathText>{step}</PathText></li>)}</ol>
         </div>
       )}
       {hasGoalReport && (

@@ -82,9 +82,9 @@ button { color: inherit; }
   contain: layout paint;
   border-right: 1px solid var(--border);
 }
-.sidebar-tabs { height: 39px; display: flex; border-bottom: 1px solid var(--border); padding: 0 8px; }
+.sidebar-tabs { height: 39px; flex-shrink: 0; display: flex; overflow-x: auto; overflow-y: hidden; border-bottom: 1px solid var(--border); padding: 0 8px; }
 .sidebar-tabs button {
-  position: relative; border: 0; background: transparent; padding: 0 12px; color: var(--muted); font-size: 11px; cursor: pointer;
+  position: relative; border: 0; background: transparent; padding: 0 9px; flex-shrink: 0; color: var(--muted); font-size: 11px; cursor: pointer;
 }
 .sidebar-tabs button.active { color: var(--bright); }
 .sidebar-tabs button.active::after { content: ""; position: absolute; height: 2px; left: 10px; right: 10px; bottom: -1px; background: var(--accent); }
@@ -301,3 +301,38 @@ kbd { min-width: 20px; height: 20px; display: grid; place-items: center; border:
 .issue-card-copy { min-width: 0; display: grid; grid-template-columns: auto 1fr; align-items: center; gap: 3px 6px; }.issue-kind { color: #718078; font-size: 7px; font-weight: 700; letter-spacing: .1em; }.issue-card.active .issue-kind { color: var(--accent); }.issue-card-copy strong { overflow: hidden; color: #aab2bb; font: 9px ui-monospace, monospace; text-overflow: ellipsis; white-space: nowrap; }.issue-card-copy small { grid-column: 1 / -1; overflow: hidden; color: #747e89; font-size: 8px; text-overflow: ellipsis; white-space: nowrap; }.issue-fact-count { color: #59646e; font-size: 8px; white-space: nowrap; }
 .issue-card-details { padding: 0 9px 9px 28px; border-top: 1px solid #1c2228; }.issue-card-details p { margin: 8px 0; color: #8d97a1; font-size: 9px; line-height: 1.45; }.issue-card-actions { display: flex; gap: 5px; }.issue-section > header { padding: 10px 10px 4px; color: #59636e; font-size: 8px; letter-spacing: .1em; }
 .run-diagnostic { width: 100%; display: grid; grid-template-columns: 17px 1fr; align-items: center; gap: 6px; border: 0; border-bottom: 1px solid #171c22; background: transparent; padding: 7px 10px; text-align: left; cursor: pointer; }.run-diagnostic > span { color: var(--danger); }.run-diagnostic div { min-width: 0; display: flex; flex-direction: column; gap: 2px; }.run-diagnostic strong { overflow: hidden; color: #9fa8b2; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }.run-diagnostic small { color: #59636e; font-size: 8px; }.fact-row { padding: 6px 10px; border-bottom: 1px solid #171c22; }.fact-row strong { display: block; color: #8ca594; font-size: 8px; }.fact-row span { display: block; margin-top: 2px; color: #747e89; font-size: 8px; line-height: 1.4; }
+
+/* Local runtime executable recovery. */
+.runtime-drawer { max-height: calc(100% - 72px); overflow-y: auto; }
+.runtime-cli-location { min-width: 0; margin: 10px 0; padding: 8px; border: 1px solid #39414b; border-radius: 5px; }
+.runtime-cli-location legend { padding: 0 4px; color: #c1c8cf; font-size: 11px; }
+.runtime-cli-location label { display: block; margin-bottom: 4px; }
+.runtime-cli-location input { width: 100%; box-sizing: border-box; }
+.runtime-cli-buttons { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 7px; }
+.runtime-cli-location details { margin-top: 8px; color: #939da8; font-size: 10px; }
+.runtime-cli-location summary { cursor: pointer; }
+.runtime-cli-location code { overflow-wrap: anywhere; }
+.runtime-subscription .runtime-cli-message { white-space: normal; overflow-wrap: anywhere; margin-top: 5px; line-height: 1.5; font-size: 10px; }
+.runtime-subscription .runtime-cli-error { color: #e7a19d; }
+.runtime-cli-location p { font-size: 10px; }
+.runtime-cli-location input:focus-visible, .runtime-cli-location summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.runtime-subscription > div strong { font-size: 11px; }
+.runtime-subscription > p { font-size: 11px; }
+.runtime-cli-location label, .runtime-cli-location input { font-size: 11px; }
+.runtime-cli-location button { font-size: 10px; }
+
+.git-setup { display: flex; flex-direction: column; gap: 10px; padding: 20px 14px; }
+.git-setup-icon { color: var(--accent); font-size: 28px; }
+.git-setup h3 { margin: 0; color: var(--bright); font-size: 13px; font-weight: 600; }
+.git-setup p { margin: 0; color: #939da8; font-size: 12px; line-height: 1.6; }
+.git-setup .error-text { color: #e7a19d; overflow-wrap: anywhere; }
+.git-setup-path { padding: 8px; border: 1px solid var(--border); border-radius: 5px; background: #0a0d10; color: #b7c0ca; font-size: 11px; line-height: 1.5; overflow-wrap: anywhere; }
+.git-setup .git-setup-hint { font-size: 11px; }
+.git-setup button { min-height: 32px; }
+.git-setup button:disabled { opacity: .55; cursor: default; }
+
+/* Discovery decisions retain readable findings without pushing controls out of the panel. */
+.discovery-extension .decision-content { max-height: 55vh; overflow-y: auto; overflow-wrap: anywhere; }
+.discovery-extension .decision-content > p { margin: 4px 0; }
+.discovery-extension .decision-content > ul { margin: 4px 0 8px; padding-left: 20px; }
+.discovery-extension .discovery-findings { white-space: pre-wrap; }
