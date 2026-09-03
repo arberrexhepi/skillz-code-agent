@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import unittest
 import tempfile
 from pathlib import Path
@@ -87,18 +88,31 @@ class ContextTreeHydrationTests(unittest.TestCase):
             self.assertIn('"type": "file"', metadata.output)
 
     def test_repo_hydration_rejects_paths_outside_workspace(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "workspace"
+            root.mkdir()
+            (root / "README.md").write_text("# Workspace\n", encoding="utf-8")
+            outside = Path(tmpdir) / "secret.txt"
+            outside.write_text("system secret\n", encoding="utf-8")
+            tree = ContextTree(root)
+            tree.index_repo(max_files=1)
+            self.assertEqual(tree.cat("/repo/../secret.txt"), "[not found: /repo/../secret.txt]")
+
+    def test_repo_hydration_rejects_external_file_symlinks(self):
         with tempfile.TemporaryDirectory() as tmpdir, tempfile.TemporaryDirectory() as outside_dir:
             root = Path(tmpdir)
             (root / "README.md").write_text("# Workspace\n", encoding="utf-8")
             outside = Path(outside_dir) / "secret.txt"
             outside.write_text("system secret\n", encoding="utf-8")
-            (root / "external.txt").symlink_to(outside)
-
+            try:
+                (root / "external.txt").symlink_to(outside)
+            except OSError as error:
+                if os.name == "nt" and error.winerror == 1314:
+                    self.skipTest("Windows file symlinks require Developer Mode or symlink privileges")
+                raise
             tree = ContextTree(root)
             tree.index_repo(max_files=1)
-
             self.assertEqual(tree.cat("/repo/external.txt"), "[not found: /repo/external.txt]")
-            self.assertEqual(tree.cat("/repo/../secret.txt"), "[not found: /repo/../secret.txt]")
 
     def test_find_accepts_familiar_name_form_without_treating_name_as_glob(self):
         with tempfile.TemporaryDirectory() as tmpdir:

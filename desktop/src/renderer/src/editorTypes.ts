@@ -7,6 +7,7 @@ export interface FileTab {
   document: FileDocument;
   content: string;
   dirty: boolean;
+  reveal?: { line: number; column: number; request: number };
 }
 
 export interface DiffTab {

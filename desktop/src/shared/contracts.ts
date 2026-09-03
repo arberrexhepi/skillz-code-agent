@@ -1,3 +1,6 @@
+import type { WorkspaceIssuesSnapshot } from './workspaceIssues';
+import type { RepoFactsSnapshot } from './repoFacts';
+
 export interface WorkspaceInfo {
   root: string;
   name: string;
@@ -24,6 +27,7 @@ export interface GitFileStatus {
 }
 
 export interface GitStatus {
+  isRepository: boolean;
   branch: string;
   upstream?: string;
   ahead: number;
@@ -95,11 +99,14 @@ export interface WorkbenchApi {
     open(root: string): Promise<WorkspaceInfo>;
     list(path?: string): Promise<FileEntry[]>;
     read(path: string): Promise<FileDocument>;
+    repoFacts(workspaceRoot: string): Promise<RepoFactsSnapshot>;
+    issues(workspaceRoot: string): Promise<WorkspaceIssuesSnapshot>;
     write(path: string, content: string): Promise<FileDocument>;
     onChange(listener: (paths: string[]) => void): () => void;
   };
   git: {
     status(): Promise<GitStatus>;
+    initialize(workspaceRoot: string): Promise<GitStatus>;
     history(limit?: number): Promise<GitCommit[]>;
     fileDiff(path: string, staged?: boolean): Promise<GitFileDiff>;
     stage(paths: string[]): Promise<GitStatus>;
@@ -126,6 +133,8 @@ export interface WorkbenchApi {
     runtimeOptions(provider?: string, model?: string): Promise<RuntimeOptionsPayload>;
     codexSubscriptionStatus(): Promise<CodexSubscriptionStatus>;
     codexSubscriptionLogin(): Promise<CodexSubscriptionStatus>;
+    chooseCodexCli(): Promise<string | null>;
+    setCodexCliPath(path: string | null): Promise<CodexSubscriptionStatus>;
     stop(): Promise<void>;
     onEvent(listener: (event: AgentEvent) => void): () => void;
   };

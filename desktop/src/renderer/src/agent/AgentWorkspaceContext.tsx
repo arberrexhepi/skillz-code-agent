@@ -21,7 +21,10 @@ export function AgentWorkspaceProvider({ children }: { children: React.ReactNode
   useEffect(() => window.workbench.agent.onEvent((event: AgentEvent) => {
     if (event.type === 'state') dispatch({ type: 'bridge-state', state: event.state });
     if (event.type === 'progress') dispatch({ type: 'progress', progress: event.payload });
-    if (event.type === 'status') dispatch({ type: 'status', status: event.status, message: event.message });
+    if (event.type === 'status') {
+      if (event.status === 'stopped') dispatch({ type: 'reset' });
+      else dispatch({ type: 'status', status: event.status, message: event.message });
+    }
     if (event.type === 'stderr') dispatch({ type: 'notice', message: event.message });
   }), []);
 
@@ -113,6 +116,7 @@ export function AgentWorkspaceProvider({ children }: { children: React.ReactNode
   const runSuggestedAction = useCallback(async (action: SuggestedAction): Promise<boolean> => {
     if (action.requires_confirmation && !window.confirm(action.confirmation_prompt || 'Proceed with this action?')) return false;
     const payload = isMap(action.payload) ? { ...action.payload } : {};
+    if (action.request_id) payload.request_id = action.request_id;
     if (action.mode) payload.mode = action.mode;
     if (action.issue_id) payload.issue_id = action.issue_id;
     if (action.max_cycles) payload.max_cycles = action.max_cycles;

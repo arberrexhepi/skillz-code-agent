@@ -32,9 +32,17 @@ export function EditorPane(props: EditorPaneProps): React.JSX.Element {
       },
     });
   };
+  const revealLine = (): void => {
+    const editor = editorRef.current;
+    if (!editor || active?.kind !== 'file' || !active.reveal) return;
+    const position = editor.getModel()?.validatePosition({ lineNumber: active.reveal.line, column: active.reveal.column });
+    if (position) { editor.setPosition(position); editor.revealPositionInCenter(position); editor.focus(); }
+  };
+  useEffect(revealLine, [active?.id, active?.kind === 'file' ? active.reveal?.request : undefined]);
   const mount: OnMount = (editor, monaco) => {
     editorRef.current = editor;
     monacoRef.current = monaco;
+    revealLine();
     editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => {
       if (active?.kind === 'file') props.onSave(active.id);
     });

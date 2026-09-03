@@ -25,7 +25,7 @@ export class TerminalService {
       rows: Math.max(1, options.rows),
       cwd: this.workspace.requireRoot(),
       env: { ...environment, TERM: 'xterm-256color', COLORTERM: 'truecolor' },
-      encoding: 'utf8',
+      ...(process.platform === 'win32' ? {} : { encoding: 'utf8' as const }),
     });
     this.sessions.set(sessionId, session);
     session.onData((data) => this.emit({ type: 'data', sessionId, data }));
@@ -37,11 +37,12 @@ export class TerminalService {
   }
 
   write(sessionId: string, data: string): void {
-    this.requireSession(sessionId).write(data);
+    // Renderer messages can arrive after workspace teardown or a natural exit.
+    this.sessions.get(sessionId)?.write(data);
   }
 
   resize(sessionId: string, cols: number, rows: number): void {
-    this.requireSession(sessionId).resize(Math.max(2, cols), Math.max(1, rows));
+    this.sessions.get(sessionId)?.resize(Math.max(2, cols), Math.max(1, rows));
   }
 
   dispose(sessionId: string): void {
@@ -53,11 +54,5 @@ export class TerminalService {
 
   disposeAll(): void {
     for (const sessionId of [...this.sessions.keys()]) this.dispose(sessionId);
-  }
-
-  private requireSession(sessionId: string): pty.IPty {
-    const session = this.sessions.get(sessionId);
-    if (!session) throw new Error('Terminal session is no longer active.');
-    return session;
   }
 }

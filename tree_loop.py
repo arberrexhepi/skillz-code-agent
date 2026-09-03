@@ -643,14 +643,14 @@ MAX_CONSECUTIVE_COMMANDLESS_TURNS = 2
 MAX_MODEL_OUTPUT_REPAIR_ATTEMPTS = 1
 
 
-def _executable_command_count(command_block: str) -> int:
-    """Count commands before execution so one model turn cannot fan out unboundedly."""
+def _executable_commands(command_block: str) -> List[str]:
+    """Inspect commands before execution without interpreting text payloads as commands."""
     if is_strategy(command_block):
         plan = parse_strategy(command_block)
         if plan is None:
-            return 0
-        return sum(len(step.commands) for label, step in plan.steps.items() if label != "error")
-    return sum(1 for command in parse_multi_command(command_block) if not is_annotation(command))
+            return []
+        return [command for label, step in plan.steps.items() if label != "error" for command in step.commands]
+    return [command for command in parse_multi_command(command_block) if not is_annotation(command)]
 
 
 class TreeLoop:
@@ -753,6 +753,9 @@ class TreeLoop:
         self._refresh_log_issue_signals()
 
         for turn_num in range(1, self.max_turns + 1):
+            before_turn = getattr(self, "before_turn", None)
+            if before_turn is not None:
+                before_turn()
             # Build prompt with current OS state + history
             os_state = self.bridge.render_for_prompt(repo_depth=2)
             prompt_steering = self._compose_steering()
@@ -907,8 +910,13 @@ class TreeLoop:
             turn_annotations: List[Annotation] = []
 
             if command_block:
-                executable_command_count = _executable_command_count(command_block)
-                if executable_command_count > MAX_EXECUTABLE_COMMANDS_PER_TURN:
+                parsed_commands = _executable_commands(command_block)
+                executable_command_count = len(parsed_commands)
+                has_extension = any(command.split(None, 1)[0].lower() == "request-discovery-extension" for command in parsed_commands)
+                if has_extension and executable_command_count != 1:
+                    commands_issued = ["command_batch_rejected"]
+                    results = [CommandResult(ok=False, command_type="error", output="A discovery extension request must be the only executable command in its turn. No commands were executed.")]
+                elif executable_command_count > MAX_EXECUTABLE_COMMANDS_PER_TURN:
                     commands_issued = ["command_batch_rejected"]
                     results = [CommandResult(
                         ok=False,
@@ -1651,7 +1659,7 @@ class TreeLoop:
             return f"write_file: path escapes workspace: {rel_path}"
 
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content)
+        target.write_text(content, encoding="utf-8")
         # Invalidate tree cache so next cat sees the new content
         self.bridge.on_write_complete(rel_path)
         self._refresh_recent_file_context(rel_path)
@@ -1685,7 +1693,7 @@ class TreeLoop:
         if not target.exists():
             return f"replace_lines: file not found: {rel_path}"
 
-        original_text = target.read_text()
+        original_text = target.read_text(encoding="utf-8")
         lines = original_text.splitlines()
         if start_line > len(lines):
             return f"replace_lines: start line out of bounds for {rel_path} ({len(lines)} total lines)"
@@ -1696,7 +1704,7 @@ class TreeLoop:
         if updated_lines and original_text.endswith("\n"):
             updated += "\n"
 
-        target.write_text(updated)
+        target.write_text(updated, encoding="utf-8")
         self.bridge.on_write_complete(rel_path)
         self._refresh_recent_file_context(rel_path)
         replaced_end = min(end_line, len(lines))
@@ -1730,7 +1738,7 @@ class TreeLoop:
         if not target.exists():
             return f"patch_file: file not found: {rel_path}"
 
-        original = target.read_text()
+        original = target.read_text(encoding="utf-8")
         occurrences = original.count(search)
         if occurrences == 0:
             return (
@@ -1742,7 +1750,7 @@ class TreeLoop:
             return f"patch_file: ambiguous search text in {rel_path}: {occurrences} matches; no changes made. Include unique surrounding context."
 
         updated = original.replace(search, replace, 1)
-        target.write_text(updated)
+        target.write_text(updated, encoding="utf-8")
         self.bridge.on_write_complete(rel_path)
         self._refresh_recent_file_context(rel_path)
         return self._append_backend_diagnostics(f"patched {rel_path}", rel_path, trigger_action="patch")
@@ -1932,6 +1940,8 @@ class TreeLoop:
                 shell=True,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 env=_subprocess_env_no_color(),
                 timeout=60,
             )
@@ -2005,6 +2015,8 @@ class TreeLoop:
                 cwd=str(self.workspace_root),
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 env=_subprocess_env_no_color(),
                 timeout=180,
             )
@@ -2031,7 +2043,7 @@ class TreeLoop:
         scripts: Dict[str, Any] = {}
         if package_json.exists():
             try:
-                package_data = json.loads(package_json.read_text())
+                package_data = json.loads(package_json.read_text(encoding="utf-8"))
                 if isinstance(package_data, dict) and isinstance(package_data.get("scripts"), dict):
                     scripts = package_data["scripts"]
             except Exception:
@@ -2096,6 +2108,8 @@ class TreeLoop:
                 shell=True,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 env=_subprocess_env_no_color(),
                 timeout=90,
             )
@@ -2266,7 +2280,7 @@ main().catch((error) => {
 """.strip()
         temp_script: Optional[str] = None
         try:
-            with tempfile.NamedTemporaryFile("w", suffix=".cjs", delete=False) as fh:
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".cjs", delete=False) as fh:
                 fh.write(script)
                 temp_script = fh.name
             result = subprocess.run(
@@ -2274,6 +2288,8 @@ main().catch((error) => {
                 cwd=str(self.workspace_root),
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=45,
             )
         except subprocess.TimeoutExpired:
@@ -2363,6 +2379,7 @@ def _strip_ansi(text: str) -> str:
 
 def _subprocess_env_no_color() -> Dict[str, str]:
     env = dict(os.environ)
+    env["PYTHONIOENCODING"] = "utf-8"
     env["NO_COLOR"] = "1"
     env["FORCE_COLOR"] = "0"
     env["CLICOLOR"] = "0"

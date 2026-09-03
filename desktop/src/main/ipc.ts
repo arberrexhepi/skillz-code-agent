@@ -19,11 +19,12 @@ const terminalId = z.string().uuid();
 
 export function registerIpc(window: BrowserWindow, services: Services): void {
   for (const channel of [
-    'workspace:current', 'workspace:choose', 'workspace:open', 'workspace:list', 'workspace:read', 'workspace:write',
-    'git:status', 'git:history', 'git:file-diff', 'git:stage', 'git:stage-all', 'git:unstage', 'git:discard', 'git:commit', 'git:push',
+    'workspace:current', 'workspace:choose', 'workspace:open', 'workspace:list', 'workspace:read', 'workspace:write', 'workspace:repo-facts', 'workspace:issues',
+    'git:status', 'git:initialize', 'git:history', 'git:file-diff', 'git:stage', 'git:stage-all', 'git:unstage', 'git:discard', 'git:commit', 'git:push',
     'terminal:create', 'agent:start', 'agent:submit', 'agent:planner-action', 'agent:worker-action',
     'agent:reconfigure-runtime', 'agent:configure-backoff', 'agent:runtime-options',
     'agent:codex-subscription-status', 'agent:codex-subscription-login', 'agent:stop',
+    'agent:choose-codex-cli', 'agent:set-codex-cli-path',
   ]) ipcMain.removeHandler(channel);
   for (const channel of ['terminal:write', 'terminal:resize', 'terminal:dispose']) ipcMain.removeAllListeners(channel);
 
@@ -56,11 +57,14 @@ export function registerIpc(window: BrowserWindow, services: Services): void {
   });
   handle('workspace:list', (_event, path: unknown = '') => services.workspace.list(z.string().max(4096).parse(path)));
   handle('workspace:read', (_event, path: unknown) => services.workspace.read(relativePath.parse(path)));
+  handle('workspace:issues', (_event, root: unknown) => services.workspace.issues(z.string().min(1).max(4096).parse(root)));
+  handle('workspace:repo-facts', (_event, root: unknown) => services.workspace.repoFacts(z.string().min(1).max(4096).parse(root)));
   handle('workspace:write', (_event, path: unknown, content: unknown) => (
     services.workspace.write(relativePath.parse(path), z.string().max(10 * 1024 * 1024).parse(content))
   ));
 
   handle('git:status', () => services.git.status());
+  handle('git:initialize', (_event, root: unknown) => services.git.initialize(z.string().min(1).max(4096).parse(root)));
   handle('git:history', (_event, limit: unknown = 50) => services.git.history(z.number().int().min(1).max(200).parse(limit)));
   handle('git:file-diff', (_event, path: unknown, staged: unknown = false) => (
     services.git.fileDiff(relativePath.parse(path), z.boolean().parse(staged))
@@ -139,5 +143,17 @@ export function registerIpc(window: BrowserWindow, services: Services): void {
   ));
   handle('agent:codex-subscription-status', () => services.agent.codexSubscriptionStatus());
   handle('agent:codex-subscription-login', () => services.agent.codexSubscriptionLogin());
+  handle('agent:choose-codex-cli', async () => {
+    const selection = await dialog.showOpenDialog(window, {
+      title: 'Locate Codex CLI',
+      buttonLabel: 'Choose Codex CLI',
+      properties: ['openFile', 'showHiddenFiles'],
+      ...(process.platform === 'win32' ? { filters: [{ name: 'Executable', extensions: ['exe'] }] } : {}),
+    });
+    return selection.canceled ? null : selection.filePaths[0] || null;
+  });
+  handle('agent:set-codex-cli-path', (_event, candidate: unknown) => services.agent.setCodexCliPath(
+    z.string().trim().min(1).max(4096).refine((value) => !value.includes('\0')).nullable().parse(candidate),
+  ));
   handle('agent:stop', () => services.agent.stop());
 }

@@ -1,3 +1,4 @@
+import { PathText } from './PathText';
 import { useEffect, useRef, useState } from 'react';
 import { agentHandoff, continuousIsActive } from '../../../shared/agentCore';
 import { conversationTimeline } from '../../../shared/agentTimeline';
@@ -41,7 +42,7 @@ export function AgentPanel(): React.JSX.Element {
         </button>
       </div>
       <div className="agent-context-strip">
-        <span>{bridge.planner.executing ? bridge.planner.executing_goal_title || 'Executing plan' : 'Workspace conversation'}</span>
+        <span><PathText>{bridge.planner.executing ? bridge.planner.executing_goal_title || 'Executing plan' : 'Workspace conversation'}</PathText></span>
         {continuousIsActive(bridge) && <strong>Auto {continuous?.cycle || 0}/{continuous?.max_cycles || '∞'}</strong>}
       </div>
       {showRuntime && <RuntimeDrawer onClose={() => setShowRuntime(false)} />}
@@ -57,7 +58,7 @@ export function AgentPanel(): React.JSX.Element {
         <TurnThought active={Boolean(pendingAction || bridge.planner.executing)} action={workingLabel} thought={agent.state.turnThought} />
         <AgentDecisionCard />
       </div>
-      {notice && <button type="button" className="agent-notice" title={notice} onClick={agent.clearNotice}>{notice}<span>×</span></button>}
+      {notice && <div className="agent-notice" role="status"><div className="notice-copy"><PathText>{notice}</PathText></div><button type="button" aria-label="Dismiss notice" onClick={agent.clearNotice}>×</button></div>}
       <div className="composer-shell">
         <div className="composer-heading"><span>NEW INSTRUCTION</span><small>Workspace-wide</small></div>
         <div className="prompt-box">

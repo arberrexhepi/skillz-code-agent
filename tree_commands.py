@@ -114,6 +114,7 @@ COMMAND_VERBS = frozenset({
     "npm",
     "patch",
     "propose-issue",
+    "request-discovery-extension",
     "read-diagnostics",
     "read-line-range",
     "read_line_range",
@@ -297,6 +298,7 @@ class TreeCommandParser:
             "replace_lines": self._cmd_replace_lines,
             "patch": self._cmd_patch,
             "propose-issue": self._cmd_propose_issue,
+            "request-discovery-extension": self._cmd_request_discovery_extension,
             "discover": self._cmd_discover,
             "mutate": self._cmd_mutate,
             "show-diff": self._cmd_show_diff,
@@ -1272,6 +1274,17 @@ class TreeCommandParser:
             return CommandResult(ok=False, command_type="error", output=f"propose-issue: {exc}")
         return CommandResult(ok=True, command_type="write", needs_tool=True,
             output="[dispatch: propose_issue]", tool_action={**payload, "type": "propose_issue"})
+
+    def _cmd_request_discovery_extension(self, rest: str) -> CommandResult:
+        try:
+            payload = json.loads(rest)
+            if not isinstance(payload, dict):
+                raise ValueError("Expected a JSON object")
+        except (ValueError, TypeError) as exc:
+            return CommandResult(ok=False, command_type="error", output=f"request-discovery-extension: {exc}")
+        return CommandResult(ok=True, command_type="control", needs_tool=True,
+            output="[dispatch: request_discovery_extension]",
+            tool_action={**payload, "type": "request_discovery_extension"})
 
     def _cmd_finish(self, rest: str) -> CommandResult:
         message = rest.strip() or "Done."

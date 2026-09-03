@@ -1,3 +1,4 @@
+import { PathText } from '../PathText';
 import { useEffect, useId, useRef, useState } from 'react';
 import { continuousIsActive } from '../../../../shared/agentCore';
 import type { PlannerPlan } from '../../../../shared/agentTypes';
@@ -84,11 +85,11 @@ export function PlanDecisionCard(): React.JSX.Element {
   return <>
     {plan && <section className="agent-decision plan-decision">
       <header><span>DECISION</span><strong>{title}</strong><small>{plan.goals?.length || 0} goals</small></header>
-      {plan.summary && <p className="plan-preview-summary">{plan.summary}</p>}
+      {plan.summary && <p className="plan-preview-summary"><PathText>{plan.summary}</PathText></p>}
       <div className="decision-buttons"><button type="button" className="primary-button" onClick={() => openReview()}>Review full plan ↗</button><button type="button" disabled={busy} onClick={() => openReview(true)}>Suggest plan changes</button></div>
-      {!review && error && <p role="alert" className="plan-error">{error}</p>}
+      {!review && error && <p role="alert" className="plan-error"><PathText>{error}</PathText></p>}
     </section>}
-    <dialog ref={dialog} className="plan-review-dialog" aria-labelledby={labelId}
+    <dialog onClickCapture={(event) => { if ((event.target as Element).closest('a.path-chip')) close(); }} ref={dialog} className="plan-review-dialog" aria-labelledby={labelId}
       onCancel={(event) => { event.preventDefault(); close(); }} onClose={() => {
         // Native close events are queued; ignore one from an earlier opening.
         if (!dialog.current?.open) setReview(null);
@@ -101,7 +102,7 @@ export function PlanDecisionCard(): React.JSX.Element {
         <div className="plan-review-body" tabIndex={0} role="region" aria-label="Full plan details"><PlanDetails plan={review} /></div>
         <footer>
           {changed && !sending && <p role="status">The plan has changed. Close this review and open the current plan before deciding.</p>}
-          {error && <p role="alert" className="plan-error">{agent.state.notice || error} Your feedback is preserved.</p>}
+          {error && <p role="alert" className="plan-error"><PathText>{agent.state.notice || error}</PathText> Your feedback is preserved.</p>}
           {editing ? <form onSubmit={(event) => { event.preventDefault(); if (!changed) void act('revise_plan', review); }}>
             <label htmlFor={`${labelId}-feedback`}>What should change?</label>
             <textarea id={`${labelId}-feedback`} ref={input} value={feedback} disabled={sending} onChange={(event) => setFeedback(event.target.value)} rows={3} placeholder="Describe changes to the scope, approach, goals, or success criteria…" />

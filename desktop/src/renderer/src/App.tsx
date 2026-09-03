@@ -1,9 +1,12 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { FileNavigationContext, PathText } from './components/PathText';
+import { resolveFileReference, type FileReference } from '../../shared/fileReferences';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { GitStatus, WorkspaceInfo } from '../../shared/contracts';
 import { groupDiagnostics } from '../../shared/agentCore';
 import { AgentWorkspaceProvider } from './agent/AgentWorkspaceContext';
 import { useAgentWorkspace } from './agent/agentWorkspace';
 import { AgentIssues } from './components/AgentIssues';
+import { RepoFactsPanel } from './components/RepoFactsPanel';
 import { AgentPanel } from './components/AgentPanel';
 import { AgentTopStatus } from './components/AgentTopStatus';
 import { EditorPane, isFileTab } from './components/EditorPane';
@@ -25,10 +28,14 @@ function WorkbenchApp(): React.JSX.Element {
   const { view, showEditor, toggleEditor, setAgentWidth, reset: resetView } = useWorkspaceView(workspace?.root || '');
   const [tabs, setTabs] = useState<EditorTab[]>([]);
   const [activeId, setActiveId] = useState('');
-  const [sidebarMode, setSidebarMode] = useState<'files' | 'git' | 'issues'>('files');
+  const [sidebarMode, setSidebarMode] = useState<'files' | 'git' | 'issues' | 'facts'>('files');
   const [revision, setRevision] = useState(0);
+  const [focusedIssueId, setFocusedIssueId] = useState('');
   const [gitStatus, setGitStatus] = useState<GitStatus | null>(null);
   const [error, setError] = useState('');
+  const workspaceRoot = useRef(workspace?.root || '');
+  workspaceRoot.current = workspace?.root || '';
+  const revealSequence = useRef(0);
 
   useEffect(() => {
     void window.workbench.workspace.current().then(setWorkspace);
@@ -39,7 +46,10 @@ function WorkbenchApp(): React.JSX.Element {
     try {
       const selected = await window.workbench.workspace.choose();
       if (!selected) return;
+      workspaceRoot.current = selected.root;
       setWorkspace(selected);
+      setFocusedIssueId('');
+      setGitStatus(null);
       setTabs([]);
       setActiveId('');
       setRevision((value) => value + 1);
@@ -49,24 +59,27 @@ function WorkbenchApp(): React.JSX.Element {
     }
   };
 
-  const openFile = useCallback(async (path: string): Promise<void> => {
+  const openFile = useCallback(async (raw: string, position?: FileReference): Promise<void> => {
+    const root = workspaceRoot.current;
+    const reference = position || resolveFileReference(raw, root);
+    if (!reference) { setError('This file reference is outside the current workspace.'); return; }
+    const path = reference.path;
     const id = `file:${path}`;
+    const reveal = reference.line ? { line: reference.line, column: reference.column || 1, request: ++revealSequence.current } : undefined;
     if (tabs.some((tab) => tab.id === id)) {
-      setActiveId(id);
-      showEditor();
-      return;
+      if (reveal) setTabs((current) => current.map((tab) => tab.id === id && tab.kind === 'file' ? { ...tab, reveal } : tab));
+      setActiveId(id); showEditor(); return;
     }
     try {
       const document = await window.workbench.workspace.read(path);
-      setTabs((current) => [...current, {
-        id, kind: 'file', title: path.split('/').at(-1) || path, document, content: document.content, dirty: false,
+      if (root !== workspaceRoot.current) return;
+      setTabs((current) => current.some((tab) => tab.id === id) ? current.map((tab) => tab.id === id && tab.kind === 'file' && reveal ? { ...tab, reveal } : tab) : [...current, {
+        id, kind: 'file', title: path.split('/').at(-1) || path, document, content: document.content, dirty: false, reveal,
       }]);
-      setActiveId(id);
-      showEditor();
-    } catch (cause) {
-      setError(cleanError(cause));
-    }
+      setActiveId(id); showEditor();
+    } catch (cause) { if (root === workspaceRoot.current) setError(cleanError(cause)); }
   }, [showEditor, tabs]);
+  const fileNavigation = useMemo(() => ({ root: workspace?.root || '', open: (reference: FileReference) => { void openFile(reference.path, reference); } }), [workspace?.root, openFile]);
 
   const openDiff = useCallback(async (path: string, staged: boolean): Promise<void> => {
     const id = `diff:${staged ? 'staged' : 'working'}:${path}`;
@@ -135,7 +148,7 @@ function WorkbenchApp(): React.JSX.Element {
   const dirtyCount = useMemo(() => tabs.filter((tab) => tab.kind === 'file' && tab.dirty).length, [tabs]);
 
   return (
-    <div className="app-shell">
+    <FileNavigationContext.Provider value={fileNavigation}><div className="app-shell">
       <header className="topbar">
         <div className="brand"><span className="brand-mark">S</span><span>skillz</span></div>
         <button type="button" className="workspace-switcher" onClick={() => void chooseWorkspace()}>
@@ -157,27 +170,29 @@ function WorkbenchApp(): React.JSX.Element {
               Git{gitStatus?.files.length ? <span className="count-badge">{gitStatus.files.length}</span> : null}
             </button>
             <button type="button" className={sidebarMode === 'issues' ? 'active' : ''} onClick={() => setSidebarMode('issues')}>Issues</button>
+            <button type="button" className={sidebarMode === 'facts' ? 'active' : ''} onClick={() => setSidebarMode('facts')}>Repo Facts</button>
           </div>
           <div className="panel-heading">
-            <span>{sidebarMode === 'files' ? workspace?.name.toUpperCase() || 'EXPLORER' : sidebarMode === 'git' ? 'SOURCE CONTROL' : 'AGENT CONTEXT'}</span>
-            <button type="button" className="icon-button push-right" onClick={() => setRevision((value) => value + 1)}>↻</button>
+            <span>{sidebarMode === 'files' ? workspace?.name.toUpperCase() || 'EXPLORER' : sidebarMode === 'git' ? 'SOURCE CONTROL' : sidebarMode === 'facts' ? 'REPOSITORY FACTS' : 'ISSUES'}</span>
+            <button type="button" className="icon-button push-right" aria-label={sidebarMode === 'facts' ? 'Refresh repo facts' : 'Refresh sidebar'} onClick={() => setRevision((value) => value + 1)}>↻</button>
           </div>
-          <div className="sidebar-content">
+          <div className="sidebar-content" key={`${workspace?.root}:${sidebarMode}`}>
             {!workspace && <div className="panel-message">Open a repository to begin.</div>}
             {workspace && sidebarMode === 'files' && <FileExplorer revision={revision} onOpenFile={(path) => void openFile(path)} />}
-            {workspace && sidebarMode === 'git' && <GitPanel key={workspace.root} revision={revision} onOpenDiff={(path, staged) => void openDiff(path, staged)} onStatus={setGitStatus} onBeforeDiscard={canDiscardPath} onDiscard={refreshDiscardedPath} />}
-            {workspace && sidebarMode === 'issues' && <AgentIssues onOpenPath={(path) => void openFile(path)} />}
+            {workspace && sidebarMode === 'git' && <GitPanel key={workspace.root} workspaceRoot={workspace.root} revision={revision} onOpenDiff={(path, staged) => void openDiff(path, staged)} onStatus={setGitStatus} onBeforeDiscard={canDiscardPath} onDiscard={refreshDiscardedPath} />}
+            {workspace && sidebarMode === 'issues' && <AgentIssues key={workspace.root} workspaceRoot={workspace.root} revision={revision} focusedIssueId={focusedIssueId} onOpenPath={(path) => void openFile(path)} />}
+            {workspace && sidebarMode === 'facts' && <RepoFactsPanel onOpenIssue={(id) => { setFocusedIssueId(id); setSidebarMode('issues'); }} key={workspace.root} workspaceRoot={workspace.root} revision={revision} onOpenPath={(path) => void openFile(path)} />}
           </div>
         </aside>
       } editor={
         <EditorPane diagnostics={groupDiagnostics(agent.state.bridge)} tabs={tabs} activeId={activeId} onActivate={setActiveId} onClose={closeTab} onChange={updateTab} onSave={(id) => void saveTab(id)} />
       } dock={
-        workspace && <WorkspaceDock key={workspace.root} onOpenPath={(path) => void openFile(path)} onOpenDiff={(path, staged) => void openDiff(path, staged)} />
+        workspace && <WorkspaceDock key={workspace.root} onOpenDiff={(path, staged) => void openDiff(path, staged)} />
       } agent={workspace ? <AgentPanel key={workspace.root} /> : (
         <aside className="agent-panel empty-right"><span>✦</span><p>The agent becomes available when a workspace is open.</p></aside>
       )} />
 
-      {error && <button type="button" className="global-error" onClick={() => setError('')}>{error}<span>×</span></button>}
+      {error && <div className="global-error" role="alert"><div className="error-copy"><PathText>{error}</PathText></div><button type="button" aria-label="Dismiss error" onClick={() => setError('')}>×</button></div>}
       {!workspace && (
         <div className="workspace-overlay">
           <div className="overlay-card">
@@ -188,7 +203,7 @@ function WorkbenchApp(): React.JSX.Element {
           </div>
         </div>
       )}
-    </div>
+    </div></FileNavigationContext.Provider>
   );
 }
 

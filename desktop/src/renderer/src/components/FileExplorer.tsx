@@ -1,3 +1,4 @@
+import { PathText } from './PathText';
 import { useEffect, useState } from 'react';
 import type { FileEntry } from '../../../shared/contracts';
 
@@ -14,7 +15,7 @@ export function FileExplorer({ revision, onOpenFile }: FileExplorerProps): React
     void window.workbench.workspace.list('').then(setEntries).catch((cause) => setError(String(cause)));
   }, [revision]);
 
-  if (error) return <div className="panel-message error-text">{error}</div>;
+  if (error) return <div className="panel-message error-text"><PathText>{error}</PathText></div>;
   return (
     <div className="tree" role="tree">
       {entries.map((entry) => (

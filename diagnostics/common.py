@@ -120,6 +120,8 @@ def run_command(command: list[str], *, cwd: Path, timeout: int = 30) -> subproce
         cwd=str(cwd),
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=timeout,
         env=subprocess_env_no_color(),
     )
@@ -127,6 +129,7 @@ def run_command(command: list[str], *, cwd: Path, timeout: int = 30) -> subproce
 
 def subprocess_env_no_color() -> dict[str, str]:
     env = dict(os.environ)
+    env["PYTHONIOENCODING"] = "utf-8"
     env.setdefault("NO_COLOR", "1")
     env.setdefault("FORCE_COLOR", "0")
     env.setdefault("CLICOLOR", "0")
