@@ -44,6 +44,7 @@ function createWindow(): void {
     path.join(app.getPath('userData'), 'artifact-settings.json'),
     app.isPackaged ? path.join(process.resourcesPath, 'artifact-template') : path.join(app.getAppPath(), 'artifact-template'),
     path.join(app.getPath('userData'), 'artifact-contexts'),
+    app.isPackaged ? path.join(process.resourcesPath, 'prebuilt-artifacts') : path.join(app.getAppPath(), 'prebuilt-artifacts'),
   );
   const artifacts = new ArtifactsService(artifactLibrary, runtimeSettings, (event) => send('artifacts:event', event), () => workspace.current()?.root || '');
   const disposeFrameSecurity = installArtifactFrameSecurity(window.webContents, () => artifacts.previewOrigins());

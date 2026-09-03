@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import unittest
@@ -42,6 +43,13 @@ elif command == '--version':
 
 class CodexUtf8Tests(unittest.TestCase):
     def setUp(self):
+        model_only = os.environ.pop('SKILLZ_CODEX_MODEL_ONLY', None)
+        def restore_model_only():
+            if model_only is None:
+                os.environ.pop('SKILLZ_CODEX_MODEL_ONLY', None)
+            else:
+                os.environ['SKILLZ_CODEX_MODEL_ONLY'] = model_only
+        self.addCleanup(restore_model_only)
         original_popen = subprocess.Popen
 
         def launch(args, **kwargs):

@@ -101,7 +101,7 @@ test('read grants are opt-in, canonical, persisted outside the artifact and cann
   const documents=path.join(root,'Documents ë');fs.mkdirSync(documents);
   const record=await library.create({title:'Reads',prompt:'Read documents',sourceRoot:'',shareFacts:false,shareMemory:false});
   assert.deepEqual(await library.access(record.id),{directories:[],allowWorkspaceRead:false});
-  const access={directories:[{id:'documents',label:'Documents',path:fs.realpathSync(documents)}],allowWorkspaceRead:true};
+  const access={directories:[{id:'documents',label:'Documents',path:fs.realpathSync(documents),access:'read'}],allowWorkspaceRead:true};
   await library.saveAccess(record.id,access);assert.deepEqual(await library.access(record.id),access);
   fs.writeFileSync(path.join(record.root,'.artifact-local.json'),JSON.stringify({sourceRoot:root,shareFacts:true,access:{directories:[{id:'secret',path:root}]}}));
   assert.deepEqual(await library.access(record.id),access);assert.equal((await library.find(record.id)).shareFacts,false);
@@ -126,4 +126,19 @@ test('Finder metadata does not prevent creating a library or artifact and stays 
   assert.doesNotMatch(await git(record.root, 'ls-files'), /\.DS_Store/);
   const occupied = path.join(root, 'Not empty'); fs.mkdirSync(occupied); fs.mkdirSync(path.join(occupied, '.DS_Store'));
   await assert.rejects(library.configure(occupied), /empty folder/);
+});
+
+
+test('prebuilt issue manager is optional, installs as an independent artifact, and requires an explicit write grant', async(t) => {
+  const {root,library}=fixture(t);await library.configure(path.join(root,'library'));
+  const repository=path.join(root,'managed repo');fs.mkdirSync(repository);fs.writeFileSync(path.join(repository,'repo_facts.md'),'# Facts\n');
+  const [preset]=await library.prebuilts();assert.equal(preset.id,'repo-issue-manager');assert.equal(preset.requiresWriteAccess,true);
+  const readonly={directories:[{id:'managed',label:'Managed repo',path:repository,access:'read'}],allowWorkspaceRead:false};
+  await assert.rejects(library.installPrebuilt(preset.id,readonly),/Allow changes/);
+  const writable={...readonly,directories:[{...readonly.directories[0],access:'write'}]};
+  const artifact=await library.installPrebuilt(preset.id,writable);
+  assert.match(fs.readFileSync(path.join(artifact.root,'src','App.tsx'),'utf8'),/Repository issue manager/);
+  assert.deepEqual(await library.access(artifact.id),writable);
+  assert.match(await git(path.join(root,'library'),'ls-files','--stage',artifact.id),/^160000 /);
+  assert.equal(await git(path.join(root,'library'),'status','--porcelain'),'');
 });

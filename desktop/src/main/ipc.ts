@@ -25,7 +25,7 @@ const terminalId = z.string().uuid();
 
 export function registerIpc(window: BrowserWindow, services: Services): void {
   for (const channel of [
-    'workspace:current', 'workspace:choose', 'workspace:open', 'workspace:list', 'workspace:read', 'workspace:write', 'workspace:repo-facts', 'workspace:issues',
+    'workspace:current', 'workspace:choose', 'workspace:open', 'workspace:list', 'workspace:read', 'workspace:write', 'workspace:repo-facts', 'workspace:issues', 'workspace:issue-action',
     'git:status', 'git:initialize', 'git:history', 'git:file-diff', 'git:stage', 'git:stage-all', 'git:unstage', 'git:discard', 'git:commit', 'git:push',
     'terminal:create', 'agent:start', 'agent:submit', 'agent:planner-action', 'agent:worker-action',
     'agent:reconfigure-runtime', 'agent:configure-backoff', 'agent:runtime-options',
@@ -47,7 +47,7 @@ export function registerIpc(window: BrowserWindow, services: Services): void {
     });
   };
 
-  const artifactChannels = ['capabilities', 'install-capabilities', 'setup-progress', 'save-provider-key', 'setup-download', 'library', 'choose-folder', 'choose-read-directory', 'access', 'save-access', 'create', 'apis', 'save-apis', 'start', 'stop', 'install-browser', 'preview', 'input', 'reload', 'close-preview', 'reveal', 'agent-start', 'agent-submit', 'agent-runtime', 'agent-planner', 'agent-worker', 'agent-reconfigure', 'agent-backoff', 'agent-stop'];
+  const artifactChannels = ['capabilities', 'install-capabilities', 'setup-progress', 'save-provider-key', 'setup-download', 'library', 'prebuilts', 'install-prebuilt', 'choose-folder', 'choose-read-directory', 'access', 'save-access', 'create', 'apis', 'save-apis', 'start', 'stop', 'install-browser', 'preview', 'input', 'reload', 'close-preview', 'reveal', 'agent-start', 'agent-submit', 'agent-runtime', 'agent-planner', 'agent-worker', 'agent-reconfigure', 'agent-backoff', 'agent-stop'];
   for (const name of artifactChannels) ipcMain.removeHandler(`artifacts:${name}`);
   handle('artifacts:capabilities', (_event, selection: unknown) => services.artifacts.capabilities.status(artifactSetupSelectionSchema.parse(selection)));
   handle('artifacts:install-capabilities', (_event, selection: unknown) => services.artifacts.capabilities.install(artifactSetupSelectionSchema.parse(selection)));
@@ -55,15 +55,17 @@ export function registerIpc(window: BrowserWindow, services: Services): void {
   handle('artifacts:save-provider-key', (_event, provider: unknown, key: unknown) => services.artifacts.capabilities.saveKey(z.enum(['openai', 'gemini', 'anthropic', 'meta']).parse(provider), z.string().trim().min(1).max(8192).nullable().parse(key)));
   handle('artifacts:setup-download', (_event, tool: unknown) => services.artifacts.capabilities.openDownload(z.enum(['python', 'git', 'docker']).parse(tool)));
   handle('artifacts:library', () => services.artifacts.library.library());
+  handle('artifacts:prebuilts', () => services.artifacts.library.prebuilts());
+  handle('artifacts:install-prebuilt', (_event, id: unknown, access: unknown, runtime: unknown) => services.artifacts.library.installPrebuilt(artifactId.parse(id), artifactAccessSchema.parse(access), runtime == null ? undefined : createArtifactSchema.shape.runtime.parse(runtime)));
   handle('artifacts:choose-folder', async () => {
     const result = await dialog.showOpenDialog(window, { title: 'Choose an empty folder or existing artifact library', properties: ['openDirectory', 'createDirectory'] });
     return result.canceled || !result.filePaths[0] ? null : services.artifacts.configure(result.filePaths[0]);
   });
   handle('artifacts:choose-read-directory', async () => {
-    const result = await dialog.showOpenDialog(window, { title: 'Allow read-only access to a folder', properties: ['openDirectory'] });
+    const result = await dialog.showOpenDialog(window, { title: 'Choose a folder to share with this artifact', properties: ['openDirectory'] });
     if (result.canceled || !result.filePaths[0]) return null;
     const directory = await fs.realpath(result.filePaths[0]);
-    return { id: `folder-${randomUUID().slice(0, 8)}`, label: path.basename(directory) || directory, path: directory };
+    return { id: `folder-${randomUUID().slice(0, 8)}`, label: path.basename(directory) || directory, path: directory, access: 'read' as const };
   });
   handle('artifacts:access', (_event, id: unknown) => services.artifacts.library.access(artifactId.parse(id)));
   handle('artifacts:save-access', async (_event, id: unknown, raw: unknown) => {
@@ -111,6 +113,11 @@ export function registerIpc(window: BrowserWindow, services: Services): void {
   handle('workspace:list', (_event, path: unknown = '') => services.workspace.list(z.string().max(4096).parse(path)));
   handle('workspace:read', (_event, path: unknown) => services.workspace.read(relativePath.parse(path)));
   handle('workspace:issues', (_event, root: unknown) => services.workspace.issues(z.string().min(1).max(4096).parse(root)));
+  handle('workspace:issue-action', (_event, root: unknown, action: unknown, extras: unknown = {}) => services.workspace.issueAction(
+    z.string().min(1).max(4096).parse(root),
+    z.enum(['create_issue', 'close_issue', 'reopen_issue']).parse(action),
+    z.record(z.string(), z.unknown()).parse(extras),
+  ));
   handle('workspace:repo-facts', (_event, root: unknown) => services.workspace.repoFacts(z.string().min(1).max(4096).parse(root)));
   handle('workspace:write', (_event, path: unknown, content: unknown) => (
     services.workspace.write(relativePath.parse(path), z.string().max(10 * 1024 * 1024).parse(content))

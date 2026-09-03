@@ -130,8 +130,8 @@ export class ArtifactsService {
   }
   async submit(id: string, text: string) {
     const artifact = await this.library.find(id);
-    const grants = [...(artifact.access?.directories || []).map(({ id, label }) => ({ path: `/reads/${id}`, label })), ...(artifact.access?.allowWorkspaceRead ? [{ path: '/reads/workspace', label: 'Workbench repository, when open at session start' }] : [])];
-    const instruction = `You are working in an independent skillz artifact repository: /repo. Build or update the requested artifact here. Read AGENTS.md and artifact.json. Preserve the Express/Vite dynamic-port runtime, use configured /api/<id> and /ws/<id> connections, and run npm run build. Shared source context is read-only at /context. Additional read-only folders are listed in SKILLZ_READ_ROOTS and mounted at /reads/<id>; use list_files and read_file there. Default file access is limited to /repo. Granted read-only directories: ${JSON.stringify(grants)}. Read AGENTS.md for the /files API. Never edit the source repository or the parent library.\n\nUser request:\n${text}`;
+    const grants = [...(artifact.access?.directories || []).map(({ id, label, access }) => ({ path: `/reads/${id}`, label, access })), ...(artifact.access?.allowWorkspaceRead ? [{ path: '/reads/workspace', label: 'Workbench repository, when open at session start' }] : [])];
+    const instruction = `You are working in an independent skillz artifact repository: /repo. Build or update the requested artifact here. Read AGENTS.md and artifact.json. Preserve the Express/Vite dynamic-port runtime, use configured /api/<id> and /ws/<id> connections, and run npm run build. Shared source context is read-only at /context. Additional read-only folders are listed in SKILLZ_READ_ROOTS and mounted at /reads/<id>; use list_files and read_file there. Default file access is limited to /repo. Granted directories: ${JSON.stringify(grants)}. A grant marked write may be changed only when the user's request requires it; all other grants are read only. Read AGENTS.md for the /files API. Never edit the source repository or the parent library.\n\nUser request:\n${text}`;
     return (await this.agent(id)).submit(instruction);
   }
   private async sandbox(id: string): Promise<ArtifactSandbox> {
@@ -139,7 +139,7 @@ export class ArtifactsService {
     const access = await this.library.access(id);
     const reads = [...access.directories];
     const workspace = access.allowWorkspaceRead ? this.activeWorkspace() : '';
-    if (workspace) reads.push({ id: 'workspace', label: 'Workbench repository', path: await fs.realpath(workspace) });
+    if (workspace) reads.push({ id: 'workspace', label: 'Workbench repository', path: await fs.realpath(workspace), access: 'read' });
     return new ArtifactSandbox(artifact.root, reads, await this.library.contextDirectory(id));
   }
   async saveAccess(id: string, access: import('../../shared/artifacts').ArtifactAccess): Promise<void> {

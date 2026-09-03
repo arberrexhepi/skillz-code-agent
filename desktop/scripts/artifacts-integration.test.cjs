@@ -11,16 +11,22 @@ test('real artifact installs, builds, serves shaped HTTP/WebSocket APIs on dynam
   let upstream;
   t.after(async()=>{await service.dispose();if(upstream)await new Promise(resolve=>upstream.close(resolve));assert.equal(fs.realpathSync(path.dirname(root)),fs.realpathSync(os.tmpdir()));assert.ok(path.basename(root).startsWith('skillz artifact integration ë '));fs.rmSync(root,{recursive:true,force:true,maxRetries:5});});
   await library.configure(path.join(root,'library'));
-  const documents=path.join(root,'documents');fs.mkdirSync(documents);fs.writeFileSync(path.join(documents,'read ë.txt'),'Readable ë');
-  const one=await library.create({title:'Schema ë',prompt:'Explore tables',sourceRoot:'',shareFacts:false,shareMemory:false,access:{directories:[{id:'documents',label:'Documents',path:fs.realpathSync(documents)}],allowWorkspaceRead:false}});
+  const documents=path.join(root,'documents'), managed=path.join(root,'managed');fs.mkdirSync(documents);fs.mkdirSync(managed);fs.writeFileSync(path.join(documents,'read ë.txt'),'Readable ë');fs.writeFileSync(path.join(managed,'repo_facts.md'),'First ë');
+  const one=await library.create({title:'Schema ë',prompt:'Explore tables',sourceRoot:'',shareFacts:false,shareMemory:false,access:{directories:[{id:'documents',label:'Documents',path:fs.realpathSync(documents),access:'read'},{id:'managed',label:'Managed repo',path:fs.realpathSync(managed),access:'write'}],allowWorkspaceRead:false}});
   const two=await library.create({title:'Code graph',prompt:'Explore dependencies',sourceRoot:'',shareFacts:false,shareMemory:false});
   const [a,b]=await Promise.all([service.start(one.id),service.start(two.id)]);
-  assert.deepEqual((await (await fetch(`${a.url}/files/roots`)).json()).map(item=>item.id),['repo','documents']);
+  assert.deepEqual((await (await fetch(`${a.url}/files/roots`)).json()).map(item=>item.id),['repo','documents','managed']);
   assert.equal(await (await fetch(`${a.url}/files/documents/read?path=read%20%C3%AB.txt`)).text(),'Readable ë');
   assert.equal((await fetch(`${a.url}/files/documents/read?path=../settings.json`)).status,403);
   assert.equal((await fetch(`${a.url}/files/unknown/list`)).status,403);
   assert.equal((await fetch(`${a.url}/files/documents/read?path=read%20%C3%AB.txt`,{method:'POST'})).status,405);
   assert.equal((await fetch(`${b.url}/files/documents/list`)).status,403);
+  assert.equal((await fetch(`${a.url}/files/documents/write`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:'read ë.txt',content:'No',expectedSha256:'0'.repeat(64)})})).status,403);
+  const sha=value=>require('node:crypto').createHash('sha256').update(value).digest('hex');
+  const changed=await fetch(`${a.url}/files/managed/write`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:'repo_facts.md',content:'Changed ë',expectedSha256:sha('First ë')})});assert.equal(changed.status,200);assert.equal(fs.readFileSync(path.join(managed,'repo_facts.md'),'utf8'),'Changed ë');
+  assert.equal((await fetch(`${a.url}/files/managed/write`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:'repo_facts.md',content:'Stale',expectedSha256:sha('First ë')})})).status,409);assert.equal(fs.readFileSync(path.join(managed,'repo_facts.md'),'utf8'),'Changed ë');
+  assert.equal((await fetch(`${a.url}/files/managed/write`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:'created.md',content:'Created',expectedSha256:sha('')})})).status,200);assert.equal(fs.readFileSync(path.join(managed,'created.md'),'utf8'),'Created');
+
   assert.equal(a.status,'running');assert.equal(b.status,'running');assert.notEqual(a.url,b.url);
   let build=await command('docker',['exec',service.runtimes.get(one.id).sandbox.name,'npm','run','build'],one.root);
   assert.match(build,/built in/);

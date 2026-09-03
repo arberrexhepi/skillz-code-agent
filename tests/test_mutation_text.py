@@ -168,7 +168,7 @@ class MutationTextTests(unittest.TestCase):
 
     def test_raw_and_planner_backed_loops_land_identical_payloads(self):
         from live_test_loop import TreeLoopPlannerWorker
-        from test_tree_loop_messages import RecordingMessageModel
+        from tests.test_tree_loop_messages import RecordingMessageModel
 
         for planner_backed in (False, True):
             with self.subTest(planner_backed=planner_backed):
@@ -198,7 +198,7 @@ class MutationTextTests(unittest.TestCase):
                 self.assertEqual((self.root / 'runtime.txt').read_text(), '  first -> next\n\t  last, literal -> s2  ')
 
     def test_runtime_never_dispatches_writes_from_an_unterminated_batch(self):
-        from test_tree_loop_messages import RecordingMessageModel
+        from tests.test_tree_loop_messages import RecordingMessageModel
 
         model = RecordingMessageModel([
             's1: write /repo/first.txt first\ns2: write /repo/second.txt <<<\n  incomplete',

@@ -103,6 +103,7 @@ export interface WorkbenchApi {
     read(path: string): Promise<FileDocument>;
     repoFacts(workspaceRoot: string): Promise<RepoFactsSnapshot>;
     issues(workspaceRoot: string): Promise<WorkspaceIssuesSnapshot>;
+    issueAction(workspaceRoot: string, action: 'create_issue' | 'close_issue' | 'reopen_issue', extras: JsonMap): Promise<WorkspaceIssuesSnapshot>;
     write(path: string, content: string): Promise<FileDocument>;
     onChange(listener: (paths: string[]) => void): () => void;
   };

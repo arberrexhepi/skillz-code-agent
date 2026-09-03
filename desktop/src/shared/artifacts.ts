@@ -23,11 +23,12 @@ export const artifactApisSchema = z.object({ version: z.literal(1), apis: z.arra
 export type ArtifactApiConfig = z.infer<typeof artifactApiSchema>;
 export type ArtifactApis = z.infer<typeof artifactApisSchema>;
 export const artifactAgentRuntimeSchema = z.object({ provider: z.string().min(1).max(80), model: z.string().min(1).max(200), backendScript: z.enum(['main.py', 'main_v2.py', 'live_test_loop.py']) });
-export const readDirectorySchema = z.object({ id: artifactId.refine((id) => !['workspace', 'repo', 'context'].includes(id), 'This ID is reserved.'), label: z.string().min(1).max(200), path: z.string().min(1).max(4096) });
+export const readDirectorySchema = z.object({ id: artifactId.refine((id) => !['workspace', 'repo', 'context'].includes(id), 'This ID is reserved.'), label: z.string().min(1).max(200), path: z.string().min(1).max(4096), access: z.enum(['read', 'write']).default('read') });
 export const artifactAccessSchema = z.object({ directories: z.array(readDirectorySchema).max(30).default([]), allowWorkspaceRead: z.boolean().default(false) }).superRefine((value, context) => {
   if (new Set(value.directories.map((item) => item.id)).size !== value.directories.length) context.addIssue({ code: 'custom', message: 'Folder IDs must be unique.' });
 });
 export type ReadDirectory = z.infer<typeof readDirectorySchema>;
+export interface PrebuiltArtifact { id: string; title: string; description: string; requiresWriteAccess: boolean; }
 export type ArtifactAccess = z.infer<typeof artifactAccessSchema>;
 export const createArtifactSchema = z.object({ title: z.string().trim().min(1).max(120), prompt: z.string().trim().min(1).max(20000), sourceRoot: z.string().max(4096), shareFacts: z.boolean(), shareMemory: z.boolean(), runtime: artifactAgentRuntimeSchema.optional(), access: artifactAccessSchema.optional() });
 export type CreateArtifact = z.infer<typeof createArtifactSchema>;
@@ -58,6 +59,8 @@ export interface ArtifactsApi {
   library(): Promise<ArtifactLibrary>;
   chooseFolder(): Promise<ArtifactLibrary | null>;
   create(options: CreateArtifact): Promise<ArtifactRecord>;
+  prebuilts(): Promise<PrebuiltArtifact[]>;
+  installPrebuilt(id: string, access: ArtifactAccess, runtime?: z.infer<typeof artifactAgentRuntimeSchema>): Promise<ArtifactRecord>;
   chooseReadDirectory(): Promise<ReadDirectory | null>;
   access(id: string): Promise<ArtifactAccess>;
   saveAccess(id: string, access: ArtifactAccess): Promise<void>;

@@ -23,7 +23,7 @@ The workbench now discovers Python through the Windows launcher as well as execu
 
 Python bridge streams, toolbelt results, and Codex subprocess pipes explicitly use UTF-8, including streaming and non-streaming model turns, account/login responses, version checks, and app-server traffic. This fixes invalid UTF-8 stdin failures after successful authentication. Git and diagnostic output also use UTF-8, and repository reads and edits preserve Unicode instead of using the Windows code page. The Windows terminal uses native node-pty encoding, avoiding the unsupported encoding warning.
 
-Repository discovery returns forward-slash virtual paths consistently across platforms, and directory scans skip Windows junctions as well as symlinks. Run `py -3 -m unittest test_repository_discovery test_tree_commands test_discovery_remediation` from the repository root for these checks. Only file-symlink cases skip when Windows lacks the necessary privileges; junction and other workspace-boundary checks still run.
+Repository discovery returns forward-slash virtual paths consistently across platforms, and directory scans skip Windows junctions as well as symlinks. Run `py -3 -m unittest tests.test_repository_discovery tests.test_tree_commands tests.test_discovery_remediation` from the repository root for these checks. Only file-symlink cases skip when Windows lacks the necessary privileges; junction and other workspace-boundary checks still run.
 
 Source Control now offers local repository initialization for a new project folder. See [Starting a Git repository](#starting-a-git-repository), [Runtime boundaries](#runtime-boundaries), and [Python resolution](#python-resolution) for the corresponding setup details.
 
@@ -50,6 +50,30 @@ Use **Artifacts** in the header to build visualizations and tools with their own
 5. **Create & ask agent** scaffolds the project and sends the request to its separate agent. Discovery, plans, approvals, and follow-up instructions use the usual workflow. The first start builds a reusable Docker image containing the harness, Node, Python, and Git; allow time for the initial download.
 6. **Start preview** installs npm dependencies in Docker and launches Express/Vite. Its local URL loads directly in a sandboxed iframe, with native-resolution rendering, normal scrolling, typing, and paste. The page resizes with the panel and retains its state across artifact and workbench tab switches. **Reload preview** starts a fresh page. **Stop** ends its preview; closing the tab also stops its agent. No Playwright browser download is needed for this view.
 
+### Ready-made artifacts
+
+Ready-made artifacts appear as optional installs in the artifact library and creation screen; none are installed automatically. **Repository issue manager** is the first bundled option. During installation, add one or more repositories under **Allowed system directories** and explicitly enable **Allow changes**. The running artifact can then initialize `repo_facts.md`, create and activate issues, and close or reopen existing schema-version-2 issues without starting an agent. It supports multiple granted repositories and shows read-only grants without mutation controls.
+
+The maintained issue-manager source is a Git submodule at `desktop/prebuilt-artifacts/repo-issue-manager`, and the desktop installer copies that version into the user's artifact library as a new independent artifact repository. Packaged builds include the submodule checkout. Clone the project and its submodules together:
+
+```bash
+git clone --recurse-submodules https://github.com/arberrexhepi/skillz-code-agent.git
+```
+
+For an existing clone, initialize all registered submodules from the repository root:
+
+```bash
+npm --prefix desktop run submodules:init
+```
+
+To move submodules to the latest commit on their configured remote branches and expose the updated Git pointers for a parent-repository commit:
+
+```bash
+npm --prefix desktop run submodules:update
+```
+
+Keep `prebuilt/repo-issue-manager` as the independent artifact source branch. Commit submodule pointer updates through the normal `app` → `dev` → `main` promotion flow; do not merge the artifact source branch into those application branches.
+
 ### Install and repair capabilities
 
 The artifact landing and creation screens check Python, Git, the Linux Docker engine, the selected provider SDK and API-key configuration, the artifact runtime image, and the optional Playwright inspection browser. **Install capabilities** downloads only missing SDK/runtime components, with live progress, bounded logs, and retry after failure. Python provider packages installed here use a separate environment in the desktop's per-user settings folder; existing usable provider installations are reused. Missing Python, Git, and Docker get official download buttons and **Recheck**. The OS installer handles system prerequisites and Docker setup.
@@ -60,7 +84,7 @@ API-key providers offer **Save API key** and removal directly in setup. Saved ke
 
 ### File access and enforcement
 
-The artifact repository is writable at `/repo`. Approved directories are mounted read-only at `/reads/<id>`; the optional workbench repository is `/reads/workspace`. Source context snapshots are mounted read-only at `/context`. Other host folders and the Docker socket are not mounted. Containers have a read-only system filesystem, no added capabilities, no privilege escalation, and bounded memory/process counts. Nested host mounts are excluded. Direct filesystem calls, shell commands, dependency install scripts, and validation tools run inside this boundary.
+The artifact repository is writable at `/repo`. Approved directories are mounted at `/reads/<id>` and default to read only; **Allow changes** is an explicit per-folder write grant. The optional workbench repository is always read only at `/reads/workspace`. Source context snapshots are mounted read-only at `/context`. Other host folders and the Docker socket are not mounted. Containers have a read-only system filesystem, no added capabilities, no privilege escalation, and bounded memory/process counts. Nested host mounts are excluded. Direct filesystem calls, shell commands, dependency install scripts, and validation tools run inside this boundary.
 
 Permission records and source-sharing metadata live in desktop settings outside the generated repositories. Editing `artifact.json` or `.artifact-local.json` cannot grant additional access. Change or revoke permissions in the artifact's **File access** tab. Saving stops both its preview and agent, including containers left by an earlier app crash, before applying changes; their next start uses the updated mounts. Imported repositories start with no external grants.
 
@@ -68,7 +92,7 @@ The agent receives the granted folder names and container paths. Stable and beta
 
 Artifact agent startup checks the selected provider's local SDK and configuration before starting Docker or accepting a request. Missing SDK errors name the exact host Python executable and its installation command. For Gemini, install `google-genai` in that environment and configure `GEMINI_API_KEY` in the harness `.env` or the environment launching the desktop. Restart the artifact agent, then choose **Send original request** to retry a newly created artifact; there is no need to recreate it. These checks do not make model calls or validate an API key against the provider.
 
-The template provides `src/files.ts`: `files.roots()`, `files.list(id, relativePath)`, `files.readText(id, relativePath)`, and `files.read(id, relativePath)`. Their GET-only endpoints are `/files/roots`, `/files/:id/list?path=...`, and `/files/:id/read?path=...`. The `repo` ID reads the artifact itself. Unknown grants, absolute paths, traversal outside a root, and files larger than 5 MB are rejected; directory responses are bounded. There is no file-write endpoint. Docker also enforces the grants if generated backend code bypasses this API.
+The template provides `src/files.ts`: `files.roots()`, `files.list(id, relativePath)`, `files.readText(id, relativePath)`, `files.read(id, relativePath)`, and `files.writeText(id, relativePath, content, expectedSha256)`. Reads use `/files/:id/list` and `/files/:id/read`; writes use `PUT /files/:id/write` and only work for an explicit write grant. Writes are bounded to 5 MB, remain inside the canonical granted root, use atomic replacement, preserve the existing mode, and require the SHA-256 of the exact loaded content. A concurrent change returns HTTP 409 instead of being overwritten. The `repo` ID reads the artifact itself and remains read only through the browser gateway. Docker mount modes enforce the same grants when generated backend code or shell commands bypass this API.
 
 ### Runtime and connections
 
@@ -106,7 +130,7 @@ Artifact model helpers run in isolated POSIX process groups. Stopping or timing 
 
 Use **Issues** to manage suggested, open, and closed work. Saved issues remain visible with the agent stopped; the connected runtime supplies current status while it runs. Search and status filters cover the entire saved backlog, including older closed records. Repository-wide architecture records are excluded from the issue list.
 
-**Continue**, **Close**, and **Reopen** remain visible on each issue card. Expand **Details** for the request, plan, lifecycle notes, blocked reason, parent/source information, and completed-goal history with validation results. These actions use the existing structured planner commands and start the configured runtime when needed. Failed actions retain the issue's state and show an error. Lifecycle actions are disabled during execution; adding an issue and accepting/ignoring suggestions can still queue behind the current action.
+**Continue**, **Close**, and **Reopen** remain visible on each issue card. Expand **Details** for the request, plan, lifecycle notes, blocked reason, parent/source information, and completed-goal history with validation results. Creating, closing, and reopening issues update `repo_facts.md` directly while the runtime is stopped or unavailable; they require neither Python nor a model connection. If the agent is already running, the same actions use its structured bridge so planner memory stays synchronized. **Continue** starts the configured runtime because it resumes agent work. Failed actions retain the issue's state and show an error. Lifecycle actions are disabled during execution; adding an issue and accepting/ignoring suggestions can still queue behind the current action.
 
 Pending agent suggestions are loaded from `.agent-issue-proposals.json`. **Accept** creates an issue without replacing the active task; **Ignore** removes the proposal from the pending list. Reading either file does not modify it. A malformed ledger does not hide readable suggestions, and a suggestion-storage error does not hide readable issues.
 
@@ -161,7 +185,7 @@ Layout regression checks: `npm run test:layout`. For browser interaction checks,
 
 Transcript/turn-thought checks: `npm run test:timeline`; append `?workflow=1` to the fixture URL for a sample discovery, approved goal plan, and live thought.
 
-Issue checks: `npm run test:issues`; append `?suggestions=1&failDecision=1` to test agent suggestions during execution, a failed save, retry, acceptance, and ignore using the real renderer with a mock bridge. Backend regressions: `../.venv/bin/python -m pytest -q ../test_issue_proposals.py` from this directory. Restart the agent bridge to load Python runtime changes.
+Issue checks: `npm run test:issues`; append `?suggestions=1&failDecision=1` to test agent suggestions during execution, a failed save, retry, acceptance, and ignore using the real renderer with a mock bridge. Backend regressions: `../.venv/bin/python -m pytest -q ../tests/test_issue_proposals.py` from this directory. Restart the agent bridge to load Python runtime changes.
 
 Plan-review checks: `npm run test:plans`; append `?plan=1` for a full five-goal plan, or `?plan=1&failRevision=1` to test revision failure and retry. The inline card stays compact: a two-line summary, goal count, and review/change controls. The reading dialog shows the complete plan with approval/rejection actions. Suggest plan changes submits explicit revision feedback (not chat commands) and requires a fresh approval afterward.
 
@@ -198,7 +222,7 @@ The desktop process reuses the same `--extension-bridge` protocol as the VS Code
 
 For both repository and artifact agents, provider/model/backend selections made while stopped are used automatically by **Start agent**, sending a message, or **Send original request**. Closing Runtime settings keeps the selection for that workspace session. Catalog refreshes cannot replace it with an older provider. For a running agent, the drawer identifies the active provider/model and offers **Apply to running agent**; the backend remains locked until stopped. Artifact provider changes validate host setup and load the selected provider's credentials before applying, preserving the current runtime if the change fails.
 
-The browser fixture `/scripts/fixtures/runtime-selection.html` exercises both independent workspace instances, delayed catalog responses, closing/reopening settings, start/send behavior, and failed live changes. `npm run test:runtime` covers host preflight and broker switching; `py -3 -m unittest test_gemini_messages test_artifact_model_host` covers model routing and Gemini's disabled automatic function calling (the SDK-specific test requires `google-genai`). The harness retains responsibility for tool dispatch and approval.
+The browser fixture `/scripts/fixtures/runtime-selection.html` exercises both independent workspace instances, delayed catalog responses, closing/reopening settings, start/send behavior, and failed live changes. `npm run test:runtime` covers host preflight and broker switching; `py -3 -m unittest tests.test_gemini_messages tests.test_artifact_model_host` covers model routing and Gemini's disabled automatic function calling (the SDK-specific test requires `google-genai`). The harness retains responsibility for tool dispatch and approval.
 
 The Codex subscription controls use a narrow helper boundary: Electron requests account/login state from the local Codex app-server, while Python model turns run ephemerally and read-only through the same local ChatGPT-managed session. No OAuth token is exposed to the renderer or copied into Skillz configuration.
 
@@ -226,7 +250,7 @@ Windows PowerShell setup, starting from the repository root:
 
 ```powershell
 py -3 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install openai google-genai anthropic
+.\.venv\Scripts\python.exe -m pip install openai google-genai anthropic pytest
 cd desktop
 npm install
 npm run dev
@@ -234,7 +258,7 @@ npm run dev
 
 For an existing interpreter, set `$env:PYTHON_AGENT_PYTHON = 'C:\Path With Spaces\Python\python.exe'` before `npm run dev`. The `py` launcher also works without a virtual environment. If Python is not installed, install Python 3 with its Windows launcher and restart your terminal before setup. Packaged apps can use the same environment override.
 
-Runtime and terminal regression checks: `npm run test:runtime`. From the repository root, run `py -3 -m unittest test_codex_subscription test_codex_discovery test_codex_utf8 test_windows_text_encoding` (or use the repository virtual environment) for Codex discovery and Unicode subprocess regressions. These checks use local fixtures without authenticating or making model calls.
+Runtime and terminal regression checks: `npm run test:runtime`. From the repository root, run `py -3 -m unittest tests.test_codex_subscription tests.test_codex_discovery tests.test_codex_utf8 tests.test_windows_text_encoding` (or use the repository virtual environment) for Codex discovery and Unicode subprocess regressions. These checks use local fixtures without authenticating or making model calls.
 
 Packaged builds include the Python agent source, but they do not yet embed a Python interpreter or provider wheels. A distributable release should ship a frozen, platform-specific Python sidecar so end users do not need to configure Python themselves.
 

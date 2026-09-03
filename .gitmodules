@@ -1,0 +1,4 @@
+[submodule "desktop/prebuilt-artifacts/repo-issue-manager"]
+	path = desktop/prebuilt-artifacts/repo-issue-manager
+	url = https://github.com/arberrexhepi/skillz-code-agent.git
+	branch = prebuilt/repo-issue-manager

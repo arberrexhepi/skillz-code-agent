@@ -9,6 +9,8 @@ from unittest.mock import patch
 from file_access import read_scope
 from discovery.dispatch import execute_discovery_action
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
 
 class ReadAccessTests(unittest.TestCase):
     def setUp(self):
@@ -23,7 +25,7 @@ class ReadAccessTests(unittest.TestCase):
         self.grants = json.dumps([{"id": "documents", "path": str(self.documents)}])
 
     def call(self, tool, *args, grants="[]"):
-        result = subprocess.run([sys.executable, "agent_tools.py", tool, "--root", str(self.root), *args], capture_output=True, text=True, encoding="utf-8", env={**os.environ, "SKILLZ_READ_ROOTS": grants, "SKILLZ_CONTEXT_ROOT": "", "PYTHONIOENCODING": "utf-8"})
+        result = subprocess.run([sys.executable, str(REPO_ROOT / "agent_tools.py"), tool, "--root", str(self.root), *args], capture_output=True, text=True, encoding="utf-8", env={**os.environ, "SKILLZ_READ_ROOTS": grants, "SKILLZ_CONTEXT_ROOT": "", "PYTHONIOENCODING": "utf-8"})
         return json.loads(result.stdout)
 
     def test_default_rejects_other_folders_and_write_remains_repository_bound(self):

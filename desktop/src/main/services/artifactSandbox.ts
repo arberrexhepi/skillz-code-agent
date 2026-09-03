@@ -112,10 +112,10 @@ export class ArtifactSandbox {
       const real = await fs.realpath(directory.path);
       if (real !== directory.path || !(await fs.stat(real)).isDirectory()) throw new Error(`Shared folder changed. Select it again: ${directory.label}`);
       const target = '/reads/' + directory.id;
-      args.push('--mount', bindMount(real, target, true)); reads.push({ ...directory, path: target });
+      args.push('--mount', bindMount(real, target, directory.access !== 'write')); reads.push({ ...directory, path: target });
     }
     args.push('--mount', bindMount(this.context, '/context', true));
-    args.push('--env', 'SKILLZ_READ_ROOTS=' + JSON.stringify(reads), '--env', 'SKILLZ_ARTIFACT_READ_ROOTS=' + JSON.stringify(reads), '--env', 'SKILLZ_OBSERVABILITY_PATH=/repo/memory_observability.md', '--env', 'SKILLZ_CONTEXT_ROOT=/context');
+    args.push('--env', 'SKILLZ_READ_ROOTS=' + JSON.stringify(reads), '--env', 'SKILLZ_WRITE_ROOTS=' + JSON.stringify(reads.filter(root => root.access === 'write')), '--env', 'SKILLZ_ARTIFACT_READ_ROOTS=' + JSON.stringify(reads), '--env', 'SKILLZ_OBSERVABILITY_PATH=/repo/memory_observability.md', '--env', 'SKILLZ_CONTEXT_ROOT=/context');
     return { docker, args: [...args, image] };
   }
   spawn(docker: string, args: string[], commandArgs: string[], options: string[] = []): ChildProcessWithoutNullStreams {

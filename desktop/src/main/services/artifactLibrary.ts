@@ -1,7 +1,7 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { artifactId, artifactApisSchema, artifactAgentRuntimeSchema, artifactAccessSchema, type ArtifactAccess, createArtifactSchema, type ArtifactApis, type ArtifactLibrary, type ArtifactRecord, type CreateArtifact } from '../../shared/artifacts';
+import { artifactId, artifactApisSchema, artifactAgentRuntimeSchema, artifactAccessSchema, type ArtifactAccess, createArtifactSchema, type ArtifactApis, type ArtifactLibrary, type ArtifactRecord, type CreateArtifact, type PrebuiltArtifact } from '../../shared/artifacts';
 import { git } from './artifactProcess';
 
 const manifestName = '.skillz-artifacts.json';
@@ -24,7 +24,7 @@ export async function readJson(file: string): Promise<unknown> {
 }
 export class ArtifactLibraryService {
   private queue: Promise<unknown> = Promise.resolve();
-  constructor(private readonly settingsFile: string, private readonly template: string, private readonly contextHome: string) {}
+  constructor(private readonly settingsFile: string, private readonly template: string, private readonly contextHome: string, private readonly prebuiltHome = path.join(path.dirname(template), 'prebuilt-artifacts')) {}
   private serial<T>(operation: () => Promise<T>): Promise<T> { const pending = this.queue.then(operation); this.queue = pending.catch(() => {}); return pending; }
   async library(): Promise<ArtifactLibrary> {
     let settings: { root?: string };
@@ -82,7 +82,21 @@ export class ArtifactLibraryService {
       return this.library();
     });
   }
-  create(raw: CreateArtifact): Promise<ArtifactRecord> {
+  create(raw: CreateArtifact): Promise<ArtifactRecord> { return this.createFrom(raw, this.template, 'Scaffold artifact'); }
+  async prebuilts(): Promise<PrebuiltArtifact[]> {
+    return [{ id: 'repo-issue-manager', title: 'Repository issue manager', description: 'Review, create, activate, close, and reopen Skillz issues in any repository you explicitly share.', requiresWriteAccess: true }];
+  }
+  async installPrebuilt(id: string, access: ArtifactAccess, runtime?: import('../../shared/artifacts').CreateArtifact['runtime']): Promise<ArtifactRecord> {
+    const preset = (await this.prebuilts()).find(item => item.id === artifactId.parse(id));
+    if (!preset) throw new Error('Unknown prebuilt artifact.');
+    const source = path.join(this.prebuiltHome, id);
+    const available = await fs.lstat(source).then(stat => stat.isDirectory() && !stat.isSymbolicLink()).catch(() => false);
+    if (!available) throw new Error('The bundled issue manager artifact is unavailable. Initialize the prebuilt artifact submodule.');
+    const checked = artifactAccessSchema.parse(access);
+    if (preset.requiresWriteAccess && !checked.directories.some(directory => directory.access === 'write')) throw new Error('Share at least one repository with Allow changes enabled.');
+    return this.createFrom({ title: preset.title, prompt: preset.description, sourceRoot: '', shareFacts: false, shareMemory: false, runtime, access: checked }, source, 'Install prebuilt artifact');
+  }
+  private createFrom(raw: CreateArtifact, source: string, initialCommit: string): Promise<ArtifactRecord> {
     return this.serial(async () => {
       const options = createArtifactSchema.parse(raw);
       const library = await this.library();
@@ -100,8 +114,9 @@ export class ArtifactLibraryService {
       // Preserve incomplete scaffolds on failure; never delete user files to retry.
       // Newer Node runtimes reject an existing directory with errorOnExist, even when empty.
       // Copy each entry into the reserved directory, retaining exclusive creation for every entry.
-      for (const entry of await fs.readdir(this.template)) {
-        await fs.cp(path.join(this.template, entry), path.join(root, entry), { recursive: true, errorOnExist: true, force: false, filter: (source) => !['node_modules', 'package-lock.json', '.DS_Store'].includes(path.basename(source)) });
+      for (const entry of await fs.readdir(source)) {
+        if (entry === ".git") continue;
+        await fs.cp(path.join(source, entry), path.join(root, entry), { recursive: true, errorOnExist: true, force: false, filter: (entry) => !['node_modules', '.DS_Store'].includes(path.basename(entry)) && (source !== this.template || path.basename(entry) !== 'package-lock.json') });
       }
       const createdAt = new Date().toISOString();
       await writeJson(path.join(root, 'artifact.json'), { version: 1, id, title: options.title, prompt: options.prompt, createdAt });
@@ -114,7 +129,7 @@ export class ArtifactLibraryService {
       if (access) await this.writePermissions(root, access);
       await git(root, 'init');
       await git(root, 'add', '--', '.');
-      await git(root, ...author, 'commit', '-m', 'Scaffold artifact');
+      await git(root, ...author, 'commit', '-m', initialCommit);
       // Existing child repository is registered as a gitlink, not added as ordinary files.
       await git(library.root, '-c', 'protocol.file.allow=always', 'submodule', 'add', `./${id}`, id);
       await git(library.root, 'submodule', 'absorbgitdirs', '--', id);
@@ -160,10 +175,14 @@ export class ArtifactLibraryService {
   }
   private async writePermissions(root: string, access: ArtifactAccess): Promise<void> {
     const checked = artifactAccessSchema.parse(access);
+    const paths = new Set<string>();
     for (const directory of checked.directories) {
       if (!path.isAbsolute(directory.path)) throw new Error('Allowed folders must use absolute paths.');
       directory.path = await fs.realpath(directory.path);
-      if (!(await fs.stat(directory.path)).isDirectory()) throw new Error('Choose a directory for read access.');
+      if (!(await fs.stat(directory.path)).isDirectory()) throw new Error('Choose a directory for artifact access.');
+      const key = process.platform === 'win32' ? directory.path.toLocaleLowerCase() : directory.path;
+      if (paths.has(key)) throw new Error('Each shared folder path may be granted only once.');
+      paths.add(key);
     }
     const data = await this.readPermissions();
     data[root] = checked;

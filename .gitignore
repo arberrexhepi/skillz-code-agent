@@ -29,5 +29,3 @@ desktop/out/
 desktop/dist/
 desktop/release/
 goal_runner.md
-/tests
-/tests/*
