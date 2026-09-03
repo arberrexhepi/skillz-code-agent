@@ -80,6 +80,11 @@ export function fileRouter(repository: string): Router {
     } catch (error) { response.status(403).json({ error: error instanceof Error ? error.message : 'Write denied.' }); }
     finally { if (temporary) await rm(temporary, { force: true }); }
   });
+  router.all('/:id/:operation', (request, response, next) => {
+    const allow = ['list', 'read'].includes(request.params.operation) ? 'GET' : request.params.operation === 'write' ? 'PUT' : '';
+    if (!allow) { next(); return; }
+    response.setHeader('Allow', allow); response.status(405).json({ error: `Use ${allow}.` });
+  });
   router.use((_request, response) => { response.status(404).json({ error: 'Unknown file operation.' }); });
   return router;
 }
