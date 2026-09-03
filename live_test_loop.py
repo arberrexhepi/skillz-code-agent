@@ -1788,7 +1788,7 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
             self.loop._base_steering = self._compose_steering()
 
     def _observability_path(self) -> Path:
-        return Path(__file__).parent / "memory_observability.md"
+        return Path(os.environ["SKILLZ_OBSERVABILITY_PATH"]) if os.environ.get("SKILLZ_OBSERVABILITY_PATH") else Path(__file__).parent / "memory_observability.md"
 
     def _reset_run_observability(self, task: str) -> None:
         self._observability_started_at = time.time()

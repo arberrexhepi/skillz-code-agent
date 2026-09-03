@@ -25,7 +25,6 @@ let actionRelease: (() => void) | undefined;
 let holdAction = false;
 const assert = (condition: unknown, message: string): void => { if (!condition) throw new Error(message); };
 const pass = (message: string): void => { const row = document.createElement('li'); row.textContent = 'PASS: ' + message; results.append(row); };
-window.workbench = { workspace: { issues: (workspaceRoot: string) => holdRead ? new Promise(resolve => { defer = resolve; holdRead = false; }) : Promise.resolve(structuredClone(stores.get(workspaceRoot)!)) } } as WorkbenchApi;
 const run = async (action: string, extras: Record<string, unknown>) => {
   requests.push({ action, extras });
   if (fail) { fail = false; return false; }
@@ -33,8 +32,15 @@ const run = async (action: string, extras: Record<string, unknown>) => {
   if (holdAction) { holdAction = false; await new Promise<void>(resolve => actionRelease = resolve); }
   applyIssueAction(stores.get(target)!, action, extras); return true;
 };
-const agent = { state: initialAgentUiState, plannerAction: run,
-  createIssue: async (summary: string) => { if (!(await run('create_issue', { summary, activate: false }))) throw new Error('Create failed'); },
+window.workbench = { workspace: {
+  issues: (workspaceRoot: string) => holdRead ? new Promise(resolve => { defer = resolve; holdRead = false; }) : Promise.resolve(structuredClone(stores.get(workspaceRoot)!)),
+  issueAction: async (workspaceRoot, action, extras) => { if (!(await run(action, extras))) throw new Error(`Could not update ${String(extras.issue_id || 'issue')}`); return structuredClone(stores.get(workspaceRoot)!); },
+} } as WorkbenchApi;
+const agent = { state: initialAgentUiState, plannerAction: async (action: string, extras: Record<string, unknown>) => {
+    if (['create_issue', 'close_issue', 'reopen_issue'].includes(action)) throw new Error('Offline lifecycle action incorrectly used the agent');
+    return run(action, extras);
+  },
+  createIssue: async () => { throw new Error('Offline creation incorrectly used the agent'); },
   decideIssueProposal: async (id: string, decision: string) => { if (!(await run(`${decision}_issue_proposal`, { proposal_id: id }))) throw new Error('Decision failed'); },
 } as unknown as AgentWorkspaceValue;
 const render = async (workspaceRoot = 'alpha', focusedIssueId?: string) => {

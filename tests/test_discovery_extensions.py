@@ -14,8 +14,8 @@ from discovery_budget import DiscoveryBudget, MAX_EXTENSION_TURNS
 from live_test_loop import TreeLoopPlannerWorker
 from main import AgentConfig, WorkingFolderAgent, _handle_bridge_planner_action
 from planner import DiscoveryRequest, PlannerAgent
-from test_planner_continuous import FakeModel, present_plan
-from test_tree_loop_messages import RecordingMessageModel
+from tests.test_planner_continuous import FakeModel, present_plan
+from tests.test_tree_loop_messages import RecordingMessageModel
 from tree_loop import TreeLoop
 
 REQUEST = {
@@ -68,7 +68,7 @@ class DiscoveryExtensionIntegrationTests(unittest.TestCase):
 
     def make_planner(self, runtime="beta", extra_responses=None):
         self.config = AgentConfig(provider="fake", model="fake", root=self.root,
-                                  tool_script=Path(__file__).parent / "agent_tools.py", max_steps=2, quiet=True)
+                                  tool_script=Path(__file__).resolve().parents[1] / "agent_tools.py", max_steps=2, quiet=True)
         if runtime == "stable":
             extension = json.dumps({"action": {"type": "request_discovery_extension", **REQUEST}})
             read = json.dumps({"action": {"type": "read_file", "path": "note.txt"}})

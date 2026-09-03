@@ -9,7 +9,7 @@ from bridge_presentation import bridge_exchange
 from planner import PlannerAgent, PlannerSession, PlannerPlan, PlannerGoal, DiscoveryRequest, DiscoveryResult, GoalExecutionResult
 from tree_loop import TreeLoop
 from live_test_loop import TreeLoopPlannerWorker
-from test_tree_loop_messages import RecordingMessageModel
+from tests.test_tree_loop_messages import RecordingMessageModel
 
 
 class BridgePresentationTests(unittest.TestCase):

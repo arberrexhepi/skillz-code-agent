@@ -11,6 +11,7 @@ import './agentSuggestions.css';
 import './repoFacts.css';
 import './issues.css';
 import './pathChips.css';
+import './artifacts.css';
 
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>

@@ -68,7 +68,7 @@ class CodexSubscriptionTests(unittest.TestCase):
     @patch("codex_subscription.resolve_codex_executable", return_value="/fake/codex")
     @patch.dict(
         os.environ,
-        {"OPENAI_API_KEY": "must-not-leak", "CODEX_API_KEY": "also-must-not-leak"},
+        {"OPENAI_API_KEY": "must-not-leak", "CODEX_API_KEY": "also-must-not-leak", "SKILLZ_CODEX_MODEL_ONLY": "1"},
         clear=False,
     )
     def test_completion_is_ephemeral_read_only_and_drops_api_credentials(
@@ -100,6 +100,8 @@ class CodexSubscriptionTests(unittest.TestCase):
 
         self.assertEqual(text, '{"action":"finish"}')
         self.assertIn("--ephemeral", captured["args"])
+        for override in ("features.shell_tool=false", "features.unified_exec=false", "tools.view_image=false", "features.code_mode_host=false", "features.apps=false", "features.plugins=false", "features.multi_agent=false", "features.skip_host_skill_discovery=true", 'web_search="disabled"', "project_doc_max_bytes=0"):
+            self.assertIn(override, captured["args"])
         self.assertEqual(captured["args"][captured["args"].index("--sandbox") + 1], "read-only")
         self.assertNotIn("OPENAI_API_KEY", captured["env"])
         self.assertNotIn("CODEX_API_KEY", captured["env"])

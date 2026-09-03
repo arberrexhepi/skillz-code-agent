@@ -78,7 +78,7 @@ class MetaModelClientTests(unittest.TestCase):
             validate_provider_model_selection("openai", "muse-spark-1.2")
 
     def test_extension_and_runtime_options_expose_meta_selection(self):
-        package = json.loads((Path(__file__).parent / "vscode-extension" / "package.json").read_text())
+        package = json.loads((Path(__file__).resolve().parents[1] / "vscode-extension" / "package.json").read_text())
         provider_setting = package["contributes"]["configuration"]["properties"]["skillzAgent.provider"]
         self.assertIn("meta", provider_setting["enum"])
 

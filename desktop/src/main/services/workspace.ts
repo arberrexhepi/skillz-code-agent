@@ -1,4 +1,4 @@
-import { readWorkspaceIssues } from './workspaceIssues';
+import { mutateWorkspaceIssue, readWorkspaceIssues, type WorkspaceIssueAction } from './workspaceIssues';
 import type { WorkspaceIssuesSnapshot } from '../../shared/workspaceIssues';
 import { promises as fs, watch, type FSWatcher } from 'node:fs';
 import path from 'node:path';
@@ -15,6 +15,7 @@ export class WorkspaceService {
   private watcher: FSWatcher | null = null;
   private changedPaths = new Set<string>();
   private flushTimer: NodeJS.Timeout | null = null;
+  private issueQueue: Promise<unknown> = Promise.resolve();
 
   constructor(private readonly onFilesChanged: (paths: string[]) => void) {}
 
@@ -89,6 +90,19 @@ export class WorkspaceService {
     const snapshot = await readWorkspaceIssues(root);
     if (this.requireRoot() !== root) throw new Error('Workspace changed while reading issues.');
     return snapshot;
+  }
+
+  issueAction(expectedRoot: string, action: WorkspaceIssueAction, extras: Record<string, unknown>): Promise<WorkspaceIssuesSnapshot> {
+    const pending = this.issueQueue.then(async () => {
+      const root = this.requireRoot();
+      if (root !== expectedRoot) throw new Error('Workspace changed. Refresh Issues in the intended folder.');
+      const assertCurrent = (): void => { if (this.requireRoot() !== root) throw new Error('Workspace changed while updating issues.'); };
+      await mutateWorkspaceIssue(root, action, extras, assertCurrent);
+      assertCurrent();
+      return readWorkspaceIssues(root);
+    });
+    this.issueQueue = pending.catch(() => {});
+    return pending;
   }
 
   async read(relativePath: string): Promise<FileDocument> {

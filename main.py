@@ -1868,6 +1868,8 @@ class GeminiModelClient(BaseModelClient):
         config_kwargs: Dict[str, Any] = {
             "system_instruction": system,
             "temperature": 0.1,
+            # The harness dispatches tools through its own approval loop.
+            "automatic_function_calling": {"disable": True},
         }
         thinking_config = self._build_thinking_config()
         if thinking_config is not None:
@@ -5313,7 +5315,7 @@ class WorkingFolderAgent(ProposalRuntimeMixin):
         )
 
     def _observability_targets(self) -> List[Path]:
-        return [Path(__file__).parent.joinpath("memory_observability.md")]
+        return [Path(os.environ["SKILLZ_OBSERVABILITY_PATH"]) if os.environ.get("SKILLZ_OBSERVABILITY_PATH") else Path(__file__).parent.joinpath("memory_observability.md")]
 
     def _write_observability_snapshot(self, *, final_message: str, finished: bool) -> None:
         if not self._run_metrics:
