@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "tsx server/index.ts",
     "build": "tsc --noEmit && vite build",
-    "start": "tsx server/index.ts --production"
+    "start": "tsx server/index.ts --production",
+    "test": "node --import tsx --test tests/*.test.ts"
   },
   "dependencies": {
     "react": "^19.2.8",
