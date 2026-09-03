@@ -6,6 +6,8 @@ import path from 'node:path';
 export class RuntimeSettingsService {
   constructor(private readonly filePath: string) {}
 
+  artifactSetupDirectory(): string { return path.join(path.dirname(this.filePath), 'artifact-setup'); }
+
   async codexCliPath(): Promise<string> {
     try {
       const settings: unknown = JSON.parse(await fs.readFile(this.filePath, 'utf8'));

@@ -1,3 +1,8 @@
+import path from 'node:path';
+import { promises as fs } from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import type { ArtifactsService } from './services/artifacts';
+import { artifactSetupSelectionSchema, artifactId, artifactApisSchema, artifactAccessSchema, createArtifactSchema, previewInputSchema } from '../shared/artifacts';
 import { dialog, ipcMain, shell, type BrowserWindow, type IpcMainEvent, type IpcMainInvokeEvent } from 'electron';
 import { isUntracked } from '../shared/gitStatus';
 import { z } from 'zod';
@@ -7,6 +12,7 @@ import type { TerminalService } from './services/terminal';
 import type { WorkspaceService } from './services/workspace';
 
 interface Services {
+  artifacts: ArtifactsService;
   workspace: WorkspaceService;
   git: GitService;
   terminal: TerminalService;
@@ -29,7 +35,7 @@ export function registerIpc(window: BrowserWindow, services: Services): void {
   for (const channel of ['terminal:write', 'terminal:resize', 'terminal:dispose']) ipcMain.removeAllListeners(channel);
 
   const trusted = (event: IpcMainInvokeEvent | IpcMainEvent): void => {
-    if (event.sender.id !== window.webContents.id) throw new Error('Untrusted IPC sender.');
+    if (event.sender.id !== window.webContents.id || event.senderFrame !== window.webContents.mainFrame) throw new Error('Untrusted IPC sender.');
   };
   const handle = <TArgs extends unknown[], TResult>(
     channel: string,
@@ -40,6 +46,53 @@ export function registerIpc(window: BrowserWindow, services: Services): void {
       return listener(event, ...(args as TArgs));
     });
   };
+
+  const artifactChannels = ['capabilities', 'install-capabilities', 'setup-progress', 'save-provider-key', 'setup-download', 'library', 'choose-folder', 'choose-read-directory', 'access', 'save-access', 'create', 'apis', 'save-apis', 'start', 'stop', 'install-browser', 'preview', 'input', 'reload', 'close-preview', 'reveal', 'agent-start', 'agent-submit', 'agent-runtime', 'agent-planner', 'agent-worker', 'agent-reconfigure', 'agent-backoff', 'agent-stop'];
+  for (const name of artifactChannels) ipcMain.removeHandler(`artifacts:${name}`);
+  handle('artifacts:capabilities', (_event, selection: unknown) => services.artifacts.capabilities.status(artifactSetupSelectionSchema.parse(selection)));
+  handle('artifacts:install-capabilities', (_event, selection: unknown) => services.artifacts.capabilities.install(artifactSetupSelectionSchema.parse(selection)));
+  handle('artifacts:setup-progress', () => services.artifacts.capabilities.snapshot());
+  handle('artifacts:save-provider-key', (_event, provider: unknown, key: unknown) => services.artifacts.capabilities.saveKey(z.enum(['openai', 'gemini', 'anthropic', 'meta']).parse(provider), z.string().trim().min(1).max(8192).nullable().parse(key)));
+  handle('artifacts:setup-download', (_event, tool: unknown) => services.artifacts.capabilities.openDownload(z.enum(['python', 'git', 'docker']).parse(tool)));
+  handle('artifacts:library', () => services.artifacts.library.library());
+  handle('artifacts:choose-folder', async () => {
+    const result = await dialog.showOpenDialog(window, { title: 'Choose an empty folder or existing artifact library', properties: ['openDirectory', 'createDirectory'] });
+    return result.canceled || !result.filePaths[0] ? null : services.artifacts.configure(result.filePaths[0]);
+  });
+  handle('artifacts:choose-read-directory', async () => {
+    const result = await dialog.showOpenDialog(window, { title: 'Allow read-only access to a folder', properties: ['openDirectory'] });
+    if (result.canceled || !result.filePaths[0]) return null;
+    const directory = await fs.realpath(result.filePaths[0]);
+    return { id: `folder-${randomUUID().slice(0, 8)}`, label: path.basename(directory) || directory, path: directory };
+  });
+  handle('artifacts:access', (_event, id: unknown) => services.artifacts.library.access(artifactId.parse(id)));
+  handle('artifacts:save-access', async (_event, id: unknown, raw: unknown) => {
+    const checkedId = artifactId.parse(id);
+    await services.artifacts.saveAccess(checkedId, artifactAccessSchema.parse(raw));
+  });
+  handle('artifacts:create', (_event, raw: unknown) => {
+    const options = createArtifactSchema.parse(raw);
+    if (options.sourceRoot && options.sourceRoot !== services.workspace.current()?.root) throw new Error('Source workspace changed. Reopen Artifacts and retry.');
+    return services.artifacts.create(options);
+  });
+  handle('artifacts:apis', (_event, id: unknown) => services.artifacts.library.apis(artifactId.parse(id)));
+  handle('artifacts:save-apis', (_event, id: unknown, config: unknown) => services.artifacts.library.saveApis(artifactId.parse(id), artifactApisSchema.parse(config)));
+  handle('artifacts:start', (_event, id: unknown) => services.artifacts.start(artifactId.parse(id)));
+  handle('artifacts:stop', (_event, id: unknown) => services.artifacts.stop(artifactId.parse(id)));
+  handle('artifacts:install-browser', () => services.artifacts.preview.installBrowser());
+  handle('artifacts:preview', (_event, id: unknown) => services.artifacts.frame(artifactId.parse(id)));
+  handle('artifacts:input', (_event, id: unknown, input: unknown) => services.artifacts.preview.input(artifactId.parse(id), previewInputSchema.parse(input)));
+  handle('artifacts:reload', (_event, id: unknown) => services.artifacts.preview.reload(artifactId.parse(id)));
+  handle('artifacts:close-preview', (_event, id: unknown) => services.artifacts.preview.close(artifactId.parse(id)));
+  handle('artifacts:reveal', async (_event, id: unknown) => { const artifact = await services.artifacts.library.find(artifactId.parse(id)); const error = await shell.openPath(artifact.root); if (error) throw new Error(error); });
+  handle('artifacts:agent-start', (_event, id: unknown, options: unknown) => services.artifacts.startAgent(artifactId.parse(id), z.object({ provider: z.string().min(1).max(80), model: z.string().min(1).max(200), backendScript: z.enum(['main.py', 'main_v2.py', 'live_test_loop.py']).optional() }).parse(options)));
+  handle('artifacts:agent-runtime', async (_event, id: unknown, provider: unknown = '', model: unknown = '') => (await services.artifacts.agent(artifactId.parse(id))).runtimeOptions(z.string().max(80).parse(provider), z.string().max(200).parse(model)));
+  handle('artifacts:agent-submit', (_event, id: unknown, text: unknown) => services.artifacts.submit(artifactId.parse(id), z.string().min(1).max(200000).parse(text)));
+  handle('artifacts:agent-planner', async (_event, id: unknown, action: unknown, extras: unknown = {}) => (await services.artifacts.agent(artifactId.parse(id))).plannerAction(z.string().min(1).max(100).parse(action), z.record(z.string(), z.unknown()).parse(extras)));
+  handle('artifacts:agent-worker', async (_event, id: unknown, action: unknown) => (await services.artifacts.agent(artifactId.parse(id))).workerAction(z.record(z.string(), z.unknown()).parse(action)));
+  handle('artifacts:agent-reconfigure', async (_event, id: unknown, provider: unknown, model: unknown) => (await services.artifacts.agent(artifactId.parse(id))).reconfigureRuntime(z.string().min(1).max(80).parse(provider), z.string().min(1).max(200).parse(model)));
+  handle('artifacts:agent-backoff', async (_event, id: unknown, enabled: unknown, limit: unknown) => (await services.artifacts.agent(artifactId.parse(id))).configureBackoff(z.boolean().parse(enabled), z.number().min(1).max(10000).parse(limit)));
+  handle('artifacts:agent-stop', async (_event, id: unknown) => (await services.artifacts.agent(artifactId.parse(id))).stop());
 
   handle('workspace:current', () => services.workspace.current());
   handle('workspace:choose', async () => {

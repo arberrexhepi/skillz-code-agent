@@ -1,3 +1,4 @@
+import type { AgentExecution } from './artifactAgent';
 import { execFile, spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
@@ -25,6 +26,7 @@ export class AgentService {
   private buffer = '';
   private processCodexPath = '';
   private stopping = false;
+  private launchGeneration = 0;
   private readonly pending = new Map<string, PendingRequest>();
   private state: AgentBridgeState = { planner: {}, transcript: [] };
 
@@ -32,10 +34,12 @@ export class AgentService {
     private readonly workspace: WorkspaceService,
     private readonly emit: (event: AgentEvent) => void,
     private readonly runtimeSettings?: RuntimeSettingsService,
+    private readonly execution?: AgentExecution,
   ) {}
 
   async start(options: AgentStartOptions): Promise<AgentResponse> {
     await this.stop();
+    const generation = this.launchGeneration;
     const agentRoot = this.agentRoot();
     const scriptName = options.backendScript || 'main.py';
     if (!BACKEND_SCRIPTS.has(scriptName)) throw new Error('Unsupported Python agent backend.');
@@ -47,11 +51,15 @@ export class AgentService {
 
     const { env } = await this.launchEnvironment();
     const python = await resolvePythonCommand(agentRoot, process.platform, env);
+    if (generation !== this.launchGeneration) throw new Error('Agent start cancelled.');
     this.stopping = false;
     this.buffer = '';
     this.state = { planner: {}, transcript: [] };
     this.emit({ type: 'status', status: 'starting' });
-    const child = spawn(python.executable, [
+    const child = this.execution ? await this.execution.launch({ agentRoot, scriptName, python, env, options }).catch((error) => {
+      if (generation === this.launchGeneration) this.emit({ type: 'status', status: 'error', message: error instanceof Error ? error.message : String(error) });
+      throw error;
+    }) : spawn(python.executable, [
       ...python.args,
       script,
       '--provider', options.provider,
@@ -64,9 +72,11 @@ export class AgentService {
       env,
       windowsHide: true,
     });
+    if (generation !== this.launchGeneration) { await this.execution?.stop(); child.kill(); throw new Error('Agent start cancelled.'); }
     this.process = child;
     this.processCodexPath = env.CODEX_CLI_PATH || '';
 
+    child.stdin.on('error', (error) => this.handleExit(child, new Error(`Agent input closed: ${error.message}`)));
     child.stdout.setEncoding('utf8');
     child.stdout.on('data', (chunk: string) => this.handleStdout(chunk));
     child.stderr.setEncoding('utf8');
@@ -81,6 +91,7 @@ export class AgentService {
     });
 
     const response = await this.request('initialize', {});
+    if (this.process !== child) throw new Error('Agent start cancelled.');
     this.emit({ type: 'status', status: 'running' });
     return response;
   }
@@ -97,8 +108,13 @@ export class AgentService {
     return this.request('worker_action', { action });
   }
 
-  reconfigureRuntime(provider: string, model: string): Promise<AgentResponse> {
-    return this.request('reconfigure_runtime', { provider, model });
+  async reconfigureRuntime(provider: string, model: string): Promise<AgentResponse> {
+    const child = this.process;
+    const commit = await this.execution?.prepareRuntime?.(provider, model);
+    if (this.process !== child) throw new Error('Runtime change cancelled.');
+    const response = await this.request('reconfigure_runtime', { provider, model });
+    if (response.ok && this.process === child) commit?.();
+    return response;
   }
 
   configureBackoff(enabled: boolean, tokenLimitK: number): Promise<AgentResponse> {
@@ -166,13 +182,21 @@ export class AgentService {
   private async launchEnvironment(): Promise<{ env: NodeJS.ProcessEnv; savedPath: string }> {
     const savedPath = await this.runtimeSettings?.codexCliPath() || '';
     const env = pythonEnvironment();
+    const root = this.workspace.current()?.root;
+    if (root) env.SKILLZ_OBSERVABILITY_PATH = path.join(root, 'memory_observability.md');
     if (savedPath) env.CODEX_CLI_PATH = savedPath;
     return { env, savedPath };
   }
 
   async stop(): Promise<void> {
-    if (!this.process) return;
+    this.launchGeneration += 1;
     this.stopping = true;
+    const wasRunning = Boolean(this.process);
+    await this.execution?.stop();
+    if (!this.process) {
+      if (wasRunning) { this.state = { planner: {}, transcript: [] }; this.emit({ type: 'status', status: 'stopped' }); }
+      return;
+    }
     this.process.kill();
     this.process = null;
     this.buffer = '';
@@ -192,6 +216,7 @@ export class AgentService {
 
   private handleStdout(chunk: string): void {
     this.buffer += chunk;
+    if (this.buffer.length > 16 * 1024 * 1024) { void this.stop(); this.emit({ type: 'status', status: 'error', message: 'Agent response exceeded 16 MB.' }); return; }
     while (true) {
       const newline = this.buffer.indexOf('\n');
       if (newline < 0) return;
@@ -200,6 +225,7 @@ export class AgentService {
       if (!line) continue;
       try {
         const payload = JSON.parse(line) as Record<string, unknown>;
+        if (this.execution?.message(payload)) continue;
         if (isBridgeState(payload.state)) {
           this.state = payload.state;
           this.emit({ type: 'state', state: this.state });

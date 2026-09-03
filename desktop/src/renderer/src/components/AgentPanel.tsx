@@ -9,7 +9,7 @@ import { TurnThought } from './agent/TurnThought';
 import { MarkdownMessage } from './agent/MarkdownMessage';
 import { RuntimeDrawer } from './agent/RuntimeDrawer';
 
-export function AgentPanel(): React.JSX.Element {
+export function AgentPanel({ label = 'WORKSPACE AGENT' }: { label?: string }): React.JSX.Element {
   const agent = useAgentWorkspace();
   const [prompt, setPrompt] = useState('');
   const [showRuntime, setShowRuntime] = useState(false);
@@ -36,13 +36,13 @@ export function AgentPanel(): React.JSX.Element {
   return (
     <aside className="agent-panel">
       <div className="agent-header">
-        <div><span className="eyebrow">WORKSPACE AGENT</span><h2>Agent</h2></div>
+        <div><span className="eyebrow">{label}</span><h2>Agent</h2></div>
         <button type="button" className={`status-pill ${status}`} onClick={() => setShowRuntime((value) => !value)} title="Runtime controls">
           <i />{status}<span className="chevron">⌄</span>
         </button>
       </div>
       <div className="agent-context-strip">
-        <span><PathText>{bridge.planner.executing ? bridge.planner.executing_goal_title || 'Executing plan' : 'Workspace conversation'}</PathText></span>
+        <span><PathText>{bridge.planner.executing ? bridge.planner.executing_goal_title || 'Executing plan' : label === 'ARTIFACT AGENT' ? 'Artifact conversation' : 'Workspace conversation'}</PathText></span>
         {continuousIsActive(bridge) && <strong>Auto {continuous?.cycle || 0}/{continuous?.max_cycles || '∞'}</strong>}
       </div>
       {showRuntime && <RuntimeDrawer onClose={() => setShowRuntime(false)} />}
@@ -60,7 +60,7 @@ export function AgentPanel(): React.JSX.Element {
       </div>
       {notice && <div className="agent-notice" role="status"><div className="notice-copy"><PathText>{notice}</PathText></div><button type="button" aria-label="Dismiss notice" onClick={agent.clearNotice}>×</button></div>}
       <div className="composer-shell">
-        <div className="composer-heading"><span>NEW INSTRUCTION</span><small>Workspace-wide</small></div>
+        <div className="composer-heading"><span>NEW INSTRUCTION</span><small>{label === 'ARTIFACT AGENT' ? 'This artifact' : 'Workspace-wide'}</small></div>
         <div className="prompt-box">
         <textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} onKeyDown={(event) => {
           if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void submit(); }

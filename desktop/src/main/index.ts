@@ -1,3 +1,6 @@
+import { installArtifactFrameSecurity } from './services/artifactFrameSecurity';
+import { ArtifactLibraryService } from './services/artifactLibrary';
+import { ArtifactsService } from './services/artifacts';
 import path from 'node:path';
 import { app, BrowserWindow, screen } from 'electron';
 import { registerIpc } from './ipc';
@@ -8,6 +11,7 @@ import { TerminalService } from './services/terminal';
 import { WorkspaceService } from './services/workspace';
 
 let mainWindow: BrowserWindow | null = null;
+const shutdownTasks = new Set<Promise<unknown>>();
 
 function createWindow(): void {
   const workArea = screen.getPrimaryDisplay().workAreaSize;
@@ -22,6 +26,7 @@ function createWindow(): void {
       preload: path.join(__dirname, '../preload/index.js'),
       contextIsolation: true,
       nodeIntegration: false,
+      nodeIntegrationInSubFrames: false,
       sandbox: true,
     },
   });
@@ -35,13 +40,23 @@ function createWindow(): void {
   const terminal = new TerminalService(workspace, (event) => send('terminal:event', event));
   const runtimeSettings = new RuntimeSettingsService(path.join(app.getPath('userData'), 'runtime-settings.json'));
   const agent = new AgentService(workspace, (event) => send('agent:event', event), runtimeSettings);
-  registerIpc(window, { workspace, git, terminal, agent });
+  const artifactLibrary = new ArtifactLibraryService(
+    path.join(app.getPath('userData'), 'artifact-settings.json'),
+    app.isPackaged ? path.join(process.resourcesPath, 'artifact-template') : path.join(app.getAppPath(), 'artifact-template'),
+    path.join(app.getPath('userData'), 'artifact-contexts'),
+  );
+  const artifacts = new ArtifactsService(artifactLibrary, runtimeSettings, (event) => send('artifacts:event', event), () => workspace.current()?.root || '');
+  const disposeFrameSecurity = installArtifactFrameSecurity(window.webContents, () => artifacts.previewOrigins());
+  registerIpc(window, { workspace, git, terminal, agent, artifacts });
 
   window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
   window.webContents.on('will-navigate', (event) => event.preventDefault());
   window.on('closed', () => {
+    disposeFrameSecurity();
     terminal.disposeAll();
-    void agent.stop();
+    const shutdown = Promise.allSettled([agent.stop(), artifacts.dispose()]);
+    shutdownTasks.add(shutdown);
+    void shutdown.finally(() => shutdownTasks.delete(shutdown));
     workspace.dispose();
     mainWindow = null;
   });
@@ -62,4 +77,11 @@ app.whenReady().then(() => {
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();
+});
+
+// Keep Electron alive until artifact servers, browser pages, and agent sessions stop.
+app.on('will-quit', (event) => {
+  if (!shutdownTasks.size) return;
+  event.preventDefault();
+  void Promise.allSettled([...shutdownTasks]).then(() => app.quit());
 });

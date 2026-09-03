@@ -18,8 +18,9 @@ test('native picker supports cancellation and validated settings IPC rejects unt
     return request === 'electron' ? electron : original.call(this, request, ...rest);
   });
   const { registerIpc } = load(() => require('../src/main/ipc.ts'));
-  registerIpc({ webContents: { id: 42 } }, { agent: { setCodexCliPath: (value) => { saved.push(value); return {}; } } });
-  const event = { sender: { id: 42 } };
+  const mainFrame = {};
+  registerIpc({ webContents: { id: 42, mainFrame } }, { agent: { setCodexCliPath: (value) => { saved.push(value); return {}; } } });
+  const event = { sender: { id: 42 }, senderFrame: mainFrame };
   const choose = handlers.get('agent:choose-codex-cli');
   assert.equal(await choose(event), null);
   assert.deepEqual(saved, []);
@@ -30,6 +31,8 @@ test('native picker supports cancellation and validated settings IPC rejects unt
   assert.ok(dialogOptions.properties.includes('showHiddenFiles'));
   const save = handlers.get('agent:set-codex-cli-path');
   assert.throws(() => save({ sender: { id: 99 } }, null), /Untrusted IPC sender/);
+  assert.throws(() => save({ sender: { id: 42 }, senderFrame: {} }, null), /Untrusted IPC sender/);
+  assert.throws(() => save({ sender: { id: 42 }, senderFrame: null }, null), /Untrusted IPC sender/);
   for (const value of [42, {}, '', 'C:\\codex.exe\0junk']) assert.throws(() => save(event, value));
   await save(event, selection.filePaths[0]);
   await save(event, null);

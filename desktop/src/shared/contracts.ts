@@ -1,3 +1,4 @@
+import type { ArtifactsApi } from './artifacts';
 import type { WorkspaceIssuesSnapshot } from './workspaceIssues';
 import type { RepoFactsSnapshot } from './repoFacts';
 
@@ -93,6 +94,7 @@ export interface TerminalCreateOptions {
 }
 
 export interface WorkbenchApi {
+  artifacts: ArtifactsApi;
   workspace: {
     current(): Promise<WorkspaceInfo | null>;
     choose(): Promise<WorkspaceInfo | null>;

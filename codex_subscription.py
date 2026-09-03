@@ -449,6 +449,24 @@ def _extract_usage(events: Iterable[Mapping[str, Any]]) -> Dict[str, int]:
     return best
 
 
+def _model_only_cli_overrides() -> List[str]:
+    """Keep the local artifact model adapter from becoming a second host tool executor.
+
+    Config controls: https://learn.chatgpt.com/docs/config-file/config-reference
+    Feature names are also exposed by `codex features list`.
+    """
+    disabled = (
+        "shell_tool", "unified_exec", "view_image", "code_mode_host", "apps", "plugins",
+        "hooks", "multi_agent", "browser_use", "browser_use_external", "in_app_browser",
+        "computer_use", "workspace_dependencies", "skill_search", "skill_mcp_dependency_install",
+        "tool_suggest", "image_generation", "memories",
+    )
+    values = [*(f"features.{feature}=false" for feature in disabled),
+              "features.skip_host_skill_discovery=true", "tools.view_image=false",
+              'web_search="disabled"', "project_doc_max_bytes=0", "mcp_servers={}"]
+    return [part for value in values for part in ("-c", value)]
+
+
 def _run_codex_exec_streaming(
     args: Sequence[str],
     *,
@@ -588,6 +606,8 @@ def run_codex_subscription_completion(
             str(output_path),
             "-",
         ]
+        if os.environ.get("SKILLZ_CODEX_MODEL_ONLY") == "1":
+            args[1:1] = _model_only_cli_overrides()
         cli_env = _clean_cli_environment()
         if progress_callback is None:
             result = subprocess.run(

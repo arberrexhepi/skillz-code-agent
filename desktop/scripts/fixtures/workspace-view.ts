@@ -104,4 +104,5 @@ window.workbench = {
   },
 } as WorkbenchApi;
 
+if (new URLSearchParams(window.location.search).has('artifacts')) await import('./artifacts-fixture');
 void import('../../src/renderer/src/main');

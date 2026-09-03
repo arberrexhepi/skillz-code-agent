@@ -9,10 +9,15 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 from pathlib import Path, PurePosixPath
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple, cast
+
+from file_access import read_scope, qualify_read_paths
+
+_READ_SCOPE: Path | None = None
 
 from diagnostics import (
     build_check,
@@ -89,6 +94,9 @@ def emit(obj: Dict[str, Any], code: int = 0) -> None:
 
 
 def ok(tool: str, data: Dict[str, Any]) -> None:
+    if _READ_SCOPE is not None:
+        data = qualify_read_paths(data, _READ_SCOPE)
+        data["read_only_root"] = str(_READ_SCOPE)
     emit({"ok": True, "tool": tool, "data": data}, 0)
 
 
@@ -646,13 +654,14 @@ def iter_tree(base: Path, include_hidden: bool, max_depth: int) -> Iterator[Path
 
 
 def format_entry(root: Path, path: Path) -> Dict[str, Any]:
-    stat = path.stat()
+    info = path.lstat()
     return {
         "path": str(path.relative_to(root)),
         "name": path.name,
-        "is_dir": path.is_dir(),
-        "size": stat.st_size if path.is_file() else None,
-        "modified": int(stat.st_mtime),
+        "is_dir": stat.S_ISDIR(info.st_mode),
+        "is_link": stat.S_ISLNK(info.st_mode),
+        "size": info.st_size if stat.S_ISREG(info.st_mode) else None,
+        "modified": int(info.st_mtime),
     }
 
 
@@ -742,7 +751,12 @@ def cmd_inspect(args: argparse.Namespace) -> None:
         rel_path = item.get("path")
         if not isinstance(rel_path, str) or not rel_path.strip():
             err(tool, "BAD_REQUEST", "Each file spec must include a non-empty path")
-        path = safe_join(root, cast(str, rel_path))
+        try:
+            scope, relative = read_scope(root, rel_path)
+            path = safe_join(scope, relative)
+        except (ValueError, OSError) as error:
+            inspect_results.append({"path": rel_path, "ok": False, "error": {"code": "READ_ACCESS_DENIED", "message": str(error)}})
+            continue
         if not path.exists():
             inspect_results.append({"path": rel_path, "ok": False, "error": {"code": "NOT_FOUND", "message": f"File does not exist: {rel_path}"}})
             continue
@@ -751,14 +765,14 @@ def cmd_inspect(args: argparse.Namespace) -> None:
             continue
         try:
             payload = {
-                "path": str(path.relative_to(root)),
+                "path": str(path.relative_to(scope)),
                 "ok": True,
                 "language": infer_language(path),
                 "size_bytes": path.stat().st_size,
             }
             if include_content:
-                payload.update(read_file_payload(root, path, item.get("start_line"), item.get("end_line")))
-            inspect_results.append(payload)
+                payload.update(read_file_payload(scope, path, item.get("start_line"), item.get("end_line")))
+            inspect_results.append(qualify_read_paths(payload, scope) if scope != root else payload)
         except SystemExit:
             raise
         except Exception as exc:
@@ -2401,6 +2415,18 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
+    # Only explicitly read-only commands can change scope. Writes and project execution keep --root.
+    read_commands = {"ls", "read", "grep", "find", "summarize", "symbols", "list-files", "find-files", "search-in-files", "outline-file", "read-symbol", "find-symbol-definitions", "find-symbol-references"}
+    if args.subcommand in read_commands and isinstance(getattr(args, "path", None), str):
+        original = resolve_root(args.root)
+        try:
+            scope, relative = read_scope(original, args.path or ".")
+        except (ValueError, OSError) as error:
+            err(args.subcommand, "READ_ACCESS_DENIED", str(error))
+        args.root, args.path = str(scope), relative
+        global _READ_SCOPE
+        if scope != original:
+            _READ_SCOPE = scope
 
     if args.subcommand == "run":
         if not args.command:
