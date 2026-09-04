@@ -2227,7 +2227,10 @@ class PlannerAgent:
         for item in self.continuous_state.completed_issues:
             if not isinstance(item, dict):
                 continue
-            for key in ["request_summary", "plan_summary", "summary", "execution_summary"]:
+            # The execution summary includes its own Next Steps section. Treating
+            # that text as completed scope suppresses every newly proposed
+            # follow-up before it can be created.
+            for key in ["request_summary", "plan_summary", "summary"]:
                 value = str(item.get(key, "") or "").strip()
                 if value:
                     texts.append(value)

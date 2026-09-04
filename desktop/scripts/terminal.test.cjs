@@ -2,7 +2,29 @@ const assert = require('node:assert/strict');
 const { test } = require('node:test');
 const pty = require('node-pty');
 const loadTypeScript = require('./load-ts.cjs');
-const { TerminalService } = loadTypeScript(() => require('../src/main/services/terminal.ts'));
+const { TerminalService, terminalEnvironment } = loadTypeScript(() => require('../src/main/services/terminal.ts'));
+
+test('terminal npm defaults avoid indefinite progress and audit steps without overriding user settings', () => {
+  assert.deepEqual(terminalEnvironment({ PATH: '/bin' }), {
+    PATH: '/bin',
+    NPM_CONFIG_PROGRESS: 'false',
+    NPM_CONFIG_AUDIT: 'false',
+    NPM_CONFIG_FUND: 'false',
+    TERM: 'xterm-256color',
+    COLORTERM: 'truecolor',
+  });
+  const configured = terminalEnvironment({
+    npm_config_progress: 'true',
+    NPM_CONFIG_AUDIT: 'true',
+    Npm_Config_Fund: 'true',
+  });
+  assert.equal(configured.npm_config_progress, 'true');
+  assert.equal(configured.NPM_CONFIG_AUDIT, 'true');
+  assert.equal(configured.Npm_Config_Fund, 'true');
+  assert.equal(Object.hasOwn(configured, 'NPM_CONFIG_PROGRESS'), false);
+  assert.equal(Object.keys(configured).filter((key) => key.toLowerCase() === 'npm_config_audit').length, 1);
+  assert.equal(Object.keys(configured).filter((key) => key.toLowerCase() === 'npm_config_fund').length, 1);
+});
 
 for (const platform of ['win32', 'darwin', 'linux']) {
   test(`${platform} terminal uses supported encoding options and forwards output`, (t) => {
@@ -29,6 +51,9 @@ for (const platform of ['win32', 'darwin', 'linux']) {
     else assert.equal(spawned.options.encoding, 'utf8');
     assert.equal(spawned.options.cwd, process.cwd());
     assert.equal(spawned.options.cols, 80);
+    assert.equal(spawned.options.env.NPM_CONFIG_PROGRESS, 'false');
+    assert.equal(spawned.options.env.NPM_CONFIG_AUDIT, 'false');
+    assert.equal(spawned.options.env.NPM_CONFIG_FUND, 'false');
     onData('café');
     assert.deepEqual(events[0], { type: 'data', sessionId, data: 'café' });
     service.disposeAll();

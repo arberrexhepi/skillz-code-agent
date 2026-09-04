@@ -298,7 +298,13 @@ kbd { min-width: 20px; height: 20px; display: grid; place-items: center; border:
 .composer-shell { min-height: 118px; padding-top: 7px; border-top: 1px solid var(--border); background: #0d1014; }.composer-heading { display: flex; align-items: center; padding: 0 11px; }.composer-heading span { color: #78838e; font-size: 7px; font-weight: 700; letter-spacing: .13em; }.composer-heading small { margin-left: auto; color: #46505a; font-size: 8px; }
 .agent-empty h3 { margin: 9px 0 1px; color: #bbc2ca; font-size: 13px; font-weight: 520; }.agent-empty p { max-width: 270px; margin-top: 6px; font-size: 10px; }
 .agent-notice { width: 100%; display: flex; gap: 8px; border: 0; border-top: 1px solid #39282b; text-align: left; cursor: pointer; }.agent-notice span { margin-left: auto; }
-.prompt-box textarea { padding-bottom: 25px; }.composer-meta { position: absolute; left: 9px; bottom: 7px; display: flex; gap: 8px; color: #4f5863; font-size: 8px; }
+.prompt-box textarea { padding-bottom: 30px; }.composer-meta { position: absolute; right: 40px; bottom: 7px; left: 9px; min-height: 20px; display: flex; align-items: center; gap: 10px; color: #4f5863; font-size: 8px; white-space: nowrap; }
+.composer-shortcuts { display: flex; gap: 8px; }
+.composer-auto-toggle, .composer-turn-limit { display: inline-flex; align-items: center; gap: 5px; color: #87929e; cursor: pointer; }
+.composer-auto-toggle input { width: 12px; height: 12px; margin: 0; accent-color: var(--accent); cursor: pointer; }
+.composer-turn-limit input { width: 38px; height: 20px; border: 1px solid #29313a; border-radius: 4px; outline: 0; background: #0d1115; color: #b9c2cb; padding: 0 3px; font-size: 9px; text-align: center; }
+.composer-turn-limit input:focus { border-color: #4d765f; }
+.composer-auto-toggle input:disabled, .composer-turn-limit input:disabled { cursor: default; opacity: .5; }
 
 .agent-decision { flex: 0 0 auto; margin: 0 10px 2px; padding: 10px; border: 1px solid #2c3932; border-radius: 7px; background: linear-gradient(135deg, #111a16, #101418); }
 .agent-decision.danger { border-color: #553238; background: #1b1215; }.agent-decision > header { display: flex; align-items: center; gap: 8px; }.agent-decision > header span { color: var(--accent); font-size: 7px; font-weight: 750; letter-spacing: .15em; }.agent-decision > header strong { color: #d7dce1; font-size: 11px; font-weight: 580; }

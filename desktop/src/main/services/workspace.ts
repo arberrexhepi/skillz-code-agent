@@ -175,10 +175,10 @@ export class WorkspaceService {
   }
 
   private startWatcher(): void {
-    this.watcher?.close();
+    this.stopWatcher();
     const root = this.requireRoot();
     try {
-      this.watcher = watch(root, { recursive: true }, (_event, filename) => {
+      const watcher = watch(root, { recursive: true }, (_event, filename) => {
         if (!filename) return;
         const relative = filename.toString().replaceAll('\\', '/');
         if (relative.split('/').some((part) => HIDDEN_DIRECTORIES.has(part))) return;
@@ -190,6 +190,19 @@ export class WorkspaceService {
           this.onFilesChanged(paths);
         }, 120);
       });
+      // Recursive watchers can exhaust OS watcher/file-descriptor limits while
+      // package managers create large dependency trees. FSWatcher reports that
+      // asynchronously; without a listener it crashes the Electron main process
+      // and tears down otherwise healthy terminal PTYs.
+      watcher.on('error', () => {
+        if (this.watcher !== watcher) return;
+        watcher.close();
+        this.watcher = null;
+        if (this.flushTimer) clearTimeout(this.flushTimer);
+        this.flushTimer = null;
+        this.changedPaths.clear();
+      });
+      this.watcher = watcher;
     } catch {
       this.watcher = null;
     }

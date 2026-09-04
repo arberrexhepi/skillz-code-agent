@@ -84,16 +84,20 @@ export class ArtifactLibraryService {
   }
   create(raw: CreateArtifact): Promise<ArtifactRecord> { return this.createFrom(raw, this.template, 'Scaffold artifact'); }
   async prebuilts(): Promise<PrebuiltArtifact[]> {
-    return [{ id: 'repo-issue-manager', title: 'Repository issue manager', description: 'Review, create, activate, close, and reopen Skillz issues in any repository you explicitly share.', requiresWriteAccess: true }];
+    return [
+      { id: 'server-manager', title: 'Server Manager', description: 'Detect, launch, stop, and inspect explicitly whitelisted repository scripts and their listening ports.', requiresWriteAccess: false, requiresProcessProxy: true },
+      { id: 'repo-issue-manager', title: 'Repository issue manager', description: 'Review, create, activate, close, and reopen Skillz issues in any repository you explicitly share.', requiresWriteAccess: true },
+    ];
   }
   async installPrebuilt(id: string, access: ArtifactAccess, runtime?: import('../../shared/artifacts').CreateArtifact['runtime']): Promise<ArtifactRecord> {
     const preset = (await this.prebuilts()).find(item => item.id === artifactId.parse(id));
     if (!preset) throw new Error('Unknown prebuilt artifact.');
     const source = path.join(this.prebuiltHome, id);
     const available = await fs.lstat(source).then(stat => stat.isDirectory() && !stat.isSymbolicLink()).catch(() => false);
-    if (!available) throw new Error('The bundled issue manager artifact is unavailable. Initialize the prebuilt artifact submodule.');
+    if (!available) throw new Error(`The bundled ${preset.title} artifact is unavailable. Initialize its prebuilt artifact submodule.`);
     const checked = artifactAccessSchema.parse(access);
     if (preset.requiresWriteAccess && !checked.directories.some(directory => directory.access === 'write')) throw new Error('Share at least one repository with Allow changes enabled.');
+    if (preset.requiresProcessProxy && !checked.directories.some(directory => directory.allowProcessProxy)) throw new Error('Share at least one repository with Allow Process Proxy enabled.');
     return this.createFrom({ title: preset.title, prompt: preset.description, sourceRoot: '', shareFacts: false, shareMemory: false, runtime, access: checked }, source, 'Install prebuilt artifact');
   }
   private createFrom(raw: CreateArtifact, source: string, initialCommit: string): Promise<ArtifactRecord> {
