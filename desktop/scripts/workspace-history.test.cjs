@@ -1,5 +1,6 @@
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
+const { EventEmitter } = require('node:events');
 const os = require('node:os');
 const path = require('node:path');
 const { test } = require('node:test');
@@ -44,4 +45,21 @@ test('workspace open records canonical roots, close returns home, and malformed 
   fs.writeFileSync(file, '# Recent repositories\n\n```json\n{broken}\n```\n');
   assert.deepEqual(await history.recent(), []);
   workspace.dispose();
+});
+
+test('workspace watcher exhaustion degrades file refresh without crashing the terminal host', async (t) => {
+  const temp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'skillz watcher recovery ')));
+  t.after(() => fs.rmSync(temp, { recursive: true, force: true, maxRetries: 5 }));
+  const watcher = new EventEmitter();
+  let closes = 0;
+  watcher.close = () => { closes++; };
+  t.mock.method(fs, 'watch', () => watcher);
+  const workspace = new WorkspaceService(() => {});
+  await workspace.open(temp);
+
+  assert.doesNotThrow(() => watcher.emit('error', Object.assign(new Error('too many open files, watch'), { code: 'EMFILE' })));
+  assert.equal(closes, 1);
+  assert.equal(workspace.current().root, temp);
+  workspace.dispose();
+  assert.equal(closes, 1);
 });

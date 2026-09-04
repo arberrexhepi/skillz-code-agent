@@ -6,6 +6,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { app } from 'electron';
 import { hostEnvironment } from './hostEnvironment';
 import { command, git, runLogged } from './artifactProcess';
+import { artifactProcessProxyScript } from './artifactProcessProxyScript';
 import type { ReadDirectory } from '../../shared/artifacts';
 
 export const containerRoot = '/repo';
@@ -29,10 +30,12 @@ async function sandboxDefinition(source: string) {
     }
   }
   await collect(source);
+  files.push({ name: 'process-proxy/npm-proxy.cjs', content: Buffer.from(artifactProcessProxyScript) });
   const dockerfile = `FROM node:22.20.0-bookworm
 RUN mkdir -p /repo/node_modules && chmod 1777 /repo/node_modules
 COPY harness /opt/skillz
-ENV PYTHONUNBUFFERED=1 PYTHONIOENCODING=utf-8 PYTHONDONTWRITEBYTECODE=1 HOME=/tmp/skillz-home
+RUN mkdir -p /opt/skillz/bin && ln -s /opt/skillz/process-proxy/npm-proxy.cjs /opt/skillz/bin/npm && chmod 755 /opt/skillz/process-proxy/npm-proxy.cjs
+ENV PYTHONUNBUFFERED=1 PYTHONIOENCODING=utf-8 PYTHONDONTWRITEBYTECODE=1 HOME=/tmp/skillz-home PATH=/opt/skillz/bin:$PATH
 WORKDIR /repo
 `;
   const hash = createHash('sha256').update(dockerfile);
@@ -100,7 +103,7 @@ export class ArtifactSandbox {
   private docker = '';
   private cancelled = false;
   private stopping?: Promise<void>;
-  constructor(readonly root: string, readonly reads: ReadDirectory[], readonly context: string) {}
+  constructor(readonly root: string, readonly reads: ReadDirectory[], readonly context: string, private readonly processProxy?: { url: string; token: string }) {}
   async prepare(log: (text: string) => void, source?: string): Promise<{ docker: string; args: string[] }> {
     const { docker, image } = await ensureSandboxImage(log, source);
     this.docker = docker;
@@ -122,6 +125,7 @@ export class ArtifactSandbox {
     }
     args.push('--mount', bindMount(this.context, '/context', true));
     args.push('--env', 'SKILLZ_READ_ROOTS=' + JSON.stringify(reads), '--env', 'SKILLZ_WRITE_ROOTS=' + JSON.stringify(reads.filter(root => root.access === 'write')), '--env', 'SKILLZ_ARTIFACT_READ_ROOTS=' + JSON.stringify(reads), '--env', 'SKILLZ_OBSERVABILITY_PATH=/repo/memory_observability.md', '--env', 'SKILLZ_CONTEXT_ROOT=/context');
+    if (this.processProxy) args.push('--env', `SKILLZ_PROCESS_PROXY_URL=${this.processProxy.url}`, '--env', `SKILLZ_PROCESS_PROXY_TOKEN=${this.processProxy.token}`);
     return { docker, args: [...args, image] };
   }
   spawn(docker: string, args: string[], commandArgs: string[], options: string[] = []): ChildProcessWithoutNullStreams {

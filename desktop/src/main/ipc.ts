@@ -60,7 +60,7 @@ export function registerIpc(window: BrowserWindow, services: Services): void {
     });
   };
 
-  const artifactChannels = ['capabilities', 'install-capabilities', 'setup-progress', 'save-provider-key', 'setup-download', 'docker-cleanup-plan', 'clean-docker', 'library', 'prebuilts', 'install-prebuilt', 'choose-folder', 'choose-read-directory', 'access', 'save-access', 'create', 'apis', 'save-apis', 'start', 'stop', 'install-browser', 'preview', 'input', 'reload', 'close-preview', 'reveal', 'agent-start', 'agent-submit', 'agent-runtime', 'agent-planner', 'agent-worker', 'agent-reconfigure', 'agent-backoff', 'agent-stop'];
+  const artifactChannels = ['capabilities', 'install-capabilities', 'setup-progress', 'save-provider-key', 'setup-download', 'docker-cleanup-plan', 'clean-docker', 'library', 'prebuilts', 'install-prebuilt', 'choose-folder', 'choose-read-directory', 'access', 'process-scripts', 'save-access', 'create', 'apis', 'save-apis', 'start', 'stop', 'install-browser', 'preview', 'input', 'reload', 'close-preview', 'reveal', 'agent-start', 'agent-submit', 'agent-runtime', 'agent-planner', 'agent-worker', 'agent-reconfigure', 'agent-backoff', 'agent-stop'];
   for (const name of artifactChannels) ipcMain.removeHandler(`artifacts:${name}`);
   handle('artifacts:capabilities', (_event, selection: unknown) => services.artifacts.capabilities.status(artifactSetupSelectionSchema.parse(selection)));
   handle('artifacts:install-capabilities', (_event, selection: unknown) => services.artifacts.capabilities.install(artifactSetupSelectionSchema.parse(selection)));
@@ -80,9 +80,21 @@ export function registerIpc(window: BrowserWindow, services: Services): void {
     const result = await dialog.showOpenDialog(window, { title: 'Choose a folder to share with this artifact', properties: ['openDirectory'] });
     if (result.canceled || !result.filePaths[0]) return null;
     const directory = await fs.realpath(result.filePaths[0]);
-    return { id: `folder-${randomUUID().slice(0, 8)}`, label: path.basename(directory) || directory, path: directory, access: 'read' as const };
+    let packageScripts: string[] = [];
+    try {
+      const manifest = path.join(directory, 'package.json');
+      const stat = await fs.lstat(manifest);
+      if (stat.isFile() && !stat.isSymbolicLink() && stat.size <= 512 * 1024) {
+        const value = JSON.parse(await fs.readFile(manifest, 'utf8')) as { scripts?: Record<string, unknown> };
+        packageScripts = Object.entries(value.scripts || {})
+          .filter((entry): entry is [string, string] => typeof entry[1] === 'string' && /^[A-Za-z0-9][A-Za-z0-9:._-]{0,127}$/.test(entry[0]))
+          .map(([name]) => name).sort().slice(0, 100);
+      }
+    } catch { /* A folder without a readable package.json simply has no scripts. */ }
+    return { id: `folder-${randomUUID().slice(0, 8)}`, label: path.basename(directory) || directory, path: directory, access: 'read' as const, packageScripts };
   });
   handle('artifacts:access', (_event, id: unknown) => services.artifacts.library.access(artifactId.parse(id)));
+  handle('artifacts:process-scripts', (_event, id: unknown) => services.artifacts.processScripts(artifactId.parse(id)));
   handle('artifacts:save-access', async (_event, id: unknown, raw: unknown) => {
     const checkedId = artifactId.parse(id);
     await services.artifacts.saveAccess(checkedId, artifactAccessSchema.parse(raw));

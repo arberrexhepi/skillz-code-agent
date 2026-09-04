@@ -132,7 +132,7 @@ test('Finder metadata does not prevent creating a library or artifact and stays 
 test('prebuilt issue manager is optional, installs as an independent artifact, and requires an explicit write grant', async(t) => {
   const {root,library}=fixture(t);await library.configure(path.join(root,'library'));
   const repository=path.join(root,'managed repo');fs.mkdirSync(repository);fs.writeFileSync(path.join(repository,'repo_facts.md'),'# Facts\n');
-  const [preset]=await library.prebuilts();assert.equal(preset.id,'repo-issue-manager');assert.equal(preset.requiresWriteAccess,true);
+  const preset=(await library.prebuilts()).find(item=>item.id==='repo-issue-manager');assert.ok(preset);assert.equal(preset.requiresWriteAccess,true);
   const readonly={directories:[{id:'managed',label:'Managed repo',path:repository,access:'read'}],allowWorkspaceRead:false};
   await assert.rejects(library.installPrebuilt(preset.id,readonly),/Allow changes/);
   const writable={...readonly,directories:[{...readonly.directories[0],access:'write'}]};
@@ -141,4 +141,17 @@ test('prebuilt issue manager is optional, installs as an independent artifact, a
   assert.deepEqual(await library.access(artifact.id),writable);
   assert.match(await git(path.join(root,'library'),'ls-files','--stage',artifact.id),/^160000 /);
   assert.equal(await git(path.join(root,'library'),'status','--porcelain'),'');
+});
+
+test('prebuilt Server Manager requires Process Proxy and installs from its dedicated source', async(t) => {
+  const {root,library}=fixture(t);await library.configure(path.join(root,'library'));
+  const repository=path.join(root,'managed server');fs.mkdirSync(repository);fs.writeFileSync(path.join(repository,'package.json'),JSON.stringify({scripts:{dev:'vite',test:'vitest'}}));
+  const preset=(await library.prebuilts()).find(item=>item.id==='server-manager');assert.ok(preset);assert.equal(preset.requiresProcessProxy,true);
+  const readonly={directories:[{id:'managed',label:'Managed server',path:repository,access:'read'}],allowWorkspaceRead:false};
+  await assert.rejects(library.installPrebuilt(preset.id,readonly),/Allow Process Proxy/);
+  const executable={...readonly,directories:[{...readonly.directories[0],allowProcessProxy:true,processProxyAllowlist:['dev','test']}]};
+  const artifact=await library.installPrebuilt(preset.id,executable);
+  assert.match(fs.readFileSync(path.join(artifact.root,'src','App.tsx'),'utf8'),/Server Manager/);
+  assert.deepEqual(await library.access(artifact.id),executable);
+  assert.match(await git(path.join(root,'library'),'ls-files','--stage',artifact.id),/^160000 /);
 });

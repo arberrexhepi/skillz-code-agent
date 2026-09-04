@@ -8,14 +8,18 @@ import { WorkflowReportCard } from './agent/WorkflowReportCard';
 import { TurnThought } from './agent/TurnThought';
 import { MarkdownMessage } from './agent/MarkdownMessage';
 import { RuntimeDrawer } from './agent/RuntimeDrawer';
+import { AgentComposerControls, DEFAULT_AUTO_MAX_TURNS, submitComposerInstruction } from './agent/AgentComposerControls';
 
 export function AgentPanel({ label = 'WORKSPACE AGENT' }: { label?: string }): React.JSX.Element {
   const agent = useAgentWorkspace();
   const [prompt, setPrompt] = useState('');
+  const [autoEnabled, setAutoEnabled] = useState(false);
+  const [autoMaxTurns, setAutoMaxTurns] = useState(String(DEFAULT_AUTO_MAX_TURNS));
   const [showRuntime, setShowRuntime] = useState(false);
   const transcriptRef = useRef<HTMLDivElement>(null);
   const { bridge, pendingAction, status, notice } = agent.state;
   const continuous = bridge.planner.continuous_mode;
+  const composerBusy = Boolean(pendingAction || continuousIsActive(bridge));
   const timeline = conversationTimeline(bridge);
   const handoff = agentHandoff(bridge);
   const workingLabel = bridge.planner.executing
@@ -28,9 +32,9 @@ export function AgentPanel({ label = 'WORKSPACE AGENT' }: { label?: string }): R
 
   const submit = async (): Promise<void> => {
     const text = prompt.trim();
-    if (!text || pendingAction) return;
+    if (!text || composerBusy) return;
     setPrompt('');
-    if (!(await agent.submit(text))) setPrompt(text);
+    if (!(await submitComposerInstruction(agent, text, autoEnabled, autoMaxTurns))) setPrompt(text);
   };
 
   return (
@@ -65,8 +69,20 @@ export function AgentPanel({ label = 'WORKSPACE AGENT' }: { label?: string }): R
         <textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} onKeyDown={(event) => {
           if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void submit(); }
         }} placeholder={status === 'running' ? 'Ask the agent…' : 'Describe what you want to build…'} rows={3} />
-        <div className="composer-meta"><span>↵ send</span><span>⇧↵ newline</span></div>
-        <button type="button" className="send-button" disabled={!prompt.trim() || Boolean(pendingAction)} onClick={() => void submit()}>↑</button>
+        <AgentComposerControls
+          autoEnabled={autoEnabled}
+          maxTurns={autoMaxTurns}
+          disabled={composerBusy}
+          onAutoEnabledChange={setAutoEnabled}
+          onMaxTurnsChange={setAutoMaxTurns}
+        />
+        <button
+          type="button"
+          className="send-button"
+          aria-label={autoEnabled ? 'Start auto run' : 'Send instruction'}
+          disabled={!prompt.trim() || composerBusy}
+          onClick={() => void submit()}
+        >↑</button>
         </div>
       </div>
     </aside>

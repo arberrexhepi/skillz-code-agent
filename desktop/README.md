@@ -52,9 +52,9 @@ Use **Artifacts** in the header to build visualizations and tools with their own
 
 ### Ready-made artifacts
 
-Ready-made artifacts appear as optional installs in the artifact library and creation screen; none are installed automatically. **Repository issue manager** is the first bundled option. During installation, add one or more repositories under **Allowed system directories** and explicitly enable **Allow changes**. The running artifact can then initialize `repo_facts.md`, create and activate issues, and close or reopen existing schema-version-2 issues without starting an agent. It supports multiple granted repositories and shows read-only grants without mutation controls.
+Ready-made artifacts appear as optional installs in the artifact library and creation screen; none are installed automatically. **Server Manager** requires **Allow Process Proxy** for at least one shared repository and exposes only its whitelisted package scripts. **Repository issue manager** requires **Allow changes** and can initialize `repo_facts.md`, create and activate issues, and close or reopen existing schema-version-2 issues without starting an agent. Both support multiple explicitly granted repositories.
 
-The maintained issue-manager source is a Git submodule at `desktop/prebuilt-artifacts/repo-issue-manager`, and the desktop installer copies that version into the user's artifact library as a new independent artifact repository. Packaged builds include the submodule checkout. Clone the project and its submodules together:
+The maintained sources are Git submodules at `desktop/prebuilt-artifacts/server-manager` and `desktop/prebuilt-artifacts/repo-issue-manager`. The desktop installer copies the selected version into the user's artifact library as a new independent artifact repository. Packaged builds include both submodule checkouts. Clone the project and its submodules together:
 
 ```bash
 git clone --recurse-submodules https://github.com/arberrexhepi/skillz-code-agent.git
@@ -72,7 +72,7 @@ To move submodules to the latest commit on their configured remote branches and 
 npm --prefix desktop run submodules:update
 ```
 
-Keep `prebuilt/repo-issue-manager` as the independent artifact source branch. Commit submodule pointer updates through the normal `app` → `dev` → `main` promotion flow; do not merge the artifact source branch into those application branches.
+Keep `prebuilt/server-manager` and `prebuilt/repo-issue-manager` as independent artifact source branches. Commit submodule pointer updates through the normal `app` → `dev` → `main` promotion flow; do not merge artifact source branches into those application branches.
 
 ### Install and repair capabilities
 
@@ -93,6 +93,8 @@ The agent receives the granted folder names and container paths. Stable and beta
 Artifact agent startup checks the selected provider's local SDK and configuration before starting Docker or accepting a request. Missing SDK errors name the exact host Python executable and its installation command. For Gemini, install `google-genai` in that environment and configure `GEMINI_API_KEY` in the harness `.env` or the environment launching the desktop. Restart the artifact agent, then choose **Send original request** to retry a newly created artifact; there is no need to recreate it. These checks do not make model calls or validate an API key against the provider.
 
 The template provides `src/files.ts`: `files.roots()`, `files.list(id, relativePath)`, `files.readText(id, relativePath)`, `files.read(id, relativePath)`, and `files.writeText(id, relativePath, content, expectedSha256)`. Reads use `/files/:id/list` and `/files/:id/read`; writes use `PUT /files/:id/write` and only work for an explicit write grant. Writes are bounded to 5 MB, remain inside the canonical granted root, use atomic replacement, preserve the existing mode, and require the SHA-256 of the exact loaded content. A concurrent change returns HTTP 409 instead of being overwritten. The `repo` ID reads the artifact itself and remains read only through the browser gateway. Docker mount modes enforce the same grants when generated backend code or shell commands bypass this API.
+
+Repository grants also have a separate **Allow Process Proxy** capability. When enabled, a two-column permission control lists package scripts detected in that repository: move only trusted scripts into **Whitelist**, leaving everything else **Disallowed**. Conventional `dev`, `start`, `serve`, and `preview` scripts (including namespaced variants) are allowed by default until the list is customized. An artifact preview can spawn only those approved `npm run <script>` commands; the desktop validates each request against the current host `package.json`, runs it with native host dependencies, streams stdout/stderr back into the container process, and stops the host process group with the preview. This avoids loading macOS or Windows `node_modules` inside Linux while keeping execution opt-in. Process Proxy does not install dependencies, and its warning is intentionally stronger than file-write access because repository scripts run with the current user's host privileges.
 
 ### Runtime and connections
 
