@@ -41,6 +41,8 @@ export type ArtifactCapabilityId = 'python' | 'git' | 'docker' | 'provider' | 'c
 export interface ArtifactCapability { id: ArtifactCapabilityId; label: string; ready: boolean; detail: string; installable?: boolean; optional?: boolean; download?: 'python' | 'git' | 'docker'; }
 export interface ArtifactCapabilities { selection: ArtifactSetupSelection; items: ArtifactCapability[]; ready: boolean; keyName?: string; keySaved: boolean; canSaveKey: boolean; }
 export interface ArtifactSetupProgress { running: boolean; step: string; log: string; error?: string; }
+export interface ArtifactDockerCleanupPlan { currentImage: string; obsoleteImages: string[]; orphanedVolumes: string[]; preservedImages: string[]; preservedVolumes: string[]; }
+export interface ArtifactDockerCleanupResult extends ArtifactDockerCleanupPlan { removedImages: string[]; removedVolumes: string[]; failures: string[]; }
 export type ArtifactEvent = { type: 'setup'; progress: ArtifactSetupProgress } | { type: 'runtime'; runtime: ArtifactRuntime } | { type: 'agent'; id: string; event: AgentEvent };
 export const previewInputSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('click'), x: z.number().min(0).max(3000), y: z.number().min(0).max(3000) }),
@@ -56,6 +58,8 @@ export interface ArtifactsApi {
   setupProgress(): Promise<ArtifactSetupProgress>;
   saveProviderKey(provider: ArtifactSetupSelection['provider'], key: string | null): Promise<void>;
   openSetupDownload(tool: 'python' | 'git' | 'docker'): Promise<void>;
+  dockerCleanupPlan(): Promise<ArtifactDockerCleanupPlan>;
+  cleanDocker(): Promise<ArtifactDockerCleanupResult>;
   library(): Promise<ArtifactLibrary>;
   chooseFolder(): Promise<ArtifactLibrary | null>;
   create(options: CreateArtifact): Promise<ArtifactRecord>;

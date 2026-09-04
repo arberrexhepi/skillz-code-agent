@@ -22,12 +22,16 @@ export function WorkspaceDock({ onOpenDiff }: { onOpenDiff: (path: string, stage
   return <section className={`workspace-dock ${collapsed ? 'collapsed' : ''}`}>
     <div className="dock-tabs">{tabs.map((tab) => <button type="button" key={tab.key} className={mode === tab.key ? 'active' : ''} onClick={() => { setMode(tab.key); setCollapsed(false); }}>{tab.label}{tab.count ? <span>{tab.count}</span> : null}</button>)}<button type="button" className="icon-button push-right" onClick={() => setCollapsed((value) => !value)}>{collapsed ? '⌃' : '⌄'}</button></div>
     {!collapsed && <div className="dock-body">
-      <div className={`dock-pane ${mode === 'terminal' ? '' : 'hidden'}`}><TerminalPanel embedded /></div>
+      <div className={`dock-pane ${mode === 'terminal' ? '' : 'hidden'}`}><TerminalPanel embedded onSendToAgent={(output) => agent.submit(terminalAgentPrompt(output))} /></div>
       {mode === 'activity' && <div className="dock-pane"><ActivityView /></div>}
       {mode === 'problems' && <div className="dock-pane"><ProblemsView diagnostics={diagnostics} /></div>}
       {mode === 'review' && <div className="dock-pane"><ReviewView onOpenDiff={onOpenDiff} /></div>}
     </div>}
   </section>;
+}
+
+export function terminalAgentPrompt(output: string): string {
+  return `Investigate this terminal output from the active workspace. Explain the cause and make the appropriate repository changes if a fix is needed.\n\n<terminal_output>\n${output}\n</terminal_output>`;
 }
 
 function ActivityView(): React.JSX.Element {

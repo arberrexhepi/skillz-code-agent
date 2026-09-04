@@ -3,7 +3,7 @@ import { promises as fs } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import type { ArtifactsService } from './services/artifacts';
 import { artifactSetupSelectionSchema, artifactId, artifactApisSchema, artifactAccessSchema, createArtifactSchema, previewInputSchema } from '../shared/artifacts';
-import { dialog, ipcMain, shell, type BrowserWindow, type IpcMainEvent, type IpcMainInvokeEvent } from 'electron';
+import { clipboard, dialog, ipcMain, Menu, shell, type BrowserWindow, type IpcMainEvent, type IpcMainInvokeEvent, type MenuItemConstructorOptions } from 'electron';
 import { isUntracked } from '../shared/gitStatus';
 import { z } from 'zod';
 import type { AgentService } from './services/agent';
@@ -22,12 +22,25 @@ interface Services {
 const relativePath = z.string().min(1).max(4096);
 const paths = z.array(relativePath).min(1).max(500);
 const terminalId = z.string().uuid();
+const fileEntry = z.object({
+  name: z.string().min(1).max(1024),
+  path: relativePath,
+  kind: z.enum(['file', 'directory']),
+});
+
+function sameWorkspacePath(left: string, right: string): boolean {
+  const normalize = (value: string): string => {
+    const resolved = path.resolve(value);
+    return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+  };
+  return normalize(left) === normalize(right);
+}
 
 export function registerIpc(window: BrowserWindow, services: Services): void {
   for (const channel of [
-    'workspace:current', 'workspace:choose', 'workspace:open', 'workspace:list', 'workspace:read', 'workspace:write', 'workspace:repo-facts', 'workspace:issues', 'workspace:issue-action',
+    'workspace:current', 'workspace:recent', 'workspace:choose', 'workspace:open', 'workspace:close', 'workspace:list', 'workspace:show-entry-menu', 'workspace:create-file', 'workspace:read', 'workspace:write', 'workspace:repo-facts', 'workspace:issues', 'workspace:issue-action',
     'git:status', 'git:initialize', 'git:history', 'git:file-diff', 'git:stage', 'git:stage-all', 'git:unstage', 'git:discard', 'git:commit', 'git:push',
-    'terminal:create', 'agent:start', 'agent:submit', 'agent:planner-action', 'agent:worker-action',
+    'terminal:create', 'terminal:copy', 'agent:start', 'agent:submit', 'agent:planner-action', 'agent:worker-action',
     'agent:reconfigure-runtime', 'agent:configure-backoff', 'agent:runtime-options',
     'agent:codex-subscription-status', 'agent:codex-subscription-login', 'agent:stop',
     'agent:choose-codex-cli', 'agent:set-codex-cli-path',
@@ -47,13 +60,15 @@ export function registerIpc(window: BrowserWindow, services: Services): void {
     });
   };
 
-  const artifactChannels = ['capabilities', 'install-capabilities', 'setup-progress', 'save-provider-key', 'setup-download', 'library', 'prebuilts', 'install-prebuilt', 'choose-folder', 'choose-read-directory', 'access', 'save-access', 'create', 'apis', 'save-apis', 'start', 'stop', 'install-browser', 'preview', 'input', 'reload', 'close-preview', 'reveal', 'agent-start', 'agent-submit', 'agent-runtime', 'agent-planner', 'agent-worker', 'agent-reconfigure', 'agent-backoff', 'agent-stop'];
+  const artifactChannels = ['capabilities', 'install-capabilities', 'setup-progress', 'save-provider-key', 'setup-download', 'docker-cleanup-plan', 'clean-docker', 'library', 'prebuilts', 'install-prebuilt', 'choose-folder', 'choose-read-directory', 'access', 'save-access', 'create', 'apis', 'save-apis', 'start', 'stop', 'install-browser', 'preview', 'input', 'reload', 'close-preview', 'reveal', 'agent-start', 'agent-submit', 'agent-runtime', 'agent-planner', 'agent-worker', 'agent-reconfigure', 'agent-backoff', 'agent-stop'];
   for (const name of artifactChannels) ipcMain.removeHandler(`artifacts:${name}`);
   handle('artifacts:capabilities', (_event, selection: unknown) => services.artifacts.capabilities.status(artifactSetupSelectionSchema.parse(selection)));
   handle('artifacts:install-capabilities', (_event, selection: unknown) => services.artifacts.capabilities.install(artifactSetupSelectionSchema.parse(selection)));
   handle('artifacts:setup-progress', () => services.artifacts.capabilities.snapshot());
   handle('artifacts:save-provider-key', (_event, provider: unknown, key: unknown) => services.artifacts.capabilities.saveKey(z.enum(['openai', 'gemini', 'anthropic', 'meta']).parse(provider), z.string().trim().min(1).max(8192).nullable().parse(key)));
   handle('artifacts:setup-download', (_event, tool: unknown) => services.artifacts.capabilities.openDownload(z.enum(['python', 'git', 'docker']).parse(tool)));
+  handle('artifacts:docker-cleanup-plan', () => services.artifacts.dockerCleanupPlan());
+  handle('artifacts:clean-docker', () => services.artifacts.cleanDocker());
   handle('artifacts:library', () => services.artifacts.library.library());
   handle('artifacts:prebuilts', () => services.artifacts.library.prebuilts());
   handle('artifacts:install-prebuilt', (_event, id: unknown, access: unknown, runtime: unknown) => services.artifacts.library.installPrebuilt(artifactId.parse(id), artifactAccessSchema.parse(access), runtime == null ? undefined : createArtifactSchema.shape.runtime.parse(runtime)));
@@ -97,20 +112,72 @@ export function registerIpc(window: BrowserWindow, services: Services): void {
   handle('artifacts:agent-stop', async (_event, id: unknown) => (await services.artifacts.agent(artifactId.parse(id))).stop());
 
   handle('workspace:current', () => services.workspace.current());
+  handle('workspace:recent', () => services.workspace.recent());
   handle('workspace:choose', async () => {
+    const previous = services.workspace.current();
     const selected = await services.workspace.choose(window);
-    if (selected) {
+    if (selected && (!previous || !sameWorkspacePath(previous.root, selected.root))) {
       services.terminal.disposeAll();
       await services.agent.stop();
     }
     return selected;
   });
   handle('workspace:open', async (_event, root: unknown) => {
+    const candidate = z.string().min(1).parse(root);
+    const current = services.workspace.current();
+    if (current && sameWorkspacePath(current.root, candidate)) return current;
     services.terminal.disposeAll();
     await services.agent.stop();
-    return services.workspace.open(z.string().min(1).parse(root));
+    return services.workspace.open(candidate);
+  });
+  handle('workspace:close', async () => {
+    services.terminal.disposeAll();
+    await services.agent.stop();
+    services.workspace.close();
   });
   handle('workspace:list', (_event, path: unknown = '') => services.workspace.list(z.string().max(4096).parse(path)));
+  handle('workspace:show-entry-menu', async (_event, rawEntry: unknown, rawExpanded: unknown) => {
+    const entry = fileEntry.parse(rawEntry);
+    const expanded = z.boolean().parse(rawExpanded);
+    const root = services.workspace.requireRoot();
+    const unresolved = services.workspace.resolve(entry.path);
+    const stat = await fs.lstat(unresolved);
+    if (stat.isSymbolicLink()) throw new Error('Linked entries cannot be opened from the workspace menu.');
+    if ((entry.kind === 'file' && !stat.isFile()) || (entry.kind === 'directory' && !stat.isDirectory())) throw new Error('The selected workspace entry has changed. Refresh Files and retry.');
+    const target = await fs.realpath(unresolved);
+    const relation = path.relative(root, target);
+    if (relation.startsWith('..') || path.isAbsolute(relation)) throw new Error('Path is outside the active workspace.');
+    if (!sameWorkspacePath(root, services.workspace.requireRoot())) throw new Error('Workspace changed. Open the menu again.');
+
+    return new Promise<'open' | 'toggle' | 'new-file' | null>((resolve) => {
+      let resolved = false;
+      const finish = (action: 'open' | 'toggle' | 'new-file' | null): void => {
+        if (resolved) return;
+        resolved = true;
+        resolve(action);
+      };
+      const revealLabel = process.platform === 'darwin' ? 'Reveal in Finder' : process.platform === 'win32' ? 'Reveal in File Explorer' : 'Show in File Manager';
+      const template: MenuItemConstructorOptions[] = [
+        ...(entry.kind === 'file'
+          ? [{ label: 'Open', click: () => finish('open') }]
+          : [
+              { label: 'New File…', click: () => finish('new-file') },
+              { type: 'separator' as const },
+              { label: expanded ? 'Collapse' : 'Expand', click: () => finish('toggle') },
+            ]),
+        { type: 'separator' },
+        { label: revealLabel, click: () => { shell.showItemInFolder(target); finish(null); } },
+        { type: 'separator' },
+        { label: 'Copy Relative Path', click: () => { clipboard.writeText(entry.path); finish(null); } },
+        { label: 'Copy Full Path', click: () => { clipboard.writeText(target); finish(null); } },
+      ];
+      Menu.buildFromTemplate(template).popup({ window, callback: () => finish(null) });
+    });
+  });
+  handle('workspace:create-file', (_event, parentPath: unknown, name: unknown) => services.workspace.createFile(
+    relativePath.parse(parentPath),
+    z.string().min(1).max(255).parse(name),
+  ));
   handle('workspace:read', (_event, path: unknown) => services.workspace.read(relativePath.parse(path)));
   handle('workspace:issues', (_event, root: unknown) => services.workspace.issues(z.string().min(1).max(4096).parse(root)));
   handle('workspace:issue-action', (_event, root: unknown, action: unknown, extras: unknown = {}) => services.workspace.issueAction(
@@ -159,6 +226,7 @@ export function registerIpc(window: BrowserWindow, services: Services): void {
     cols: z.number().int().min(2).max(1000),
     rows: z.number().int().min(1).max(1000),
   }).parse(options)));
+  handle('terminal:copy', (_event, text: unknown) => clipboard.writeText(z.string().min(1).max(200_000).parse(text)));
   ipcMain.on('terminal:write', (event, id: unknown, data: unknown) => {
     trusted(event);
     services.terminal.write(terminalId.parse(id), z.string().max(1024 * 1024).parse(data));

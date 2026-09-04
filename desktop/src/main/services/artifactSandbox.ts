@@ -40,6 +40,12 @@ WORKDIR /repo
   const image = 'skillz-artifact:' + hash.digest('hex').slice(0, 20);
   return { image, files, dockerfile };
 }
+export async function artifactRuntimeImage(source = harnessRoot()): Promise<string> {
+  return (await sandboxDefinition(source)).image;
+}
+export function artifactDependencyVolume(root: string): string {
+  return 'skillz-artifact-deps-' + createHash('sha256').update(root).digest('hex').slice(0, 20);
+}
 export async function sandboxImageReady(docker: string, source = harnessRoot()): Promise<boolean> {
   const { image } = await sandboxDefinition(source);
   return command(docker, ['image', 'inspect', image], source).then(() => true, () => false);
@@ -103,7 +109,7 @@ export class ArtifactSandbox {
     const args = ['run', '--rm', '--init', '--name', this.name, '--label', 'agency.aiam.skillz.artifact=true', '--label', 'agency.aiam.skillz.root=' + rootLabel(realRoot), '--cap-drop=ALL', '--security-opt=no-new-privileges', '--read-only', '--pids-limit=256', '--memory=2g', '--cpus=2', '--tmpfs', '/tmp:rw,nosuid,size=512m', '--add-host', 'host.docker.internal:host-gateway', '--workdir', containerRoot, '--mount', bindMount(realRoot, containerRoot, false)];
     if (process.platform !== 'win32' && process.getuid && process.getgid) args.push('--user', `${process.getuid()}:${process.getgid()}`);
     // Isolate Linux dependencies from packages installed on the host OS.
-    const volume = 'skillz-artifact-deps-' + createHash('sha256').update(realRoot).digest('hex').slice(0, 20);
+    const volume = artifactDependencyVolume(realRoot);
     args.push('--mount', `type=volume,src=${volume},dst=/repo/node_modules`);
     const gitDir = await git(realRoot, 'rev-parse', '--absolute-git-dir');
     args.push('--mount', bindMount(await fs.realpath(gitDir), '/artifact-git', false), '--env', 'GIT_DIR=/artifact-git', '--env', 'GIT_WORK_TREE=/repo', '--env', 'GIT_CONFIG_COUNT=1', '--env', 'GIT_CONFIG_KEY_0=safe.directory', '--env', 'GIT_CONFIG_VALUE_0=/repo');

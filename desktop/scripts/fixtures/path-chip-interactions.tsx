@@ -18,7 +18,7 @@ const calls: FileReference[] = [];
 const assert = (condition: unknown, message: string): void => { if (!condition) throw new Error(message); };
 const pass = (message: string): void => { const row = document.createElement('li'); row.textContent = 'PASS: ' + message; results.append(row); };
 const click = async (label: string) => {
-  const element = [...host.querySelectorAll<HTMLAnchorElement>('a.path-chip')].find(a=>a.getAttribute('aria-label')===label);
+  const element = [...host.querySelectorAll<HTMLElement>('.path-chip')].find(item=>item.getAttribute('aria-label')===label);
   assert(element, 'Missing link ' + label); await act(async()=>element!.click());
 };
 const markdown = 'Read `/repo/src/app.ts:12:3` and `docs/My kërkesë.md`. Compare [the guide](docs/guide.md#L8).\n\n```ts\nconst path = "src/app.ts";\n```\n\n[External](https://example.com/src/app.ts) <img src="data:," onerror="alert(1)"><a data-file-reference="src/evil.ts" href="#noop">Spoofed link</a>';
@@ -49,7 +49,7 @@ try {
   assert(calls.at(-1)?.path==='src/plan.ts','Plan path did not navigate');
   pass('Facts and plans share clickable chips without triggering disclosure controls');
   await act(async()=>root.render(<FileNavigationContext.Provider value={{root:'D:/next',open:ref=>calls.push(ref)}}><PathText>{String.raw`C:\work\src\old.ts /repo/src/new.ts`}</PathText></FileNavigationContext.Provider>));
-  assert(host.querySelectorAll('a.path-chip').length===1 && host.querySelectorAll('.path-chip.unavailable').length===1,'Old absolute path stayed active after a folder switch');
+  assert(host.querySelectorAll('.path-chip[data-file-reference]').length===1 && host.querySelectorAll('.path-chip.unavailable').length===1,'Old absolute path stayed active after a folder switch');
   await click('Open file /repo/src/new.ts');
   assert(calls.at(-1)?.path==='src/new.ts','Alias did not follow the new workspace');
   pass('Folder switches update navigation and disable paths outside the new workspace');

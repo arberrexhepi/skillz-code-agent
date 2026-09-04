@@ -43,7 +43,7 @@ const { EventEmitter } = require('node:events');
 function terminalFixture(t) {
   const children = [];
   let root = '/repo/alpha';
-  const workspace = { requireRoot: () => root };
+  const workspace = { requireRoot: () => root, current: () => ({ root, name: root.split('/').at(-1) }) };
   t.mock.method(pty, 'spawn', (_shell, _args, options) => {
     const child = { writes: [], sizes: [], kills: 0, options,
       onData(callback) { this.data = callback; },
@@ -90,11 +90,12 @@ for (const channel of ['workspace:choose', 'workspace:open']) {
     const { service, workspace, children, switchRoot } = terminalFixture(t);
     const ipcMain = new EventEmitter();
     const handlers = new Map();
+    const clipboardWrites = [];
     ipcMain.removeHandler = (name) => handlers.delete(name);
     ipcMain.handle = (name, handler) => handlers.set(name, handler);
     const original = Module._load;
     t.mock.method(Module, '_load', function (request, ...rest) {
-      return request === 'electron' ? { ipcMain, dialog: {}, shell: {} } : original.call(this, request, ...rest);
+      return request === 'electron' ? { ipcMain, clipboard: { writeText: (text) => clipboardWrites.push(text) }, dialog: {}, shell: {} } : original.call(this, request, ...rest);
     });
     const filename = require.resolve('../src/main/ipc.ts');
     delete require.cache[filename];
@@ -102,18 +103,30 @@ for (const channel of ['workspace:choose', 'workspace:open']) {
     const { registerIpc } = loadTypeScript(() => require(filename));
     let finishStop;
     let startedStop;
+    let stopCalls = 0;
     const stopping = new Promise((resolve) => { startedStop = resolve; });
     const info = { root: '/repo/beta', name: 'beta' };
     workspace.open = async () => { switchRoot(info.root); return info; };
     workspace.choose = workspace.open;
     registerIpc({ webContents: { id: 42 } }, {
       terminal: service, workspace,
-      agent: { stop: () => { startedStop(); return new Promise((resolve) => { finishStop = resolve; }); } },
+      git: { fileDiff: async (path, staged) => ({ path, staged }) },
+      agent: { stop: () => { stopCalls++; startedStop(); return new Promise((resolve) => { finishStop = resolve; }); } },
     });
     const event = { sender: { id: 42 } };
+    await handlers.get('terminal:copy')(event, 'selected failure');
+    assert.deepEqual(clipboardWrites, ['selected failure']);
+    assert.deepEqual(await handlers.get('git:file-diff')(event, 'src/app.ts', false), { path: 'src/app.ts', staged: false });
+    assert.equal(stopCalls, 0);
+    if (channel === 'workspace:open') {
+      assert.deepEqual(await handlers.get(channel)(event, '/repo/alpha'), { root: '/repo/alpha', name: 'alpha' });
+      assert.equal(children.length, 0);
+      assert.equal(stopCalls, 0);
+    }
     const oldId = service.create({ cols: 80, rows: 24 });
     const switching = handlers.get(channel)(event, info.root);
     await stopping;
+    assert.equal(stopCalls, 1);
     assert.equal(children[0].kills, 1);
     assert.doesNotThrow(() => {
       ipcMain.emit('terminal:resize', event, oldId, 100, 30);

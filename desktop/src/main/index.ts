@@ -2,16 +2,45 @@ import { installArtifactFrameSecurity } from './services/artifactFrameSecurity';
 import { ArtifactLibraryService } from './services/artifactLibrary';
 import { ArtifactsService } from './services/artifacts';
 import path from 'node:path';
-import { app, BrowserWindow, screen } from 'electron';
+import { app, BrowserWindow, Menu, screen, type MenuItemConstructorOptions } from 'electron';
 import { registerIpc } from './ipc';
 import { AgentService } from './services/agent';
 import { RuntimeSettingsService } from './services/runtimeSettings';
 import { GitService } from './services/git';
 import { TerminalService } from './services/terminal';
 import { WorkspaceService } from './services/workspace';
+import { WorkspaceHistoryService } from './services/workspaceHistory';
 
 let mainWindow: BrowserWindow | null = null;
 const shutdownTasks = new Set<Promise<unknown>>();
+
+function installApplicationMenu(): void {
+  const editorCommand = (command: 'undo' | 'redo' | 'find'): void => {
+    const window = BrowserWindow.getFocusedWindow() || mainWindow;
+    if (window && !window.isDestroyed()) window.webContents.send('editor:command', command);
+  };
+  const template: MenuItemConstructorOptions[] = [
+    ...(process.platform === 'darwin' ? [{ role: 'appMenu' as const }] : []),
+    { role: 'fileMenu' },
+    {
+      label: 'Edit',
+      submenu: [
+        { label: 'Undo', accelerator: 'CmdOrCtrl+Z', registerAccelerator: false, click: () => editorCommand('undo') },
+        { label: 'Redo', accelerator: process.platform === 'darwin' ? 'CmdOrCtrl+Shift+Z' : 'Ctrl+Y', registerAccelerator: false, click: () => editorCommand('redo') },
+        { type: 'separator' },
+        { label: 'Find', accelerator: 'CmdOrCtrl+F', click: () => editorCommand('find') },
+        { type: 'separator' },
+        { role: 'cut' },
+        { role: 'copy' },
+        { role: 'paste' },
+        { role: 'selectAll' },
+      ],
+    },
+    { role: 'viewMenu' },
+    { role: 'windowMenu' },
+  ];
+  Menu.setApplicationMenu(Menu.buildFromTemplate(template));
+}
 
 function createWindow(): void {
   const workArea = screen.getPrimaryDisplay().workAreaSize;
@@ -35,7 +64,8 @@ function createWindow(): void {
   const send = (channel: string, payload: unknown): void => {
     if (!window.isDestroyed()) window.webContents.send(channel, payload);
   };
-  const workspace = new WorkspaceService((paths) => send('workspace:changed', paths));
+  const workspaceHistory = new WorkspaceHistoryService(path.join(app.getPath('userData'), '.recent_repositories.md'));
+  const workspace = new WorkspaceService((paths) => send('workspace:changed', paths), workspaceHistory);
   const git = new GitService(workspace);
   const terminal = new TerminalService(workspace, (event) => send('terminal:event', event));
   const runtimeSettings = new RuntimeSettingsService(path.join(app.getPath('userData'), 'runtime-settings.json'));
@@ -70,6 +100,7 @@ function createWindow(): void {
 }
 
 app.whenReady().then(() => {
+  installApplicationMenu();
   createWindow();
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();

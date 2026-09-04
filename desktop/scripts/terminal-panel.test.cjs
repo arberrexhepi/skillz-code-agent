@@ -13,9 +13,10 @@ function fixture(t) {
   const observers = [];
   const requests = [];
   const events = new Set();
-  const calls = { writes: [], sizes: [], disposed: [] };
+  const calls = { writes: [], sizes: [], disposed: [], copied: [], sent: [] };
   const api = {
     create: () => new Promise((resolve, reject) => requests.push({ resolve, reject })),
+    copy: async (text) => { calls.copied.push(text); },
     write: (...args) => calls.writes.push(args),
     resize: (...args) => calls.sizes.push(args),
     dispose: (id) => calls.disposed.push(id),
@@ -35,19 +36,24 @@ function fixture(t) {
       else delete globalThis[key];
     }
   });
+  let refIndex = 0;
   const fakeReact = {
     ...React,
     useContext: () => null,
-    useRef: () => ({ current: {} }),
+    useRef: (initial) => ({ current: refIndex++ === 0 ? {} : initial }),
     useState: (initial) => [initial, (value) => labels.push(value)],
     useEffect: (effect) => effects.push(effect),
   };
   const fakeXterm = { Terminal: class {
-    constructor() { this.cols = 80; this.rows = 24; this.output = []; terminals.push(this); }
+    constructor() { this.cols = 80; this.rows = 24; this.output = []; this.selection = ''; terminals.push(this); }
     loadAddon(addon) { addon.terminal = this; }
     open() {}
     write(data) { assert.ok(!this.disposed); this.output.push(data); }
     onData(callback) { this.input = callback; return { dispose: () => { this.inputDisposed = true; } }; }
+    onSelectionChange(callback) { this.selectionChange = callback; return { dispose: () => { this.selectionDisposed = true; } }; }
+    hasSelection() { return Boolean(this.selection); }
+    getSelection() { return this.selection; }
+    clear() { this.clearCount = (this.clearCount || 0) + 1; }
     dispose() { this.disposed = true; }
   } };
   const fakeFit = { FitAddon: class { fit() { assert.ok(!this.terminal.disposed); } } };
@@ -61,13 +67,26 @@ function fixture(t) {
   const filename = require.resolve('../src/renderer/src/components/TerminalPanel.tsx');
   delete require.cache[filename];
   t.after(() => { delete require.cache[filename]; });
-  const { TerminalPanel } = load(() => require(filename));
-  TerminalPanel({ embedded: true });
-  return { setup: effects[0], labels, terminals, observers, requests, calls, events,
+  const { TerminalPanel, cleanTerminalOutput } = load(() => require(filename));
+  const tree = TerminalPanel({ embedded: true, onSendToAgent: async (output) => { calls.sent.push(output); return true; } });
+  return { setup: effects[0], labels, terminals, observers, requests, calls, events, tree, cleanTerminalOutput,
     emit: (event) => { for (const listener of events) listener(event); },
   };
 }
 const flush = () => new Promise((resolve) => setImmediate(resolve));
+
+function findButton(node, label) {
+  if (!node || typeof node !== 'object') return undefined;
+  if (node.type === 'button' && textOf(node.props.children) === label) return node;
+  for (const child of React.Children.toArray(node.props?.children)) {
+    const found = findButton(child, label);
+    if (found) return found;
+  }
+}
+
+function textOf(value) {
+  return React.Children.toArray(value).map((child) => typeof child === 'string' ? child : textOf(child?.props?.children)).join('');
+}
 
 test('a delayed create reply from an old effect is disposed without replacing the new session', async (t) => {
   const f = fixture(t);
@@ -137,4 +156,22 @@ test('creation failures are reported only while the panel is mounted', async (t)
   await flush();
   assert.match(f.labels.at(-1), /Could not start terminal:.*shell missing/);
   cleanupNew();
+});
+
+test('terminal actions copy selections, send clean recent output, and clear the display', async (t) => {
+  const f = fixture(t);
+  const cleanup = f.setup();
+  f.requests[0].resolve('session');
+  await flush();
+  f.emit({ type: 'data', sessionId: 'session', data: '\x1b[31mError: café failed\x1b[0m\r\n' });
+  await findButton(f.tree, 'Ask agent').props.onClick();
+  assert.deepEqual(f.calls.sent, ['Error: café failed']);
+  f.terminals[0].selection = 'selected error';
+  f.terminals[0].selectionChange();
+  await findButton(f.tree, 'Copy').props.onClick();
+  assert.deepEqual(f.calls.copied, ['selected error']);
+  findButton(f.tree, 'Clear').props.onClick();
+  assert.equal(f.terminals[0].clearCount, 1);
+  cleanup();
+  assert.equal(f.terminals[0].selectionDisposed, true);
 });
