@@ -3,7 +3,7 @@ import { promises as fs } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import type { ArtifactsService } from './services/artifacts';
 import { artifactSetupSelectionSchema, artifactId, artifactApisSchema, artifactAccessSchema, createArtifactSchema, previewInputSchema } from '../shared/artifacts';
-import { clipboard, dialog, ipcMain, shell, type BrowserWindow, type IpcMainEvent, type IpcMainInvokeEvent } from 'electron';
+import { clipboard, dialog, ipcMain, Menu, shell, type BrowserWindow, type IpcMainEvent, type IpcMainInvokeEvent, type MenuItemConstructorOptions } from 'electron';
 import { isUntracked } from '../shared/gitStatus';
 import { z } from 'zod';
 import type { AgentService } from './services/agent';
@@ -22,6 +22,11 @@ interface Services {
 const relativePath = z.string().min(1).max(4096);
 const paths = z.array(relativePath).min(1).max(500);
 const terminalId = z.string().uuid();
+const fileEntry = z.object({
+  name: z.string().min(1).max(1024),
+  path: relativePath,
+  kind: z.enum(['file', 'directory']),
+});
 
 function sameWorkspacePath(left: string, right: string): boolean {
   const normalize = (value: string): string => {
@@ -33,7 +38,7 @@ function sameWorkspacePath(left: string, right: string): boolean {
 
 export function registerIpc(window: BrowserWindow, services: Services): void {
   for (const channel of [
-    'workspace:current', 'workspace:recent', 'workspace:choose', 'workspace:open', 'workspace:close', 'workspace:list', 'workspace:read', 'workspace:write', 'workspace:repo-facts', 'workspace:issues', 'workspace:issue-action',
+    'workspace:current', 'workspace:recent', 'workspace:choose', 'workspace:open', 'workspace:close', 'workspace:list', 'workspace:show-entry-menu', 'workspace:create-file', 'workspace:read', 'workspace:write', 'workspace:repo-facts', 'workspace:issues', 'workspace:issue-action',
     'git:status', 'git:initialize', 'git:history', 'git:file-diff', 'git:stage', 'git:stage-all', 'git:unstage', 'git:discard', 'git:commit', 'git:push',
     'terminal:create', 'terminal:copy', 'agent:start', 'agent:submit', 'agent:planner-action', 'agent:worker-action',
     'agent:reconfigure-runtime', 'agent:configure-backoff', 'agent:runtime-options',
@@ -131,6 +136,48 @@ export function registerIpc(window: BrowserWindow, services: Services): void {
     services.workspace.close();
   });
   handle('workspace:list', (_event, path: unknown = '') => services.workspace.list(z.string().max(4096).parse(path)));
+  handle('workspace:show-entry-menu', async (_event, rawEntry: unknown, rawExpanded: unknown) => {
+    const entry = fileEntry.parse(rawEntry);
+    const expanded = z.boolean().parse(rawExpanded);
+    const root = services.workspace.requireRoot();
+    const unresolved = services.workspace.resolve(entry.path);
+    const stat = await fs.lstat(unresolved);
+    if (stat.isSymbolicLink()) throw new Error('Linked entries cannot be opened from the workspace menu.');
+    if ((entry.kind === 'file' && !stat.isFile()) || (entry.kind === 'directory' && !stat.isDirectory())) throw new Error('The selected workspace entry has changed. Refresh Files and retry.');
+    const target = await fs.realpath(unresolved);
+    const relation = path.relative(root, target);
+    if (relation.startsWith('..') || path.isAbsolute(relation)) throw new Error('Path is outside the active workspace.');
+    if (!sameWorkspacePath(root, services.workspace.requireRoot())) throw new Error('Workspace changed. Open the menu again.');
+
+    return new Promise<'open' | 'toggle' | 'new-file' | null>((resolve) => {
+      let resolved = false;
+      const finish = (action: 'open' | 'toggle' | 'new-file' | null): void => {
+        if (resolved) return;
+        resolved = true;
+        resolve(action);
+      };
+      const revealLabel = process.platform === 'darwin' ? 'Reveal in Finder' : process.platform === 'win32' ? 'Reveal in File Explorer' : 'Show in File Manager';
+      const template: MenuItemConstructorOptions[] = [
+        ...(entry.kind === 'file'
+          ? [{ label: 'Open', click: () => finish('open') }]
+          : [
+              { label: 'New File…', click: () => finish('new-file') },
+              { type: 'separator' as const },
+              { label: expanded ? 'Collapse' : 'Expand', click: () => finish('toggle') },
+            ]),
+        { type: 'separator' },
+        { label: revealLabel, click: () => { shell.showItemInFolder(target); finish(null); } },
+        { type: 'separator' },
+        { label: 'Copy Relative Path', click: () => { clipboard.writeText(entry.path); finish(null); } },
+        { label: 'Copy Full Path', click: () => { clipboard.writeText(target); finish(null); } },
+      ];
+      Menu.buildFromTemplate(template).popup({ window, callback: () => finish(null) });
+    });
+  });
+  handle('workspace:create-file', (_event, parentPath: unknown, name: unknown) => services.workspace.createFile(
+    relativePath.parse(parentPath),
+    z.string().min(1).max(255).parse(name),
+  ));
   handle('workspace:read', (_event, path: unknown) => services.workspace.read(relativePath.parse(path)));
   handle('workspace:issues', (_event, root: unknown) => services.workspace.issues(z.string().min(1).max(4096).parse(root)));
   handle('workspace:issue-action', (_event, root: unknown, action: unknown, extras: unknown = {}) => services.workspace.issueAction(

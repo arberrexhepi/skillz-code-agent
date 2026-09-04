@@ -46,6 +46,8 @@ const api: WorkbenchApi = {
     open: (root) => ipcRenderer.invoke('workspace:open', root),
     close: () => ipcRenderer.invoke('workspace:close'),
     list: (path = '') => ipcRenderer.invoke('workspace:list', path),
+    showEntryMenu: (entry, expanded) => ipcRenderer.invoke('workspace:show-entry-menu', entry, expanded),
+    createFile: (parentPath, name) => ipcRenderer.invoke('workspace:create-file', parentPath, name),
     read: (path) => ipcRenderer.invoke('workspace:read', path),
     issues: (root) => ipcRenderer.invoke('workspace:issues', root),
     issueAction: (root, action, extras) => ipcRenderer.invoke('workspace:issue-action', root, action, extras),

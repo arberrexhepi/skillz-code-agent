@@ -14,6 +14,8 @@ export interface FileEntry {
   kind: 'file' | 'directory';
 }
 
+export type WorkspaceEntryMenuAction = 'open' | 'toggle' | 'new-file' | null;
+
 export interface FileDocument {
   path: string;
   content: string;
@@ -103,6 +105,8 @@ export interface WorkbenchApi {
     open(root: string): Promise<WorkspaceInfo>;
     close(): Promise<void>;
     list(path?: string): Promise<FileEntry[]>;
+    showEntryMenu(entry: FileEntry, expanded: boolean): Promise<WorkspaceEntryMenuAction>;
+    createFile(parentPath: string, name: string): Promise<FileDocument>;
     read(path: string): Promise<FileDocument>;
     repoFacts(workspaceRoot: string): Promise<RepoFactsSnapshot>;
     issues(workspaceRoot: string): Promise<WorkspaceIssuesSnapshot>;

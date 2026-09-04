@@ -104,12 +104,19 @@ button { color: inherit; }
   color: #aeb5be; text-align: left; cursor: default; font-size: 12px; white-space: nowrap;
 }
 .tree-row:hover { background: #171c22; color: var(--bright); }
+.tree-row.context-target { background: #20262d; color: var(--bright); }
 .tree-row.active { background: #1a2420; color: #d6e6dd; box-shadow: inset 2px 0 var(--accent); }
 .tree-chevron { width: 10px; color: #68717d; font-size: 15px; }
 .tree-icon { width: 13px; text-align: center; color: #68717d; font-size: 9px; }
 .tree-icon.directory { color: #8a7ab8; }
 .tree-label { overflow: hidden; text-overflow: ellipsis; }
 .tree-loading { height: 22px; color: var(--muted); font-size: 10px; }
+.tree-new-file { height: 29px; display: flex; align-items: center; gap: 3px; padding-right: 5px; }
+.tree-new-file input { min-width: 0; flex: 1; height: 23px; border: 1px solid #466f5e; border-radius: 3px; outline: 0; background: #0a0d10; color: var(--bright); padding: 2px 5px; font-size: 11px; }
+.tree-new-file input:focus { border-color: var(--accent); box-shadow: 0 0 0 1px #69c39a33; }
+.tree-new-file button { width: 22px; height: 22px; padding: 0; border: 1px solid #303943; border-radius: 3px; background: #151a20; color: #9ea8b3; font-size: 11px; }
+.tree-new-file button:hover:not(:disabled) { border-color: #4b5967; color: var(--bright); }
+.tree-new-file button:disabled { opacity: .45; }
 
 .git-panel { display: flex; flex-direction: column; min-height: 100%; }
 .git-summary { height: 30px; padding: 0 9px 0 13px; display: flex; align-items: center; gap: 7px; font-size: 11px; color: #aab2bc; }

@@ -96,7 +96,7 @@ test('editor exposes save UI, keeps its shortcut current, and reveals lines with
   assert.deepEqual(calls.at(-1),{lineNumber:12,column:3});
   active={...active,reveal:{line:8,column:1,request:2}};
   onSave=id=>saves.push(`shortcut:${id}`);tree=render();element=findEditor(tree);
-  refs[3].current={scrollIntoView:()=>Promise.resolve()};
+  let tabScrolls=0;refs[3].current={scrollIntoView:()=>{tabScrolls++;return Promise.resolve();}};
   assert.equal(effects[1](),undefined);
   effects.forEach((effect,index)=>{if(index!==1)effect();});saveCommand();
   assert.deepEqual(calls.at(-1),{lineNumber:8,column:1});
@@ -106,5 +106,5 @@ test('editor exposes save UI, keeps its shortcut current, and reveals lines with
   assert.deepEqual(saves,['button:file:src/app.ts','shortcut:file:src/app.ts']);
   assert.equal(element.props.value,'unsaved edits');
   assert.deepEqual(calls.filter(value=>typeof value==='string'),['undo','redo','undo','action:actions.find']);
-  assert.equal(reveals,1);assert.equal(scroll.scrollLeft,40);assert.equal(wheel.prevented,true);
+  assert.equal(reveals,1);assert.equal(tabScrolls,2);assert.equal(scroll.scrollLeft,40);assert.equal(wheel.prevented,true);
 });

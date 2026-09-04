@@ -44,9 +44,12 @@ export function EditorPane(props: EditorPaneProps): React.JSX.Element {
     const position = editor.getModel()?.validatePosition({ lineNumber: active.reveal.line, column: active.reveal.column });
     if (position) { editor.setPosition(position); editor.revealPositionInCenter(position); editor.focus(); }
   };
+  const revealActiveTab = (): void => {
+    activeTabRef.current?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+  };
   useEffect(revealLine, [active?.id, active?.kind === 'file' ? active.reveal?.request : undefined]);
   useEffect(() => {
-    activeTabRef.current?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+    revealActiveTab();
   }, [active?.id]);
   const runMonacoCommand = (command: 'undo' | 'redo'): void => {
     const editor = editorRef.current;
@@ -120,7 +123,7 @@ export function EditorPane(props: EditorPaneProps): React.JSX.Element {
             </button>
           ))}
         </div>
-        <button type="button" className="editor-reveal" title="Reveal the active file in the explorer" disabled={!active} onClick={props.onRevealActive}>Jump to opened</button>
+        <button type="button" className="editor-reveal" title="Reveal the active tab and file in the explorer" disabled={!active} onClick={() => { revealActiveTab(); props.onRevealActive(); }}>Jump to opened</button>
         <button type="button" className="editor-command" aria-label="Undo" title="Undo (Ctrl/Cmd+Z)" disabled={active?.kind !== 'file'} onClick={() => runMonacoCommand('undo')}>↶</button>
         <button type="button" className="editor-command" aria-label="Redo" title="Redo (Ctrl+Y)" disabled={active?.kind !== 'file'} onClick={() => runMonacoCommand('redo')}>↷</button>
         <button type="button" className="editor-save" title="Save active file (Ctrl/Cmd+S)" disabled={active?.kind !== 'file' || !active.dirty || Boolean(props.saving)} onClick={() => { if (active?.kind === 'file') props.onSave(active.id); }}>{props.saving ? 'Saving…' : 'Save'}</button>

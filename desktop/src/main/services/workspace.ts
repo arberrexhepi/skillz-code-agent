@@ -10,6 +10,13 @@ import type { WorkspaceHistoryService } from './workspaceHistory';
 
 const HIDDEN_DIRECTORIES = new Set(['.git', 'node_modules', '.venv', '__pycache__', 'out', 'dist', 'release']);
 const MAX_TEXT_FILE_BYTES = 5 * 1024 * 1024;
+const WINDOWS_RESERVED_NAME = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i;
+
+function validateNewFileName(name: string): void {
+  if (!name || name === '.' || name === '..') throw new Error('Enter a file name.');
+  if (name !== name.trim() || name.endsWith('.') || /[<>:"/\\|?*\0]/.test(name)) throw new Error('The file name contains characters that are not supported on Windows and macOS.');
+  if (WINDOWS_RESERVED_NAME.test(name)) throw new Error('That file name is reserved by Windows.');
+}
 
 export class WorkspaceService {
   private root: string | null = null;
@@ -123,6 +130,27 @@ export class WorkspaceService {
       language: languageForPath(relativePath),
       modifiedAt: stat.mtimeMs,
     };
+  }
+
+  async createFile(parentPath: string, name: string): Promise<FileDocument> {
+    validateNewFileName(name);
+    const root = this.requireRoot();
+    const parent = this.resolve(parentPath);
+    const parentStat = await fs.lstat(parent);
+    if (parentStat.isSymbolicLink() || !parentStat.isDirectory()) throw new Error('Files can only be created in a workspace folder.');
+    const realParent = await fs.realpath(parent);
+    const relation = path.relative(root, realParent);
+    if (relation.startsWith('..') || path.isAbsolute(relation)) throw new Error('Path is outside the active workspace.');
+    if (this.requireRoot() !== root) throw new Error('Workspace changed before the file could be created.');
+    const target = path.join(realParent, name);
+    try {
+      await fs.writeFile(target, '', { encoding: 'utf8', flag: 'wx' });
+    } catch (cause) {
+      if ((cause as NodeJS.ErrnoException).code === 'EEXIST') throw new Error(`A file or folder named ${name} already exists.`);
+      throw cause;
+    }
+    const relative = path.posix.join(parentPath.replaceAll('\\', '/'), name);
+    return this.read(relative);
   }
 
   async write(relativePath: string, content: string): Promise<FileDocument> {

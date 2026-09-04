@@ -17,6 +17,8 @@ let emitAgent: ((event: AgentEvent) => void) | undefined;
 let emitEditorCommand: ((command: 'undo' | 'redo' | 'find') => void) | undefined;
 const pathsPreview = new URLSearchParams(window.location.search).has('paths');
 const manyFilesPreview = new URLSearchParams(window.location.search).has('manyFiles');
+const newFilePreview = new URLSearchParams(window.location.search).has('newFile');
+const createdFixtureFiles: Array<{ name: string; path: string; kind: 'file' }> = [];
 const factsPreview = new URLSearchParams(window.location.search).has('facts') || pathsPreview || issuesPreview;
 const planPreview = new URLSearchParams(window.location.search).has('plan');
 let planState = structuredClone(reviewFixture);
@@ -35,9 +37,17 @@ window.workbench = {
     choose: async () => { emitAgent?.({ type: 'status', status: 'stopped' }); root = root.endsWith('alpha') ? '/layout-fixture/beta' : '/layout-fixture/alpha'; return info(); },
     open: async (next) => { root = next; return info(); },
     close: async () => {},
-    list: async () => manyFilesPreview
-      ? Array.from({ length: 12 }, (_, index) => ({ name: `example-${index + 1}.ts`, path: `example-${index + 1}.ts`, kind: 'file' as const }))
-      : [{ name: 'example.ts', path: 'example.ts', kind: 'file' }],
+    list: async (path = '') => newFilePreview
+      ? path ? createdFixtureFiles : [{ name: 'src', path: 'src', kind: 'directory' as const }]
+      : manyFilesPreview
+        ? Array.from({ length: 12 }, (_, index) => ({ name: `example-${index + 1}.ts`, path: `example-${index + 1}.ts`, kind: 'file' as const }))
+        : [{ name: 'example.ts', path: 'example.ts', kind: 'file' }],
+    showEntryMenu: async (entry) => newFilePreview && entry.kind === 'directory' ? 'new-file' : entry.kind === 'file' ? 'open' : 'toggle',
+    createFile: async (parentPath, name) => {
+      const created = document(`${parentPath}/${name}`);
+      createdFixtureFiles.push({ name, path: created.path, kind: 'file' });
+      return created;
+    },
     issues: async (workspaceRoot) => factsPreview && workspaceRoot.endsWith('alpha') ? { ...structuredClone(persistedIssues), workspaceRoot } : { workspaceRoot, status: 'missing', activeIssueId: '', issues: [], proposals: [], warnings: [] },
     issueAction: async (workspaceRoot, action, extras) => { applyIssueAction(persistedIssues, action, extras); return { ...structuredClone(persistedIssues), workspaceRoot }; },
     repoFacts: async (workspaceRoot) => factsPreview && workspaceRoot.endsWith('alpha') ? repoFactsSnapshot(workspaceRoot) : { workspaceRoot, path: 'repo_facts.md', status: 'missing' },
