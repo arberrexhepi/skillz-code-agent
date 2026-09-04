@@ -5,6 +5,7 @@ import cssWorker from 'monaco-editor/languages/features/css/css.worker.js?worker
 import htmlWorker from 'monaco-editor/languages/features/html/html.worker.js?worker';
 import jsonWorker from 'monaco-editor/languages/features/json/json.worker.js?worker';
 import tsWorker from 'monaco-editor/languages/features/typescript/ts.worker.js?worker';
+import 'monaco-editor/editor/contrib/find/browser/findController.js';
 import 'monaco-editor/languages/features/css/register.js';
 import 'monaco-editor/languages/features/html/register.js';
 import 'monaco-editor/languages/features/json/register.js';

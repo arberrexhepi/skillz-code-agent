@@ -10,7 +10,7 @@ export function PathChip({ path, label }: { path: string; label?: string }): Rea
   const split = display.lastIndexOf('/');
   const title = reference ? `Open ${reference.path}${reference.line ? ` at line ${reference.line}, column ${reference.column}` : ''}\n${path}` : `${path}\nOutside the current workspace or unavailable`;
   const content = <><span className="path-chip-icon" aria-hidden="true">▧</span>{split >= 0 && <span className="path-chip-directory">{display.slice(0, split + 1)}</span>}<span className="path-chip-name">{display.slice(split + 1)}</span></>;
-  return reference && navigation ? <a className="path-chip" href={`#file:${encodeURIComponent(path)}`} title={title} aria-label={`Open file ${path}`} onClick={(event) => { event.preventDefault(); event.stopPropagation(); navigation.open(reference); }}>{content}</a>
+  return reference && navigation ? <button type="button" className="path-chip" data-file-reference={path} title={title} aria-label={`Open file ${path}`} onClick={(event) => { event.stopPropagation(); navigation.open(reference); }}>{content}</button>
     : <span className="path-chip unavailable" title={title}>{content}</span>;
 }
 function textWithPaths(value: string): ReactNode {

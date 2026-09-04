@@ -1,7 +1,7 @@
 const assert = require('node:assert/strict');
 const fs = require('node:fs'); const os = require('node:os'); const path = require('node:path');
 const { test } = require('node:test'); const load = require('./load-ts.cjs');
-const { ArtifactLibraryService, ArtifactSandbox, ArtifactsService, RuntimeSettingsService } = load(() => ({...require('../src/main/services/artifactLibrary.ts'),...require('../src/main/services/artifactSandbox.ts'),...require('../src/main/services/artifacts.ts'),...require('../src/main/services/runtimeSettings.ts')}));
+const { ArtifactLibraryService, ArtifactSandbox, ArtifactsService, RuntimeSettingsService, artifactRuntimeImage, dockerCommand, removeArtifactDependencyVolumes, command } = load(() => ({...require('../src/main/services/artifactLibrary.ts'),...require('../src/main/services/artifactSandbox.ts'),...require('../src/main/services/artifacts.ts'),...require('../src/main/services/runtimeSettings.ts'),...require('../src/main/services/artifactDockerCleanup.ts'),...require('../src/main/services/artifactProcess.ts')}));
 const harness = path.resolve(__dirname, '../..');
 function completed(child) { return new Promise((resolve,reject)=>{let out='',err='';child.stdout.setEncoding('utf8');child.stderr.setEncoding('utf8');child.stdout.on('data',s=>out+=s);child.stderr.on('data',s=>err+=s);child.on('error',reject);child.on('close',code=>code===0?resolve(out):reject(new Error(err||out)));child.stdin.end();}); }
 test('Docker enforces read grants for direct Node, subprocesses and agent tools; revocation and separate agent backends work', {timeout:240000}, async(t)=>{
@@ -14,7 +14,7 @@ test('Docker enforces read grants for direct Node, subprocesses and agent tools;
   const events=[];
   const service=new ArtifactsService(library,new RuntimeSettingsService(path.join(temp,'runtime.json')),event=>{events.push(event);if(event.type==='agent'&&event.event.type==='stderr')console.log(event.event.message.slice(-1200));},()=>workspace);
   const sandboxes=[];
-  t.after(async()=>{await service.dispose();for(const sandbox of sandboxes)await sandbox.stop();assert.equal(fs.realpathSync(path.dirname(temp)),fs.realpathSync(os.tmpdir()));assert.ok(path.basename(temp).startsWith('skillz sandbox ë '));fs.rmSync(temp,{recursive:true,force:true,maxRetries:5});});
+  t.after(async()=>{await service.dispose();for(const sandbox of sandboxes)await sandbox.stop();const records=(await library.library()).artifacts;await removeArtifactDependencyVolumes(records.map(record=>record.root),temp);assert.equal(fs.realpathSync(path.dirname(temp)),fs.realpathSync(os.tmpdir()));assert.ok(path.basename(temp).startsWith('skillz sandbox ë '));fs.rmSync(temp,{recursive:true,force:true,maxRetries:5});});
   await library.configure(path.join(temp,'library'));
   const record=await library.create({title:'Sandbox',prompt:'Read files',sourceRoot:'',shareFacts:false,shareMemory:false,access:{directories:[{id:'documents',label:'Documents',path:fs.realpathSync(documents)}],allowWorkspaceRead:true}});
   const sandbox=await service.sandbox(record.id);sandboxes.push(sandbox);
@@ -82,7 +82,7 @@ print(json.dumps({'text':request['messages'][0]['content'],'metrics':{'host_conf
   const {ArtifactAgentExecution}=load(()=>require('../src/main/services/artifactAgent.ts'));
   const sandbox=new ArtifactSandbox(record.root,[],await library.contextDirectory(record.id));
   const execution=new ArtifactAgentExecution(async()=>sandbox,()=>{});
-  t.after(async()=>{await execution.stop();assert.equal(fs.realpathSync(path.dirname(temp)),fs.realpathSync(os.tmpdir()));assert.ok(path.basename(temp).startsWith('skillz model broker '));fs.rmSync(temp,{recursive:true,force:true,maxRetries:5});});
+  t.after(async()=>{await execution.stop();await removeArtifactDependencyVolumes([record.root],temp);const docker=await dockerCommand();await command(docker,['image','rm',await artifactRuntimeImage(source)],temp).catch(error=>{if(!/no such image/i.test(String(error)))throw error;});assert.equal(fs.realpathSync(path.dirname(temp)),fs.realpathSync(os.tmpdir()));assert.ok(path.basename(temp).startsWith('skillz model broker '));fs.rmSync(temp,{recursive:true,force:true,maxRetries:5});});
   const child=await execution.launch({agentRoot:source,scriptName:'main.py',python:{executable:process.platform==='win32'?'py':'python3',args:process.platform==='win32'?['-3']:[]},env:{...process.env,PYTHONIOENCODING:'utf-8',BROKER_TEST_SECRET:'sentinel'},options:{provider:'fixture',model:'fixture'}});
   const result=await new Promise((resolve,reject)=>{let buffer='',errors='';child.stdout.setEncoding('utf8');child.stderr.setEncoding('utf8');child.stderr.on('data',text=>errors+=text);child.stdout.on('data',text=>{buffer+=text;let newline;while((newline=buffer.indexOf('\n'))>=0){const payload=JSON.parse(buffer.slice(0,newline));buffer=buffer.slice(newline+1);if(!execution.message(payload)&&payload.broker_result)resolve(payload);}});child.on('error',reject);child.on('close',code=>{if(code)reject(new Error(errors));});});
   assert.equal(result.broker_result,'hello ë');assert.equal(result.host_secret,null);assert.equal(result.metrics.host_configured,true);assert.deepEqual(result.events,[{type:'turn.started'}]);

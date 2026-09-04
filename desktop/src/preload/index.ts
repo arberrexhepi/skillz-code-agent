@@ -9,6 +9,8 @@ const api: WorkbenchApi = {
     setupProgress: () => ipcRenderer.invoke('artifacts:setup-progress'),
     saveProviderKey: (provider, key) => ipcRenderer.invoke('artifacts:save-provider-key', provider, key),
     openSetupDownload: (tool) => ipcRenderer.invoke('artifacts:setup-download', tool),
+    dockerCleanupPlan: () => ipcRenderer.invoke('artifacts:docker-cleanup-plan'),
+    cleanDocker: () => ipcRenderer.invoke('artifacts:clean-docker'),
     library: () => ipcRenderer.invoke('artifacts:library'),
     prebuilts: () => ipcRenderer.invoke('artifacts:prebuilts'),
     installPrebuilt: (id, access, runtime) => ipcRenderer.invoke('artifacts:install-prebuilt', id, access, runtime),
@@ -39,9 +41,13 @@ const api: WorkbenchApi = {
   },
   workspace: {
     current: () => ipcRenderer.invoke('workspace:current'),
+    recent: () => ipcRenderer.invoke('workspace:recent'),
     choose: () => ipcRenderer.invoke('workspace:choose'),
     open: (root) => ipcRenderer.invoke('workspace:open', root),
+    close: () => ipcRenderer.invoke('workspace:close'),
     list: (path = '') => ipcRenderer.invoke('workspace:list', path),
+    showEntryMenu: (entry, expanded) => ipcRenderer.invoke('workspace:show-entry-menu', entry, expanded),
+    createFile: (parentPath, name) => ipcRenderer.invoke('workspace:create-file', parentPath, name),
     read: (path) => ipcRenderer.invoke('workspace:read', path),
     issues: (root) => ipcRenderer.invoke('workspace:issues', root),
     issueAction: (root, action, extras) => ipcRenderer.invoke('workspace:issue-action', root, action, extras),
@@ -63,10 +69,14 @@ const api: WorkbenchApi = {
   },
   terminal: {
     create: (options) => ipcRenderer.invoke('terminal:create', options),
+    copy: (text) => ipcRenderer.invoke('terminal:copy', text),
     write: (sessionId, data) => ipcRenderer.send('terminal:write', sessionId, data),
     resize: (sessionId, cols, rows) => ipcRenderer.send('terminal:resize', sessionId, cols, rows),
     dispose: (sessionId) => ipcRenderer.send('terminal:dispose', sessionId),
     onEvent: (listener) => subscribe<TerminalEvent>('terminal:event', listener),
+  },
+  editor: {
+    onCommand: (listener) => subscribe<'undo' | 'redo' | 'find'>('editor:command', listener),
   },
   agent: {
     start: (options) => ipcRenderer.invoke('agent:start', options),

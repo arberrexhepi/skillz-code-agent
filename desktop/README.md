@@ -179,6 +179,8 @@ npm install
 npm run dev
 ```
 
+The development renderer starts at `http://localhost:55173` instead of Vite's common port 5173, leaving repository applications free to use their usual defaults. If 55173 is already occupied, Vite selects the next available port and Electron follows the resulting URL automatically.
+
 The `predev` check resolves Electron before electron-vite starts. Electron 44 can restore a missing local runtime lazily, while electron-vite otherwise fails early with `Error: Electron uninstall` when `path.txt` is absent.
 
 Layout regression checks: `npm run test:layout`. For browser interaction checks, `npm run test:layout:preview` serves `/scripts/fixtures/workspace-view.html` with the real renderer and a mock bridge (no real files, shell, or Python process). The workspace switcher alternates two fixture repositories for checking preference isolation.

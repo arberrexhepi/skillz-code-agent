@@ -12,6 +12,7 @@ import type { RuntimeSettingsService } from './runtimeSettings';
 import { terminate } from './artifactProcess';
 import { ArtifactSandbox, stopArtifactContainers } from './artifactSandbox';
 import { ArtifactAgentExecution } from './artifactAgent';
+import { cleanArtifactDockerResources, planArtifactDockerCleanup } from './artifactDockerCleanup';
 import { createServer } from 'node:net';
 
 interface Running { state: ArtifactRuntime; child?: ChildProcess; sandbox?: ArtifactSandbox; start?: Promise<ArtifactRuntime>; cancelled: boolean }
@@ -37,6 +38,9 @@ export class ArtifactsService {
     finally { this.syncing = false; }
   }
   async configure(root: string) { await this.disposeSessions(); return this.library.configure(root); }
+  private async artifactRoots(): Promise<string[]> { return (await this.library.library()).artifacts.map(artifact => artifact.root); }
+  async dockerCleanupPlan() { return planArtifactDockerCleanup(await this.artifactRoots()); }
+  async cleanDocker() { return cleanArtifactDockerResources(await this.artifactRoots()); }
   create(options: CreateArtifact): Promise<ArtifactRecord> { return this.library.create(options); }
   async start(id: string): Promise<ArtifactRuntime> {
     if (this.changingAccess.has(id)) throw new Error('File permissions are changing. Retry when saving finishes.');
