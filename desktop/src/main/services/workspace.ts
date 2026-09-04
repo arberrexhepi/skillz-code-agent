@@ -6,6 +6,7 @@ import { readRepoFacts } from './repoFacts';
 import type { RepoFactsSnapshot } from '../../shared/repoFacts';
 import { dialog, type BrowserWindow } from 'electron';
 import type { FileDocument, FileEntry, WorkspaceInfo } from '../../shared/contracts';
+import type { WorkspaceHistoryService } from './workspaceHistory';
 
 const HIDDEN_DIRECTORIES = new Set(['.git', 'node_modules', '.venv', '__pycache__', 'out', 'dist', 'release']);
 const MAX_TEXT_FILE_BYTES = 5 * 1024 * 1024;
@@ -17,7 +18,7 @@ export class WorkspaceService {
   private flushTimer: NodeJS.Timeout | null = null;
   private issueQueue: Promise<unknown> = Promise.resolve();
 
-  constructor(private readonly onFilesChanged: (paths: string[]) => void) {}
+  constructor(private readonly onFilesChanged: (paths: string[]) => void, private readonly history?: WorkspaceHistoryService) {}
 
   current(): WorkspaceInfo | null {
     if (!this.root) return null;
@@ -37,10 +38,14 @@ export class WorkspaceService {
     const resolved = path.resolve(candidate);
     const stat = await fs.stat(resolved);
     if (!stat.isDirectory()) throw new Error('Workspace must be a directory.');
-    this.root = resolved;
+    this.root = await fs.realpath(resolved);
     this.startWatcher();
-    return { root: resolved, name: path.basename(resolved) };
+    await this.history?.record(this.root).catch(() => {});
+    return { root: this.root, name: path.basename(this.root) };
   }
+
+  recent() { return this.history?.recent() || Promise.resolve([]); }
+  close(): void { this.root = null; this.stopWatcher(); }
 
   requireRoot(): string {
     if (!this.root) throw new Error('Open a workspace first.');
@@ -129,10 +134,16 @@ export class WorkspaceService {
   }
 
   dispose(): void {
+    this.root = null;
+    this.stopWatcher();
+  }
+
+  private stopWatcher(): void {
     this.watcher?.close();
     this.watcher = null;
     if (this.flushTimer) clearTimeout(this.flushTimer);
     this.flushTimer = null;
+    this.changedPaths.clear();
   }
 
   private startWatcher(): void {

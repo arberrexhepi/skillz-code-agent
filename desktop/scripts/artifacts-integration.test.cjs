@@ -2,14 +2,14 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs'); const os = require('node:os'); const path = require('node:path');
 const http = require('node:http'); const { test } = require('node:test');
 const load = require('./load-ts.cjs');
-const { ArtifactsService, ArtifactLibraryService, RuntimeSettingsService, nodeRuntime, runLogged, command } = load(() => ({ ...require('../src/main/services/artifacts.ts'), ...require('../src/main/services/artifactLibrary.ts'), ...require('../src/main/services/runtimeSettings.ts'), ...require('../src/main/services/artifactProcess.ts') }));
+const { ArtifactsService, ArtifactLibraryService, RuntimeSettingsService, nodeRuntime, runLogged, command, removeArtifactDependencyVolumes } = load(() => ({ ...require('../src/main/services/artifacts.ts'), ...require('../src/main/services/artifactLibrary.ts'), ...require('../src/main/services/runtimeSettings.ts'), ...require('../src/main/services/artifactProcess.ts'), ...require('../src/main/services/artifactDockerCleanup.ts') }));
 
 test('real artifact installs, builds, serves shaped HTTP/WebSocket APIs on dynamic ports, and renders independent Playwright pages', { timeout: 480000 }, async(t) => {
   const root=fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'skillz artifact integration ë ')));
   const library=new ArtifactLibraryService(path.join(root,'settings.json'),path.resolve(__dirname,'../artifact-template'),path.join(root,'contexts'));
   const service=new ArtifactsService(library,new RuntimeSettingsService(path.join(root,'runtime.json')),()=>{});
   let upstream;
-  t.after(async()=>{await service.dispose();if(upstream)await new Promise(resolve=>upstream.close(resolve));assert.equal(fs.realpathSync(path.dirname(root)),fs.realpathSync(os.tmpdir()));assert.ok(path.basename(root).startsWith('skillz artifact integration ë '));fs.rmSync(root,{recursive:true,force:true,maxRetries:5});});
+  t.after(async()=>{await service.dispose();if(upstream)await new Promise(resolve=>upstream.close(resolve));const records=(await library.library()).artifacts;await removeArtifactDependencyVolumes(records.map(record=>record.root),root);assert.equal(fs.realpathSync(path.dirname(root)),fs.realpathSync(os.tmpdir()));assert.ok(path.basename(root).startsWith('skillz artifact integration ë '));fs.rmSync(root,{recursive:true,force:true,maxRetries:5});});
   await library.configure(path.join(root,'library'));
   const documents=path.join(root,'documents'), managed=path.join(root,'managed');fs.mkdirSync(documents);fs.mkdirSync(managed);fs.writeFileSync(path.join(documents,'read ë.txt'),'Readable ë');fs.writeFileSync(path.join(managed,'repo_facts.md'),'First ë');
   const one=await library.create({title:'Schema ë',prompt:'Explore tables',sourceRoot:'',shareFacts:false,shareMemory:false,access:{directories:[{id:'documents',label:'Documents',path:fs.realpathSync(documents),access:'read'},{id:'managed',label:'Managed repo',path:fs.realpathSync(managed),access:'write'}],allowWorkspaceRead:false}});

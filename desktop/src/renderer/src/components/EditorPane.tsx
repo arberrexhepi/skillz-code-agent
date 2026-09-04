@@ -11,12 +11,15 @@ interface EditorPaneProps {
   onClose: (id: string) => void;
   onChange: (id: string, content: string) => void;
   onSave: (id: string) => void;
+  saving?: boolean;
 }
 
 export function EditorPane(props: EditorPaneProps): React.JSX.Element {
   const active = props.tabs.find((tab) => tab.id === props.activeId);
   const monacoRef = useRef<Monaco | null>(null);
   const editorRef = useRef<Parameters<OnMount>[0] | null>(null);
+  const propsRef = useRef(props);
+  propsRef.current = props;
   const beforeMount = (monaco: Monaco): void => {
     monaco.editor.defineTheme('skillz-dark', {
       base: 'vs-dark',
@@ -39,14 +42,27 @@ export function EditorPane(props: EditorPaneProps): React.JSX.Element {
     if (position) { editor.setPosition(position); editor.revealPositionInCenter(position); editor.focus(); }
   };
   useEffect(revealLine, [active?.id, active?.kind === 'file' ? active.reveal?.request : undefined]);
+  const runMonacoCommand = (command: 'undo' | 'redo'): void => {
+    const editor = editorRef.current;
+    if (!editor || active?.kind !== 'file') return;
+    editor.trigger('skillz-workbench', command, null);
+    editor.focus();
+  };
   const mount: OnMount = (editor, monaco) => {
     editorRef.current = editor;
     monacoRef.current = monaco;
     revealLine();
     editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => {
-      if (active?.kind === 'file') props.onSave(active.id);
+      const current = propsRef.current.tabs.find(tab => tab.id === propsRef.current.activeId);
+      if (current?.kind === 'file') propsRef.current.onSave(current.id);
     });
   };
+
+  useEffect(() => window.workbench.editor.onCommand((command) => {
+    const monacoFocused = editorRef.current?.hasTextFocus() || Boolean(document.activeElement?.closest?.('.monaco-editor'));
+    if (monacoFocused && active?.kind === 'file') runMonacoCommand(command);
+    else document.execCommand(command);
+  }), [active?.id, active?.kind]);
 
   useEffect(() => {
     const monaco = monacoRef.current;
@@ -66,20 +82,25 @@ export function EditorPane(props: EditorPaneProps): React.JSX.Element {
 
   return (
     <section className="editor-pane">
-      <div className="editor-tabs" role="tablist">
-        {props.tabs.map((tab) => (
-          <button
-            type="button"
-            key={tab.id}
-            className={`editor-tab ${tab.id === props.activeId ? 'active' : ''}`}
-            onClick={() => props.onActivate(tab.id)}
-            role="tab"
-          >
-            <span>{tab.kind === 'diff' ? 'Δ ' : ''}{tab.title}</span>
-            {tab.kind === 'file' && tab.dirty && <span className="dirty-dot">●</span>}
-            <span className="tab-close" onClick={(event) => { event.stopPropagation(); props.onClose(tab.id); }}>×</span>
-          </button>
-        ))}
+      <div className="editor-header">
+        <div className="editor-tabs" role="tablist">
+          {props.tabs.map((tab) => (
+            <button
+              type="button"
+              key={tab.id}
+              className={`editor-tab ${tab.id === props.activeId ? 'active' : ''}`}
+              onClick={() => props.onActivate(tab.id)}
+              role="tab"
+            >
+              <span>{tab.kind === 'diff' ? 'Δ ' : ''}{tab.title}</span>
+              {tab.kind === 'file' && tab.dirty && <span className="dirty-dot">●</span>}
+              <span className="tab-close" onClick={(event) => { event.stopPropagation(); props.onClose(tab.id); }}>×</span>
+            </button>
+          ))}
+        </div>
+        <button type="button" className="editor-command" aria-label="Undo" title="Undo (Ctrl/Cmd+Z)" disabled={active?.kind !== 'file'} onClick={() => runMonacoCommand('undo')}>↶</button>
+        <button type="button" className="editor-command" aria-label="Redo" title="Redo (Ctrl+Y)" disabled={active?.kind !== 'file'} onClick={() => runMonacoCommand('redo')}>↷</button>
+        <button type="button" className="editor-save" title="Save active file (Ctrl/Cmd+S)" disabled={active?.kind !== 'file' || !active.dirty || Boolean(props.saving)} onClick={() => { if (active?.kind === 'file') props.onSave(active.id); }}>{props.saving ? 'Saving…' : 'Save'}</button>
       </div>
       <div className="editor-surface">
         {!active && <EditorWelcome />}
@@ -131,7 +152,7 @@ function EditorWelcome(): React.JSX.Element {
       <div className="welcome-mark">S</div>
       <h2>Agent workbench</h2>
       <p>Open a file from the explorer or ask the agent to start shaping the repository.</p>
-      <div className="shortcut"><kbd>⌘</kbd><kbd>S</kbd><span>Save active file</span></div>
+      <div className="shortcut"><kbd>Ctrl/⌘</kbd><kbd>S</kbd><span>Save active file</span></div>
     </div>
   );
 }

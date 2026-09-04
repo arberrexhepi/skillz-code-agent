@@ -46,26 +46,37 @@ test('terminal links use terminal-cell positions across wrapping and Unicode, th
   assert.deepEqual(calls,[{path:'src/a.ts',line:12,column:3}]);
 });
 
-test('editor reveals requested lines on mount and repeated requests without replacing edited content', (t) => {
+test('editor exposes save UI, keeps its shortcut current, and reveals lines without replacing edited content', (t) => {
   const Module = require('node:module');
   const original=Module._load;
-  const refs=[];let refIndex=0;let effects=[];
+  const refs=[];let refIndex=0;let effects=[];let shellCommand;
+  const previousWindow=globalThis.window;const previousDocument=globalThis.document;
+  globalThis.window={workbench:{editor:{onCommand:(listener)=>{shellCommand=listener;return ()=>{};}}}};
+  globalThis.document={execCommand:(command)=>calls.push(`document:${command}`)};
+  t.after(()=>{globalThis.window=previousWindow;globalThis.document=previousDocument;});
   const fakeReact={...React,useRef:(value)=>refs[refIndex++] ||= {current:value},useEffect:(effect)=>effects.push(effect)};
   const FakeEditor=()=>null;
   t.mock.method(Module,'_load',function(request,...rest){ if(request==='react')return fakeReact; if(request==='@monaco-editor/react')return {__esModule:true,default:FakeEditor}; return original.call(this,request,...rest); });
   const {EditorPane}=load(()=>require('../src/renderer/src/components/EditorPane.tsx'));
   let active={id:'file:src/app.ts',kind:'file',title:'app.ts',document:{path:'src/app.ts',language:'typescript',content:'saved'},content:'unsaved edits',dirty:true,reveal:{line:12,column:3,request:1}};
-  const calls=[];
-  const editor={getModel:()=>({validatePosition:(p)=>p}),setPosition:p=>calls.push(p),revealPositionInCenter(){},focus(){},addCommand(){}};
+  const calls=[];let saveCommand;
+  const editor={getModel:()=>({validatePosition:(p)=>p}),setPosition:p=>calls.push(p),revealPositionInCenter(){},focus(){},hasTextFocus:()=>true,trigger:(_source,command)=>calls.push(command),addCommand(_key,callback){saveCommand=callback;}};
   const monaco={KeyMod:{CtrlCmd:1},KeyCode:{KeyS:2},editor:{setModelMarkers(){}}};
-  function render() {refIndex=0;effects=[];return EditorPane({tabs:[active],activeId:active.id,diagnostics:{},onSave(){}});}
+  let onSave=()=>{};
+  function render() {refIndex=0;effects=[];return EditorPane({tabs:[active],activeId:active.id,diagnostics:{},onActivate(){},onClose(){},onChange(){},onSave});}
   const findEditor=(node)=>{if(!React.isValidElement(node))return null;if(node.type===FakeEditor)return node;return React.Children.toArray(node.props.children).map(findEditor).find(Boolean);};
-  let element=findEditor(render());
+  const findSave=(node)=>{if(!React.isValidElement(node))return null;if(node.props.className==='editor-save')return node;return React.Children.toArray(node.props.children).map(findSave).find(Boolean);};
+  const findCommand=(node,label)=>{if(!React.isValidElement(node))return null;if(node.props['aria-label']===label)return node;return React.Children.toArray(node.props.children).map(child=>findCommand(child,label)).find(Boolean);};
+  const saves=[];onSave=id=>saves.push(`button:${id}`);let tree=render();let element=findEditor(tree);
   assert.equal(element.props.value,'unsaved edits');
+  const save=findSave(tree);assert.equal(save.props.disabled,false);save.props.onClick();assert.deepEqual(saves,['button:file:src/app.ts']);
   element.props.onMount(editor,monaco);
   assert.deepEqual(calls.at(-1),{lineNumber:12,column:3});
   active={...active,reveal:{line:8,column:1,request:2}};
-  element=findEditor(render());effects.forEach(effect=>effect());
+  onSave=id=>saves.push(`shortcut:${id}`);tree=render();element=findEditor(tree);effects.forEach(effect=>effect());saveCommand();
   assert.deepEqual(calls.at(-1),{lineNumber:8,column:1});
+  findCommand(tree,'Undo').props.onClick();findCommand(tree,'Redo').props.onClick();shellCommand('undo');
+  assert.deepEqual(saves,['button:file:src/app.ts','shortcut:file:src/app.ts']);
   assert.equal(element.props.value,'unsaved edits');
+  assert.deepEqual(calls.filter(value=>typeof value==='string'),['undo','redo','undo']);
 });

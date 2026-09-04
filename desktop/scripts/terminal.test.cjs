@@ -90,11 +90,12 @@ for (const channel of ['workspace:choose', 'workspace:open']) {
     const { service, workspace, children, switchRoot } = terminalFixture(t);
     const ipcMain = new EventEmitter();
     const handlers = new Map();
+    const clipboardWrites = [];
     ipcMain.removeHandler = (name) => handlers.delete(name);
     ipcMain.handle = (name, handler) => handlers.set(name, handler);
     const original = Module._load;
     t.mock.method(Module, '_load', function (request, ...rest) {
-      return request === 'electron' ? { ipcMain, dialog: {}, shell: {} } : original.call(this, request, ...rest);
+      return request === 'electron' ? { ipcMain, clipboard: { writeText: (text) => clipboardWrites.push(text) }, dialog: {}, shell: {} } : original.call(this, request, ...rest);
     });
     const filename = require.resolve('../src/main/ipc.ts');
     delete require.cache[filename];
@@ -111,6 +112,8 @@ for (const channel of ['workspace:choose', 'workspace:open']) {
       agent: { stop: () => { startedStop(); return new Promise((resolve) => { finishStop = resolve; }); } },
     });
     const event = { sender: { id: 42 } };
+    await handlers.get('terminal:copy')(event, 'selected failure');
+    assert.deepEqual(clipboardWrites, ['selected failure']);
     const oldId = service.create({ cols: 80, rows: 24 });
     const switching = handlers.get(channel)(event, info.root);
     await stopping;

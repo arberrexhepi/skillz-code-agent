@@ -28,6 +28,9 @@ button { color: inherit; }
   border-bottom: 1px solid var(--border); background: #0c0f12; -webkit-app-region: drag;
 }
 .topbar button { -webkit-app-region: no-drag; }
+.home-button { width: 28px; height: 28px; display: grid; place-items: center; flex-shrink: 0; border: 1px solid transparent; border-radius: 5px; padding: 5px; background: transparent; color: #8f9aa6; cursor: pointer; }
+.home-button:hover { border-color: var(--border); background: #1a2026; color: var(--bright); }
+.home-button svg { width: 16px; height: 16px; fill: currentColor; }
 .workspace-view-controls { display: flex; align-items: center; flex-shrink: 0; gap: 3px; border-left: 1px solid var(--border); padding-left: 10px; }
 .workspace-view-controls button { display: flex; align-items: center; gap: 6px; height: 28px; padding: 0 7px; border: 1px solid transparent; border-radius: 4px; background: transparent; color: #929ca8; font-size: 10px; cursor: pointer; }
 .workspace-view-controls button:hover { background: #20262d; color: var(--bright); }
@@ -146,7 +149,14 @@ button { color: inherit; }
 .primary-button.large { padding: 10px 18px; font-size: 12px; }
 
 .editor-pane { min-width: 0; min-height: 0; display: flex; flex-direction: column; }
-.editor-tabs { height: 36px; display: flex; overflow: auto hidden; background: #0c0f12; border-bottom: 1px solid var(--border); scrollbar-width: none; }
+.editor-header { height: 36px; display: flex; flex-shrink: 0; background: #0c0f12; border-bottom: 1px solid var(--border); }
+.editor-tabs { min-width: 0; flex: 1; display: flex; overflow: auto hidden; scrollbar-width: none; }
+.editor-save { flex-shrink: 0; min-width: 58px; border: 0; border-left: 1px solid var(--border); padding: 0 12px; background: #11171d; color: #b9c5d1; font-size: 11px; cursor: pointer; }
+.editor-save:hover:not(:disabled) { background: #1b2731; color: #e4edf6; }
+.editor-save:disabled { color: #4f5a65; cursor: default; }
+.editor-command { width: 34px; flex: 0 0 34px; border: 0; border-left: 1px solid var(--border); background: #0f1419; color: #8e99a5; font-size: 18px; line-height: 1; cursor: pointer; }
+.editor-command:hover:not(:disabled) { background: #1b2731; color: #e4edf6; }
+.editor-command:disabled { color: #3f4851; cursor: default; }
 .editor-tab {
   min-width: 115px; max-width: 190px; height: 36px; display: flex; align-items: center; gap: 7px; border: 0; border-right: 1px solid var(--border);
   background: #0e1115; padding: 0 8px 0 11px; font-size: 11px; color: #7d8793; cursor: pointer;
@@ -171,6 +181,11 @@ kbd { min-width: 20px; height: 20px; display: grid; place-items: center; border:
 .terminal-heading small { margin-left: 10px; color: #725f5f; font-size: 9px; letter-spacing: normal; }
 .terminal-host { min-height: 0; flex: 1; padding: 5px 8px; overflow: hidden; }
 .terminal-host .xterm { height: 100%; }
+.terminal-tools { min-height: 28px; display: flex; align-items: center; gap: 5px; padding: 2px 7px; border-bottom: 1px solid var(--border-soft); background: #0c0f12; }
+.terminal-tools > span { min-width: 0; overflow: hidden; color: #718079; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.terminal-tools button { min-height: 22px; border: 1px solid #29323a; border-radius: 4px; background: #13191f; color: #929da8; padding: 2px 8px; font-size: 9px; cursor: pointer; }
+.terminal-tools button:hover:not(:disabled) { border-color: #405048; color: #d7e2dc; }
+.terminal-tools button:disabled { opacity: .38; cursor: default; }
 
 .agent-panel { min-height: 0; display: flex; flex-direction: column; border-left: 1px solid var(--border); background: #0e1115; }
 .agent-header { min-height: 72px; display: flex; align-items: center; padding: 12px 14px; border-bottom: 1px solid var(--border); }
@@ -230,10 +245,18 @@ kbd { min-width: 20px; height: 20px; display: grid; place-items: center; border:
 .empty-right span { color: var(--accent); font-size: 18px; }
 
 .workspace-overlay { position: fixed; inset: 46px 0 0; display: grid; place-items: center; z-index: 20; background: radial-gradient(circle at 50% 38%, #141d1a 0, #0b0d10 42%); }
-.overlay-card { width: 430px; display: flex; flex-direction: column; align-items: center; text-align: center; }
+.overlay-card { width: min(560px, calc(100vw - 48px)); max-height: calc(100vh - 94px); display: flex; flex-direction: column; align-items: center; text-align: center; }
 .overlay-mark { width: 62px; height: 62px; border-radius: 17px; font-size: 28px; margin-bottom: 25px; }
 .overlay-card h1 { color: var(--bright); font-size: 24px; font-weight: 520; letter-spacing: -.02em; margin: 0 0 10px; }
 .overlay-card p { color: var(--muted); font-size: 12px; line-height: 1.7; margin: 0 0 25px; }
+.recent-workspaces { width: 100%; max-height: 300px; overflow:auto; margin-top: 25px; border-top: 1px solid var(--border); padding-top: 18px; text-align: left; }
+.recent-workspaces h2 { margin: 0 0 9px; color: #94a0ac; font-size: 10px; letter-spacing: .11em; text-transform: uppercase; }
+.recent-workspaces button { width: 100%; display: grid; grid-template-columns:minmax(0,1fr) auto; gap: 4px 12px; border: 1px solid transparent; border-radius: 6px; padding: 10px 11px; background: transparent; color: #cdd5dd; text-align:left; cursor:pointer; }
+.recent-workspaces button:hover:not(:disabled) { border-color: #35443d; background: #151f1b; }
+.recent-workspaces button:disabled { opacity:.5; cursor:default; }
+.recent-workspaces strong { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:12px; }
+.recent-workspaces span { grid-column:1 / -1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:#72808e; font-size:10px; }
+.recent-workspaces small { grid-column:2; grid-row:1; color:#aa8e63; font-size:9px; text-transform:uppercase; letter-spacing:.06em; }
 .global-error { position: fixed; left: 50%; bottom: 15px; transform: translateX(-50%); z-index: 40; max-width: 660px; display: flex; gap: 16px; border: 1px solid #633b3f; background: #28171a; color: #efabab; padding: 9px 12px; border-radius: 6px; font-size: 10px; box-shadow: 0 8px 30px #0008; cursor: pointer; }
 .global-error span { margin-left: auto; }
 

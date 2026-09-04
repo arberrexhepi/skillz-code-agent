@@ -2,7 +2,7 @@ import { ArtifactsWorkbench } from './components/ArtifactsWorkbench';
 import { FileNavigationContext, PathText } from './components/PathText';
 import { resolveFileReference, type FileReference } from '../../shared/fileReferences';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import type { GitStatus, WorkspaceInfo } from '../../shared/contracts';
+import type { GitStatus, RecentWorkspace, WorkspaceInfo } from '../../shared/contracts';
 import { groupDiagnostics } from '../../shared/agentCore';
 import { AgentWorkspaceProvider } from './agent/AgentWorkspaceContext';
 import { useAgentWorkspace } from './agent/agentWorkspace';
@@ -28,8 +28,10 @@ function WorkbenchApp(): React.JSX.Element {
   const [artifactsVisible, setArtifactsVisible] = useState(false);
   const [artifactsLoaded, setArtifactsLoaded] = useState(false);
   const [workspace, setWorkspace] = useState<WorkspaceInfo | null>(null);
+  const [recentWorkspaces, setRecentWorkspaces] = useState<RecentWorkspace[]>([]);
   const { view, showEditor, toggleEditor, setAgentWidth, reset: resetView } = useWorkspaceView(workspace?.root || '');
   const [tabs, setTabs] = useState<EditorTab[]>([]);
+  const [savingIds, setSavingIds] = useState<Set<string>>(() => new Set());
   const [activeId, setActiveId] = useState('');
   const [sidebarMode, setSidebarMode] = useState<'files' | 'git' | 'issues' | 'facts'>('files');
   const [revision, setRevision] = useState(0);
@@ -42,24 +44,50 @@ function WorkbenchApp(): React.JSX.Element {
 
   useEffect(() => {
     void window.workbench.workspace.current().then(setWorkspace);
+    void window.workbench.workspace.recent().then(setRecentWorkspaces).catch(() => setRecentWorkspaces([]));
     return window.workbench.workspace.onChange(() => setRevision((value) => value + 1));
   }, []);
 
+  const useWorkspace = (selected: WorkspaceInfo): void => {
+    workspaceRoot.current = selected.root;
+    setWorkspace(selected);
+    setFocusedIssueId('');
+    setGitStatus(null);
+    setTabs([]);
+    setActiveId('');
+    setRevision((value) => value + 1);
+    setError('');
+    setArtifactsVisible(false);
+    void window.workbench.workspace.recent().then(setRecentWorkspaces).catch(() => {});
+  };
+
+  const canLeaveWorkspace = (): boolean => !tabs.some(tab => tab.kind === 'file' && tab.dirty) || window.confirm('Leave this workspace and discard unsaved editor changes?');
+
   const chooseWorkspace = async (): Promise<void> => {
+    if (!canLeaveWorkspace()) return;
     try {
       const selected = await window.workbench.workspace.choose();
       if (!selected) return;
-      workspaceRoot.current = selected.root;
-      setWorkspace(selected);
-      setFocusedIssueId('');
-      setGitStatus(null);
-      setTabs([]);
-      setActiveId('');
-      setRevision((value) => value + 1);
-      setError('');
+      useWorkspace(selected);
     } catch (cause) {
       setError(cleanError(cause));
     }
+  };
+
+  const openRecentWorkspace = async (root: string): Promise<void> => {
+    if (!canLeaveWorkspace()) return;
+    try { useWorkspace(await window.workbench.workspace.open(root)); }
+    catch (cause) { setError(cleanError(cause)); void window.workbench.workspace.recent().then(setRecentWorkspaces).catch(() => {}); }
+  };
+
+  const goHome = async (): Promise<void> => {
+    if (!canLeaveWorkspace()) return;
+    try {
+      await window.workbench.workspace.close();
+      workspaceRoot.current = '';
+      setWorkspace(null); setTabs([]); setActiveId(''); setGitStatus(null); setFocusedIssueId(''); setArtifactsVisible(false); setError('');
+      setRecentWorkspaces(await window.workbench.workspace.recent());
+    } catch (cause) { setError(cleanError(cause)); }
   };
 
   const openFile = useCallback(async (raw: string, position?: FileReference): Promise<void> => {
@@ -110,14 +138,18 @@ function WorkbenchApp(): React.JSX.Element {
 
   const saveTab = async (id: string): Promise<void> => {
     const tab = tabs.find((candidate) => candidate.id === id);
-    if (!isFileTab(tab) || !tab.dirty) return;
+    if (!isFileTab(tab) || !tab.dirty || savingIds.has(id)) return;
+    setSavingIds(current => new Set(current).add(id));
+    setError('');
     try {
       const document = await window.workbench.workspace.write(tab.document.path, tab.content);
       setTabs((current) => current.map((candidate) => candidate.id === id && candidate.kind === 'file'
-        ? { ...candidate, document, content: document.content, dirty: false }
+        ? { ...candidate, document, dirty: candidate.content !== document.content }
         : candidate));
     } catch (cause) {
       setError(cleanError(cause));
+    } finally {
+      setSavingIds(current => { const next = new Set(current); next.delete(id); return next; });
     }
   };
 
@@ -153,6 +185,7 @@ function WorkbenchApp(): React.JSX.Element {
   return (
     <FileNavigationContext.Provider value={fileNavigation}><div className="app-shell">
       <header className="topbar">
+        <button type="button" className="home-button" aria-label="Home" title="Home" onClick={() => void goHome()}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 11.2 12 4l9 7.2v8.3a.5.5 0 0 1-.5.5H15v-6H9v6H3.5a.5.5 0 0 1-.5-.5Z" /></svg></button>
         <div className="brand"><span className="brand-mark">S</span><span>skillz</span></div>
         <button type="button" className="workspace-switcher" onClick={() => void chooseWorkspace()}>
           <span className="muted">Workspace</span>
@@ -189,7 +222,7 @@ function WorkbenchApp(): React.JSX.Element {
           </div>
         </aside>
       } editor={
-        <EditorPane diagnostics={groupDiagnostics(agent.state.bridge)} tabs={tabs} activeId={activeId} onActivate={setActiveId} onClose={closeTab} onChange={updateTab} onSave={(id) => void saveTab(id)} />
+        <EditorPane diagnostics={groupDiagnostics(agent.state.bridge)} tabs={tabs} activeId={activeId} onActivate={setActiveId} onClose={closeTab} onChange={updateTab} onSave={(id) => void saveTab(id)} saving={savingIds.has(activeId)} />
       } dock={
         workspace && <WorkspaceDock key={workspace.root} onOpenDiff={(path, staged) => void openDiff(path, staged)} />
       } agent={workspace ? <AgentPanel key={workspace.root} /> : (
@@ -205,6 +238,7 @@ function WorkbenchApp(): React.JSX.Element {
             <h1>Build from the repository outward.</h1>
             <p>Open a local project to activate Monaco, the terminal, Git controls, and the Python agent.</p>
             <button type="button" className="primary-button large" onClick={() => void chooseWorkspace()}>Open repository</button>
+            {recentWorkspaces.length > 0 && <section className="recent-workspaces" aria-label="Recent repositories"><h2>Recent repositories</h2>{recentWorkspaces.map(item => <button type="button" key={item.root} disabled={!item.available} onClick={() => void openRecentWorkspace(item.root)}><strong>{item.name}</strong><span>{item.root}</span>{!item.available && <small>Unavailable</small>}</button>)}</section>}
           </div>
         </div>
       )}

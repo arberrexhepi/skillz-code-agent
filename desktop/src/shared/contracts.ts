@@ -6,6 +6,7 @@ export interface WorkspaceInfo {
   root: string;
   name: string;
 }
+export interface RecentWorkspace extends WorkspaceInfo { lastOpenedAt: string; available: boolean }
 
 export interface FileEntry {
   name: string;
@@ -97,8 +98,10 @@ export interface WorkbenchApi {
   artifacts: ArtifactsApi;
   workspace: {
     current(): Promise<WorkspaceInfo | null>;
+    recent(): Promise<RecentWorkspace[]>;
     choose(): Promise<WorkspaceInfo | null>;
     open(root: string): Promise<WorkspaceInfo>;
+    close(): Promise<void>;
     list(path?: string): Promise<FileEntry[]>;
     read(path: string): Promise<FileDocument>;
     repoFacts(workspaceRoot: string): Promise<RepoFactsSnapshot>;
@@ -121,10 +124,14 @@ export interface WorkbenchApi {
   };
   terminal: {
     create(options: TerminalCreateOptions): Promise<string>;
+    copy(text: string): Promise<void>;
     write(sessionId: string, data: string): void;
     resize(sessionId: string, cols: number, rows: number): void;
     dispose(sessionId: string): void;
     onEvent(listener: (event: TerminalEvent) => void): () => void;
+  };
+  editor: {
+    onCommand(listener: (command: 'undo' | 'redo') => void): () => void;
   };
   agent: {
     start(options: AgentStartOptions): Promise<AgentResponse>;

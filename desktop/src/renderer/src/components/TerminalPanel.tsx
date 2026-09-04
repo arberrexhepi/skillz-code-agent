@@ -5,11 +5,34 @@ import { FitAddon } from '@xterm/addon-fit';
 import { Terminal } from '@xterm/xterm';
 import type { TerminalEvent } from '../../../shared/contracts';
 
-export function TerminalPanel({ embedded = false }: { embedded?: boolean }): React.JSX.Element {
+interface TerminalPanelProps {
+  embedded?: boolean;
+  onSendToAgent?: (output: string) => Promise<boolean>;
+}
+
+const MAX_CAPTURED_OUTPUT = 50_000;
+const MAX_AGENT_OUTPUT = 12_000;
+
+export function cleanTerminalOutput(output: string): string {
+  const clean = output
+    .replace(/\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, '')
+    .replace(/\r/g, '')
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, '')
+    .trim();
+  return clean.length > MAX_AGENT_OUTPUT ? `[Earlier output omitted]\n${clean.slice(-MAX_AGENT_OUTPUT)}` : clean;
+}
+
+export function TerminalPanel({ embedded = false, onSendToAgent }: TerminalPanelProps): React.JSX.Element {
   const hostRef = useRef<HTMLDivElement>(null);
+  const terminalRef = useRef<Terminal | null>(null);
+  const outputRef = useRef('');
   const [collapsed, setCollapsed] = useState(false);
   const [exitLabel, setExitLabel] = useState('');
   const [paths, setPaths] = useState<string[]>([]);
+  const [hasSelection, setHasSelection] = useState(false);
+  const [hasOutput, setHasOutput] = useState(false);
+  const [actionLabel, setActionLabel] = useState('');
+  const [sending, setSending] = useState(false);
   const navigation = useFileNavigation();
   const navigationRef = useRef(navigation);
   navigationRef.current = navigation;
@@ -29,6 +52,7 @@ export function TerminalPanel({ embedded = false }: { embedded?: boolean }): Rea
       lineHeight: 1.25,
       theme: { background: '#0b0d10', foreground: '#c6ccd5', cursor: '#9ce5c0', selectionBackground: '#26425f' },
     });
+    terminalRef.current = terminal;
     const fit = new FitAddon();
     terminal.loadAddon(fit);
     terminal.open(hostRef.current);
@@ -61,7 +85,11 @@ export function TerminalPanel({ embedded = false }: { embedded?: boolean }): Rea
       // A PTY can produce its prompt or exit before create's IPC reply arrives.
       if (starting) { pendingEvents.push(event); return; }
       if (event.sessionId !== sessionId) return;
-      if (event.type === 'data') terminal.write(event.data);
+      if (event.type === 'data') {
+        terminal.write(event.data);
+        outputRef.current = `${outputRef.current}${event.data}`.slice(-MAX_CAPTURED_OUTPUT);
+        setHasOutput(Boolean(cleanTerminalOutput(outputRef.current)));
+      }
       if (event.type === 'exit') {
         sessionId = null;
         setExitLabel(`Exited ${event.exitCode}`);
@@ -71,6 +99,7 @@ export function TerminalPanel({ embedded = false }: { embedded?: boolean }): Rea
     const input = terminal.onData((data) => {
       if (!disposed && sessionId) window.workbench.terminal.write(sessionId, data);
     });
+    const selection = terminal.onSelectionChange(() => setHasSelection(terminal.hasSelection()));
     const resize = (): void => {
       if (disposed) return;
       fit.fit();
@@ -102,12 +131,49 @@ export function TerminalPanel({ embedded = false }: { embedded?: boolean }): Rea
       observer.disconnect();
       unsubscribe();
       input.dispose();
+      selection.dispose();
       if (sessionId) window.workbench.terminal.dispose(sessionId);
       sessionId = null;
       pendingEvents.length = 0;
       terminal.dispose();
+      if (terminalRef.current === terminal) terminalRef.current = null;
     };
   }, [collapsed]);
+
+  const selectedText = (): string => terminalRef.current?.getSelection().trim() || '';
+  const copySelection = async (): Promise<void> => {
+    const text = selectedText();
+    if (!text) return;
+    try {
+      await window.workbench.terminal.copy(text);
+      setActionLabel('Copied selection');
+    } catch (cause) {
+      setActionLabel(String(cause).replace(/^Error:\s*/, ''));
+    }
+  };
+  const clear = (): void => {
+    terminalRef.current?.clear();
+    outputRef.current = '';
+    setHasOutput(false);
+    setHasSelection(false);
+    setPaths([]);
+    setActionLabel('Terminal cleared');
+  };
+  const sendToAgent = async (): Promise<void> => {
+    if (!onSendToAgent) return;
+    const output = selectedText() || cleanTerminalOutput(outputRef.current);
+    if (!output) return;
+    setSending(true);
+    setActionLabel('');
+    try {
+      const sent = await onSendToAgent(output);
+      setActionLabel(sent ? 'Sent to agent' : 'Agent could not accept the output');
+    } catch (cause) {
+      setActionLabel(String(cause).replace(/^Error:\s*/, ''));
+    } finally {
+      setSending(false);
+    }
+  };
 
   return (
     <section className={`terminal-panel ${embedded ? 'embedded' : ''} ${collapsed ? 'collapsed' : ''}`}>
@@ -118,6 +184,12 @@ export function TerminalPanel({ embedded = false }: { embedded?: boolean }): Rea
       </div>}
       {embedded && exitLabel && <div className="panel-message" role="status"><PathText>{exitLabel}</PathText></div>}
       {!collapsed && paths.length > 0 && <nav className="terminal-file-paths" aria-label="Files in terminal output"><span>Files</span>{paths.map((path) => <PathChip key={path} path={path} />)}</nav>}
+      {!collapsed && <div className="terminal-tools">
+        {actionLabel && <span role="status"><PathText>{actionLabel}</PathText></span>}
+        <button type="button" className="push-right" disabled={!hasSelection} onClick={() => void copySelection()} title="Copy selected terminal text">Copy</button>
+        {onSendToAgent && <button type="button" disabled={sending || (!hasSelection && !hasOutput)} onClick={() => void sendToAgent()} title="Send the selection, or recent output, to the workspace agent">{sending ? 'Sending…' : 'Ask agent'}</button>}
+        <button type="button" onClick={clear} title="Clear terminal output">Clear</button>
+      </div>}
       {!collapsed && <div className="terminal-host" ref={hostRef} />}
     </section>
   );

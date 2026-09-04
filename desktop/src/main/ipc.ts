@@ -3,7 +3,7 @@ import { promises as fs } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import type { ArtifactsService } from './services/artifacts';
 import { artifactSetupSelectionSchema, artifactId, artifactApisSchema, artifactAccessSchema, createArtifactSchema, previewInputSchema } from '../shared/artifacts';
-import { dialog, ipcMain, shell, type BrowserWindow, type IpcMainEvent, type IpcMainInvokeEvent } from 'electron';
+import { clipboard, dialog, ipcMain, shell, type BrowserWindow, type IpcMainEvent, type IpcMainInvokeEvent } from 'electron';
 import { isUntracked } from '../shared/gitStatus';
 import { z } from 'zod';
 import type { AgentService } from './services/agent';
@@ -25,9 +25,9 @@ const terminalId = z.string().uuid();
 
 export function registerIpc(window: BrowserWindow, services: Services): void {
   for (const channel of [
-    'workspace:current', 'workspace:choose', 'workspace:open', 'workspace:list', 'workspace:read', 'workspace:write', 'workspace:repo-facts', 'workspace:issues', 'workspace:issue-action',
+    'workspace:current', 'workspace:recent', 'workspace:choose', 'workspace:open', 'workspace:close', 'workspace:list', 'workspace:read', 'workspace:write', 'workspace:repo-facts', 'workspace:issues', 'workspace:issue-action',
     'git:status', 'git:initialize', 'git:history', 'git:file-diff', 'git:stage', 'git:stage-all', 'git:unstage', 'git:discard', 'git:commit', 'git:push',
-    'terminal:create', 'agent:start', 'agent:submit', 'agent:planner-action', 'agent:worker-action',
+    'terminal:create', 'terminal:copy', 'agent:start', 'agent:submit', 'agent:planner-action', 'agent:worker-action',
     'agent:reconfigure-runtime', 'agent:configure-backoff', 'agent:runtime-options',
     'agent:codex-subscription-status', 'agent:codex-subscription-login', 'agent:stop',
     'agent:choose-codex-cli', 'agent:set-codex-cli-path',
@@ -47,13 +47,15 @@ export function registerIpc(window: BrowserWindow, services: Services): void {
     });
   };
 
-  const artifactChannels = ['capabilities', 'install-capabilities', 'setup-progress', 'save-provider-key', 'setup-download', 'library', 'prebuilts', 'install-prebuilt', 'choose-folder', 'choose-read-directory', 'access', 'save-access', 'create', 'apis', 'save-apis', 'start', 'stop', 'install-browser', 'preview', 'input', 'reload', 'close-preview', 'reveal', 'agent-start', 'agent-submit', 'agent-runtime', 'agent-planner', 'agent-worker', 'agent-reconfigure', 'agent-backoff', 'agent-stop'];
+  const artifactChannels = ['capabilities', 'install-capabilities', 'setup-progress', 'save-provider-key', 'setup-download', 'docker-cleanup-plan', 'clean-docker', 'library', 'prebuilts', 'install-prebuilt', 'choose-folder', 'choose-read-directory', 'access', 'save-access', 'create', 'apis', 'save-apis', 'start', 'stop', 'install-browser', 'preview', 'input', 'reload', 'close-preview', 'reveal', 'agent-start', 'agent-submit', 'agent-runtime', 'agent-planner', 'agent-worker', 'agent-reconfigure', 'agent-backoff', 'agent-stop'];
   for (const name of artifactChannels) ipcMain.removeHandler(`artifacts:${name}`);
   handle('artifacts:capabilities', (_event, selection: unknown) => services.artifacts.capabilities.status(artifactSetupSelectionSchema.parse(selection)));
   handle('artifacts:install-capabilities', (_event, selection: unknown) => services.artifacts.capabilities.install(artifactSetupSelectionSchema.parse(selection)));
   handle('artifacts:setup-progress', () => services.artifacts.capabilities.snapshot());
   handle('artifacts:save-provider-key', (_event, provider: unknown, key: unknown) => services.artifacts.capabilities.saveKey(z.enum(['openai', 'gemini', 'anthropic', 'meta']).parse(provider), z.string().trim().min(1).max(8192).nullable().parse(key)));
   handle('artifacts:setup-download', (_event, tool: unknown) => services.artifacts.capabilities.openDownload(z.enum(['python', 'git', 'docker']).parse(tool)));
+  handle('artifacts:docker-cleanup-plan', () => services.artifacts.dockerCleanupPlan());
+  handle('artifacts:clean-docker', () => services.artifacts.cleanDocker());
   handle('artifacts:library', () => services.artifacts.library.library());
   handle('artifacts:prebuilts', () => services.artifacts.library.prebuilts());
   handle('artifacts:install-prebuilt', (_event, id: unknown, access: unknown, runtime: unknown) => services.artifacts.library.installPrebuilt(artifactId.parse(id), artifactAccessSchema.parse(access), runtime == null ? undefined : createArtifactSchema.shape.runtime.parse(runtime)));
@@ -97,6 +99,7 @@ export function registerIpc(window: BrowserWindow, services: Services): void {
   handle('artifacts:agent-stop', async (_event, id: unknown) => (await services.artifacts.agent(artifactId.parse(id))).stop());
 
   handle('workspace:current', () => services.workspace.current());
+  handle('workspace:recent', () => services.workspace.recent());
   handle('workspace:choose', async () => {
     const selected = await services.workspace.choose(window);
     if (selected) {
@@ -109,6 +112,11 @@ export function registerIpc(window: BrowserWindow, services: Services): void {
     services.terminal.disposeAll();
     await services.agent.stop();
     return services.workspace.open(z.string().min(1).parse(root));
+  });
+  handle('workspace:close', async () => {
+    services.terminal.disposeAll();
+    await services.agent.stop();
+    services.workspace.close();
   });
   handle('workspace:list', (_event, path: unknown = '') => services.workspace.list(z.string().max(4096).parse(path)));
   handle('workspace:read', (_event, path: unknown) => services.workspace.read(relativePath.parse(path)));
@@ -159,6 +167,7 @@ export function registerIpc(window: BrowserWindow, services: Services): void {
     cols: z.number().int().min(2).max(1000),
     rows: z.number().int().min(1).max(1000),
   }).parse(options)));
+  handle('terminal:copy', (_event, text: unknown) => clipboard.writeText(z.string().min(1).max(200_000).parse(text)));
   ipcMain.on('terminal:write', (event, id: unknown, data: unknown) => {
     trusted(event);
     services.terminal.write(terminalId.parse(id), z.string().max(1024 * 1024).parse(data));
