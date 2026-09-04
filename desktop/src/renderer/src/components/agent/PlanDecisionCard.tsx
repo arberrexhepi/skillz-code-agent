@@ -89,7 +89,7 @@ export function PlanDecisionCard(): React.JSX.Element {
       <div className="decision-buttons"><button type="button" className="primary-button" onClick={() => openReview()}>Review full plan ↗</button><button type="button" disabled={busy} onClick={() => openReview(true)}>Suggest plan changes</button></div>
       {!review && error && <p role="alert" className="plan-error"><PathText>{error}</PathText></p>}
     </section>}
-    <dialog onClickCapture={(event) => { if ((event.target as Element).closest('a.path-chip')) close(); }} ref={dialog} className="plan-review-dialog" aria-labelledby={labelId}
+    <dialog onClickCapture={(event) => { if ((event.target as Element).closest('.path-chip[data-file-reference]')) close(); }} ref={dialog} className="plan-review-dialog" aria-labelledby={labelId}
       onCancel={(event) => { event.preventDefault(); close(); }} onClose={() => {
         // Native close events are queued; ignore one from an earlier opening.
         if (!dialog.current?.open) setReview(null);

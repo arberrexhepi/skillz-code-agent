@@ -74,7 +74,7 @@ const api: WorkbenchApi = {
     onEvent: (listener) => subscribe<TerminalEvent>('terminal:event', listener),
   },
   editor: {
-    onCommand: (listener) => subscribe<'undo' | 'redo'>('editor:command', listener),
+    onCommand: (listener) => subscribe<'undo' | 'redo' | 'find'>('editor:command', listener),
   },
   agent: {
     start: (options) => ipcRenderer.invoke('agent:start', options),

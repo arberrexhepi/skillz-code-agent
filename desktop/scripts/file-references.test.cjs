@@ -46,6 +46,27 @@ test('terminal links use terminal-cell positions across wrapping and Unicode, th
   assert.deepEqual(calls,[{path:'src/a.ts',line:12,column:3}]);
 });
 
+test('editor refresh replaces clean files and diffs while preserving unsaved buffers', () => {
+  const {applyEditorRefresh}=load(()=>require('../src/renderer/src/editorTypes.ts'));
+  const document=(content,modifiedAt)=>({path:'src/app.ts',content,language:'typescript',modifiedAt});
+  const diff=(modified)=>({path:'src/app.ts',original:'before',modified,language:'typescript'});
+  const tabs=[
+    {id:'file:clean',kind:'file',title:'clean',document:document('old',1),content:'old',dirty:false},
+    {id:'file:dirty',kind:'file',title:'dirty',document:document('old',1),content:'local edit',dirty:true},
+    {id:'diff:working:src/app.ts',kind:'diff',title:'diff',diff:diff('old'),revision:2},
+  ];
+  const next=applyEditorRefresh(tabs,[
+    {id:'file:clean',kind:'file',document:document('new',2)},
+    {id:'file:dirty',kind:'file',document:document('disk edit',2)},
+    {id:'diff:working:src/app.ts',kind:'diff',diff:diff('new')},
+  ]);
+  assert.equal(next[0].content,'new');
+  assert.equal(next[1].content,'local edit');
+  assert.equal(next[1].document.content,'old');
+  assert.equal(next[2].diff.modified,'new');
+  assert.equal(next[2].revision,3);
+});
+
 test('editor exposes save UI, keeps its shortcut current, and reveals lines without replacing edited content', (t) => {
   const Module = require('node:module');
   const original=Module._load;
@@ -60,23 +81,30 @@ test('editor exposes save UI, keeps its shortcut current, and reveals lines with
   const {EditorPane}=load(()=>require('../src/renderer/src/components/EditorPane.tsx'));
   let active={id:'file:src/app.ts',kind:'file',title:'app.ts',document:{path:'src/app.ts',language:'typescript',content:'saved'},content:'unsaved edits',dirty:true,reveal:{line:12,column:3,request:1}};
   const calls=[];let saveCommand;
-  const editor={getModel:()=>({validatePosition:(p)=>p}),setPosition:p=>calls.push(p),revealPositionInCenter(){},focus(){},hasTextFocus:()=>true,trigger:(_source,command)=>calls.push(command),addCommand(_key,callback){saveCommand=callback;}};
+  const editor={getModel:()=>({validatePosition:(p)=>p}),setPosition:p=>calls.push(p),revealPositionInCenter(){},focus(){},hasTextFocus:()=>true,trigger:(_source,command)=>calls.push(command),getAction:(name)=>({run:()=>calls.push(`action:${name}`)}),addCommand(_key,callback){saveCommand=callback;}};
   const monaco={KeyMod:{CtrlCmd:1},KeyCode:{KeyS:2},editor:{setModelMarkers(){}}};
-  let onSave=()=>{};
-  function render() {refIndex=0;effects=[];return EditorPane({tabs:[active],activeId:active.id,diagnostics:{},onActivate(){},onClose(){},onChange(){},onSave});}
+  let onSave=()=>{};let reveals=0;
+  function render() {refIndex=0;effects=[];return EditorPane({tabs:[active],activeId:active.id,diagnostics:{},onActivate(){},onClose(){},onChange(){},onSave,onRevealActive(){reveals++;}});}
   const findEditor=(node)=>{if(!React.isValidElement(node))return null;if(node.type===FakeEditor)return node;return React.Children.toArray(node.props.children).map(findEditor).find(Boolean);};
   const findSave=(node)=>{if(!React.isValidElement(node))return null;if(node.props.className==='editor-save')return node;return React.Children.toArray(node.props.children).map(findSave).find(Boolean);};
   const findCommand=(node,label)=>{if(!React.isValidElement(node))return null;if(node.props['aria-label']===label)return node;return React.Children.toArray(node.props.children).map(child=>findCommand(child,label)).find(Boolean);};
+  const findClass=(node,name)=>{if(!React.isValidElement(node))return null;if(node.props.className===name)return node;return React.Children.toArray(node.props.children).map(child=>findClass(child,name)).find(Boolean);};
   const saves=[];onSave=id=>saves.push(`button:${id}`);let tree=render();let element=findEditor(tree);
   assert.equal(element.props.value,'unsaved edits');
   const save=findSave(tree);assert.equal(save.props.disabled,false);save.props.onClick();assert.deepEqual(saves,['button:file:src/app.ts']);
   element.props.onMount(editor,monaco);
   assert.deepEqual(calls.at(-1),{lineNumber:12,column:3});
   active={...active,reveal:{line:8,column:1,request:2}};
-  onSave=id=>saves.push(`shortcut:${id}`);tree=render();element=findEditor(tree);effects.forEach(effect=>effect());saveCommand();
+  onSave=id=>saves.push(`shortcut:${id}`);tree=render();element=findEditor(tree);
+  refs[3].current={scrollIntoView:()=>Promise.resolve()};
+  assert.equal(effects[1](),undefined);
+  effects.forEach((effect,index)=>{if(index!==1)effect();});saveCommand();
   assert.deepEqual(calls.at(-1),{lineNumber:8,column:1});
-  findCommand(tree,'Undo').props.onClick();findCommand(tree,'Redo').props.onClick();shellCommand('undo');
+  findCommand(tree,'Undo').props.onClick();findCommand(tree,'Redo').props.onClick();shellCommand('undo');shellCommand('find');
+  findClass(tree,'editor-reveal').props.onClick();
+  const scroll={scrollLeft:0};const wheel={deltaX:0,deltaY:40,currentTarget:scroll,preventDefault(){this.prevented=true;}};findClass(tree,'editor-tabs').props.onWheel(wheel);
   assert.deepEqual(saves,['button:file:src/app.ts','shortcut:file:src/app.ts']);
   assert.equal(element.props.value,'unsaved edits');
-  assert.deepEqual(calls.filter(value=>typeof value==='string'),['undo','redo','undo']);
+  assert.deepEqual(calls.filter(value=>typeof value==='string'),['undo','redo','undo','action:actions.find']);
+  assert.equal(reveals,1);assert.equal(scroll.scrollLeft,40);assert.equal(wheel.prevented,true);
 });

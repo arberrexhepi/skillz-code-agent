@@ -23,7 +23,7 @@ export function GoalReportDialog({ handoff, onClose }: GoalReportDialogProps): R
 
   return (
     <div className="goal-report-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
-      <section onClickCapture={(event) => { if ((event.target as Element).closest('a.path-chip')) onClose(); }} className="goal-report-dialog" role="dialog" aria-modal="true" aria-labelledby="goal-report-title">
+      <section onClickCapture={(event) => { if ((event.target as Element).closest('.path-chip[data-file-reference]')) onClose(); }} className="goal-report-dialog" role="dialog" aria-modal="true" aria-labelledby="goal-report-title">
         <header>
           <div><span>{inProgress ? 'GOAL PROGRESS' : 'GOAL REPORT'}</span><h3 id="goal-report-title"><PathText>{handoff.plan?.summary || (inProgress ? 'Work in progress' : 'Completed work')}</PathText></h3></div>
           <button ref={closeRef} type="button" className="icon-button" aria-label="Close goal report" onClick={onClose}>×</button>

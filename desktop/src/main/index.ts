@@ -15,7 +15,7 @@ let mainWindow: BrowserWindow | null = null;
 const shutdownTasks = new Set<Promise<unknown>>();
 
 function installApplicationMenu(): void {
-  const editorCommand = (command: 'undo' | 'redo'): void => {
+  const editorCommand = (command: 'undo' | 'redo' | 'find'): void => {
     const window = BrowserWindow.getFocusedWindow() || mainWindow;
     if (window && !window.isDestroyed()) window.webContents.send('editor:command', command);
   };
@@ -27,6 +27,8 @@ function installApplicationMenu(): void {
       submenu: [
         { label: 'Undo', accelerator: 'CmdOrCtrl+Z', registerAccelerator: false, click: () => editorCommand('undo') },
         { label: 'Redo', accelerator: process.platform === 'darwin' ? 'CmdOrCtrl+Shift+Z' : 'Ctrl+Y', registerAccelerator: false, click: () => editorCommand('redo') },
+        { type: 'separator' },
+        { label: 'Find', accelerator: 'CmdOrCtrl+F', click: () => editorCommand('find') },
         { type: 'separator' },
         { role: 'cut' },
         { role: 'copy' },

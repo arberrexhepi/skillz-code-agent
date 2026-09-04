@@ -1,5 +1,5 @@
 import { useEffect, useRef } from 'react';
-import Editor, { DiffEditor, type Monaco, type OnMount } from '@monaco-editor/react';
+import Editor, { DiffEditor, type DiffOnMount, type Monaco, type OnMount } from '@monaco-editor/react';
 import type { DiagnosticItem } from '../../../shared/agentTypes';
 import type { EditorTab, FileTab } from '../editorTypes';
 
@@ -11,6 +11,7 @@ interface EditorPaneProps {
   onClose: (id: string) => void;
   onChange: (id: string, content: string) => void;
   onSave: (id: string) => void;
+  onRevealActive: () => void;
   saving?: boolean;
 }
 
@@ -18,6 +19,8 @@ export function EditorPane(props: EditorPaneProps): React.JSX.Element {
   const active = props.tabs.find((tab) => tab.id === props.activeId);
   const monacoRef = useRef<Monaco | null>(null);
   const editorRef = useRef<Parameters<OnMount>[0] | null>(null);
+  const diffEditorRef = useRef<Parameters<DiffOnMount>[0] | null>(null);
+  const activeTabRef = useRef<HTMLButtonElement | null>(null);
   const propsRef = useRef(props);
   propsRef.current = props;
   const beforeMount = (monaco: Monaco): void => {
@@ -42,6 +45,9 @@ export function EditorPane(props: EditorPaneProps): React.JSX.Element {
     if (position) { editor.setPosition(position); editor.revealPositionInCenter(position); editor.focus(); }
   };
   useEffect(revealLine, [active?.id, active?.kind === 'file' ? active.reveal?.request : undefined]);
+  useEffect(() => {
+    activeTabRef.current?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+  }, [active?.id]);
   const runMonacoCommand = (command: 'undo' | 'redo'): void => {
     const editor = editorRef.current;
     if (!editor || active?.kind !== 'file') return;
@@ -57,8 +63,19 @@ export function EditorPane(props: EditorPaneProps): React.JSX.Element {
       if (current?.kind === 'file') propsRef.current.onSave(current.id);
     });
   };
+  const mountDiff: DiffOnMount = (editor) => {
+    diffEditorRef.current = editor;
+  };
 
   useEffect(() => window.workbench.editor.onCommand((command) => {
+    if (command === 'find') {
+      const editor = active?.kind === 'diff' ? diffEditorRef.current?.getModifiedEditor() : editorRef.current;
+      if (editor) {
+        editor.focus();
+        void editor.getAction('actions.find')?.run();
+      }
+      return;
+    }
     const monacoFocused = editorRef.current?.hasTextFocus() || Boolean(document.activeElement?.closest?.('.monaco-editor'));
     if (monacoFocused && active?.kind === 'file') runMonacoCommand(command);
     else document.execCommand(command);
@@ -83,9 +100,14 @@ export function EditorPane(props: EditorPaneProps): React.JSX.Element {
   return (
     <section className="editor-pane">
       <div className="editor-header">
-        <div className="editor-tabs" role="tablist">
+        <div className="editor-tabs" role="tablist" onWheel={(event) => {
+          if (Math.abs(event.deltaY) <= Math.abs(event.deltaX)) return;
+          event.currentTarget.scrollLeft += event.deltaY;
+          event.preventDefault();
+        }}>
           {props.tabs.map((tab) => (
             <button
+              ref={tab.id === props.activeId ? activeTabRef : undefined}
               type="button"
               key={tab.id}
               className={`editor-tab ${tab.id === props.activeId ? 'active' : ''}`}
@@ -98,6 +120,7 @@ export function EditorPane(props: EditorPaneProps): React.JSX.Element {
             </button>
           ))}
         </div>
+        <button type="button" className="editor-reveal" title="Reveal the active file in the explorer" disabled={!active} onClick={props.onRevealActive}>Jump to opened</button>
         <button type="button" className="editor-command" aria-label="Undo" title="Undo (Ctrl/Cmd+Z)" disabled={active?.kind !== 'file'} onClick={() => runMonacoCommand('undo')}>↶</button>
         <button type="button" className="editor-command" aria-label="Redo" title="Redo (Ctrl+Y)" disabled={active?.kind !== 'file'} onClick={() => runMonacoCommand('redo')}>↷</button>
         <button type="button" className="editor-save" title="Save active file (Ctrl/Cmd+S)" disabled={active?.kind !== 'file' || !active.dirty || Boolean(props.saving)} onClick={() => { if (active?.kind === 'file') props.onSave(active.id); }}>{props.saving ? 'Saving…' : 'Save'}</button>
@@ -119,12 +142,13 @@ export function EditorPane(props: EditorPaneProps): React.JSX.Element {
         )}
         {active?.kind === 'diff' && (
           <DiffEditor
-            key={active.id}
+            key={`${active.id}:${active.revision || 0}`}
             original={active.diff.original}
             modified={active.diff.modified}
             language={active.diff.language}
             theme="skillz-dark"
             beforeMount={beforeMount}
+            onMount={mountDiff}
             options={{ ...editorOptions, readOnly: true, renderSideBySide: true }}
           />
         )}

@@ -14,7 +14,9 @@ const response = async () => ({ ok: true, state: { planner: {}, transcript: [] }
 const issuesPreview = new URLSearchParams(window.location.search).has('issues');
 let persistedIssues = issuesSnapshot(root);
 let emitAgent: ((event: AgentEvent) => void) | undefined;
+let emitEditorCommand: ((command: 'undo' | 'redo' | 'find') => void) | undefined;
 const pathsPreview = new URLSearchParams(window.location.search).has('paths');
+const manyFilesPreview = new URLSearchParams(window.location.search).has('manyFiles');
 const factsPreview = new URLSearchParams(window.location.search).has('facts') || pathsPreview || issuesPreview;
 const planPreview = new URLSearchParams(window.location.search).has('plan');
 let planState = structuredClone(reviewFixture);
@@ -33,7 +35,9 @@ window.workbench = {
     choose: async () => { emitAgent?.({ type: 'status', status: 'stopped' }); root = root.endsWith('alpha') ? '/layout-fixture/beta' : '/layout-fixture/alpha'; return info(); },
     open: async (next) => { root = next; return info(); },
     close: async () => {},
-    list: async () => [{ name: 'example.ts', path: 'example.ts', kind: 'file' }],
+    list: async () => manyFilesPreview
+      ? Array.from({ length: 12 }, (_, index) => ({ name: `example-${index + 1}.ts`, path: `example-${index + 1}.ts`, kind: 'file' as const }))
+      : [{ name: 'example.ts', path: 'example.ts', kind: 'file' }],
     issues: async (workspaceRoot) => factsPreview && workspaceRoot.endsWith('alpha') ? { ...structuredClone(persistedIssues), workspaceRoot } : { workspaceRoot, status: 'missing', activeIssueId: '', issues: [], proposals: [], warnings: [] },
     issueAction: async (workspaceRoot, action, extras) => { applyIssueAction(persistedIssues, action, extras); return { ...structuredClone(persistedIssues), workspaceRoot }; },
     repoFacts: async (workspaceRoot) => factsPreview && workspaceRoot.endsWith('alpha') ? repoFactsSnapshot(workspaceRoot) : { workspaceRoot, path: 'repo_facts.md', status: 'missing' },
@@ -47,7 +51,12 @@ window.workbench = {
     create: async () => `fixture-terminal-${++terminalCount}`, copy: async () => {}, write: noop, resize: noop, dispose: noop,
     onEvent: (listener) => { const timer = setTimeout(() => listener({ type: 'data', sessionId: `fixture-terminal-${terminalCount}`, data: pathsPreview ? '\r\nError /repo/src/app.ts:12:3 — inspect `docs/My kërkesë.md`\r\n' : '\r\nLayout fixture terminal — no shell connected.\r\n' }), 100); return () => clearTimeout(timer); },
   },
-  editor: { onCommand: () => noop },
+  editor: {
+    onCommand: (listener) => {
+      emitEditorCommand = listener;
+      return () => { if (emitEditorCommand === listener) emitEditorCommand = undefined; };
+    },
+  },
   agent: {
     start: async () => issuesPreview ? (emitAgent?.({ type: 'status', status: 'running' }), { ok: true, state: issuesBridge(persistedIssues) }) : suggestionsPreview ? { ok: true, state: suggestionsState } : planPreview ? { ok: true, state: planState } : response(), submit: response,
     plannerAction: async (action, extras) => {
@@ -107,6 +116,8 @@ window.workbench = {
     },
   },
 } as WorkbenchApi;
+
+(window as typeof window & { sendFixtureEditorCommand?: (command: 'undo' | 'redo' | 'find') => void }).sendFixtureEditorCommand = (command) => emitEditorCommand?.(command);
 
 if (new URLSearchParams(window.location.search).has('artifacts')) await import('./artifacts-fixture');
 void import('../../src/renderer/src/main');

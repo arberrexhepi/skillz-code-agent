@@ -16,7 +16,7 @@ import { GitPanel } from './components/GitPanel';
 import { WorkspaceDock } from './components/WorkspaceDock';
 import { WorkspaceLayout } from './components/WorkspaceLayout';
 import { WorkspaceViewControls } from './components/WorkspaceViewControls';
-import type { EditorTab } from './editorTypes';
+import { applyEditorRefresh, type EditorTab, type RefreshedEditorTab } from './editorTypes';
 import { useWorkspaceView } from './useWorkspaceView';
 
 export default function App(): React.JSX.Element {
@@ -33,6 +33,7 @@ function WorkbenchApp(): React.JSX.Element {
   const [tabs, setTabs] = useState<EditorTab[]>([]);
   const [savingIds, setSavingIds] = useState<Set<string>>(() => new Set());
   const [activeId, setActiveId] = useState('');
+  const [explorerReveal, setExplorerReveal] = useState<{ path: string; request: number }>();
   const [sidebarMode, setSidebarMode] = useState<'files' | 'git' | 'issues' | 'facts'>('files');
   const [revision, setRevision] = useState(0);
   const [focusedIssueId, setFocusedIssueId] = useState('');
@@ -40,21 +41,48 @@ function WorkbenchApp(): React.JSX.Element {
   const [error, setError] = useState('');
   const workspaceRoot = useRef(workspace?.root || '');
   workspaceRoot.current = workspace?.root || '';
+  const tabsRef = useRef(tabs);
+  tabsRef.current = tabs;
   const revealSequence = useRef(0);
+  const refreshSequence = useRef(0);
+
+  const refreshOpenTabs = useCallback(async (): Promise<void> => {
+    const root = workspaceRoot.current;
+    if (!root) return;
+    const request = ++refreshSequence.current;
+    const candidates = tabsRef.current.filter((tab) => tab.kind === 'diff' || !tab.dirty);
+    const refreshed = (await Promise.all(candidates.map(async (tab): Promise<RefreshedEditorTab | null> => {
+      try {
+        return tab.kind === 'file'
+          ? { id: tab.id, kind: 'file', document: await window.workbench.workspace.read(tab.document.path) }
+          : { id: tab.id, kind: 'diff', diff: await window.workbench.git.fileDiff(tab.diff.path, tab.id.startsWith('diff:staged:')) };
+      } catch {
+        return null;
+      }
+    }))).filter((item): item is RefreshedEditorTab => Boolean(item));
+    if (root !== workspaceRoot.current || request !== refreshSequence.current) return;
+    setTabs((current) => applyEditorRefresh(current, refreshed));
+  }, []);
 
   useEffect(() => {
     void window.workbench.workspace.current().then(setWorkspace);
     void window.workbench.workspace.recent().then(setRecentWorkspaces).catch(() => setRecentWorkspaces([]));
-    return window.workbench.workspace.onChange(() => setRevision((value) => value + 1));
-  }, []);
+    return window.workbench.workspace.onChange(() => {
+      setRevision((value) => value + 1);
+      void refreshOpenTabs();
+    });
+  }, [refreshOpenTabs]);
 
   const useWorkspace = (selected: WorkspaceInfo): void => {
     workspaceRoot.current = selected.root;
+    tabsRef.current = [];
+    refreshSequence.current += 1;
     setWorkspace(selected);
     setFocusedIssueId('');
     setGitStatus(null);
     setTabs([]);
     setActiveId('');
+    setExplorerReveal(undefined);
     setRevision((value) => value + 1);
     setError('');
     setArtifactsVisible(false);
@@ -85,7 +113,9 @@ function WorkbenchApp(): React.JSX.Element {
     try {
       await window.workbench.workspace.close();
       workspaceRoot.current = '';
-      setWorkspace(null); setTabs([]); setActiveId(''); setGitStatus(null); setFocusedIssueId(''); setArtifactsVisible(false); setError('');
+      tabsRef.current = [];
+      refreshSequence.current += 1;
+      setWorkspace(null); setTabs([]); setActiveId(''); setExplorerReveal(undefined); setGitStatus(null); setFocusedIssueId(''); setArtifactsVisible(false); setError('');
       setRecentWorkspaces(await window.workbench.workspace.recent());
     } catch (cause) { setError(cleanError(cause)); }
   };
@@ -97,9 +127,12 @@ function WorkbenchApp(): React.JSX.Element {
     const path = reference.path;
     const id = `file:${path}`;
     const reveal = reference.line ? { line: reference.line, column: reference.column || 1, request: ++revealSequence.current } : undefined;
-    if (tabs.some((tab) => tab.id === id)) {
+    const existing = tabsRef.current.find((tab) => tab.id === id);
+    if (existing) {
       if (reveal) setTabs((current) => current.map((tab) => tab.id === id && tab.kind === 'file' ? { ...tab, reveal } : tab));
-      setActiveId(id); showEditor(); return;
+      setActiveId(id); showEditor();
+      if (existing.kind === 'file' && !existing.dirty) void refreshOpenTabs();
+      return;
     }
     try {
       const document = await window.workbench.workspace.read(path);
@@ -109,26 +142,24 @@ function WorkbenchApp(): React.JSX.Element {
       }]);
       setActiveId(id); showEditor();
     } catch (cause) { if (root === workspaceRoot.current) setError(cleanError(cause)); }
-  }, [showEditor, tabs]);
+  }, [refreshOpenTabs, showEditor]);
   const fileNavigation = useMemo(() => ({ root: workspace?.root || '', open: (reference: FileReference) => { void openFile(reference.path, reference); } }), [workspace?.root, openFile]);
 
   const openDiff = useCallback(async (path: string, staged: boolean): Promise<void> => {
+    const root = workspaceRoot.current;
     const id = `diff:${staged ? 'staged' : 'working'}:${path}`;
-    const existing = tabs.some((tab) => tab.id === id);
-    if (existing) {
-      setActiveId(id);
-      showEditor();
-      return;
-    }
     try {
       const diff = await window.workbench.git.fileDiff(path, staged);
-      setTabs((current) => [...current, { id, kind: 'diff', title: `${path.split('/').at(-1)} (diff)`, diff }]);
+      if (root !== workspaceRoot.current) return;
+      setTabs((current) => current.some((tab) => tab.id === id)
+        ? current.map((tab) => tab.id === id && tab.kind === 'diff' ? { ...tab, diff, revision: (tab.revision || 0) + 1 } : tab)
+        : [...current, { id, kind: 'diff', title: `${path.split('/').at(-1)} (diff)`, diff, revision: 0 }]);
       setActiveId(id);
       showEditor();
     } catch (cause) {
       setError(cleanError(cause));
     }
-  }, [showEditor, tabs]);
+  }, [showEditor]);
 
   const updateTab = (id: string, content: string): void => {
     setTabs((current) => current.map((tab) => tab.id === id && tab.kind === 'file'
@@ -181,6 +212,21 @@ function WorkbenchApp(): React.JSX.Element {
   };
 
   const dirtyCount = useMemo(() => tabs.filter((tab) => tab.kind === 'file' && tab.dirty).length, [tabs]);
+  const activeTab = tabs.find((tab) => tab.id === activeId);
+  const activePath = activeTab?.kind === 'file' ? activeTab.document.path : activeTab?.kind === 'diff' ? activeTab.diff.path : undefined;
+  const revealActiveFile = (): void => {
+    if (!activePath) return;
+    setSidebarMode('files');
+    setExplorerReveal({ path: activePath, request: ++revealSequence.current });
+  };
+  const refreshWorkspace = (): void => {
+    setRevision((value) => value + 1);
+    void refreshOpenTabs();
+  };
+  const handleGitStatus = useCallback((status: GitStatus | null): void => {
+    setGitStatus(status);
+    void refreshOpenTabs();
+  }, [refreshOpenTabs]);
 
   return (
     <FileNavigationContext.Provider value={fileNavigation}><div className="app-shell">
@@ -211,18 +257,18 @@ function WorkbenchApp(): React.JSX.Element {
           </div>
           <div className="panel-heading">
             <span>{sidebarMode === 'files' ? workspace?.name.toUpperCase() || 'EXPLORER' : sidebarMode === 'git' ? 'SOURCE CONTROL' : sidebarMode === 'facts' ? 'REPOSITORY FACTS' : 'ISSUES'}</span>
-            <button type="button" className="icon-button push-right" aria-label={sidebarMode === 'facts' ? 'Refresh repo facts' : 'Refresh sidebar'} onClick={() => setRevision((value) => value + 1)}>↻</button>
+            <button type="button" className="icon-button push-right" aria-label={sidebarMode === 'facts' ? 'Refresh repo facts' : 'Refresh sidebar'} onClick={refreshWorkspace}>↻</button>
           </div>
           <div className="sidebar-content" key={`${workspace?.root}:${sidebarMode}`}>
             {!workspace && <div className="panel-message">Open a repository to begin.</div>}
-            {workspace && sidebarMode === 'files' && <FileExplorer revision={revision} onOpenFile={(path) => void openFile(path)} />}
-            {workspace && sidebarMode === 'git' && <GitPanel key={workspace.root} workspaceRoot={workspace.root} revision={revision} onOpenDiff={(path, staged) => void openDiff(path, staged)} onStatus={setGitStatus} onBeforeDiscard={canDiscardPath} onDiscard={refreshDiscardedPath} />}
+            {workspace && sidebarMode === 'files' && <FileExplorer revision={revision} activePath={activePath} reveal={explorerReveal} onOpenFile={(path) => void openFile(path)} />}
+            {workspace && sidebarMode === 'git' && <GitPanel key={workspace.root} workspaceRoot={workspace.root} revision={revision} onOpenDiff={(path, staged) => void openDiff(path, staged)} onStatus={handleGitStatus} onBeforeDiscard={canDiscardPath} onDiscard={refreshDiscardedPath} />}
             {workspace && sidebarMode === 'issues' && <AgentIssues key={workspace.root} workspaceRoot={workspace.root} revision={revision} focusedIssueId={focusedIssueId} onOpenPath={(path) => void openFile(path)} />}
             {workspace && sidebarMode === 'facts' && <RepoFactsPanel onOpenIssue={(id) => { setFocusedIssueId(id); setSidebarMode('issues'); }} key={workspace.root} workspaceRoot={workspace.root} revision={revision} onOpenPath={(path) => void openFile(path)} />}
           </div>
         </aside>
       } editor={
-        <EditorPane diagnostics={groupDiagnostics(agent.state.bridge)} tabs={tabs} activeId={activeId} onActivate={setActiveId} onClose={closeTab} onChange={updateTab} onSave={(id) => void saveTab(id)} saving={savingIds.has(activeId)} />
+        <EditorPane diagnostics={groupDiagnostics(agent.state.bridge)} tabs={tabs} activeId={activeId} onActivate={setActiveId} onClose={closeTab} onChange={updateTab} onSave={(id) => void saveTab(id)} onRevealActive={revealActiveFile} saving={savingIds.has(activeId)} />
       } dock={
         workspace && <WorkspaceDock key={workspace.root} onOpenDiff={(path, staged) => void openDiff(path, staged)} />
       } agent={workspace ? <AgentPanel key={workspace.root} /> : (

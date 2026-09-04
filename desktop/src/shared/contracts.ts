@@ -131,7 +131,7 @@ export interface WorkbenchApi {
     onEvent(listener: (event: TerminalEvent) => void): () => void;
   };
   editor: {
-    onCommand(listener: (command: 'undo' | 'redo') => void): () => void;
+    onCommand(listener: (command: 'undo' | 'redo' | 'find') => void): () => void;
   };
   agent: {
     start(options: AgentStartOptions): Promise<AgentResponse>;

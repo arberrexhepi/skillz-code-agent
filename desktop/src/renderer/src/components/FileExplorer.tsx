@@ -1,13 +1,15 @@
 import { PathText } from './PathText';
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { FileEntry } from '../../../shared/contracts';
 
 interface FileExplorerProps {
   revision: number;
+  activePath?: string;
+  reveal?: { path: string; request: number };
   onOpenFile: (path: string) => void;
 }
 
-export function FileExplorer({ revision, onOpenFile }: FileExplorerProps): React.JSX.Element {
+export function FileExplorer({ revision, activePath, reveal, onOpenFile }: FileExplorerProps): React.JSX.Element {
   const [entries, setEntries] = useState<FileEntry[]>([]);
   const [error, setError] = useState('');
 
@@ -19,7 +21,7 @@ export function FileExplorer({ revision, onOpenFile }: FileExplorerProps): React
   return (
     <div className="tree" role="tree">
       {entries.map((entry) => (
-        <TreeEntry key={`${entry.kind}:${entry.path}`} entry={entry} depth={0} revision={revision} onOpenFile={onOpenFile} />
+        <TreeEntry key={`${entry.kind}:${entry.path}`} entry={entry} depth={0} revision={revision} activePath={activePath} reveal={reveal} onOpenFile={onOpenFile} />
       ))}
     </div>
   );
@@ -30,7 +32,8 @@ interface TreeEntryProps extends FileExplorerProps {
   depth: number;
 }
 
-function TreeEntry({ entry, depth, revision, onOpenFile }: TreeEntryProps): React.JSX.Element {
+function TreeEntry({ entry, depth, revision, activePath, reveal, onOpenFile }: TreeEntryProps): React.JSX.Element {
+  const rowRef = useRef<HTMLButtonElement>(null);
   const [expanded, setExpanded] = useState(false);
   const [children, setChildren] = useState<FileEntry[]>([]);
   const [loading, setLoading] = useState(false);
@@ -43,6 +46,12 @@ function TreeEntry({ entry, depth, revision, onOpenFile }: TreeEntryProps): Reac
       .finally(() => setLoading(false));
   }, [entry.kind, entry.path, expanded, revision]);
 
+  useEffect(() => {
+    if (!reveal?.request) return;
+    if (entry.kind === 'directory' && reveal.path.startsWith(`${entry.path}/`)) setExpanded(true);
+    if (entry.kind === 'file' && reveal.path === entry.path) rowRef.current?.scrollIntoView?.({ block: 'center', inline: 'nearest' });
+  }, [entry.kind, entry.path, reveal?.path, reveal?.request]);
+
   const activate = (): void => {
     if (entry.kind === 'directory') setExpanded((value) => !value);
     else onOpenFile(entry.path);
@@ -51,11 +60,13 @@ function TreeEntry({ entry, depth, revision, onOpenFile }: TreeEntryProps): Reac
   return (
     <>
       <button
+        ref={rowRef}
         type="button"
-        className="tree-row"
+        className={`tree-row ${entry.kind === 'file' && activePath === entry.path ? 'active' : ''}`}
         style={{ paddingLeft: 10 + depth * 14 }}
         onClick={activate}
         role="treeitem"
+        aria-current={entry.kind === 'file' && activePath === entry.path ? 'page' : undefined}
         aria-expanded={entry.kind === 'directory' ? expanded : undefined}
       >
         <span className="tree-chevron">{entry.kind === 'directory' ? (expanded ? '⌄' : '›') : ''}</span>
@@ -71,6 +82,8 @@ function TreeEntry({ entry, depth, revision, onOpenFile }: TreeEntryProps): Reac
               entry={child}
               depth={depth + 1}
               revision={revision}
+              activePath={activePath}
+              reveal={reveal}
               onOpenFile={onOpenFile}
             />
           ))

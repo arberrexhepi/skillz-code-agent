@@ -23,6 +23,14 @@ const relativePath = z.string().min(1).max(4096);
 const paths = z.array(relativePath).min(1).max(500);
 const terminalId = z.string().uuid();
 
+function sameWorkspacePath(left: string, right: string): boolean {
+  const normalize = (value: string): string => {
+    const resolved = path.resolve(value);
+    return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+  };
+  return normalize(left) === normalize(right);
+}
+
 export function registerIpc(window: BrowserWindow, services: Services): void {
   for (const channel of [
     'workspace:current', 'workspace:recent', 'workspace:choose', 'workspace:open', 'workspace:close', 'workspace:list', 'workspace:read', 'workspace:write', 'workspace:repo-facts', 'workspace:issues', 'workspace:issue-action',
@@ -101,17 +109,21 @@ export function registerIpc(window: BrowserWindow, services: Services): void {
   handle('workspace:current', () => services.workspace.current());
   handle('workspace:recent', () => services.workspace.recent());
   handle('workspace:choose', async () => {
+    const previous = services.workspace.current();
     const selected = await services.workspace.choose(window);
-    if (selected) {
+    if (selected && (!previous || !sameWorkspacePath(previous.root, selected.root))) {
       services.terminal.disposeAll();
       await services.agent.stop();
     }
     return selected;
   });
   handle('workspace:open', async (_event, root: unknown) => {
+    const candidate = z.string().min(1).parse(root);
+    const current = services.workspace.current();
+    if (current && sameWorkspacePath(current.root, candidate)) return current;
     services.terminal.disposeAll();
     await services.agent.stop();
-    return services.workspace.open(z.string().min(1).parse(root));
+    return services.workspace.open(candidate);
   });
   handle('workspace:close', async () => {
     services.terminal.disposeAll();
