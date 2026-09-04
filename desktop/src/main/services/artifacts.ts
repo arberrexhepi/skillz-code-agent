@@ -14,8 +14,9 @@ import { ArtifactSandbox, stopArtifactContainers } from './artifactSandbox';
 import { ArtifactAgentExecution } from './artifactAgent';
 import { cleanArtifactDockerResources, planArtifactDockerCleanup } from './artifactDockerCleanup';
 import { createServer } from 'node:net';
+import { ArtifactProcessProxy } from './artifactProcessProxy';
 
-interface Running { state: ArtifactRuntime; child?: ChildProcess; sandbox?: ArtifactSandbox; start?: Promise<ArtifactRuntime>; cancelled: boolean }
+interface Running { state: ArtifactRuntime; child?: ChildProcess; sandbox?: ArtifactSandbox; processProxy?: ArtifactProcessProxy; start?: Promise<ArtifactRuntime>; cancelled: boolean }
 export class ArtifactsService {
   readonly preview = new ArtifactPreviewService();
   readonly capabilities: ArtifactCapabilitiesService;
@@ -49,16 +50,22 @@ export class ArtifactsService {
     if (prior?.state.status === 'running') return prior.state;
     const runtime: Running = { state: { id, status: 'starting', logs: '' }, cancelled: false };
     this.runtimes.set(id, runtime);
-    runtime.start = this.launch(id, runtime).catch((error) => { if (!runtime.cancelled) this.update(runtime, { status: 'error', error: String(error) }); throw error; }).finally(() => { runtime.start = undefined; });
+    runtime.start = this.launch(id, runtime).catch(async (error) => { await runtime.processProxy?.close(); if (!runtime.cancelled) this.update(runtime, { status: 'error', error: String(error) }); throw error; }).finally(() => { runtime.start = undefined; });
     return runtime.start;
   }
   private update(runtime: Running, change: Partial<ArtifactRuntime>): void { Object.assign(runtime.state, change); this.emit({ type: 'runtime', runtime: { ...runtime.state } }); }
   private async launch(id: string, runtime: Running): Promise<ArtifactRuntime> {
+    const check = () => { if (runtime.cancelled) throw new Error('Artifact start cancelled.'); };
+    check();
     const artifact = await this.library.find(id);
     await this.library.syncContext(artifact);
-    const sandbox = await this.sandbox(id); runtime.sandbox = sandbox;
+    check();
+    const baseSandbox = await this.sandbox(id);
+    const processProxy = new ArtifactProcessProxy(baseSandbox.reads); runtime.processProxy = processProxy;
+    check();
+    const proxyConnection = await processProxy.start();
+    const sandbox = new ArtifactSandbox(baseSandbox.root, baseSandbox.reads, baseSandbox.context, proxyConnection); runtime.sandbox = sandbox;
     const log = (text: string) => this.update(runtime, { logs: (runtime.state.logs + text).slice(-30000) });
-    const check = () => { if (runtime.cancelled) throw new Error('Artifact start cancelled.'); };
     check();
     this.update(runtime, { status: 'installing' });
     const prepared = await sandbox.prepare(log);
@@ -91,6 +98,7 @@ export class ArtifactsService {
       child.on('error', (error) => { clearTimeout(timeout); reject(error); });
       child.on('exit', (code) => {
         clearTimeout(timeout);
+        void processProxy.close();
         if (runtime.cancelled) { if (!ready) reject(new Error('Artifact start cancelled.')); return; }
         const error = /EAI_AGAIN|ENOTFOUND/.test(runtime.state.logs) ? 'Docker could not resolve the package registry. Check Docker Desktop network/DNS settings and retry.' : `Artifact server exited with code ${code}. See Server logs.`;
         this.update(runtime, { status: 'error', url: undefined, error });
@@ -100,13 +108,14 @@ export class ArtifactsService {
   }
   async stop(id: string): Promise<void> {
     const runtime = this.runtimes.get(id);
-    if (runtime) { runtime.cancelled = true; await runtime.sandbox?.stop(); if (runtime.child) await terminate(runtime.child); this.update(runtime, { status: 'stopped', url: undefined }); this.runtimes.delete(id); }
+    if (runtime) { runtime.cancelled = true; await runtime.sandbox?.stop(); await runtime.processProxy?.close(); if (runtime.child) await terminate(runtime.child); this.update(runtime, { status: 'stopped', url: undefined }); this.runtimes.delete(id); }
     await this.preview.close(id);
   }
   previewOrigins(): string[] {
     return [...this.runtimes.values()].flatMap(({ state, cancelled }) =>
       !cancelled && state.status === 'running' && state.url ? [new URL(state.url).origin] : []);
   }
+  processOrigins(): string[] { return [...this.runtimes.values()].flatMap(({ processProxy, cancelled }) => cancelled ? [] : processProxy?.origins() || []); }
   async frame(id: string): Promise<PreviewFrame> {
     const runtime = this.runtimes.get(id)?.state;
     if (runtime?.status !== 'running' || !runtime.url) throw new Error('Start the artifact before opening its preview.');
@@ -134,16 +143,32 @@ export class ArtifactsService {
   }
   async submit(id: string, text: string) {
     const artifact = await this.library.find(id);
-    const grants = [...(artifact.access?.directories || []).map(({ id, label, access }) => ({ path: `/reads/${id}`, label, access })), ...(artifact.access?.allowWorkspaceRead ? [{ path: '/reads/workspace', label: 'Workbench repository, when open at session start' }] : [])];
-    const instruction = `You are working in an independent skillz artifact repository: /repo. Build or update the requested artifact here. Read AGENTS.md and artifact.json. Preserve the Express/Vite dynamic-port runtime, use configured /api/<id> and /ws/<id> connections, and run npm run build. Shared source context is read-only at /context. Additional read-only folders are listed in SKILLZ_READ_ROOTS and mounted at /reads/<id>; use list_files and read_file there. Default file access is limited to /repo. Granted directories: ${JSON.stringify(grants)}. A grant marked write may be changed only when the user's request requires it; all other grants are read only. Read AGENTS.md for the /files API. Never edit the source repository or the parent library.\n\nUser request:\n${text}`;
+    const grants = [...(artifact.access?.directories || []).map(({ id, label, access, allowProcessProxy, processProxyAllowlist }) => ({ path: `/reads/${id}`, label, access, allowProcessProxy: Boolean(allowProcessProxy), processProxyAllowlist })), ...(artifact.access?.allowWorkspaceRead ? [{ path: '/reads/workspace', label: 'Workbench repository, when open at session start', access: 'read', allowProcessProxy: Boolean(artifact.access.allowWorkspaceProcessProxy), processProxyAllowlist: artifact.access.workspaceProcessProxyAllowlist }] : [])];
+    const instruction = `You are working in an independent skillz artifact repository: /repo. Build or update the requested artifact here. Read AGENTS.md and artifact.json. Preserve the Express/Vite dynamic-port runtime, use configured /api/<id> and /ws/<id> connections, and run npm run build. Shared source context is read-only at /context. Additional read-only folders are listed in SKILLZ_READ_ROOTS and mounted at /reads/<id>; use list_files and read_file there. Default file access is limited to /repo. Granted directories: ${JSON.stringify(grants)}. A grant marked write may be changed only when the user's request requires it; all other grants are read only. A grant with allowProcessProxy may launch only package scripts named in processProxyAllowlist through the desktop host; when no explicit list exists, conventional dev, start, serve, and preview scripts are the defaults. Prefer dev for source development and describe preview as a built-app preview. Process Proxy is separate from read/write permission and must be shown as unavailable when not granted. Read AGENTS.md for the /files API. Never edit the source repository or the parent library.\n\nUser request:\n${text}`;
     return (await this.agent(id)).submit(instruction);
+  }
+  async processScripts(id: string): Promise<Record<string, string[]>> {
+    const access = await this.library.access(id);
+    const roots = [...access.directories];
+    const workspace = access.allowWorkspaceRead ? this.activeWorkspace() : '';
+    if (workspace) roots.push({ id: 'workspace', label: 'Workbench repository', path: await fs.realpath(workspace), access: 'read' });
+    return Object.fromEntries(await Promise.all(roots.map(async (root) => {
+      try {
+        const manifest = path.join(root.path, 'package.json');
+        const stat = await fs.lstat(manifest);
+        if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 512 * 1024) return [root.id, []] as const;
+        const value = JSON.parse(await fs.readFile(manifest, 'utf8')) as { scripts?: Record<string, unknown> };
+        const scripts = Object.entries(value.scripts || {}).filter((entry): entry is [string, string] => typeof entry[1] === 'string' && /^[A-Za-z0-9][A-Za-z0-9:._-]{0,127}$/.test(entry[0])).map(([name]) => name).sort();
+        return [root.id, scripts.slice(0, 100)] as const;
+      } catch { return [root.id, []] as const; }
+    })));
   }
   private async sandbox(id: string): Promise<ArtifactSandbox> {
     const artifact = await this.library.find(id);
     const access = await this.library.access(id);
     const reads = [...access.directories];
     const workspace = access.allowWorkspaceRead ? this.activeWorkspace() : '';
-    if (workspace) reads.push({ id: 'workspace', label: 'Workbench repository', path: await fs.realpath(workspace), access: 'read' });
+    if (workspace) reads.push({ id: 'workspace', label: 'Workbench repository', path: await fs.realpath(workspace), access: 'read', allowProcessProxy: access.allowWorkspaceProcessProxy, processProxyAllowlist: access.workspaceProcessProxyAllowlist });
     return new ArtifactSandbox(artifact.root, reads, await this.library.contextDirectory(id));
   }
   async saveAccess(id: string, access: import('../../shared/artifacts').ArtifactAccess): Promise<void> {

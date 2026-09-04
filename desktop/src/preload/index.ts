@@ -17,6 +17,7 @@ const api: WorkbenchApi = {
     chooseFolder: () => ipcRenderer.invoke('artifacts:choose-folder'),
     chooseReadDirectory: () => ipcRenderer.invoke('artifacts:choose-read-directory'),
     access: (id) => ipcRenderer.invoke('artifacts:access', id),
+    processScripts: (id) => ipcRenderer.invoke('artifacts:process-scripts', id),
     saveAccess: (id, access) => ipcRenderer.invoke('artifacts:save-access', id, access),
     create: (options) => ipcRenderer.invoke('artifacts:create', options),
     apis: (id) => ipcRenderer.invoke('artifacts:apis', id),

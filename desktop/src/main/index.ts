@@ -2,7 +2,7 @@ import { installArtifactFrameSecurity } from './services/artifactFrameSecurity';
 import { ArtifactLibraryService } from './services/artifactLibrary';
 import { ArtifactsService } from './services/artifacts';
 import path from 'node:path';
-import { app, BrowserWindow, Menu, screen, type MenuItemConstructorOptions } from 'electron';
+import { app, BrowserWindow, Menu, screen, shell, type MenuItemConstructorOptions } from 'electron';
 import { registerIpc } from './ipc';
 import { AgentService } from './services/agent';
 import { RuntimeSettingsService } from './services/runtimeSettings';
@@ -80,7 +80,12 @@ function createWindow(): void {
   const disposeFrameSecurity = installArtifactFrameSecurity(window.webContents, () => artifacts.previewOrigins());
   registerIpc(window, { workspace, git, terminal, agent, artifacts });
 
-  window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+  window.webContents.setWindowOpenHandler(({ url }) => {
+    let target = '';
+    try { target = new URL(url).origin; } catch { /* Deny malformed URLs. */ }
+    if (artifacts.processOrigins().includes(target)) void shell.openExternal(url);
+    return { action: 'deny' };
+  });
   window.webContents.on('will-navigate', (event) => event.preventDefault());
   window.on('closed', () => {
     disposeFrameSecurity();

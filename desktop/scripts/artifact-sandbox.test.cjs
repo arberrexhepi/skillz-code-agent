@@ -1,9 +1,26 @@
 const assert = require('node:assert/strict');
 const fs = require('node:fs'); const os = require('node:os'); const path = require('node:path');
 const { test } = require('node:test'); const load = require('./load-ts.cjs');
-const { ArtifactLibraryService, ArtifactSandbox, ArtifactsService, RuntimeSettingsService, artifactRuntimeImage, dockerCommand, removeArtifactDependencyVolumes, command } = load(() => ({...require('../src/main/services/artifactLibrary.ts'),...require('../src/main/services/artifactSandbox.ts'),...require('../src/main/services/artifacts.ts'),...require('../src/main/services/runtimeSettings.ts'),...require('../src/main/services/artifactDockerCleanup.ts'),...require('../src/main/services/artifactProcess.ts')}));
+const { ArtifactLibraryService, ArtifactSandbox, ArtifactProcessProxy, ArtifactsService, RuntimeSettingsService, artifactRuntimeImage, dockerCommand, removeArtifactDependencyVolumes, command } = load(() => ({...require('../src/main/services/artifactLibrary.ts'),...require('../src/main/services/artifactSandbox.ts'),...require('../src/main/services/artifactProcessProxy.ts'),...require('../src/main/services/artifacts.ts'),...require('../src/main/services/runtimeSettings.ts'),...require('../src/main/services/artifactDockerCleanup.ts'),...require('../src/main/services/artifactProcess.ts')}));
 const harness = path.resolve(__dirname, '../..');
 function completed(child) { return new Promise((resolve,reject)=>{let out='',err='';child.stdout.setEncoding('utf8');child.stderr.setEncoding('utf8');child.stdout.on('data',s=>out+=s);child.stderr.on('data',s=>err+=s);child.on('error',reject);child.on('close',code=>code===0?resolve(out):reject(new Error(err||out)));child.stdin.end();}); }
+
+test('Process Proxy transparently runs granted npm development scripts on the host from a Linux artifact', {timeout:240000}, async(t)=>{
+  const temp=fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'skillz process proxy docker ')));
+  const artifact=path.join(temp,'artifact'),project=path.join(temp,'project'),context=path.join(temp,'context');
+  for(const directory of [artifact,project,context])fs.mkdirSync(directory);
+  await command('git',['init'],artifact);
+  fs.writeFileSync(path.join(project,'package.json'),JSON.stringify({scripts:{dev:`node -e "console.log(JSON.stringify({platform:process.platform,url:'http://localhost:43128'}))"`}}));
+  const reads=[{id:'project',label:'Project',path:fs.realpathSync(project),access:'read',allowProcessProxy:true}];
+  const proxy=new ArtifactProcessProxy(reads);const connection=await proxy.start();
+  const sandbox=new ArtifactSandbox(artifact,reads,context,connection);
+  t.after(async()=>{await sandbox.stop();await proxy.close();await removeArtifactDependencyVolumes([artifact],temp);assert.equal(fs.realpathSync(path.dirname(temp)),fs.realpathSync(os.tmpdir()));assert.ok(path.basename(temp).startsWith('skillz process proxy docker '));fs.rmSync(temp,{recursive:true,force:true,maxRetries:5});});
+  const prepared=await sandbox.prepare(()=>{},harness);
+  const script=`const {spawn}=require('child_process');const child=spawn('npm',['run','dev'],{cwd:'/reads/project',stdio:['ignore','pipe','pipe']});child.stdout.pipe(process.stdout);child.stderr.pipe(process.stderr);child.on('exit',code=>process.exitCode=code??1);`;
+  const output=await completed(sandbox.spawn(prepared.docker,prepared.args,['node','-e',script]));
+  assert.match(output,new RegExp(`"platform":"${process.platform}"`));
+  assert.match(output,/http:\/\/localhost:43128/);
+});
 test('Docker enforces read grants for direct Node, subprocesses and agent tools; revocation and separate agent backends work', {timeout:240000}, async(t)=>{
   const temp=fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'skillz sandbox ë ')));
   const library=new ArtifactLibraryService(path.join(temp,'settings.json'),path.resolve(__dirname,'../artifact-template'),path.join(temp,'contexts'));

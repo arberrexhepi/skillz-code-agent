@@ -2,3 +2,7 @@
 	path = desktop/prebuilt-artifacts/repo-issue-manager
 	url = https://github.com/arberrexhepi/skillz-code-agent.git
 	branch = prebuilt/repo-issue-manager
+[submodule "desktop/prebuilt-artifacts/server-manager"]
+	path = desktop/prebuilt-artifacts/server-manager
+	url = https://github.com/arberrexhepi/skillz-code-agent.git
+	branch = prebuilt/server-manager
