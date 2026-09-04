@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "id": "server-manager-c8538773",
+  "id": "server-manager",
   "title": "Server Manager",
   "prompt": "I would like to have a crisp visual dashboard to see what ports are running related to the repos I give this artifact access to (make dynamic as i may add more repos in the future). I'd also like to auto-detect their dev startup commands to launch them from the server manager.",
   "createdAt": "2026-09-04T07:02:01.632Z"

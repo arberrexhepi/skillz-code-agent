@@ -1,6 +1,8 @@
-# Artifact development
+# Maintained Server Manager artifact
 
 Build the user's requested artifact in this repository using React, Vite, TypeScript, and Express. Read artifact.json for the original request. The existing starter is only a scaffold: implement the actual requested experience and verify it.
+
+This artifact is distributed as the `server-manager` prebuilt. Preserve its primary server-launch action, secondary package-script overflow, visible process failures, and dynamic repository inventory. Only show scripts allowed by each grant's Process Proxy allowlist. Prefer `dev`, then `start`, `serve`, and `preview`; label preview as a production-build preview.
 
 Keep the runtime protocol intact: server/index.ts prints SKILLZ_ARTIFACT_READY followed by a JSON object with its dynamically assigned URL. Use SKILLZ_ARTIFACT_HOST and SKILLZ_ARTIFACT_PORT from the desktop (default 127.0.0.1 and port 0 outside Docker) and let Vite middleware/HMR use that server. Do not hardcode ports or remove the configured gateway.
 

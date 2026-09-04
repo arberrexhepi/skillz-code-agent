@@ -1,4 +1,5 @@
 import { fileRouter } from './files';
+import { processManager } from './manager';
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import type { Server } from 'node:http';
@@ -39,6 +40,8 @@ export function attachGateway(app: Express, server: Server, root: string): () =>
     next();
   });
   app.use('/files', fileRouter(root));
+  const manager = processManager(root);
+  app.use('/manager', manager.router);
   app.get('/context/:id', async (request, response) => {
     const names: Record<string, string> = { 'repo-facts': 'repo_facts.md', memory: 'memory_observability.md' };
     const name = names[request.params.id];
@@ -106,5 +109,5 @@ export function attachGateway(app: Express, server: Server, root: string): () =>
       });
     })().catch(() => { socket.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n'); socket.destroy(); });
   });
-  return () => { for (const socket of upstreams) socket.terminate(); for (const client of sockets.clients) client.terminate(); sockets.close(); };
+  return () => { manager.close(); for (const socket of upstreams) socket.terminate(); for (const client of sockets.clients) client.terminate(); sockets.close(); };
 }

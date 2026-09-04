@@ -1,4 +1,6 @@
-# Artifact
+# Server Manager
+
+A maintained Skillz artifact for discovering approved repository scripts, launching them through Process Proxy, tracking lifecycle output, and opening detected local ports.
 
 React + Vite + TypeScript with an Express server and configured HTTP/WebSocket gateways.
 
