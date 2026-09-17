@@ -4,15 +4,20 @@ import path from 'node:path';
 import type { GitCommit, GitDiscardResult, GitFileDiff, GitFileStatus, GitStatus } from '../../shared/contracts';
 import { canDiscard, isUntracked } from '../../shared/gitStatus';
 import { discardFileFingerprint } from './gitDiscardSafety';
-import { languageForPath, type WorkspaceService } from './workspace';
+import { languageForPath } from './workspace';
 
 interface GitResult {
   stdout: string;
   stderr: string;
 }
 
+export interface GitWorkspace {
+  requireRoot(): string;
+  resolve(relativePath?: string): string;
+}
+
 export class GitService {
-  constructor(private readonly workspace: WorkspaceService) {}
+  constructor(private readonly workspace: GitWorkspace) {}
 
   async status(): Promise<GitStatus> {
     return this.statusAt(this.workspace.requireRoot());

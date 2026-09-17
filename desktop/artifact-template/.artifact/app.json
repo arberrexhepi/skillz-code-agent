@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "chatbot": { "enabled": false },
+  "database": {
+    "enabled": false,
+    "dialect": "sqlite",
+    "connectionEnv": "DATABASE_URL",
+    "storage": ".artifact-data/data.sqlite"
+  }
+}

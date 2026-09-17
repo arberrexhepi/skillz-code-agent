@@ -1,11 +1,24 @@
 import { PathText } from './PathText';
 import { useCallback, useEffect, useRef, useState } from 'react';
-import type { GitCommit, GitStatus } from '../../../shared/contracts';
+import type { GitCommit, GitDiscardResult, GitFileDiff, GitStatus } from '../../../shared/contracts';
 import { isStaged, isUnstaged } from '../../../shared/gitStatus';
 import { GitChangeRow } from './GitChangeRow';
 
+export interface GitPanelApi {
+  status(): Promise<GitStatus>;
+  initialize(workspaceRoot: string): Promise<GitStatus>;
+  history(limit?: number): Promise<GitCommit[]>;
+  fileDiff(path: string, staged?: boolean): Promise<GitFileDiff>;
+  stage(paths: string[]): Promise<GitStatus>;
+  stageAll(): Promise<GitStatus>;
+  unstage(paths: string[]): Promise<GitStatus>;
+  discard(path: string): Promise<GitDiscardResult>;
+  commit(message: string): Promise<GitStatus>;
+  push(): Promise<GitStatus>;
+}
 interface GitPanelProps {
   workspaceRoot: string;
+  api?: GitPanelApi;
   revision: number;
   onOpenDiff: (path: string, staged: boolean) => void;
   onStatus: (status: GitStatus | null) => void;
@@ -13,7 +26,7 @@ interface GitPanelProps {
   onDiscard: (path: string) => Promise<void>;
 }
 
-export function GitPanel({ workspaceRoot, revision, onOpenDiff, onStatus, onBeforeDiscard, onDiscard }: GitPanelProps): React.JSX.Element {
+export function GitPanel({ workspaceRoot, api = window.workbench.git, revision, onOpenDiff, onStatus, onBeforeDiscard, onDiscard }: GitPanelProps): React.JSX.Element {
   const [status, setStatus] = useState<GitStatus | null>(null);
   const [history, setHistory] = useState<GitCommit[]>([]);
   const [mode, setMode] = useState<'changes' | 'history'>('changes');
@@ -32,8 +45,8 @@ export function GitPanel({ workspaceRoot, revision, onOpenDiff, onStatus, onBefo
     if (mutationPending.current) return;
     const request = ++refreshVersion.current;
     try {
-      const next = await window.workbench.git.status();
-      const commits = next.isRepository ? await window.workbench.git.history(75) : [];
+      const next = await api.status();
+      const commits = next.isRepository ? await api.history(75) : [];
       if (!mounted.current || request !== refreshVersion.current) return;
       setStatus(next);
       setHistory(commits);
@@ -46,7 +59,7 @@ export function GitPanel({ workspaceRoot, revision, onOpenDiff, onStatus, onBefo
       onStatus(null);
       setError(cleanError(cause));
     }
-  }, [onStatus]);
+  }, [api, onStatus]);
 
   useEffect(() => { void refresh(); }, [refresh, revision]);
 
@@ -72,7 +85,7 @@ export function GitPanel({ workspaceRoot, revision, onOpenDiff, onStatus, onBefo
   };
 
   const initialize = async (): Promise<void> => {
-    if (!(await mutate('__initialize__', () => window.workbench.git.initialize(workspaceRoot)))) return;
+    if (!(await mutate('__initialize__', () => api.initialize(workspaceRoot)))) return;
     setMode('changes');
     await refresh();
   };
@@ -84,9 +97,9 @@ export function GitPanel({ workspaceRoot, revision, onOpenDiff, onStatus, onBefo
       setError('Stage at least one changed file before committing.');
       return;
     }
-    if (!(await mutate('__commit__', () => window.workbench.git.commit(commitMessage)))) return;
+    if (!(await mutate('__commit__', () => api.commit(commitMessage)))) return;
     setCommitMessage('');
-    try { setHistory(await window.workbench.git.history(75)); } catch { /* Status errors remain the primary Git signal. */ }
+    try { setHistory(await api.history(75)); } catch { /* Status errors remain the primary Git signal. */ }
   };
 
   const discard = async (path: string): Promise<void> => {
@@ -95,7 +108,7 @@ export function GitPanel({ workspaceRoot, revision, onOpenDiff, onStatus, onBefo
       return;
     }
     await mutate(path, async () => {
-      const result = await window.workbench.git.discard(path);
+      const result = await api.discard(path);
       if (result.discarded) await onDiscard(path);
       return result.status;
     });
@@ -134,9 +147,9 @@ export function GitPanel({ workspaceRoot, revision, onOpenDiff, onStatus, onBefo
           rows={2}
         />
         <div className="commit-actions">
-          <button type="button" disabled={!unstagedCount || Boolean(busyPath)} onClick={() => void mutate('__stage_all__', () => window.workbench.git.stageAll())}>Stage all{unstagedCount ? ` (${unstagedCount})` : ''}</button>
+          <button type="button" disabled={!unstagedCount || Boolean(busyPath)} onClick={() => void mutate('__stage_all__', () => api.stageAll())}>Stage all{unstagedCount ? ` (${unstagedCount})` : ''}</button>
           <button type="button" className="primary-button" disabled={!commitMessage.trim() || Boolean(busyPath)} onClick={() => void commit()}>Commit staged{stagedCount ? ` (${stagedCount})` : ''}</button>
-          <button type="button" className={`sync-button ${sync.pending ? 'pending' : ''}`} disabled={sync.disabled} title={sync.title} onClick={() => void mutate('__push__', () => window.workbench.git.push())}>{sync.label}</button>
+          <button type="button" className={`sync-button ${sync.pending ? 'pending' : ''}`} disabled={sync.disabled} title={sync.title} onClick={() => void mutate('__push__', () => api.push())}>{sync.label}</button>
         </div>
       </div>
       {error && <div className="inline-error"><PathText>{error}</PathText></div>}
@@ -148,8 +161,8 @@ export function GitPanel({ workspaceRoot, revision, onOpenDiff, onStatus, onBefo
             file={file}
             busy={Boolean(busyPath)}
             onDiff={onOpenDiff}
-            onStage={(path) => void mutate(path, () => window.workbench.git.stage([path]))}
-            onUnstage={(path) => void mutate(path, () => window.workbench.git.unstage([path]))}
+            onStage={(path) => void mutate(path, () => api.stage([path]))}
+            onUnstage={(path) => void mutate(path, () => api.unstage([path]))}
             onDiscard={(path) => void discard(path)}
           />
         ))}

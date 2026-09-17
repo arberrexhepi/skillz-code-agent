@@ -2,7 +2,7 @@ import path from 'node:path';
 import { promises as fs } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import type { ArtifactsService } from './services/artifacts';
-import { artifactSetupSelectionSchema, artifactId, artifactApisSchema, artifactAccessSchema, createArtifactSchema, previewInputSchema } from '../shared/artifacts';
+import { artifactSetupSelectionSchema, artifactId, artifactApisSchema, artifactAccessSchema, artifactAppSchema, createArtifactSchema, previewInputSchema } from '../shared/artifacts';
 import { clipboard, dialog, ipcMain, Menu, shell, type BrowserWindow, type IpcMainEvent, type IpcMainInvokeEvent, type MenuItemConstructorOptions } from 'electron';
 import { isUntracked } from '../shared/gitStatus';
 import { z } from 'zod';
@@ -60,7 +60,7 @@ export function registerIpc(window: BrowserWindow, services: Services): void {
     });
   };
 
-  const artifactChannels = ['capabilities', 'install-capabilities', 'setup-progress', 'save-provider-key', 'setup-download', 'docker-cleanup-plan', 'clean-docker', 'library', 'prebuilts', 'install-prebuilt', 'choose-folder', 'choose-read-directory', 'access', 'process-scripts', 'save-access', 'create', 'apis', 'save-apis', 'start', 'stop', 'install-browser', 'preview', 'input', 'reload', 'close-preview', 'reveal', 'agent-start', 'agent-submit', 'agent-runtime', 'agent-planner', 'agent-worker', 'agent-reconfigure', 'agent-backoff', 'agent-stop'];
+  const artifactChannels = ['capabilities', 'install-capabilities', 'setup-progress', 'save-provider-key', 'setup-download', 'docker-cleanup-plan', 'clean-docker', 'library', 'prebuilts', 'install-prebuilt', 'choose-folder', 'choose-read-directory', 'access', 'process-scripts', 'save-access', 'create', 'apis', 'save-apis', 'run-api-collection', 'app', 'save-app', 'start', 'stop', 'install-browser', 'preview', 'input', 'reload', 'close-preview', 'reveal', 'git-status', 'git-initialize', 'git-history', 'git-file-diff', 'git-stage', 'git-stage-all', 'git-unstage', 'git-discard', 'git-commit', 'git-push', 'agent-start', 'agent-submit', 'agent-runtime', 'agent-planner', 'agent-worker', 'agent-reconfigure', 'agent-backoff', 'agent-stop'];
   for (const name of artifactChannels) ipcMain.removeHandler(`artifacts:${name}`);
   handle('artifacts:capabilities', (_event, selection: unknown) => services.artifacts.capabilities.status(artifactSetupSelectionSchema.parse(selection)));
   handle('artifacts:install-capabilities', (_event, selection: unknown) => services.artifacts.capabilities.install(artifactSetupSelectionSchema.parse(selection)));
@@ -106,6 +106,9 @@ export function registerIpc(window: BrowserWindow, services: Services): void {
   });
   handle('artifacts:apis', (_event, id: unknown) => services.artifacts.library.apis(artifactId.parse(id)));
   handle('artifacts:save-apis', (_event, id: unknown, config: unknown) => services.artifacts.library.saveApis(artifactId.parse(id), artifactApisSchema.parse(config)));
+  handle('artifacts:run-api-collection', (_event, id: unknown, collection: unknown, variables: unknown = {}, approveMutations: unknown = false) => services.artifacts.runApiCollection(artifactId.parse(id), artifactId.parse(collection), z.record(z.string(), z.unknown()).parse(variables), z.boolean().parse(approveMutations)));
+  handle('artifacts:app', (_event, id: unknown) => services.artifacts.library.app(artifactId.parse(id)));
+  handle('artifacts:save-app', (_event, id: unknown, config: unknown) => services.artifacts.library.saveApp(artifactId.parse(id), artifactAppSchema.parse(config)));
   handle('artifacts:start', (_event, id: unknown) => services.artifacts.start(artifactId.parse(id)));
   handle('artifacts:stop', (_event, id: unknown) => services.artifacts.stop(artifactId.parse(id)));
   handle('artifacts:install-browser', () => services.artifacts.preview.installBrowser());
@@ -114,6 +117,36 @@ export function registerIpc(window: BrowserWindow, services: Services): void {
   handle('artifacts:reload', (_event, id: unknown) => services.artifacts.preview.reload(artifactId.parse(id)));
   handle('artifacts:close-preview', (_event, id: unknown) => services.artifacts.preview.close(artifactId.parse(id)));
   handle('artifacts:reveal', async (_event, id: unknown) => { const artifact = await services.artifacts.library.find(artifactId.parse(id)); const error = await shell.openPath(artifact.root); if (error) throw new Error(error); });
+  handle('artifacts:git-status', (_event, id: unknown) => services.artifacts.git.status(artifactId.parse(id)));
+  handle('artifacts:git-initialize', (_event, id: unknown) => services.artifacts.git.initialize(artifactId.parse(id)));
+  handle('artifacts:git-history', (_event, id: unknown, limit: unknown = 75) => services.artifacts.git.history(artifactId.parse(id), z.number().int().min(1).max(200).parse(limit)));
+  handle('artifacts:git-file-diff', (_event, id: unknown, value: unknown, staged: unknown = false) => services.artifacts.git.fileDiff(artifactId.parse(id), relativePath.parse(value), z.boolean().parse(staged)));
+  handle('artifacts:git-stage', (_event, id: unknown, values: unknown) => services.artifacts.git.stage(artifactId.parse(id), paths.parse(values)));
+  handle('artifacts:git-stage-all', (_event, id: unknown) => services.artifacts.git.stageAll(artifactId.parse(id)));
+  handle('artifacts:git-unstage', (_event, id: unknown, values: unknown) => services.artifacts.git.unstage(artifactId.parse(id), paths.parse(values)));
+  handle('artifacts:git-discard', (_event, id: unknown, value: unknown) => services.artifacts.git.discard(
+    artifactId.parse(id),
+    relativePath.parse(value),
+    async (file) => {
+      const untracked = isUntracked(file);
+      const result = await dialog.showMessageBox(window, {
+        type: 'warning',
+        title: untracked ? 'Move untracked file to Trash?' : 'Discard unstaged changes?',
+        message: file.path,
+        detail: untracked
+          ? 'This file is not tracked by Git. It will be moved to Trash, where you can recover it.'
+          : 'Restore this file to its staged version. Staged changes will be kept. Unstaged changes will be lost and cannot be undone.',
+        buttons: ['Cancel', untracked ? 'Move to Trash' : 'Discard Changes'],
+        defaultId: 0,
+        cancelId: 0,
+        noLink: true,
+      });
+      return result.response === 1;
+    },
+    (path) => shell.trashItem(path),
+  ));
+  handle('artifacts:git-commit', (_event, id: unknown, message: unknown) => services.artifacts.git.commit(artifactId.parse(id), z.string().min(1).max(2000).parse(message)));
+  handle('artifacts:git-push', (_event, id: unknown) => services.artifacts.git.push(artifactId.parse(id)));
   handle('artifacts:agent-start', (_event, id: unknown, options: unknown) => services.artifacts.startAgent(artifactId.parse(id), z.object({ provider: z.string().min(1).max(80), model: z.string().min(1).max(200), backendScript: z.enum(['main.py', 'main_v2.py', 'live_test_loop.py']).optional() }).parse(options)));
   handle('artifacts:agent-runtime', async (_event, id: unknown, provider: unknown = '', model: unknown = '') => (await services.artifacts.agent(artifactId.parse(id))).runtimeOptions(z.string().max(80).parse(provider), z.string().max(200).parse(model)));
   handle('artifacts:agent-submit', (_event, id: unknown, text: unknown) => services.artifacts.submit(artifactId.parse(id), z.string().min(1).max(200000).parse(text)));

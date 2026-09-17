@@ -4,7 +4,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { test } = require('node:test');
 const load = require('./load-ts.cjs');
-const { ArtifactLibraryService, artifactApisSchema, git } = load(() => ({ ...require('../src/main/services/artifactLibrary.ts'), ...require('../src/shared/artifacts.ts'), ...require('../src/main/services/artifactProcess.ts') }));
+const { ArtifactLibraryService, ArtifactGitService, artifactApisSchema, git } = load(() => ({ ...require('../src/main/services/artifactLibrary.ts'), ...require('../src/shared/artifacts.ts'), ...require('../src/main/services/artifactProcess.ts'), ...require('../src/main/services/artifactGit.ts') }));
 function fixture(t) {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'skillz artifacts ë ')));
   // Async removal avoids the bundled runtime's Windows rmSync Unicode-path failure.
@@ -37,6 +37,22 @@ test('artifact library persists its folder, creates independent Git submodules, 
   await assert.rejects(library.find('../source'));
   await assert.rejects(library.find('absent'));
 });
+test('artifact repository management is scoped to the selected artifact', async(t)=>{
+  const {root,library}=fixture(t);await library.configure(path.join(root,'library'));
+  const one=await library.create({title:'Managed repo',prompt:'Build one',sourceRoot:'',shareFacts:false,shareMemory:false});
+  const two=await library.create({title:'Sibling repo',prompt:'Build two',sourceRoot:'',shareFacts:false,shareMemory:false});
+  const repositories=new ArtifactGitService(library);
+  fs.writeFileSync(path.join(one.root,'managed.txt'),'first version\n');fs.writeFileSync(path.join(two.root,'sibling.txt'),'leave alone\n');
+  let status=await repositories.status(one.id);assert.deepEqual(status.files.map(file=>file.path),['managed.txt']);
+  const diff=await repositories.fileDiff(one.id,'managed.txt');assert.equal(diff.original,'');assert.equal(diff.modified,'first version\n');
+  await assert.rejects(repositories.fileDiff(one.id,'../sibling.txt'),/outside the artifact repository/);
+  const outside=path.join(root,'outside-git'),linked=path.join(one.root,'linked');fs.mkdirSync(outside);fs.writeFileSync(path.join(outside,'secret.txt'),'secret');fs.symlinkSync(outside,linked,process.platform==='win32'?'junction':'dir');await assert.rejects(repositories.fileDiff(one.id,'linked/secret.txt'),/outside the artifact repository|Linked paths/);fs.unlinkSync(linked);
+  await repositories.stage(one.id,['managed.txt']);await git(one.root,'config','user.name','Artifact test');await git(one.root,'config','user.email','artifact@example.test');
+  status=await repositories.commit(one.id,'Track managed file');assert.equal(status.files.length,0);assert.equal((await repositories.history(one.id,1))[0].subject,'Track managed file');
+  fs.writeFileSync(path.join(one.root,'managed.txt'),'changed\n');let trashed=false;
+  const discarded=await repositories.discard(one.id,'managed.txt',async()=>true,async()=>{trashed=true;});assert.equal(discarded.discarded,true);assert.equal(trashed,false);assert.equal(fs.readFileSync(path.join(one.root,'managed.txt'),'utf8').trim(),'first version');
+  assert.deepEqual((await repositories.status(two.id)).files.map(file=>file.path),['sibling.txt']);
+});
 test('creation is serialized and never overwrites an existing folder or unrelated Git index entries',async(t)=>{
   const {root,library}=fixture(t);const folder=path.join(root,'library');await library.configure(folder);
   fs.writeFileSync(path.join(folder,'user-notes.txt'),'Keep me');await git(folder,'add','user-notes.txt');
@@ -68,6 +84,34 @@ test('connection configuration supports named HTTP/WebSocket shapes, persists ed
   await library.saveApis(artifact.id,config);assert.deepEqual(await library.apis(artifact.id),config);
   for (const apis of [[{...config.apis[0],url:'file:///secret'}],[{...config.apis[0],url:'https://user:password@example.com'}],[config.apis[0],config.apis[0]],[{...config.apis[0],transport:'websocket'}],[{...config.apis[0],id:'../escape'}]])assert.throws(()=>artifactApisSchema.parse({version:1,apis}));
   await assert.rejects(library.saveApis(artifact.id,{version:1,apis:[{...config.apis[0],id:'../escape'}]}));assert.deepEqual(await library.apis(artifact.id),config);
+});
+
+test('app capabilities persist and install only the selected Sequelize driver', async(t) => {
+  const {root,library}=fixture(t);await library.configure(path.join(root,'library'));
+  const artifact=await library.create({title:'Factory app',prompt:'Build a chatbot',sourceRoot:'',shareFacts:false,shareMemory:false,app:{version:1,chatbot:{enabled:true},database:{enabled:true,dialect:'sqlite',connectionEnv:'DATABASE_URL',storage:'.artifact-data/app.sqlite'}}});
+  assert.equal((await library.app(artifact.id)).chatbot.enabled,true);
+  let manifest=JSON.parse(fs.readFileSync(path.join(artifact.root,'package.json'),'utf8'));
+  assert.ok(manifest.dependencies.sequelize);assert.ok(manifest.dependencies.sqlite3);assert.equal(manifest.dependencies.pg,undefined);
+  const result=await library.saveApp(artifact.id,{version:1,chatbot:{enabled:true},database:{enabled:true,dialect:'postgres',connectionEnv:'APP_DATABASE_URL',storage:'.artifact-data/app.sqlite'}});assert.equal(result.migrated,false);
+  manifest=JSON.parse(fs.readFileSync(path.join(artifact.root,'package.json'),'utf8'));
+  assert.ok(manifest.dependencies.sequelize);assert.ok(manifest.dependencies.pg);assert.equal(manifest.dependencies.sqlite3,undefined);
+  assert.equal((await library.find(artifact.id)).app.database.connectionEnv,'APP_DATABASE_URL');
+});
+
+test('legacy artifacts migrate managed runtime files while preserving app code and custom routes', async(t) => {
+  const {root,library}=fixture(t);await library.configure(path.join(root,'library'));
+  const artifact=await library.create({title:'Legacy app',prompt:'Keep working',sourceRoot:'',shareFacts:false,shareMemory:false});
+  const appFile=path.join(artifact.root,'src','App.tsx'),customApp='export default function App(){return <main>Keep my app</main>}\n';fs.writeFileSync(appFile,customApp);await git(artifact.root,'add','--','src/App.tsx');
+  const indexFile=path.join(artifact.root,'server','index.ts');let legacyIndex=fs.readFileSync(indexFile,'utf8').replace("import { attachArtifactAgent } from './agent';\n",'').replace("import { closeDatabase } from './database';\n",'').replace('const closeAgent = attachArtifactAgent(app);\n','').replace('closeAgent(); ','').replace('await closeDatabase(); ','');legacyIndex=legacyIndex.replace('const closeGateway = attachGateway(app, server, root);',"app.get('/custom-health', (_request, response) => response.send('ok'));\nconst closeGateway = attachGateway(app, server, root);");fs.writeFileSync(indexFile,legacyIndex);
+  fs.writeFileSync(path.join(artifact.root,'server','gateway.ts'),'// legacy managed gateway\n');fs.writeFileSync(path.join(artifact.root,'server','schema.ts'),'// legacy managed schema\n');
+  for(const relative of ['.artifact/runtime.json','server/agent.ts','server/database.ts','src/skillz.ts'])fs.rmSync(path.join(artifact.root,relative),{force:true});
+  const result=await library.saveApp(artifact.id,{version:1,chatbot:{enabled:true},database:{enabled:false,dialect:'sqlite',connectionEnv:'DATABASE_URL',storage:'.artifact-data/data.sqlite'}});
+  assert.equal(result.migrated,true);assert.ok(result.commit);assert.ok(result.checkpointCommit);assert.equal(await git(artifact.root,'rev-parse','HEAD'),result.commit);assert.equal(fs.readFileSync(appFile,'utf8'),customApp);
+  const migratedIndex=fs.readFileSync(indexFile,'utf8');assert.match(migratedIndex,/custom-health/);assert.match(migratedIndex,/attachArtifactAgent/);assert.match(migratedIndex,/closeDatabase/);
+  assert.match(fs.readFileSync(path.join(artifact.root,'server','gateway.ts'),'utf8'),/advertisedCommands/);assert.equal(JSON.parse(fs.readFileSync(path.join(artifact.root,'.artifact','runtime.json'),'utf8')).version,1);
+  assert.equal(await git(artifact.root,'show',`${result.checkpointCommit}:server/gateway.ts`),'// legacy managed gateway');assert.match(await git(artifact.root,'show',`${result.commit}:server/gateway.ts`),/advertisedCommands/);assert.match(fs.readFileSync(path.join(artifact.root,'.gitignore'),'utf8'),/\.artifact-data\//);
+  assert.match(await git(artifact.root,'status','--porcelain','--','src/App.tsx'),/^M  src\/App\.tsx$/);assert.doesNotMatch(await git(artifact.root,'show','--name-only','--pretty=format:',result.commit),/src\/App\.tsx/);
+  assert.equal((await library.app(artifact.id)).chatbot.enabled,true);
 });
 
 test('context snapshots refresh after atomic replacement and do not require symlinks', async(t)=>{

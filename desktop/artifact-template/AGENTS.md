@@ -4,7 +4,9 @@ Build the user's requested artifact in this repository using React, Vite, TypeSc
 
 Keep the runtime protocol intact: server/index.ts prints SKILLZ_ARTIFACT_READY followed by a JSON object with its dynamically assigned URL. Use SKILLZ_ARTIFACT_HOST and SKILLZ_ARTIFACT_PORT from the desktop (default 127.0.0.1 and port 0 outside Docker) and let Vite middleware/HMR use that server. Do not hardcode ports or remove the configured gateway.
 
-Add or modify API definitions in .artifact/apis.json. Each has a unique id, transport (http or websocket), title, url, HTTP method, requestSchema, responseSchema, and headerEnv. Frontend HTTP calls use /api/<id>, WebSocket calls use /ws/<id>. No credentials in frontend code or tracked files. Validate API shapes and keep response errors visible.
+Add or modify API Blueprints in .artifact/apis.json. Each request has a unique id, collection, transport, title, description, URL, HTTP method, schemas, example input, tests, extraction rules, and headerEnv. Frontend HTTP calls use /api/<id>; WebSocket calls use /ws/<id>. HTTP requests are also advertised as artifact-specific Skillz commands. GET defaults to discovery; POST, PUT, PATCH, and DELETE default to mutation and require explicit approval. No credentials belong in frontend code or tracked files.
+
+Read .artifact/app.json for generated app capabilities. When `chatbot.enabled` is true, use `askSkillz` from `src/skillz.ts`; its Python process runs inside Docker and receives model output through the desktop's credential broker. When `database.enabled` is true, Sequelize and the selected DBMS driver are installed. `db_query` is a discovery command and `db_execute` is a mutation command. Non-SQLite connection URLs come from the named environment variable.
 
 Optional source context is mounted read-only at /context; never expose other source-workspace files. This artifact's own repo_facts.md and memory_observability.md are separate. Do not change or commit the parent library or other artifacts. Run npm run build after edits; use the desktop Preview to view the result.
 

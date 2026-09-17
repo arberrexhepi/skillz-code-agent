@@ -6,7 +6,7 @@ import type { ArtifactCapabilities, ArtifactCapability, ArtifactSetupProgress, A
 import type { AgentLaunch } from './artifactAgent';
 import type { ArtifactPreviewService } from './artifactPreview';
 import { dockerCommand, ensureSandboxImage, harnessRoot, sandboxImageReady } from './artifactSandbox';
-import { command, runLogged } from './artifactProcess';
+import { command, runLogged, spawnModelHelper, terminate } from './artifactProcess';
 import { pythonEnvironment, resolvePythonCommand, type PythonCommand } from './python';
 import { readJson, writeJson } from './artifactLibrary';
 
@@ -57,6 +57,19 @@ export class ArtifactCapabilitiesService {
   async hostContext(context: AgentLaunch): Promise<AgentLaunch> {
     const env = await this.environment(context.options.provider, context.env);
     return { ...context, env, python: await this.python(context.agentRoot, env) };
+  }
+  async modelRequest(selection: ArtifactSetupSelection, payload: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const source = this.source(); const env = await this.environment(selection.provider); const python = await this.python(source, env);
+    return new Promise((resolve, reject) => {
+      const child = spawnModelHelper(python.executable, [...python.args, path.join(source, 'artifact_model_host.py')], { cwd: source, env, windowsHide: true });
+      let output = '', errors = ''; let final: Record<string, unknown> | undefined;
+      const timeout = setTimeout(() => { void terminate(child); reject(new Error('Artifact app model request timed out.')); }, 1_200_000);
+      child.stdout.setEncoding('utf8'); child.stderr.setEncoding('utf8');
+      child.stdout.on('data', (text: string) => { output += text; if (output.length > 16 * 1024 * 1024) void terminate(child); let newline: number; while ((newline = output.indexOf('\n')) >= 0) { const line = output.slice(0, newline); output = output.slice(newline + 1); try { const value = JSON.parse(line) as Record<string, unknown>; if (!('progress' in value)) final = value; } catch { errors = 'Model helper returned invalid JSON.'; } } });
+      child.stderr.on('data', (text: string) => { errors = (errors + text).slice(-3000); }); child.on('error', reject);
+      child.on('close', () => { clearTimeout(timeout); if (!final || final.error) reject(new Error(String(final?.error || errors || 'Model helper returned no response.'))); else resolve(final); });
+      child.stdin.on('error', reject); child.stdin.end(JSON.stringify({ ...payload, provider: selection.provider, model: selection.model }));
+    });
   }
   private probe(python: PythonCommand, env: NodeJS.ProcessEnv, selection: ArtifactSetupSelection): Promise<ProviderProbe> {
     return new Promise((resolve, reject) => {

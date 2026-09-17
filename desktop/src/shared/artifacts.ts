@@ -1,18 +1,30 @@
 import { z } from 'zod';
-import type { AgentEvent, AgentResponse, AgentStartOptions } from './contracts';
+import type { AgentEvent, AgentResponse, AgentStartOptions, GitCommit, GitDiscardResult, GitFileDiff, GitStatus } from './contracts';
 import type { JsonMap, RuntimeOptionsPayload } from './agentTypes';
 
 export const artifactId = z.string().regex(/^[a-z0-9][a-z0-9-]{0,63}$/);
 const shape = z.record(z.string(), z.unknown());
+const headerEnvironment = z.union([z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/), z.object({ env: z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/), prefix: z.string().max(100).default('') })]);
 export const artifactApiSchema = z.object({
   id: artifactId,
   title: z.string().max(120).default(''),
+  description: z.string().max(500).default(''),
+  collection: artifactId.default('default'),
   transport: z.enum(['http', 'websocket']),
   url: z.url().refine((value) => ['http:', 'https:', 'ws:', 'wss:'].includes(new URL(value).protocol), 'Use an HTTP or WebSocket URL.'),
   method: z.enum(['GET', 'POST', 'PUT', 'PATCH', 'DELETE']).default('GET'),
   requestSchema: shape.default({}),
   responseSchema: shape.default({}),
-  headerEnv: z.record(z.string(), z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/)).default({}),
+  headerEnv: z.record(z.string(), headerEnvironment).default({}),
+  commandKind: z.enum(['discovery', 'mutation']).optional(),
+  example: shape.default({}),
+  tests: z.array(z.object({ path: z.string().max(500).default(''), operator: z.enum(['exists', 'equals', 'contains']), expected: z.unknown().optional() })).max(30).default([]),
+  extract: z.array(z.object({ name: z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/), path: z.string().min(1).max(500) })).max(30).default([]),
+  scripts: z.array(z.discriminatedUnion('action', [
+    z.object({ phase: z.literal('before'), action: z.literal('set'), name: z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/), value: z.unknown() }),
+    z.object({ phase: z.literal('after'), action: z.literal('extract'), name: z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/), path: z.string().min(1).max(500) }),
+    z.object({ phase: z.literal('after'), action: z.literal('assert'), path: z.string().max(500).default(''), operator: z.enum(['exists', 'equals', 'contains']), expected: z.unknown().optional() }),
+  ])).max(50).default([]),
 }).superRefine((value, context) => {
   if ((value.transport === 'http') !== /^https?:/.test(value.url)) context.addIssue({ code: 'custom', message: 'Transport and URL must match.' });
   if (new URL(value.url).username || new URL(value.url).password) context.addIssue({ code: 'custom', message: 'Use environment variables for credentials.' });
@@ -22,6 +34,19 @@ export const artifactApisSchema = z.object({ version: z.literal(1), apis: z.arra
 });
 export type ArtifactApiConfig = z.infer<typeof artifactApiSchema>;
 export type ArtifactApis = z.infer<typeof artifactApisSchema>;
+export const artifactDatabaseDialectSchema = z.enum(['sqlite', 'postgres', 'mysql', 'mariadb', 'mssql']);
+export const artifactAppSchema = z.object({
+  version: z.literal(1),
+  chatbot: z.object({ enabled: z.boolean().default(false) }).default({ enabled: false }),
+  database: z.object({
+    enabled: z.boolean().default(false),
+    dialect: artifactDatabaseDialectSchema.default('sqlite'),
+    connectionEnv: z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/).default('DATABASE_URL'),
+    storage: z.string().min(1).max(500).default('.artifact-data/data.sqlite'),
+  }).default({ enabled: false, dialect: 'sqlite', connectionEnv: 'DATABASE_URL', storage: '.artifact-data/data.sqlite' }),
+});
+export type ArtifactAppConfig = z.infer<typeof artifactAppSchema>;
+export const defaultArtifactApp = (): ArtifactAppConfig => artifactAppSchema.parse({ version: 1 });
 export const artifactAgentRuntimeSchema = z.object({ provider: z.string().min(1).max(80), model: z.string().min(1).max(200), backendScript: z.enum(['main.py', 'main_v2.py', 'live_test_loop.py']) });
 export const packageScriptName = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9:._-]{0,127}$/);
 export const readDirectorySchema = z.object({ id: artifactId.refine((id) => !['workspace', 'repo', 'context'].includes(id), 'This ID is reserved.'), label: z.string().min(1).max(200), path: z.string().min(1).max(4096), access: z.enum(['read', 'write']).default('read'), allowProcessProxy: z.boolean().optional(), processProxyAllowlist: z.array(packageScriptName).max(100).optional() });
@@ -33,7 +58,7 @@ export type ReadDirectory = z.infer<typeof readDirectorySchema>;
 export type ReadDirectoryChoice = ReadDirectory & { packageScripts: string[] };
 export interface PrebuiltArtifact { id: string; title: string; description: string; requiresWriteAccess: boolean; requiresProcessProxy?: boolean; }
 export type ArtifactAccess = z.infer<typeof artifactAccessSchema>;
-export const createArtifactSchema = z.object({ title: z.string().trim().min(1).max(120), prompt: z.string().trim().min(1).max(20000), sourceRoot: z.string().max(4096), shareFacts: z.boolean(), shareMemory: z.boolean(), runtime: artifactAgentRuntimeSchema.optional(), access: artifactAccessSchema.optional() });
+export const createArtifactSchema = z.object({ title: z.string().trim().min(1).max(120), prompt: z.string().trim().min(1).max(20000), sourceRoot: z.string().max(4096), shareFacts: z.boolean(), shareMemory: z.boolean(), runtime: artifactAgentRuntimeSchema.optional(), access: artifactAccessSchema.optional(), app: artifactAppSchema.optional() });
 export type CreateArtifact = z.infer<typeof createArtifactSchema>;
 export interface ArtifactRecord extends CreateArtifact { id: string; root: string; createdAt: string; contextMode: 'links' | 'junction' | 'snapshot' | 'unavailable' | 'none'; contextWarning?: string }
 export interface ArtifactLibrary { root: string; artifacts: ArtifactRecord[] }
@@ -46,6 +71,7 @@ export interface ArtifactCapabilities { selection: ArtifactSetupSelection; items
 export interface ArtifactSetupProgress { running: boolean; step: string; log: string; error?: string; }
 export interface ArtifactDockerCleanupPlan { currentImage: string; obsoleteImages: string[]; orphanedVolumes: string[]; preservedImages: string[]; preservedVolumes: string[]; }
 export interface ArtifactDockerCleanupResult extends ArtifactDockerCleanupPlan { removedImages: string[]; removedVolumes: string[]; failures: string[]; }
+export interface ArtifactAppSaveResult { migrated: boolean; commit?: string; checkpointCommit?: string; }
 export type ArtifactEvent = { type: 'setup'; progress: ArtifactSetupProgress } | { type: 'runtime'; runtime: ArtifactRuntime } | { type: 'agent'; id: string; event: AgentEvent };
 export const previewInputSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('click'), x: z.number().min(0).max(3000), y: z.number().min(0).max(3000) }),
@@ -74,6 +100,9 @@ export interface ArtifactsApi {
   saveAccess(id: string, access: ArtifactAccess): Promise<void>;
   apis(id: string): Promise<ArtifactApis>;
   saveApis(id: string, config: ArtifactApis): Promise<void>;
+  runApiCollection(id: string, collection: string, variables?: JsonMap, approveMutations?: boolean): Promise<JsonMap>;
+  app(id: string): Promise<ArtifactAppConfig>;
+  saveApp(id: string, config: ArtifactAppConfig): Promise<ArtifactAppSaveResult>;
   start(id: string): Promise<ArtifactRuntime>;
   stop(id: string): Promise<void>;
   installBrowser(): Promise<void>;
@@ -82,6 +111,16 @@ export interface ArtifactsApi {
   reload(id: string): Promise<void>;
   closePreview(id: string): Promise<void>;
   reveal(id: string): Promise<void>;
+  gitStatus(id: string): Promise<GitStatus>;
+  gitInitialize(id: string): Promise<GitStatus>;
+  gitHistory(id: string, limit?: number): Promise<GitCommit[]>;
+  gitFileDiff(id: string, path: string, staged?: boolean): Promise<GitFileDiff>;
+  gitStage(id: string, paths: string[]): Promise<GitStatus>;
+  gitStageAll(id: string): Promise<GitStatus>;
+  gitUnstage(id: string, paths: string[]): Promise<GitStatus>;
+  gitDiscard(id: string, path: string): Promise<GitDiscardResult>;
+  gitCommit(id: string, message: string): Promise<GitStatus>;
+  gitPush(id: string): Promise<GitStatus>;
   agentStart(id: string, options: AgentStartOptions): Promise<AgentResponse>;
   agentSubmit(id: string, text: string): Promise<AgentResponse>;
   agentRuntimeOptions(id: string, provider?: string, model?: string): Promise<RuntimeOptionsPayload>;
