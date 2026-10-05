@@ -1,0 +1,33 @@
+name: Prebuilt artifacts
+
+on:
+  push:
+    branches-ignore:
+      - 'prebuilt/**'
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  recursive-checkout:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # On PRs, ./ must resolve to the contributor's repository.
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          submodules: recursive
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          package-manager-cache: false
+      - name: Check bundled sources
+        run: npm --prefix desktop run submodules:check
+      - name: Verify pins on this repository's remote
+        run: npm --prefix desktop run submodules:verify -- origin
+      - name: Test independent publishing and fresh clones
+        run: npm --prefix desktop run test:prebuilts

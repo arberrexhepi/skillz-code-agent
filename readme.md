@@ -1,444 +1,204 @@
 # Skillz Code Agent
 
-Skillz is a planner-first coding agent for real repositories, available as a standalone Electron/React workbench, a CLI, and a VS Code extension. The planner handles clarification, bounded discovery, goal sequencing, approvals, recovery, and final next steps; the worker performs concrete repository actions and validation.
+Turn a coding request into a reviewable plan, verified repository changes, and a clear record of the work.
 
-Model invocation is provider-neutral. API-backed providers remain available, while the additive `codex-subscription` backend can invoke supported Codex models through an existing local ChatGPT subscription session without converting or replacing the OpenAI API path.
+[![Prebuilt checks](https://github.com/arberrexhepi/skillz-code-agent/actions/workflows/prebuilt-artifacts.yml/badge.svg?branch=main)](.github/workflows/prebuilt-artifacts.yml)
+![Python](https://img.shields.io/badge/Python-3.10%2B-blue)
+![Node.js](https://img.shields.io/badge/Node.js-22.12%2B-green)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
-## TLDR: Ways To Use The Agent
+[Getting started](#getting-started) · [Usage](#usage) · [Artifacts](#artifacts-and-git-portability) · [Development](#development) · [Documentation](#documentation)
 
-| Interface | Best for | How to start | How to use |
-| --- | --- | --- | --- |
-| Desktop Workbench | The complete local workflow: repository browsing, editing, terminal, Git, planner execution, runtime selection, and live goal activity. | `cd desktop && npm install && npm run dev` | Open a repository, configure the provider/model/backend in Runtime settings, start the agent, then work through discovery, approval, execution, and goal reports. |
-| Codex subscription runtime | Running either stable or TreeLoop workers with a locally authenticated ChatGPT/Codex subscription instead of API-key billing. | Run `codex login`, then select `codex-subscription` in the desktop Runtime drawer or pass it to the CLI. | Choose a model from the detected local catalog. The existing `openai` provider remains available separately. |
-| Planner CLI | Normal repo work where you want discovery, a reviewable plan, then execution. | `python main.py --provider openai --model gpt-5.4 --root /your/project` | Type the request, choose discovery depth if offered, then `approve` to run the plan. |
-| Auto CLI | Letting the planner run one or more issue cycles without pausing for plan approval. | `start-auto 3 Build the feature described in PROPOSAL.md` from the planner prompt | The optional text becomes the auto-run prompt; cycles create/close issues and use completed issue context to avoid repeats. |
-| Direct Worker CLI | Small, concrete edits when you do not need planner decomposition. | `python main.py --provider openai --model gpt-5.4 --root /your/project --worker-mode` | Give a focused task; the worker reads, edits, validates, and finishes directly. |
-| Beta TreeLoop Worker | Fast command-grammar workflow and current-run diagnostics. | `python main_v2.py --provider gemini --model gemini-3-flash-preview --root /your/project --worker-mode` | Use tree commands like `cat`, `replace-lines`, `run-check`, `list-run-issues`, and `show-run-issue`. |
-| VS Code Extension | Desktop UI for planner state, Auto mode, issues, diagnostics, diffs, and suggested actions. | Open `vscode-extension/` in VS Code and run `Run Python Agent Extension` | Use the panel to submit prompts, create issues, start Auto cycles, approve plans, inspect diagnostics, and open files/diffs. |
+## Overview
 
-Common planner commands: `/reset`, `/start-auto 3 optional prompt`, `/stop-auto`, `/create-issue details`, `reopen issue-123`, `approve`, `reject`.
+Skillz is a planner-first coding agent for developers working in real Git repositories. It clarifies a request, performs bounded discovery, proposes a plan for review, then runs repository actions and validation through its Python host.
 
-> **Roadmap note:** The Electron/React Workbench is the primary desktop direction and is expected to phase out the VS Code extension. The extension remains useful for current development and compatibility, but should not be the sole reason to adopt Skillz or be treated as a long-term product commitment.
+The **Electron/React workbench** is the primary desktop interface: an editor, terminal, source control, agent conversation, and issue history in one application. The CLI shares the same backend. A transitional VS Code extension remains available, while ongoing desktop development centers on the standalone workbench.
 
-## Latest Development Update
+## Key features
 
-The desktop workbench now includes **Artifacts** for ad hoc visualizations, code explorers, dashboards, and tools. It also offers an optional ready-made repository issue manager: select repository folders, explicitly grant write access, and manage their durable Skillz issues without starting an agent. Configure a library folder, describe an artifact, and work with its own agent conversation and live iframe preview tab. Playwright is retained separately for browser inspection tooling. Each React/Vite/TypeScript + Express project has an independent Git history as a submodule in the library, a selectable agent runtime, Docker-enforced folder grants that default to read only, optional active-repository reads and source context snapshots, dynamic ports, and named HTTP/WebSocket API connections with JSON Schema validation. Artifact agents and previews require a running Linux Docker engine; permissions are managed in the workbench and apply to both. Clone with `--recurse-submodules`, or run `npm --prefix desktop run submodules:init` in an existing checkout. See the [Artifacts guide](desktop/README.md#artifacts).
+- **Review before execution:** bounded discovery, explicit plan approval, stable and beta/live workers, and recovery from interrupted goals.
+- **Choice of model provider:** API providers, local endpoints, and an optional local Codex/ChatGPT subscription runtime.
+- **A complete repository workspace:** Monaco editing and diffs, a native terminal, Git controls, clickable file references, diagnostics, issues, and repository facts.
+- **Independent artifacts:** React/Express apps with their own Git history, Docker previews and agents, explicit folder grants, and optional chatbots or databases.
+- **Reusable service setup:** API Blueprints, a constrained configuration agent, and a Vault that keeps provider keys outside artifact repositories.
+- **Portable prebuilt sources:** a publish command that uploads and checks prebuilt histories on the selected remote before publishing the application.
 
-File paths throughout the desktop workbench now render as clickable chips, with full-path tooltips and editor navigation to optional line/column references. This includes chat, facts, issues, plans, reports, activity, diagnostics, Git, and terminal shortcuts. Windows paths and quoted Unicode filenames are supported. See [file reference chips](desktop/README.md#file-reference-chips).
+## Getting started
 
-The desktop **Issues** and **Repo Facts** tabs extract different views from the saved ledger. **Issues** keeps saved issues and pending suggestions visible with the agent stopped; creating, closing, and reopening issues works directly against the saved ledger without starting Python or a model. Continue resumes work through the agent. **Repo Facts** focuses on architecture/goal facts and provenance, with links back to the related issue. Both refresh on file changes. See the [issues and repository facts guide](desktop/README.md#issues-and-repository-facts).
+### Prerequisites
 
-Discovery can now pause at its action limit or on its last allotted turn to request **1–10 additional turns** when material ambiguity remains. The request shows the turn count, reason, a short investigation proposal, unresolved questions, and findings collected so far.
+| Requirement | When needed |
+| --- | --- |
+| Python **3.10+**; **3.13** is the documented development target | Python backend and desktop agents |
+| Git on `PATH` | Repository operations and prebuilt submodules |
+| Node.js **22.12+** and npm | Workbench or extension development |
+| Credentials for the chosen provider | API-backed model calls |
+| Local Codex CLI and an authenticated session | Only for `codex-subscription` |
+| A running **Linux Docker engine** | Artifact previews and artifact agents |
 
-- **Allow more turns** resumes the same discovery conversation, retaining its history, context, and cumulative budget. Each approved turn also adds one tool-action slot; discovery stays read-only.
-- **Plan with current findings** ends discovery and passes the unresolved questions and unperformed checks to the goal planner, which must state assumptions, risks, and necessary validation rather than treat ambiguity as resolved.
-- Stable and beta workers share validation and budget accounting. Continuous/Auto mode also pauses for this decision; it never grants an extension automatically. Once discovery finishes, the plan returns for review.
-- In the CLI, use `approve` or `no` for the pending extension (`/discovery` shows it again). An additional extension requires a new explicit decision. Paused worker context is held in the running session; stopping the agent or switching folders ends that session.
-
-
-The desktop workbench now handles common Windows setup failures, provides a manual Codex location fallback, and helps users start version control in a new project folder:
-
-- **Windows Python discovery:** agent startup, runtime options, and Codex status/login share interpreter detection. The workbench checks an explicit override and the repository virtual environment, then tries `python`, the Windows `py -3` launcher, and `python3`. This fixes `spawn python ENOENT` when Python is installed through the launcher but absent from `PATH`.
-- **Codex discovery and manual setup:** Windows discovery recognizes the local Codex desktop application's versioned runtime directories. In Runtime settings, users can browse or paste a CLI executable, validate it with **Save and check**, and keep the selection on their computer. **Use automatic discovery** restores normal lookup; changing a running agent's CLI path displays restart guidance.
-- **UTF-8 message handling:** Python bridge streams, toolbelt results, Codex subprocess pipes, Git output, and diagnostic commands use explicit UTF-8. Repository text reads and edits also specify UTF-8. Prompts, responses, account status, and model discovery handle accented text, multilingual content, and emoji without Windows code-page conversion. This fixes the invalid UTF-8 stdin error that could occur even after successful Codex authentication.
-- **Windows terminal compatibility:** the embedded terminal uses node-pty's native Windows encoding behavior, removing the unsupported encoding warning.
-- **New repository setup:** Source Control offers **Initialize repository** for folders without Git metadata, then shows files ready for staging and a first commit. It recognizes existing repositories and worktrees, preserves actionable errors, and rejects initialization requests for a folder the user has already switched away from.
-- **Consistent repository discovery:** file, directory, and symbol searches return forward-slash virtual paths on Windows, macOS, and Linux. Directory scans skip symlinks and Windows junctions, keeping searches within the workspace and avoiding linked-directory traversal errors.
-- **Regression coverage:** focused Python and desktop tests cover discovery, saved CLI settings, UTF-8 subprocess traffic, terminal options, and Git initialization. Browser fixtures exercise setup, retry, and concurrent refresh behavior; Git fixtures account for Windows line endings and symlink privileges.
-
-See [Windows quick start](#windows-quick-start) and the [desktop guide](desktop/README.md) for setup and verification commands. Packaged builds still require a separately installed Python interpreter and provider dependencies.
-
-### Earlier development highlights
-
-The planner/worker improvements below remain part of the current workbench:
-
-- **Smaller model turns:** stable and beta workers now keep provider-native message transcripts after the first turn instead of rebuilding the full prompt every time. OpenAI prompt-cache keys, cached-token accounting, explicit context drops, and compact fresh-context final retries reduce repeated context without losing current repository state.
-- **Resilient provider calls:** transient 408/409/425/429 and 5xx failures receive bounded retries, `Retry-After` is honored, repeated 500s receive a longer cooldown, and request IDs plus retry timing are retained for observability. Terminal provider failures pause execution with partial edits preserved so retry starts by inspecting and repairing the current diff.
-- **Reliable plan continuation:** completed goals are persisted as issue checkpoints, continuation plans reconcile dependencies on completed or omitted goals, and unsafe dependency graphs are rejected before execution. Resuming skips completed goals and starts at the failed or next incomplete goal without another approval cycle.
-- **Clear issue identity:** durable planner issues use `issue-*` identifiers, while transient validation findings use stable `run-*` identifiers and dedicated list/show commands. This prevents a worker from mistaking an editor diagnostic for the active issue it is implementing.
-- **Preemptive output recovery:** annotation-only, prose-only, and malformed command turns are repaired into the beta command grammar before they become terminal `model_output_invalid` failures.
-- **Expanded guarded Git support:** the beta worker now supports bounded status, diff, revision-range log, branch, remote, rev-parse, show, blame, add, restore, move, remove, commit, and push operations. Mutating or remote operations remain authorization-gated, paths are explicit, and broad or unsafe revision expressions are rejected.
-- **Meta Muse Spark support:** `muse-spark-1.2` is available through Meta's OpenAI-compatible API using `META_AI_API_KEY`, including provider/model selection in the extension. The standard model remains distinct from the opt-in contributor tier whose prompts and completions may be used for Meta training.
-- **Local Codex subscription support:** `codex-subscription` invokes models through the locally installed Codex CLI and its ChatGPT-managed session. It remains isolated from the existing `openai` API-key provider and appears with account, plan, and live-model status in the Electron Runtime drawer.
-- **Standalone desktop workbench:** the Electron main process hosts workspace, Git, PTY, and Python bridge services behind validated IPC, while the sandboxed React renderer provides Monaco editing/diffs, an xterm terminal, lifecycle-aware agent cards, goal reports, and live model/tool activity.
-- **Evidence-based execution recovery:** the beta/live TreeLoop interrupts repeated empty searches or unchanged repository observations, not useful source inspection or skill loading. New evidence resumes execution; failed patch diagnostics and the affected source remain available for repair. Repeated unproductive exploration still ends in an incomplete stop.
-- **Lossless mutation text:** quoted patch operands decode once, embedded arrows stay inside source text, and write/replace payloads retain indentation and trailing whitespace through extraction, heredocs, and strategy steps. Patches require one exact match; incomplete heredocs reject the batch without dispatching writes.
-- **Workspace-backed discovery:** `/repo` reads, recursive filename/content/symbol searches, and diagnostics snapshots no longer depend on the capped metadata preview or preloaded content. Typed TypeScript component declarations share the discovery symbol scanner; other virtual mounts stay in-memory.
-- **Better extension state:** the panel shows provider-specific model choices, per-session and per-issue usage, transient recovery details, durable-versus-run issue context, completed checkpoints, and the exact goal where a paused plan will resume.
-
-These changes are covered by targeted provider, prompt-cache, transcript, recovery, continuation, usage-accounting, beta Git, command-repair, and extension panel tests.
-
-## Architecture
-
-```text
-Electron / React workbench                 CLI / VS Code extension
-            │ validated IPC                         │
-            ▼                                       │
-Electron main process                               │
-  ├── workspace, Git, PTY                           │
-  ├── Codex account/model status                    │
-  └── Python process manager ───── NDJSON bridge ───┘
-                                      │
-                                      ▼
-                         Python planner + worker
-                           ├── stable runtime
-                           ├── beta/live TreeLoop
-                           └── provider adapters
-                                ├── API providers
-                                ├── local providers
-                                └── Codex subscription
-```
-
-The Python planner/worker is the source of truth for lifecycle and repository actions. Skillz uses Codex only as a model backend: a subscription-backed Codex subprocess cannot directly edit the target repository, and must return Skillz actions for the host to validate and execute.
-
-## Setup
-
-Requirements:
-
-- Python 3.13 is the current development target.
-- Git must be available for status, diff, review, and repository mutation flows.
-- Node.js and npm are required for the Electron workbench or VS Code extension.
-- The Codex CLI, or a discovered desktop-bundled Codex executable on Windows or macOS, is required only for `codex-subscription`.
-
-Install Python provider dependencies:
+### 1. Clone with the prebuilt sources
 
 ```bash
-pip install openai google-genai anthropic pytest
+git clone --recurse-submodules https://github.com/arberrexhepi/skillz-code-agent.git
+cd skillz-code-agent
 ```
 
-Set an API key with environment variables or a local `.env` file:
+Already cloned without submodules? Run `npm --prefix desktop run submodules:init` from the repository root.
+
+### 2. Create the Python environment
+
+**macOS / Linux**
 
 ```bash
-export OPENAI_API_KEY=...
-export META_AI_API_KEY=...
-export GEMINI_API_KEY=...
-export ANTHROPIC_API_KEY=...
+python3 -m venv .venv
+.venv/bin/python -m pip install openai google-genai anthropic pytest
+cp .env-example .env
 ```
 
-Only configure credentials for the API-backed providers you use. `codex-subscription` does not require `OPENAI_API_KEY`; it requires a local Codex session authenticated with ChatGPT.
-
-Start the desktop workbench:
-
-```bash
-cd desktop
-npm install
-npm run dev
-```
-
-Then open a project folder, open Runtime settings, choose a provider/model and one of the stable, beta, or live backends, and select **Start agent**. If the folder has no Git repository, Source Control offers **Initialize repository**; afterward, choose files to stage and make the first commit.
-
-### Windows quick start
-
-Install Python 3 with the Windows launcher, Git, and Node.js/npm. From the repository root in PowerShell:
+**Windows PowerShell**
 
 ```powershell
 py -3 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install openai google-genai anthropic pytest
-cd desktop
-npm install
-npm run dev
+Copy-Item .env-example .env
 ```
 
-The workbench uses `.venv\Scripts\python.exe` automatically. To use another installation, set `$env:PYTHON_AGENT_PYTHON = 'C:\Path With Spaces\Python\python.exe'` before launching it. Use only the executable path, without arguments or embedded quotes. Without an override or repository virtual environment, Windows lookup tries `python`, `py -3`, then `python3`; macOS/Linux lookup tries `python3`, then `python`. An invalid explicit selection produces a setup error so the workbench does not silently use a different environment.
+Edit `.env` and set the key for the provider you will use: `OPENAI_API_KEY`, `GEMINI_API_KEY`, `ANTHROPIC_API_KEY`, or `META_AI_API_KEY`. The file is ignored by Git. For `codex-subscription`, select that provider in Runtime settings and complete its sign-in instead of configuring an API key.
 
-For a local ChatGPT subscription, select **Codex / ChatGPT subscription** in Runtime settings. If automatic discovery fails, expand **Locate Codex CLI**, browse or paste the native `codex.exe` path, and choose **Save and check**. Use **Sign in with ChatGPT** if needed. After changing the executable for a running agent, stop and start the agent to use it for model calls. See [Codex / ChatGPT subscription runtime](#codex--chatgpt-subscription-runtime) for discovery paths and environment overrides.
-
-Run the focused checks from the repository root:
-
-```powershell
-.\.venv\Scripts\python.exe -m pytest -q tests
-.\.venv\Scripts\python.exe -m unittest tests.test_codex_subscription tests.test_codex_discovery tests.test_codex_utf8 tests.test_windows_text_encoding
-.\.venv\Scripts\python.exe -m unittest tests.test_repository_discovery tests.test_tree_commands tests.test_discovery_remediation
-cd desktop
-npm run test:runtime
-npm run test:git
-npm run build
-```
-
-File-symlink tests report a skip on Windows when Developer Mode or symlink privileges are unavailable. Directory-junction, excluded-directory, and parent-traversal checks still run without those privileges.
-
-## Run
-
-Planner-first mode:
+### 3. Start the workbench
 
 ```bash
-python main.py --provider openai --model gpt-5.4 --root /your/project
-python main.py --provider codex-subscription --model gpt-5.6-terra --root /your/project
-python main.py --provider meta --model muse-spark-1.2 --root /your/project
-python main.py --provider anthropic --model claude-sonnet-4-6 --root /your/project
-python main.py --provider local --model gemma4 --root /your/project
+npm --prefix desktop install
+npm --prefix desktop run dev
 ```
 
-Direct worker mode:
+Open a project folder, open **Runtime**, select the provider, model, and backend, then choose **Start agent**. The workbench discovers the repository virtual environment automatically. Interpreter overrides and Windows/macOS troubleshooting are covered in the [runtime guide](docs/runtime-guide.md#setup) and [desktop guide](desktop/README.md#python-resolution).
 
-```bash
-python main.py --provider openai --model gpt-5.4 --root /your/project --worker-mode
-python main.py --provider codex-subscription --model gpt-5.6-terra --root /your/project --worker-mode
-python main.py --provider meta --model muse-spark-1.2 --root /your/project --worker-mode
-python main.py --provider anthropic --model claude-sonnet-4-6 --root /your/project --worker-mode
-python main_v2.py --provider gemini --model gemini-3-flash-preview --root /your/project --worker-mode
-python main.py --provider local --model gemma4 --root /your/project --worker-mode
-```
+## Usage
 
-Optional runtime tuning:
+### Workbench
 
-```bash
-python main.py --provider openai --model gpt-5.4 --root /your/project --max-parallel-workers 6
-```
+Submit a concrete request, such as “Add a ten-second countdown before the first drill.” Choose the discovery depth if prompted, review the plan, and approve execution. Follow the resulting changes, diagnostics, and validation report; pause or resume through the agent controls.
 
-Live runtime switching in the CLI:
+An illustrative CLI exchange using the same planner workflow:
 
 ```text
-/runtime anthropic claude-sonnet-4-6
-/model claude-sonnet-4-6
-/runtime-show
-/providers
-/models
-/models gemini
-```
-
-`/providers` lists supported runtimes. `/models [provider]` shows the current provider by default and prints suggested model names for any supported provider. On startup, the backend does one best-effort live model refresh for providers with installed SDKs and credentials, then falls back to the built-in catalog if a provider cannot be queried. Custom model strings remain available for providers that support them; `codex-subscription` is intentionally limited to its local live/fallback catalog.
-
-### Codex / ChatGPT subscription runtime
-
-The `codex-subscription` provider is an additive alternative to `openai`; it does not replace or modify API-key invocation.
-
-1. Install the Codex CLI, or use a discovered desktop-bundled executable on Windows or macOS.
-2. Run `codex login` and complete the browser flow. Confirm the active method with `codex login status`; it must report ChatGPT authentication rather than API-key authentication.
-3. In the Electron Workbench Runtime drawer, choose **Codex / ChatGPT subscription**. The drawer shows the detected account, subscription plan, CLI version, and live model catalog. If needed, use **Sign in with ChatGPT**.
-4. Select one of the models advertised by the local Codex catalog and apply the runtime.
-
-You can inspect the same integration without starting the desktop app:
-
-```bash
-python codex_subscription.py status
-python main.py --provider codex-subscription --model gpt-5.6-terra --root /your/project
-```
-
-Skillz discovers the executable in this order: `CODEX_CLI_PATH`, `codex` on `PATH`, then the local desktop bundle. On macOS this is `/Applications/ChatGPT.app`. On Windows it checks `%LOCALAPPDATA%\OpenAI\Codex\bin\<runtime>\codex.exe` (newest binary first), then the older `bin\codex.exe` layout. Windows discovery works even when the desktop app was launched without Codex on `PATH`. Override discovery when needed:
-
-```bash
-export CODEX_CLI_PATH=/absolute/path/to/codex
-```
-
-Desktop users can also choose **Runtime → Locate Codex CLI**, browse or paste the executable path, and select **Save and check**. This validated, per-computer selection takes precedence over `CODEX_CLI_PATH`; **Use automatic discovery** removes it. A missing explicit path is reported instead of silently switching installations.
-
-In Windows PowerShell, set `$env:CODEX_CLI_PATH = 'C:\Path With Spaces\codex.exe'` before launching Skillz. Use the executable path only, without command arguments. Inspect discovery and session status with `py -3 codex_subscription.py status` from the repository root.
-
-Each model turn runs through `codex exec --ephemeral` in a temporary, read-only workspace. Skillz removes `OPENAI_API_KEY`, OpenAI base-URL overrides, and Codex API/access-token variables from the child process, preventing this provider from silently falling back to usage-based API authentication. Repository reads, writes, and validation remain controlled by the Skillz host.
-
-Set `CODEX_SUBSCRIPTION_TIMEOUT_SECONDS` to override the default model-turn timeout. Authentication and model discovery use the local Codex app-server; credentials remain owned by Codex and are never copied into the renderer or Skillz configuration.
-
-OpenAI documents ChatGPT subscription and API-key login as separate Codex authentication paths. API-key invocation continues to use standard API billing, while ChatGPT sign-in uses the permissions and limits of the selected ChatGPT account/workspace. See [Codex authentication](https://learn.chatgpt.com/docs/auth), [Codex app-server](https://learn.chatgpt.com/docs/app-server), and [Codex non-interactive mode](https://learn.chatgpt.com/docs/non-interactive-mode).
-
-Muse Spark uses Meta's OpenAI-compatible Responses API. Add `META_AI_API_KEY=...` to the repository `.env`, then select `--provider meta --model muse-spark-1.2`. The shared startup loader reads `.env` before constructing any provider client, including when the VS Code extension launches the backend. The base URL defaults to `https://api.meta.ai/v1` and can be overridden with `META_MODEL_API_BASE_URL`. Meta does not support `--thinking-mode none`; use `minimal` or higher. The discounted `muse-spark-1.2-contributor` model is also listed, but its prompts and completions may be used by Meta for training, unlike the standard tier.
-
-## VS Code Extension
-
-An initial desktop VS Code extension shell is available under `vscode-extension/`.
-
-The extension is a transitional integration surface. Ongoing product development is centered on the standalone Electron/React Workbench, which is intended to replace the extension rather than maintain permanent feature parity with it.
-
-What it currently provides:
-
-- launches the Python planner/worker runtime as a background bridge process
-- renders planner state, worker runtime state, transcript history, and current-run facts in a webview panel
-- turns planner and worker `suggested_next_actions` into clickable buttons for plan approval, rejection, discovery selection, validation, review, and recovery flows
-- surfaces backend-generated diagnostics in the panel and mirrors them into the VS Code Problems view, including file-targeted checks that also work in pure CLI mode
-- opens file paths surfaced from runtime state directly in the editor and can open review reports plus working-tree-vs-HEAD file diffs
-
-Extension development setup:
-
-```bash
-cd vscode-extension
-npm install
-npm run compile
-npm test
-npm run test:integration
-```
-
-Then open `vscode-extension/` as the extension development workspace and run the `Run Python Agent Extension` launch configuration.
-
-Extension settings:
-
-- `skillzAgent.provider`
-- `skillzAgent.model`
-- `skillzAgent.pythonPath`
-- `skillzAgent.backendScript`
-
-To launch the beta TreeLoop planner bridge from the extension, set `skillzAgent.backendScript` to `main_v2.py`. Leave it as `main.py` to keep using the stable planner/worker backend.
-
-Changing `skillzAgent.provider` or `skillzAgent.model` while the extension backend is running now hot-updates the active runtime without killing the process.
-
-Backend requirements:
-
-- Python 3.13 is the current development target; the extension will also work with a compatible Python interpreter that can run `main.py` and `agent_tools.py`.
-- Install Python dependencies for the selected provider before launching the extension: `openai` for OpenAI mode, `anthropic` for Anthropic mode, `google-genai` for Gemini mode.
-- Set provider credentials in the repository `.env` or the environment seen by VS Code, such as `OPENAI_API_KEY`, `META_AI_API_KEY`, `ANTHROPIC_API_KEY`, or `GEMINI_API_KEY`.
-- Keep `git` available on `PATH`; review, diff, and file comparison flows rely on repository commands.
-- `skillzAgent.pythonPath` should point at the interpreter or virtual environment you want the extension backend to use.
-- The `local` provider targets the existing localhost OpenAI-compatible endpoint at `http://127.0.0.1:5051/v1`, which can be used for models such as Gemma 4.
-- Node.js and `npm` are required only for extension development inside `vscode-extension/`, not for the Python backend itself.
-
-The extension currently targets desktop VS Code APIs and uses the Python runtime as the source of truth for planner/worker behavior.
-
-## Desktop Workbench
-
-The standalone Electron application is under `desktop/`. It is an agent-first coding workbench rather than a VS Code clone.
-
-Current workspace capabilities:
-
-- lazy repository tree, Monaco tabs, dirty-state tracking, save shortcuts, and file/Git diffs
-- real PTY terminals through xterm.js and `node-pty`
-- repository initialization for new project folders, branch/status inspection, staging, unstaging, diff review, and commits
-- Activity, Problems, Review, and Terminal dock surfaces, with diagnostics mirrored into Monaco markers
-- planner conversation, bounded discovery choices, plan approval, continuous execution, durable issues, run diagnostics, work handoffs, and per-goal reports
-- live model-call and tool-action feedback so long subscription-backed turns do not appear frozen
-- Runtime settings for provider, live model catalog, stable/beta/live backend, token backoff, agent start/stop, Codex subscription account status, and a saved CLI executable fallback
-
-The renderer is sandboxed and has no direct Node, filesystem, shell, or credential access. Workspace, Git, terminal, Codex status/login, and Python bridge operations run in Electron's main process behind a narrow validated preload API.
-
-Development and packaging commands:
-
-```bash
-cd desktop
-npm run typecheck
-npm run build
-npm run package
-```
-
-See [`desktop/README.md`](desktop/README.md) for architecture, development commands, packaging, and current distribution constraints.
-
-## Planner Flow
-
-- Starts in planner mode by default.
-- Asks clarification questions when the request is materially underspecified.
-- Offers a discovery phase when repo inspection is needed before planning.
-- Supports `Quick Scan`, `Moderate Scan`, and `Deep Scan` discovery depths.
-- Produces a plan that must be approved before execution.
-- Delegates goals one at a time to the worker.
-- Can execute dependency-ready read-only or validation-only goals concurrently when the planner marks them safe to parallelize.
-- After discovery, pushes discovered files, constraints, and risks into delegation so goals are concrete rather than vague.
-- Ends with specific next steps tied to the executed work.
-- Opens an issue-scoped execution context when an approved plan starts, closes it on full success, and can explicitly reopen recent issues for follow-up work.
-- Pauses on retryable model failures while preserving completed-goal checkpoints and partial repository changes.
-- Resumes from the failed or next incomplete goal without rerunning completed goals or requiring plan re-approval.
-
-Planner commands:
-
-- `/approve` executes the pending plan.
-- `/reject` rejects the pending plan.
-- `/plan` shows the current pending plan.
-- `/discover` shows the current discovery offer.
-- `/providers` lists supported runtime providers.
-- `/models [provider]` lists suggested models for the current or specified provider.
-- `/reset` clears planner state.
-- `/worker` enters direct worker debug mode.
-- `/quit` exits.
-
-## Example Session
-
-Example request:
-
-```text
-When opening a routine, do a 10 second countdown with speech and an indicator before the first drill starts.
-```
-
-Typical planner-first flow:
-
-```text
-planner> When opening a routine, do a 10 second countdown with speech and an indicator before the first drill starts.
-
-Discovery suggested: The request depends on the current routine start flow and UI entrypoints.
-Choose a discovery depth:
-1. Quick Scan [budget: 6 tool calls]
-2. Moderate Scan (recommended) [budget: 12 tool calls]
-3. Deep Scan [budget: 15 tool calls]
-
-planner> 2
-
-Discovery complete: Moderate Scan
-Worker result: Discovery found the routine entry flow in src/app.py and the immediate start behavior in src/routine.py.
-Tool budget: 7/12
-
-Plan summary: Fix routine start flow
-Discovery basis: Discovery found the routine entry flow in src/app.py and the immediate start behavior in src/routine.py.
-Goals:
-1. Implement countdown before first drill [goal-1] - preserve_context=false
-	Goal: Update the routine startup flow to show a 10 second countdown, play countdown speech, and begin the first drill only after countdown completion.
-	Why next: Discovery already identified the startup flow and the files controlling routine start behavior.
-	Delegation: Primary discovered files: src/app.py, src/routine.py; Use the discovery findings directly rather than repeating broad discovery.
-	Success signals: The worker reports a concrete completed outcome tied to the discovered flow, not additional broad discovery.
-
+planner> Add a ten-second countdown before the first drill.
+[Skillz discovers the entry flow and presents a proposed plan.]
 planner> approve
-
-Executing confirmed plan.
-Goal 1/1 completed: Implement countdown before first drill
-Worker result: Updated the startup flow and added countdown behavior before the first drill begins.
-
-Specific next steps:
-1. Validate the countdown timing and speech cadence in the routine UI.
-2. Verify the first drill starts only after countdown completion.
+[Skillz edits the relevant files, validates the change, and reports the outcome.]
 ```
 
-What this example shows:
+### CLI
 
-- The planner offers discovery when repo structure matters.
-- Discovery findings are carried into the plan rather than discarded.
-- Goal delegation names concrete files, outcomes, and success signals.
-- Approval is explicit before worker execution begins.
+From the repository root, use the virtual environment for planner mode. Replace `/path/to/project` with the repository to work on, and choose a model available to your provider:
 
-## Worker Tooling
+```bash
+.venv/bin/python main.py --provider openai --model gpt-5.4 --root /path/to/project
+```
 
-The worker supports focused repository actions instead of a generic shell-first workflow.
+On Windows, use `.\.venv\Scripts\python.exe` instead of `.venv/bin/python`. Add `--worker-mode` for direct worker execution, or `--confirm-writes --confirm-shell` for per-action confirmation. `main_v2.py` selects the beta TreeLoop backend; `live_test_loop.py` exposes its live entrypoint.
 
-Core file and search actions:
+| Command | Purpose |
+| --- | --- |
+| `/discover` | Show the pending discovery choice |
+| `/plan`, `approve`, `reject` | Inspect or decide on the proposed plan |
+| `/providers`, `/models` | Inspect the runtime catalog |
+| `/start-auto 3 <request>`, `/stop-auto` | Start or stop continuous issue cycles |
+| `/create-issue <details>`, `reopen issue-123` | Create or resume durable work |
 
-- `list_files` with recursive listing, max depth, and glob filters.
-- `read_file` with optional line windows.
-- `inspect_files` for batched multi-file reads.
-- `summarize_files` for dependency-aware file summaries.
-- `grep` scoped by path and glob, with ripgrep when available.
-- `find_files` scoped by path and glob.
-- `symbol_search` for Python and JS/TS symbols, including imports/exports and Python methods.
+See [runtime configuration](docs/runtime-guide.md#run), [agent workflow and tools](docs/agent-workflow.md), and the [VS Code guide](vscode-extension/README.md) for the complete interfaces.
 
-Change and git actions:
+## Architecture and tech stack
 
-- `write_file` and `patch_file` with verification-aware follow-up.
-- `git_status` with parsed entries and counts.
-- `git_diff` with staged, stat, and name-only modes.
-- `review_changes` with risk and validation summaries.
-- `git_add`, `git_restore`, `git_commit`, `git_log`, and `git_branch`.
+```mermaid
+flowchart TB
+    Desktop["Electron / React workbench"] --> Bridge["Validated IPC and Python bridge"]
+    Bridge --> Host["Python planner / worker"]
+    CLI["CLI / VS Code extension"] --> Host
+    Host --> Models["Provider adapters: API, local, subscription"]
+    Host --> Tools["Skillz tools: repository actions and validation"]
+```
 
-The beta TreeLoop worker exposes a guarded Git command library for `status`, `diff`, revision-range `log`, read-only branch and remote inspection, `rev-parse`, `show`, `blame`, explicit-path staging/restoration/moves/removals, commits, and authorized pushes. Remote writes require explicit task authorization, and repository paths and revisions are validated before execution.
+| Layer | Main technologies |
+| --- | --- |
+| Workbench | Electron, React, TypeScript, Vite, Monaco |
+| Host integration | Validated IPC, xterm.js, node-pty, Git |
+| Agent runtime | Python, planner/worker protocols, provider adapters |
+| Artifact apps | React/Vite/TypeScript, Express, Docker |
+| Optional artifact data | Sequelize with SQLite, PostgreSQL, MySQL, MariaDB, or SQL Server |
 
-Execution and context actions:
+### Runtime boundaries
 
-- `diagnose` for backend file-targeted diagnostics on `.ts`, `.tsx`, `.js`, `.jsx`, and `.py` files without relying on VS Code.
-- `run_shell` for validation, formatting, or targeted inspection.
-- `meta` and `show_diff` for repository context.
-- `history_expand` and `memory_expand` for compact context recovery.
-- `drop_context` and `finish` for execution control.
+- The Python host controls repository actions and validation. Model backends return actions for Skillz to validate; the subscription model process does not directly edit the target repository.
+- The renderer has no direct Node, filesystem, or process access. Discovery is read-only; mutations and remote writes follow the host’s authorization rules.
+- Artifact agents and previews run in Docker with explicit folder grants. **Allow changes** and **Allow Process Proxy** are separate capabilities; approved Process Proxy scripts run with the user’s host privileges.
+- Durable `issue-*` records differ from transient `run-*` validation findings. Architecture facts persist across issues; goal facts return with the active or reopened issue.
 
-Playground OS skills:
+Read the [runtime boundaries](desktop/README.md#runtime-boundaries), [artifact access model](desktop/README.md#file-access-and-enforcement), and [issue facts guide](docs/agent-workflow.md#issue-scoped-facts) before extending those surfaces.
 
-- Bundled skills live under `skills/*.md` with front matter for `name`, `description`, optional `args_schema`, optional `tags`, optional `category`, and optional `priority`.
-- Both the stable runtime and the beta TreeLoop runtime auto-load bundled skills from this repo and workspace-local skills from `<target-repo>/skills/*.md`.
-- In the stable runtime, use the `skill` action to list skills or load a named skill payload.
-- Use `skill` to list them and `skill <name>` to invoke a cached Markdown skill payload.
+## Artifacts and Git portability
 
-## Issue-Scoped Facts
+Use **Artifacts** to build an app or install Server Manager or Repository issue manager. Choose an artifact library, grant only the folders and scripts it needs, and start its agent or preview. Database, chatbot, Blueprint, Vault, dependency repair, and Docker details are in the [Artifacts guide](desktop/README.md#artifacts).
 
-- Durable facts in `repo_facts.md` are now schema-versioned and stored in an issue-aware ledger instead of a flat list.
-- `architecture` facts are cross-issue repo memory and remain available for unrelated future work.
-- `goal` facts are issue-local memory and return only while the issue is active or when that issue is explicitly reopened.
-- Approved plan execution opens an issue automatically; successful completion closes it.
-- The planner and extension can surface recent closed issues as explicit reopen actions instead of silently leaking old goal facts into new requests.
+### Cloning and publishing the prebuilt artifacts
 
-## Notes
+The bundled prebuilts are submodules on `prebuilt/server-manager` and `prebuilt/repo-issue-manager`. Their `./` URLs resolve to the cloned repository; the application records exact source commits. Installed copies in a user’s artifact library have independent repositories and publishing configuration.
 
-- The planner is designed to reduce repeated exploration and push the worker toward concrete execution once enough evidence exists.
-- Successful writes and patches require read-based verification before the worker treats them as complete.
-- Discovery is intended to improve delegation quality, not become a substitute for execution.
-- The host can prefetch discovery probes in parallel and run parallel post-write validation, while repository writes remain serialized behind runtime locks.
-- The backend now exposes a structured runtime catalog for supported providers and suggested models, so the CLI and VS Code extension can reuse the same source of truth instead of hardcoding separate lists.
+After pulling, restore the recorded versions. To publish the application and its required prebuilt histories to a configured remote:
+
+```bash
+npm --prefix desktop run submodules:init
+npm --prefix desktop run repo:publish -- origin
+```
+
+Commit child changes and updated parent pointers before publishing. A plain application `git push` bypasses the publisher. The [full prebuilt guide](docs/prebuilt-artifacts.md) covers independent GitHub copies, detached submodule checkouts, second-machine pulls, and destination verification. The [Prebuilt artifacts workflow](.github/workflows/prebuilt-artifacts.yml) should be a required check on protected application branches.
+
+## Development
+
+Run the checks relevant to the code you changed. From the repository root:
+
+```bash
+.venv/bin/python -m pytest -q tests
+npm --prefix desktop run typecheck
+npm --prefix desktop run test:runtime
+npm --prefix desktop run test:git
+npm --prefix desktop run test:prebuilts
+npm --prefix desktop run build
+```
+
+On Windows, replace the Python executable with `.\.venv\Scripts\python.exe`. Artifact Docker/browser integration suites are separate; see the [desktop development guide](desktop/README.md#development). Packaging uses `npm --prefix desktop run package`.
+
+## Roadmap and current limitations
+
+- [x] Planner/worker CLI and standalone Electron workbench.
+- [x] Independent artifacts, Docker access boundaries, and prebuilt publishing checks.
+- [ ] Bundle a platform-specific Python interpreter and provider dependencies with distributable builds.
+- [ ] Complete branded installer icons and macOS signing/notarization.
+- [ ] Add Language Server Protocol support as a separate main-process service.
+
+Packaged builds currently include the agent source but still require host Python and provider dependencies. The VS Code extension is transitional. See [distribution notes](desktop/README.md#distribution-notes) for the remaining release work.
+
+## Documentation
+
+| Topic | Guide |
+| --- | --- |
+| Desktop UI, artifacts, permissions, and packaging | [Workbench](desktop/README.md) |
+| Setup, providers, model selection, and executable discovery | [Runtime guide](docs/runtime-guide.md) |
+| Discovery, approvals, recovery, tools, and issue facts | [Agent workflow](docs/agent-workflow.md) |
+| Clones, remotes, submodule changes, and publishing | [Prebuilt artifacts](docs/prebuilt-artifacts.md) |
+| Generated dependency notices and release verification | [Third-party licenses](docs/third-party-licenses.md) |
+| Detailed implementation updates and compatibility behavior | [Development notes](docs/development-notes.md) |
+| Bundled and workspace-local skills | [Skills](skills/README.md) |
+| Existing VS Code integration | [Extension](vscode-extension/README.md) |
+
+## License and acknowledgments
+
+Licensed under the [Apache License 2.0](LICENSE).
+
+Copyright 2026 arbër inc. See [NOTICE](NOTICE) for the copyright notice.
+
+Desktop releases include generated third-party license notices and verify them during packaging. See the [third-party license guide](docs/third-party-licenses.md) for coverage and verification commands.
+
+Skillz builds on Electron, React, Vite, TypeScript, Monaco, xterm.js, node-pty, Zod, Express, Sequelize, and the supported provider SDKs. See the [desktop dependencies](desktop/package.json) and [artifact template](desktop/artifact-template/package.json) for their declarations.
