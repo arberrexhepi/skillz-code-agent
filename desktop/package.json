@@ -1,12 +1,17 @@
 {
   "name": "skillz-agent-workbench",
   "version": "0.1.0",
+  "license": "Apache-2.0",
   "private": true,
   "description": "Agent-first desktop coding workbench.",
   "main": "./out/main/index.js",
   "scripts": {
-    "submodules:init": "git -C .. submodule update --init --recursive",
-    "submodules:update": "git -C .. submodule update --init --remote --recursive",
+    "submodules:init": "node scripts/prebuilt-artifacts.cjs init",
+    "submodules:update": "node scripts/prebuilt-artifacts.cjs update",
+    "submodules:check": "node scripts/prebuilt-artifacts.cjs check",
+    "submodules:verify": "node scripts/prebuilt-artifacts.cjs verify",
+    "repo:publish": "node scripts/prebuilt-artifacts.cjs publish",
+    "test:prebuilts": "node --test scripts/prebuilt-artifacts.test.cjs",
     "test:runtime": "node --test scripts/python.test.cjs scripts/agent-runtime.test.cjs scripts/terminal.test.cjs scripts/terminal-panel.test.cjs scripts/runtime-settings.test.cjs scripts/runtime-settings-ipc.test.cjs",
     "test:git": "node --test scripts/git.test.cjs scripts/git-initialize.test.cjs",
     "test:issues": "node --test scripts/issues.test.cjs scripts/issue-proposals.test.cjs scripts/workspace-issues.test.cjs",
@@ -16,20 +21,27 @@
     "test:timeline": "node --test scripts/agent-timeline.test.cjs",
     "test:plans": "node --test scripts/plan-review.test.cjs scripts/discovery-extension.test.cjs",
     "test:layout:preview": "vite --config scripts/fixtures/vite.config.mjs --open /scripts/fixtures/workspace-view.html",
-    "predev": "node scripts/ensure-electron.cjs",
+    "predev": "node scripts/prebuilt-artifacts.cjs check && node scripts/ensure-electron.cjs",
     "dev": "electron-vite dev",
+    "prebuild": "node scripts/prebuilt-artifacts.cjs check",
     "build": "npm run typecheck && electron-vite build",
     "typecheck": "tsc -p tsconfig.node.json --noEmit && tsc -p tsconfig.web.json --noEmit",
-    "prepreview": "node scripts/ensure-electron.cjs",
+    "prepreview": "node scripts/prebuilt-artifacts.cjs check && node scripts/ensure-electron.cjs",
     "preview": "electron-vite preview",
     "package": "npm run build && electron-builder --dir",
     "dist": "npm run build && electron-builder",
-    "test:artifacts": "node --test scripts/artifacts.test.cjs scripts/artifact-process.test.cjs scripts/artifact-process-proxy.test.cjs scripts/artifact-docker-cleanup.test.cjs",
+    "test:artifacts": "node --test scripts/artifacts.test.cjs scripts/artifact-blueprints.test.cjs scripts/artifact-blueprint-agent.test.cjs scripts/artifact-model-broker.test.cjs scripts/artifact-process.test.cjs scripts/artifact-process-proxy.test.cjs scripts/artifact-docker-cleanup.test.cjs",
     "test:artifacts:preview": "node --test scripts/artifact-frame.test.cjs",
     "test:artifacts:integration": "node --test scripts/artifacts-integration.test.cjs",
+    "test:artifacts:sqlite": "node --test scripts/artifact-sqlite-integration.test.cjs",
     "test:artifacts:sandbox": "node --test scripts/artifact-sandbox.test.cjs",
     "test:artifacts:setup": "node --test scripts/artifact-capabilities.test.cjs",
-    "test:artifacts:setup:integration": "node --test scripts/artifact-capabilities-integration.test.cjs"
+    "test:artifacts:setup:integration": "node --test scripts/artifact-capabilities-integration.test.cjs",
+    "postbuild": "node scripts/third-party-notices.cjs generate",
+    "notices:generate": "node scripts/third-party-notices.cjs generate",
+    "notices:check": "node scripts/third-party-notices.cjs check",
+    "notices:verify": "node scripts/third-party-notices.cjs verify",
+    "test:notices": "node --test scripts/third-party-notices.test.cjs"
   },
   "build": {
     "appId": "agency.aiam.skillz-workbench",
@@ -39,7 +51,8 @@
     },
     "files": [
       "out/**/*",
-      "package.json"
+      "package.json",
+      "!out/licenses/**/*"
     ],
     "asarUnpack": [
       "node_modules/node-pty/**/*",
@@ -47,6 +60,22 @@
       "node_modules/playwright-core/**/*"
     ],
     "extraResources": [
+      {
+        "from": "../LICENSE",
+        "to": "LICENSE"
+      },
+      {
+        "from": "../NOTICE",
+        "to": "NOTICE"
+      },
+      {
+        "from": "out/licenses/THIRD_PARTY_NOTICES.txt",
+        "to": "THIRD_PARTY_NOTICES.txt"
+      },
+      {
+        "from": "out/licenses/third-party-licenses",
+        "to": "third-party-licenses"
+      },
       {
         "from": "../",
         "to": "python-agent",
@@ -63,8 +92,10 @@
         "to": "artifact-template",
         "filter": [
           "**/*",
-          "!node_modules/**/*",
-          "!package-lock.json"
+          "!package-lock.json",
+          "!**/node_modules{,/**/*}",
+          "!**/dist{,/**/*}",
+          "!**/.git{,/**/*}"
         ]
       },
       {
@@ -72,9 +103,9 @@
         "to": "prebuilt-artifacts",
         "filter": [
           "**/*",
-          "!.git",
-          "!.git/**/*",
-          "!node_modules/**/*"
+          "!**/node_modules{,/**/*}",
+          "!**/dist{,/**/*}",
+          "!**/.git{,/**/*}"
         ]
       }
     ],
@@ -91,7 +122,9 @@
         "deb"
       ],
       "category": "Development"
-    }
+    },
+    "beforePack": "./scripts/third-party-notices.cjs",
+    "afterPack": "./scripts/third-party-notices.cjs"
   },
   "dependencies": {
     "@monaco-editor/react": "^4.7.0",

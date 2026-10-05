@@ -2,6 +2,7 @@ node_modules/
 dist/
 .context/
 .artifact-local.json
+.artifact-data/
 .env
 .env.*
 repo_facts.md

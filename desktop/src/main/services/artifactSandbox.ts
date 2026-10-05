@@ -7,6 +7,7 @@ import { app } from 'electron';
 import { hostEnvironment } from './hostEnvironment';
 import { command, git, runLogged } from './artifactProcess';
 import { artifactProcessProxyScript } from './artifactProcessProxyScript';
+import { artifactDependenciesScript } from './artifactDependenciesScript';
 import type { ReadDirectory } from '../../shared/artifacts';
 
 export const containerRoot = '/repo';
@@ -31,7 +32,10 @@ async function sandboxDefinition(source: string) {
   }
   await collect(source);
   files.push({ name: 'process-proxy/npm-proxy.cjs', content: Buffer.from(artifactProcessProxyScript) });
+  files.push({ name: 'prepare-dependencies.cjs', content: Buffer.from(artifactDependenciesScript) });
   const dockerfile = `FROM node:22.20.0-bookworm
+RUN apt-get update && apt-get install -y --no-install-recommends python3 ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN command -v python3 && command -v make && command -v g++ && test -f /usr/local/include/node/node.h
 RUN mkdir -p /repo/node_modules && chmod 1777 /repo/node_modules
 COPY harness /opt/skillz
 RUN mkdir -p /opt/skillz/bin && ln -s /opt/skillz/process-proxy/npm-proxy.cjs /opt/skillz/bin/npm && chmod 755 /opt/skillz/process-proxy/npm-proxy.cjs
@@ -103,7 +107,7 @@ export class ArtifactSandbox {
   private docker = '';
   private cancelled = false;
   private stopping?: Promise<void>;
-  constructor(readonly root: string, readonly reads: ReadDirectory[], readonly context: string, private readonly processProxy?: { url: string; token: string }) {}
+  constructor(readonly root: string, readonly reads: ReadDirectory[], readonly context: string, private readonly processProxy?: { url: string; token: string }, private readonly modelBroker?: { url: string; token: string; provider: string; model: string }) {}
   async prepare(log: (text: string) => void, source?: string): Promise<{ docker: string; args: string[] }> {
     const { docker, image } = await ensureSandboxImage(log, source);
     this.docker = docker;
@@ -126,6 +130,7 @@ export class ArtifactSandbox {
     args.push('--mount', bindMount(this.context, '/context', true));
     args.push('--env', 'SKILLZ_READ_ROOTS=' + JSON.stringify(reads), '--env', 'SKILLZ_WRITE_ROOTS=' + JSON.stringify(reads.filter(root => root.access === 'write')), '--env', 'SKILLZ_ARTIFACT_READ_ROOTS=' + JSON.stringify(reads), '--env', 'SKILLZ_OBSERVABILITY_PATH=/repo/memory_observability.md', '--env', 'SKILLZ_CONTEXT_ROOT=/context');
     if (this.processProxy) args.push('--env', `SKILLZ_PROCESS_PROXY_URL=${this.processProxy.url}`, '--env', `SKILLZ_PROCESS_PROXY_TOKEN=${this.processProxy.token}`);
+    if (this.modelBroker) args.push('--env', `SKILLZ_MODEL_BROKER_URL=${this.modelBroker.url}`, '--env', `SKILLZ_MODEL_BROKER_TOKEN=${this.modelBroker.token}`, '--env', `SKILLZ_APP_AGENT_PROVIDER=${this.modelBroker.provider}`, '--env', `SKILLZ_APP_AGENT_MODEL=${this.modelBroker.model}`);
     return { docker, args: [...args, image] };
   }
   spawn(docker: string, args: string[], commandArgs: string[], options: string[] = []): ChildProcessWithoutNullStreams {

@@ -1,7 +1,7 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { artifactId, artifactApisSchema, artifactAgentRuntimeSchema, artifactAccessSchema, type ArtifactAccess, createArtifactSchema, type ArtifactApis, type ArtifactLibrary, type ArtifactRecord, type CreateArtifact, type PrebuiltArtifact } from '../../shared/artifacts';
+import { artifactId, artifactApisSchema, artifactAgentRuntimeSchema, artifactAccessSchema, artifactAppSchema, defaultArtifactApp, type ArtifactAccess, createArtifactSchema, type ArtifactApis, type ArtifactAppConfig, type ArtifactAppSaveResult, type ArtifactLibrary, type ArtifactRecord, type CreateArtifact, type PrebuiltArtifact } from '../../shared/artifacts';
 import { git } from './artifactProcess';
 
 const manifestName = '.skillz-artifacts.json';
@@ -22,8 +22,15 @@ export async function readJson(file: string): Promise<unknown> {
   if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 256000) throw new Error(`Expected a regular JSON file smaller than 256 KB: ${path.basename(file)}`);
   return JSON.parse(await fs.readFile(file, 'utf8'));
 }
+async function writeText(file: string, value: string): Promise<void> {
+  const temp = `${file}.${randomUUID()}.tmp`;
+  await fs.mkdir(path.dirname(file), { recursive: true });
+  try { await fs.writeFile(temp, value, { flag: 'wx' }); await fs.rename(temp, file); }
+  finally { await fs.rm(temp, { force: true }); }
+}
 export class ArtifactLibraryService {
   private queue: Promise<unknown> = Promise.resolve();
+  private legacyPrebuiltIds = new Map<string, string | undefined>();
   constructor(private readonly settingsFile: string, private readonly template: string, private readonly contextHome: string, private readonly prebuiltHome = path.join(path.dirname(template), 'prebuilt-artifacts')) {}
   private serial<T>(operation: () => Promise<T>): Promise<T> { const pending = this.queue.then(operation); this.queue = pending.catch(() => {}); return pending; }
   async library(): Promise<ArtifactLibrary> {
@@ -40,13 +47,32 @@ export class ArtifactLibraryService {
     for (const rawId of manifest.artifacts) {
       const id = artifactId.parse(rawId);
       const directory = await this.directory(root, id);
-      const meta = await readJson(path.join(directory, 'artifact.json')) as { title: string; prompt: string; createdAt: string };
+      const meta = await readJson(path.join(directory, 'artifact.json')) as { title: string; prompt: string; createdAt: string; prebuiltId?: unknown };
       // Imported/legacy repositories cannot grant themselves access by editing local JSON.
       const local = records[directory] || { sourceRoot: '', shareFacts: false, shareMemory: false, contextMode: 'none' };
       const access = permissions[directory] || { directories: [], allowWorkspaceRead: false };
-      artifacts.push({ id, root: directory, title: meta.title, prompt: meta.prompt, createdAt: meta.createdAt, sourceRoot: local.sourceRoot || '', shareFacts: Boolean(local.shareFacts), shareMemory: Boolean(local.shareMemory), contextMode: local.contextMode || 'none', contextWarning: local.contextWarning, runtime: artifactAgentRuntimeSchema.optional().parse(local.runtime), access: artifactAccessSchema.parse(access) });
+      const app = await this.appForRoot(directory);
+      const origin = artifactId.optional().safeParse(meta.prebuiltId ?? local.prebuiltId);
+      const prebuiltId = origin.success && origin.data ? origin.data : await this.legacyPrebuiltId(directory);
+      artifacts.push({ id, root: directory, prebuiltId, title: meta.title, prompt: meta.prompt, createdAt: meta.createdAt, sourceRoot: local.sourceRoot || '', shareFacts: Boolean(local.shareFacts), shareMemory: Boolean(local.shareMemory), contextMode: local.contextMode || 'none', contextWarning: local.contextWarning, runtime: artifactAgentRuntimeSchema.optional().parse(local.runtime), access: artifactAccessSchema.parse(access), app });
     }
     return { root, artifacts };
+  }
+  private async legacyPrebuiltId(root: string): Promise<string | undefined> {
+    if (this.legacyPrebuiltIds.has(root)) return this.legacyPrebuiltIds.get(root);
+    try {
+      // Older installs did not record their origin. Use the original install commit,
+      // rather than the current title, so renamed copies and personal namesakes work.
+      const first = (await git(root, 'rev-list', '--max-parents=0', 'HEAD')).split('\n')[0];
+      const subject = await git(root, 'show', '-s', '--format=%s', first);
+      let id: string | undefined;
+      if (subject === 'Install prebuilt artifact') {
+        const original = JSON.parse(await git(root, 'show', first + ':artifact.json')) as { title?: string; prompt?: string };
+        id = (await this.prebuilts()).find(item => item.title === original.title && item.description === original.prompt)?.id;
+      }
+      this.legacyPrebuiltIds.set(root, id);
+      return id;
+    } catch { return undefined; }
   }
   async find(id: string): Promise<ArtifactRecord> {
     artifactId.parse(id);
@@ -98,9 +124,9 @@ export class ArtifactLibraryService {
     const checked = artifactAccessSchema.parse(access);
     if (preset.requiresWriteAccess && !checked.directories.some(directory => directory.access === 'write')) throw new Error('Share at least one repository with Allow changes enabled.');
     if (preset.requiresProcessProxy && !checked.directories.some(directory => directory.allowProcessProxy)) throw new Error('Share at least one repository with Allow Process Proxy enabled.');
-    return this.createFrom({ title: preset.title, prompt: preset.description, sourceRoot: '', shareFacts: false, shareMemory: false, runtime, access: checked }, source, 'Install prebuilt artifact');
+    return this.createFrom({ title: preset.title, prompt: preset.description, sourceRoot: '', shareFacts: false, shareMemory: false, runtime, access: checked }, source, 'Install prebuilt artifact', preset.id);
   }
-  private createFrom(raw: CreateArtifact, source: string, initialCommit: string): Promise<ArtifactRecord> {
+  private createFrom(raw: CreateArtifact, source: string, initialCommit: string, prebuiltId?: string): Promise<ArtifactRecord> {
     return this.serial(async () => {
       const options = createArtifactSchema.parse(raw);
       const library = await this.library();
@@ -122,11 +148,13 @@ export class ArtifactLibraryService {
         if (entry === ".git") continue;
         await fs.cp(path.join(source, entry), path.join(root, entry), { recursive: true, errorOnExist: true, force: false, filter: (entry) => !['node_modules', '.DS_Store'].includes(path.basename(entry)) && (source !== this.template || path.basename(entry) !== 'package-lock.json') });
       }
+      const app = artifactAppSchema.parse(options.app || defaultArtifactApp());
+      await this.writeAppForRoot(root, app);
       const createdAt = new Date().toISOString();
-      await writeJson(path.join(root, 'artifact.json'), { version: 1, id, title: options.title, prompt: options.prompt, createdAt });
-      let record: ArtifactRecord = { ...options, id, root, createdAt, contextMode: 'none' };
+      await writeJson(path.join(root, 'artifact.json'), { version: 1, id, title: options.title, prompt: options.prompt, createdAt, prebuiltId });
+      let record: ArtifactRecord = { ...options, app, id, root, createdAt, prebuiltId, contextMode: 'none' };
       record = await this.linkContext(record);
-      const { access, ...localRecord } = record;
+      const { access, app: _app, ...localRecord } = record;
       await writeJson(path.join(root, '.artifact-local.json'), localRecord);
       const records = await this.readLocalRecords(); records[root] = localRecord;
       await writeJson(path.join(path.dirname(this.settingsFile), 'artifact-records.json'), records);
@@ -204,4 +232,102 @@ export class ArtifactLibraryService {
     if ((await fs.lstat(directory)).isSymbolicLink()) throw new Error('API configuration directory cannot be a symlink.');
     await writeJson(path.join(directory, 'apis.json'), validated);
   }
+  private async appForRoot(root: string): Promise<ArtifactAppConfig> {
+    try { return artifactAppSchema.parse(await readJson(path.join(root, '.artifact/app.json'))); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return defaultArtifactApp(); throw error; }
+  }
+  private async writeAppForRoot(root: string, config: ArtifactAppConfig): Promise<void> {
+    const validated = artifactAppSchema.parse(config);
+    await writeJson(path.join(root, '.artifact/app.json'), validated);
+    const packageFile = path.join(root, 'package.json');
+    const manifest = await readJson(packageFile) as { dependencies?: Record<string, string>; [key: string]: unknown };
+    const dependencies = { ...(manifest.dependencies || {}) };
+    const drivers: Record<ArtifactAppConfig['database']['dialect'], [string, string]> = {
+      sqlite: ['sqlite3', '^5.1.7'], postgres: ['pg', '^8.16.3'], mysql: ['mysql2', '^3.14.4'], mariadb: ['mariadb', '^3.4.5'], mssql: ['tedious', '^19.1.3'],
+    };
+    for (const [name] of Object.values(drivers)) delete dependencies[name];
+    if (validated.database.enabled) {
+      dependencies.sequelize = '^6.37.7';
+      const [name, version] = drivers[validated.database.dialect]; dependencies[name] = version;
+    } else delete dependencies.sequelize;
+    await writeJson(packageFile, { ...manifest, dependencies });
+  }
+  private async appRuntimeReady(root: string): Promise<boolean> {
+    const required = ['.artifact/runtime.json', 'server/agent.ts', 'server/database.ts', 'src/skillz.ts'];
+    const filesReady = await Promise.all(required.map(name => fs.lstat(path.join(root, name)).then(stat => stat.isFile() && !stat.isSymbolicLink(), () => false)));
+    const runtimeReady = await readJson(path.join(root, '.artifact/runtime.json')).then(value => Boolean(value && typeof value === 'object' && (value as { version?: unknown }).version === 1), () => false);
+    const gatewayReady = await fs.readFile(path.join(root, 'server/gateway.ts'), 'utf8').then(text => text.includes('advertisedCommands'), () => false);
+    const indexReady = await fs.readFile(path.join(root, 'server/index.ts'), 'utf8').then(text => text.includes('attachArtifactAgent') && text.includes('closeDatabase'), () => false);
+    return filesReady.every(Boolean) && runtimeReady && gatewayReady && indexReady;
+  }
+  private async commitPaths(root: string, message: string, files: string[]): Promise<string | undefined> {
+    if (!(await git(root, 'status', '--porcelain', '--untracked-files=all', '--', ...files))) return undefined;
+    await git(root, 'add', '-A', '--', ...files);
+    await git(root, ...author, 'commit', '--only', '-m', message, '--', ...files);
+    return git(root, 'rev-parse', 'HEAD');
+  }
+  private async migrateAppRuntime(root: string, config: ArtifactAppConfig): Promise<ArtifactAppSaveResult> {
+    if (await this.appRuntimeReady(root)) return { migrated: false };
+    const managed = ['.artifact/runtime.json', 'server/agent.ts', 'server/database.ts', 'server/gateway.ts', 'server/schema.ts', 'src/skillz.ts'];
+    const replacements = new Map<string, string>();
+    for (const relative of managed) {
+      const source = path.join(this.template, relative);
+      const sourceStat = await fs.lstat(source);
+      if (!sourceStat.isFile() || sourceStat.isSymbolicLink()) throw new Error(`Artifact template runtime file is invalid: ${relative}`);
+      replacements.set(relative, await fs.readFile(source, 'utf8'));
+    }
+    const indexRelative = 'server/index.ts';
+    const indexFile = path.join(root, indexRelative);
+    let index = await fs.readFile(indexFile, 'utf8').catch((error: NodeJS.ErrnoException) => {
+      if (error.code === 'ENOENT') return '';
+      throw error;
+    });
+    if (!index) index = await fs.readFile(path.join(this.template, indexRelative), 'utf8');
+    else {
+      if (!index.includes("from './agent'")) {
+        const updated = index.replace(/(import\s+\{\s*attachGateway\s*\}\s+from\s+['"]\.\/gateway['"];?)/, "$1\nimport { attachArtifactAgent } from './agent';\nimport { closeDatabase } from './database';");
+        if (updated === index) throw new Error('The artifact server entry point was customized beyond automatic migration. Restore server/index.ts or ask the artifact agent to merge the current template runtime.');
+        index = updated;
+      } else if (!index.includes("from './database'")) {
+        index = index.replace(/(import\s+\{\s*attachArtifactAgent\s*\}\s+from\s+['"]\.\/agent['"];?)/, "$1\nimport { closeDatabase } from './database';");
+      }
+      if (!index.includes('const closeAgent = attachArtifactAgent(app);')) {
+        const updated = index.replace(/(const\s+closeGateway\s*=\s*attachGateway\(app,\s*server,\s*root\);)/, '$1\nconst closeAgent = attachArtifactAgent(app);');
+        if (updated === index) throw new Error('The artifact server startup was customized beyond automatic migration. Restore server/index.ts or ask the artifact agent to merge the current template runtime.');
+        index = updated;
+      }
+      if (!index.includes('closeAgent();')) index = index.replace(/(async\s+function\s+stop\(\)\s*\{)/, '$1 closeAgent();');
+      if (!index.includes('await closeDatabase();')) index = index.replace(/(async\s+function\s+stop\(\)\s*\{[^}]*?closeGateway\(\);)/, '$1 await closeDatabase();');
+      if (!index.includes('closeAgent();') || !index.includes('await closeDatabase();')) throw new Error('The artifact server shutdown handler was customized beyond automatic migration. Restore server/index.ts or ask the artifact agent to merge the current template runtime.');
+    }
+    replacements.set(indexRelative, index);
+    const changed: string[] = [];
+    for (const [relative, next] of replacements) {
+      const target = path.join(root, relative);
+      const stat = await fs.lstat(target).catch((error: NodeJS.ErrnoException) => {
+        if (error.code === 'ENOENT') return undefined;
+        throw error;
+      });
+      if (stat?.isSymbolicLink() || (stat && !stat.isFile())) throw new Error(`Artifact runtime path must be a regular file: ${relative}`);
+      const previous = stat ? await fs.readFile(target, 'utf8') : undefined;
+      if (previous !== next) changed.push(relative);
+    }
+    const commitScope = [...managed, indexRelative, '.gitignore', '.artifact/app.json', 'package.json'];
+    const checkpointCommit = await this.commitPaths(root, 'Checkpoint artifact before runtime migration', commitScope);
+    for (const relative of changed) await writeText(path.join(root, relative), replacements.get(relative)!);
+    const ignoreFile = path.join(root, '.gitignore');
+    const ignore = await fs.readFile(ignoreFile, 'utf8').catch((error: NodeJS.ErrnoException) => { if (error.code === 'ENOENT') return ''; throw error; });
+    if (!ignore.split(/\r?\n/).includes('.artifact-data/')) await writeText(ignoreFile, `${ignore}${ignore && !ignore.endsWith('\n') ? '\n' : ''}.artifact-data/\n`);
+    await this.writeAppForRoot(root, config);
+    const commit = await this.commitPaths(root, 'Upgrade artifact app runtime to v1', commitScope);
+    if (!commit) throw new Error('Artifact runtime migration produced no Git commit.');
+    return { migrated: true, commit, ...(checkpointCommit ? { checkpointCommit } : {}) };
+  }
+  async app(id: string): Promise<ArtifactAppConfig> { return this.appForRoot((await this.find(id)).root); }
+  saveApp(id: string, config: ArtifactAppConfig): Promise<ArtifactAppSaveResult> { return this.serial(async () => {
+    const root = (await this.find(id)).root; const validated = artifactAppSchema.parse(config);
+    const result = validated.chatbot.enabled || validated.database.enabled ? await this.migrateAppRuntime(root, validated) : { migrated: false };
+    if (!result.migrated) await this.writeAppForRoot(root, validated);
+    return result;
+  }); }
 }

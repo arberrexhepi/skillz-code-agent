@@ -1,6 +1,17 @@
 import type { ArtifactEvent, ArtifactLibrary, ArtifactRuntime, ArtifactApis } from '../../src/shared/artifacts';
 import type { AgentBridgeState } from '../../src/shared/contracts';
+const prebuilts: import('../../src/shared/artifacts').PrebuiltArtifact[] = [
+  { id: 'server-manager', title: 'Server Manager', description: 'Manage repository scripts and listening ports.', requiresWriteAccess: false, requiresProcessProxy: true },
+  { id: 'repo-issue-manager', title: 'Repository issue manager', description: 'Manage issues in explicitly shared repositories.', requiresWriteAccess: true },
+];
 let library: ArtifactLibrary = { root: '', artifacts: [] };
+if (new URLSearchParams(window.location.search).has('installedPrebuilts')) {
+  const common = { createdAt: new Date().toISOString(), sourceRoot: '', shareFacts: false, shareMemory: false, contextMode: 'none' as const };
+  library = { root: '/artifacts-library', artifacts: [
+    { ...common, id: 'personal-dashboard', root: '/artifacts-library/personal-dashboard', title: 'My dashboard', prompt: 'Build a dashboard' },
+    ...prebuilts.map(item => ({ ...common, id: item.id + '-installed', root: '/artifacts-library/' + item.id + '-installed', prebuiltId: item.id, title: item.title, prompt: item.description })),
+  ] };
+}
 const listeners = new Set<(event: ArtifactEvent) => void>();
 const selections = new Map<string, import('../../src/shared/contracts').AgentStartOptions>();
 const configs = new Map<string, ArtifactApis>();
@@ -26,17 +37,19 @@ window.workbench.artifacts = {
   capabilities: async(selection)=>capabilities(selection),
   installCapabilities: async(selection)=>{setupProgress={running:true,step:'Installing artifact capabilities',log:'Preparing capabilities…'};emit({type:'setup',progress:setupProgress});await new Promise(resolve=>setTimeout(resolve,500));installed=true;setupProgress={running:false,step:'Downloads complete',log:'Capabilities installed.'};emit({type:'setup',progress:setupProgress});return capabilities(selection);},
   setupProgress: async()=>setupProgress,
+  vault: async()=>({canSaveKey:true,entries:[{provider:'gemini',label:'Google Gemini',keyName:'GEMINI_API_KEY',source:keySaved?'saved':'missing'}]}),
   saveProviderKey: async(_provider,key)=>{keySaved=Boolean(key);},
   openSetupDownload: async()=>{},
   library: async () => structuredClone(library),
-  prebuilts: async () => [{id:'repo-issue-manager',title:'Repository issue manager',description:'Manage issues in explicitly shared repositories.',requiresWriteAccess:true}],
-  installPrebuilt: async (_presetId, access, runtime) => { const id = `issue-manager-${library.artifacts.length + 1}`; const record = { id, root: `${library.root}/${id}`, title: 'Repository issue manager', prompt: 'Manage issues', createdAt: new Date().toISOString(), sourceRoot: '', shareFacts: false, shareMemory: false, contextMode: 'none' as const, access, runtime }; library = { ...library, artifacts: [...library.artifacts, record] }; return record; },
+  prebuilts: async () => prebuilts,
+  installPrebuilt: async (prebuiltId, access, runtime) => { const preset = prebuilts.find(item => item.id === prebuiltId)!; const id = preset.id + '-' + (library.artifacts.length + 1); const record = { id, prebuiltId, root: library.root + '/' + id, title: preset.title, prompt: preset.description, createdAt: new Date().toISOString(), sourceRoot: '', shareFacts: false, shareMemory: false, contextMode: 'none' as const, access, runtime }; library = { ...library, artifacts: [...library.artifacts, record] }; return record; },
   chooseFolder: async () => { library = { root: '/artifacts-library', artifacts: [] }; return library; },
   create: async (options) => { const id = `artifact-${library.artifacts.length + 1}`; const record = { ...options, id, root: `${library.root}/${id}`, createdAt: new Date().toISOString(), contextMode: options.shareFacts || options.shareMemory ? 'snapshot' as const : 'none' as const }; library = { ...library, artifacts: [...library.artifacts, record] }; return record; },
   chooseReadDirectory: async () => ({ id: 'documents', label: 'Documents', path: 'C:\\Users\\example\\Documents', access: 'read' as const }),
   access: async (id) => library.artifacts.find((record) => record.id === id)?.access || { directories: [], allowWorkspaceRead: false },
   saveAccess: async (id, access) => { const record = library.artifacts.find((item) => item.id === id); if (record) record.access = access; emit({ type: 'runtime', runtime: { id, status: 'stopped', logs: '' } }); emit({ type: 'agent', id, event: { type: 'status', status: 'stopped' } }); },
-  apis: async (id) => configs.get(id) || { version: 1, apis: [] }, saveApis: async (id, config) => { configs.set(id, config); },
+  apis: async (id) => configs.get(id) || { version: 1, apis: [] }, saveApis: async (id, config) => { configs.set(id, config); emit({type:'apis',id}); },
+  blueprintAgent: async (id, message) => ({ message: 'Blueprint mode handled: ' + message, config: configs.get(id) || { version: 1, apis: [] }, changes: [] }),
   start: async (id) => { const {url} = await (await fetch('/__fixture-artifact-url')).json(); const runtime: ArtifactRuntime = { id, status: 'running', logs: 'Artifact listening on an available port.', url: `${url}/?id=${id}` }; emit({ type: 'runtime', runtime }); return runtime; },
   stop: async (id) => { emit({ type: 'runtime', runtime: { id, status: 'stopped', logs: '' } }); },
   installBrowser: async () => { inspectionInstalled = true; },

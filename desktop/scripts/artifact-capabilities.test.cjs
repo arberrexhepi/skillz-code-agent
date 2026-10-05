@@ -36,7 +36,7 @@ test('inspection is read-only and installation provisions only missing capabilit
   assert.deepEqual(before.items.filter(item=>item.installable).map(item=>item.id),['provider','runtime','browser']);
   const after=await service.install(selection);
   const pip=calls.find(call=>call.includes('pip'));assert.equal(pip.at(-1),'google-genai');assert.match(pip[0],/settings.*python/);
-  assert.equal(after.items.find(item=>item.id==='provider').ready,true);assert.equal(after.items.find(item=>item.id==='credentials').ready,false);
+  assert.equal(after.items.find(item=>item.id==='provider').ready,true);assert.equal(after.items.find(item=>item.id==='credentials').ready,false);assert.equal(after.items.find(item=>item.id==='credentials').optional,true);assert.equal(after.ready,true);
   assert.equal(service.snapshot().running,false);assert.ok(events.some(event=>event.log.includes('Image ready')));assert.equal(calls.some(call=>call[0]==='browser'),false);
   const count=calls.length;await service.install(selection);assert.equal(calls.length,count);
 });
@@ -45,11 +45,11 @@ test('keys use encrypted host settings, never appear in readiness results, and r
   const {root,service,state}=fixture(t);state.sdk=state.browser=state.image=true;
   await service.saveKey('gemini','test-secret-value');
   const disk=fs.readFileSync(path.join(root,'settings','provider-keys.json'),'utf8');assert.equal(disk.includes('test-secret-value'),false);
-  const status=await service.status(selection);assert.equal(status.ready,true);assert.equal(status.keySaved,true);assert.equal(JSON.stringify(status).includes('test-secret-value'),false);
+  const status=await service.status(selection);assert.equal(status.ready,true);assert.equal(status.keySaved,true);assert.equal((await service.vault()).entries.find(item=>item.provider==='gemini').source,'saved');assert.equal(JSON.stringify(status).includes('test-secret-value'),false);
   const context={agentRoot:root,scriptName:'main.py',python:{executable:'base',args:[]},env:{KEEP:'yes'},options:selection};
   assert.equal((await service.hostContext(context)).env.GEMINI_API_KEY,'test-secret-value');
   assert.equal((await service.hostContext({...context,options:{provider:'codex-subscription',model:'gpt-5.4'}})).env.GEMINI_API_KEY,undefined);
-  await service.saveKey('gemini',null);assert.equal((await service.status(selection)).keySaved,false);
+  await service.saveKey('gemini',null);assert.equal((await service.status(selection)).keySaved,false);assert.notEqual((await service.vault()).entries.find(item=>item.provider==='gemini').source,'saved');
 });
 
 test('missing Docker stays actionable while independent capabilities can install',async(t)=>{
@@ -71,6 +71,28 @@ test('unavailable encryption never falls back to storing plaintext keys',async(t
   const {service,storage,root}=fixture(t);storage.isEncryptionAvailable=()=>false;
   await assert.rejects(service.saveKey('gemini','secret'),/Secure credential storage is unavailable/);
   assert.equal(fs.existsSync(path.join(root,'settings','provider-keys.json')),false);
+});
+
+test('artifact dependency readiness participates in Setup and repair reports progress and failures', async t => {
+  const { service, state, events } = fixture(t);
+  state.sdk = state.image = true;
+  let ready = false, fail = false, installs = 0;
+  const dependencies = {
+    status: async () => [{ id: 'sqlite', label: 'SQLite native driver', ready, installable: !ready, detail: 'Per-artifact dependency volume' }],
+    install: async log => { installs++; log('Repairing SQLite'); if (fail) throw new Error('SQLite rebuild failed'); ready = true; },
+  };
+  assert.equal((await service.status(selection, dependencies)).ready, false);
+  assert.equal((await service.install(selection, dependencies)).ready, true);
+  assert.ok(events.some(event => event.step === 'Repairing SQLite dependencies' && event.log.includes('Repairing SQLite')));
+  await service.install(selection, dependencies);
+  assert.equal(installs, 1);
+  ready = false; fail = true;
+  await assert.rejects(service.install(selection, dependencies), /SQLite rebuild failed/);
+  assert.equal(service.snapshot().running, false);
+  assert.match(service.snapshot().error, /SQLite rebuild failed/);
+  fail = false;
+  assert.equal((await service.install(selection, dependencies)).ready, true);
+  assert.equal(service.snapshot().error, undefined);
 });
 
 
