@@ -199,3 +199,66 @@ test('prebuilt Server Manager requires Process Proxy and installs from its dedic
   assert.deepEqual(await library.access(artifact.id),executable);
   assert.match(await git(path.join(root,'library'),'ls-files','--stage',artifact.id),/^160000 /);
 });
+
+
+test('prebuilt origin survives reloads and imports without importing folder grants', async t => {
+  const { root, library } = fixture(t);
+  const folder = path.join(root, 'library');
+  await library.configure(folder);
+  const repository = path.join(root, 'managed'); fs.mkdirSync(repository);
+  const access = { directories: [{ id: 'managed', label: 'Managed', path: repository, access: 'write' }], allowWorkspaceRead: false };
+  const installed = await library.installPrebuilt('repo-issue-manager', access);
+  assert.equal(installed.prebuiltId, 'repo-issue-manager');
+  const metaFile = path.join(installed.root, 'artifact.json');
+  const meta = JSON.parse(fs.readFileSync(metaFile, 'utf8'));
+  assert.equal(meta.prebuiltId, 'repo-issue-manager');
+  meta.title = 'Our custom issue tracker'; fs.writeFileSync(metaFile, JSON.stringify(meta));
+  const reloaded = new ArtifactLibraryService(path.join(root, 'settings.json'), 'unused', path.join(root, 'contexts'));
+  assert.equal((await reloaded.find(installed.id)).prebuiltId, 'repo-issue-manager');
+  const imported = new ArtifactLibraryService(path.join(root, 'other-machine', 'settings.json'), 'unused', path.join(root, 'other-contexts'));
+  await imported.configure(folder);
+  const copy = await imported.find(installed.id);
+  assert.equal(copy.prebuiltId, 'repo-issue-manager');
+  assert.equal(copy.title, meta.title);
+  assert.deepEqual(copy.access, { directories: [], allowWorkspaceRead: false });
+});
+
+test('legacy installs are recognized from their original commits, including renamed copies and multiple installations', async t => {
+  const { root, library } = fixture(t);
+  await library.configure(path.join(root, 'library'));
+  const repository = path.join(root, 'managed'); fs.mkdirSync(repository);
+  const access = { directories: [{ id: 'managed', label: 'Managed', path: repository, access: 'write', allowProcessProxy: true }], allowWorkspaceRead: false };
+  const installed = [];
+  for (const prebuiltId of ['repo-issue-manager', 'server-manager', 'repo-issue-manager']) {
+    const record = await library.installPrebuilt(prebuiltId, access);
+    installed.push(record);
+    const metaFile = path.join(record.root, 'artifact.json');
+    const meta = JSON.parse(fs.readFileSync(metaFile, 'utf8')); delete meta.prebuiltId;
+    fs.writeFileSync(metaFile, JSON.stringify(meta));
+    await git(record.root, 'add', '--', 'artifact.json');
+    await git(record.root, '-c', 'user.name=Artifact test', '-c', 'user.email=artifact@example.test', 'commit', '--amend', '--no-edit');
+    meta.title = 'Renamed '+record.id; meta.prompt = 'Customized request';
+    fs.writeFileSync(metaFile, JSON.stringify(meta));
+  }
+  const recordsFile = path.join(root, 'artifact-records.json');
+  const local = JSON.parse(fs.readFileSync(recordsFile, 'utf8'));
+  for (const record of installed) delete local[record.root].prebuiltId;
+  fs.writeFileSync(recordsFile, JSON.stringify(local));
+  const preset = (await library.prebuilts()).find(item => item.id === 'repo-issue-manager');
+  const personal = await library.create({ title: preset.title, prompt: preset.description, sourceRoot: '', shareFacts: false, shareMemory: false });
+  const reloaded = new ArtifactLibraryService(path.join(root, 'settings.json'), 'unused', path.join(root, 'contexts'));
+  for (const record of installed) {
+    const metaFile = path.join(record.root, 'artifact.json');
+    const before = fs.readFileSync(metaFile, 'utf8');
+    assert.equal((await reloaded.find(record.id)).prebuiltId, record.prebuiltId);
+    assert.equal(fs.readFileSync(metaFile, 'utf8'), before);
+    assert.deepEqual(await reloaded.access(record.id), access);
+  }
+  assert.equal((await reloaded.find(personal.id)).prebuiltId, undefined);
+  const imported = new ArtifactLibraryService(path.join(root, 'imported', 'settings.json'), 'unused', path.join(root, 'imported-contexts'));
+  await imported.configure(path.join(root, 'library'));
+  for (const record of installed) {
+    assert.equal((await imported.find(record.id)).prebuiltId, record.prebuiltId);
+    assert.deepEqual(await imported.access(record.id), { directories: [], allowWorkspaceRead: false });
+  }
+});

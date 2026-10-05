@@ -1,7 +1,7 @@
 import { type ChildProcess } from 'node:child_process';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
-import { artifactSetupSelectionSchema, type ArtifactEvent, type ArtifactRecord, type ArtifactRuntime, type CreateArtifact, type PreviewFrame } from '../../shared/artifacts';
+import { artifactSetupSelectionSchema, type ArtifactApis, type ArtifactBlueprintAgentResult, type ArtifactBlueprintChatMessage, type ArtifactEvent, type ArtifactRecord, type ArtifactRuntime, type ArtifactSetupSelection, type CreateArtifact, type PreviewFrame } from '../../shared/artifacts';
 import type { AgentStartOptions } from '../../shared/contracts';
 import { ArtifactCapabilitiesService } from './artifactCapabilities';
 import { ArtifactLibraryService } from './artifactLibrary';
@@ -17,6 +17,8 @@ import { createServer } from 'node:net';
 import { ArtifactProcessProxy } from './artifactProcessProxy';
 import { ArtifactModelBroker } from './artifactModelBroker';
 import { ArtifactGitService } from './artifactGit';
+import { runArtifactBlueprintTurn } from './artifactBlueprintAgent';
+import { sqliteCapability } from './artifactDependencies';
 
 interface Running { state: ArtifactRuntime; child?: ChildProcess; sandbox?: ArtifactSandbox; processProxy?: ArtifactProcessProxy; modelBroker?: ArtifactModelBroker; start?: Promise<ArtifactRuntime>; cancelled: boolean }
 export class ArtifactsService {
@@ -30,6 +32,7 @@ export class ArtifactsService {
   private contextTimer: NodeJS.Timeout;
   private syncing = false;
   private changingAccess = new Set<string>();
+  private dependencyRepairs = new Map<string, ArtifactSandbox>();
   constructor(readonly library: ArtifactLibraryService, private readonly settings: RuntimeSettingsService, private readonly emit: (event: ArtifactEvent) => void, private readonly activeWorkspace: () => string = () => '') {
     this.git = new ArtifactGitService(library);
     this.capabilities = new ArtifactCapabilitiesService(settings.artifactSetupDirectory(), this.preview, (progress) => this.emit({ type: 'setup', progress }));
@@ -47,7 +50,44 @@ export class ArtifactsService {
   async dockerCleanupPlan() { return planArtifactDockerCleanup(await this.artifactRoots()); }
   async cleanDocker() { return cleanArtifactDockerResources(await this.artifactRoots()); }
   create(options: CreateArtifact): Promise<ArtifactRecord> { return this.library.create(options); }
+  private async dependencySetup(id?: string) {
+    if (!id) return undefined;
+    const artifact = await this.library.find(id);
+    const config = await this.library.app(id);
+    if (!config.database.enabled || config.database.dialect !== 'sqlite') return undefined;
+    return {
+      status: async () => [await sqliteCapability(artifact.root)],
+      install: async (log: (text: string) => void) => {
+        if (this.dependencyRepairs.has(id)) throw new Error('Artifact dependency repair is already running.');
+        const sandbox = new ArtifactSandbox(artifact.root, [], await this.library.contextDirectory(id));
+        this.dependencyRepairs.set(id, sandbox);
+        try {
+          log('Stopping this artifact’s preview and agent before repairing its dependency volume. Database files are preserved.\n');
+          await this.stop(id);
+          await (await this.agentCreations.get(id))?.stop();
+          await this.agents.get(id)?.agent.stop();
+          const prepared = await sandbox.prepare(log);
+          await new Promise<void>((resolve, reject) => {
+            const child = sandbox.spawn(prepared.docker, prepared.args, ['node', '/opt/skillz/prepare-dependencies.cjs']);
+            const timeout = setTimeout(() => { void sandbox.stop(); reject(new Error('Dependency repair timed out. See installation details and retry.')); }, 180000);
+            child.stdout.setEncoding('utf8'); child.stderr.setEncoding('utf8');
+            child.stdout.on('data', log); child.stderr.on('data', log);
+            child.on('error', error => { clearTimeout(timeout); reject(error); });
+            child.on('close', code => { clearTimeout(timeout); code === 0 ? resolve() : reject(new Error('Dependency repair failed. See installation details and retry.')); });
+            child.stdin.end();
+          });
+        } finally { try { await sandbox.stop(); } finally { this.dependencyRepairs.delete(id); } }
+      },
+    };
+  }
+  async capabilityStatus(selection: ArtifactSetupSelection, id?: string) {
+    return this.capabilities.status(selection, await this.dependencySetup(id));
+  }
+  async installCapabilities(selection: ArtifactSetupSelection, id?: string) {
+    return this.capabilities.install(selection, await this.dependencySetup(id));
+  }
   async start(id: string): Promise<ArtifactRuntime> {
+    if (this.dependencyRepairs.has(id)) throw new Error('Artifact dependencies are being repaired. Retry when repair finishes.');
     if (this.changingAccess.has(id)) throw new Error('File permissions are changing. Retry when saving finishes.');
     const prior = this.runtimes.get(id);
     if (prior?.start) return prior.start;
@@ -88,7 +128,7 @@ export class ArtifactsService {
     const secretEnv = [...variables].filter((name) => process.env[name] !== undefined).flatMap((name) => ['--env', name]);
     check(); this.update(runtime, { status: 'starting', error: undefined });
     return new Promise<ArtifactRuntime>((resolve, reject) => {
-      const child = sandbox.spawn(prepared.docker, prepared.args, ['sh', '-c', 'mkdir -p "$HOME" && npm install --no-audit --no-fund --fetch-retries=0 --fetch-timeout=30000 && exec node --import tsx server/index.ts'], [...secretEnv, '--publish', `127.0.0.1::${port}`, '--env', `SKILLZ_ARTIFACT_PORT=${port}`, '--env', 'SKILLZ_ARTIFACT_HOST=0.0.0.0']);
+      const child = sandbox.spawn(prepared.docker, prepared.args, ['sh', '-c', 'node /opt/skillz/prepare-dependencies.cjs && exec node --import tsx server/index.ts'], [...secretEnv, '--publish', `127.0.0.1::${port}`, '--env', `SKILLZ_ARTIFACT_PORT=${port}`, '--env', 'SKILLZ_ARTIFACT_HOST=0.0.0.0']);
       runtime.child = child;
       let buffer = '', ready = false;
       const timeout = setTimeout(() => { void sandbox.stop(); reject(new Error('Artifact server did not become ready within three minutes. See logs.')); }, 180000);
@@ -124,6 +164,26 @@ export class ArtifactsService {
     if (runtime) { runtime.cancelled = true; await runtime.sandbox?.stop(); await runtime.processProxy?.close(); await runtime.modelBroker?.close(); if (runtime.child) await terminate(runtime.child); this.update(runtime, { status: 'stopped', url: undefined }); this.runtimes.delete(id); }
     await this.preview.close(id);
   }
+  async saveApis(id: string, config: ArtifactApis): Promise<void> {
+    await this.library.saveApis(id, config);
+    this.emit({ type: 'apis', id });
+  }
+  async blueprintAgent(id: string, message: string, history: ArtifactBlueprintChatMessage[], selection: ArtifactSetupSelection): Promise<ArtifactBlueprintAgentResult> {
+    const current = await this.library.apis(id);
+    const result = await runArtifactBlueprintTurn({
+      current,
+      message,
+      history,
+      selection,
+      request: (runtime, payload) => this.capabilities.modelRequest(runtime, payload),
+    });
+    if (result.changes.length) {
+      const latest = await this.library.apis(id);
+      if (JSON.stringify(latest) !== JSON.stringify(current)) throw new Error('API Blueprints changed while Blueprint mode was working. Review the latest configuration and retry.');
+      await this.saveApis(id, result.config);
+    }
+    return result;
+  }
   async runApiCollection(id: string, collection: string, variables: Record<string, unknown> = {}, approveMutations = false): Promise<Record<string, unknown>> {
     const runtime = this.runtimes.get(id)?.state;
     if (runtime?.status !== 'running' || !runtime.url) throw new Error('Start the artifact preview before running an API collection.');
@@ -147,7 +207,7 @@ export class ArtifactsService {
     const inFlight = this.agentCreations.get(id); if (inFlight) return inFlight;
     const creation = (async () => {
       const artifact = await this.library.find(id);
-      const workspace = new WorkspaceService(() => {}); await workspace.open(artifact.root);
+      const workspace = new WorkspaceService((paths) => { if (paths.includes('.artifact/apis.json')) this.emit({ type: 'apis', id }); }); await workspace.open(artifact.root);
       const execution = new ArtifactAgentExecution(() => this.sandbox(id), (message) => this.emit({ type: 'agent', id, event: { type: 'stderr', message } }), (context) => this.capabilities.hostContext(context));
       const agent = new AgentService(workspace, (event) => this.emit({ type: 'agent', id, event }), this.settings, execution);
       this.agents.set(id, { workspace, agent }); return agent;
@@ -156,6 +216,7 @@ export class ArtifactsService {
     try { return await creation; } finally { this.agentCreations.delete(id); }
   }
   async startAgent(id: string, options: AgentStartOptions) {
+    if (this.dependencyRepairs.has(id)) throw new Error('Artifact dependencies are being repaired. Retry when repair finishes.');
     if (this.changingAccess.has(id)) throw new Error('File permissions are changing. Retry when saving finishes.');
     if (this.agentStarts.has(id)) throw new Error('Artifact agent is already starting.');
     const pending = (async () => (await this.agent(id)).start(options))();
@@ -205,6 +266,6 @@ export class ArtifactsService {
       await this.library.saveAccess(id, access);
     } finally { this.changingAccess.delete(id); }
   }
-  private async disposeSessions(): Promise<void> { await Promise.allSettled(this.agentCreations.values()); await Promise.allSettled([...this.runtimes.keys()].map((id) => this.stop(id))); for (const session of this.agents.values()) { await session.agent.stop(); session.workspace.dispose(); } this.agents.clear(); await this.preview.dispose(); }
+  private async disposeSessions(): Promise<void> { await Promise.allSettled([...this.dependencyRepairs.values()].map(sandbox => sandbox.stop())); await Promise.allSettled(this.agentCreations.values()); await Promise.allSettled([...this.runtimes.keys()].map((id) => this.stop(id))); for (const session of this.agents.values()) { await session.agent.stop(); session.workspace.dispose(); } this.agents.clear(); await this.preview.dispose(); }
   async dispose(): Promise<void> { clearInterval(this.contextTimer); await this.disposeSessions(); }
 }

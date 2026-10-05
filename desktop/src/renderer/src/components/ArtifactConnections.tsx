@@ -3,13 +3,26 @@ import { artifactApisSchema, type ArtifactApiConfig } from '../../../shared/arti
 import { artifactApiBlueprints, openApiToArtifactBlueprint } from '../../../shared/artifactBlueprints';
 
 const empty = (): ArtifactApiConfig => artifactApisSchema.parse({ version: 1, apis: [{ id: 'new-request', title: '', transport: 'http', url: 'https://example.com', method: 'GET' }] }).apis[0];
-export function ArtifactConnections({ id, running }: { id: string; running: boolean }): React.JSX.Element {
+export function ArtifactConnections({ id, running, revision = 0 }: { id: string; running: boolean; revision?: number }): React.JSX.Element {
   const [apis, setApis] = useState<ArtifactApiConfig[]>([]); const [selected, setSelected] = useState(-1); const [draft, setDraft] = useState(empty);
   const [request, setRequest] = useState('{}'); const [response, setResponse] = useState('{}'); const [headers, setHeaders] = useState('{}'); const [example, setExample] = useState('{}'); const [tests, setTests] = useState('[]'); const [extract, setExtract] = useState('[]'); const [scripts, setScripts] = useState('[]');
   const [variables, setVariables] = useState('{}'); const [approveMutations, setApproveMutations] = useState(false); const [openApi, setOpenApi] = useState(''); const [showImport, setShowImport] = useState(false);
   const [error, setError] = useState(''); const [notice, setNotice] = useState(''); const [result, setResult] = useState(''); const [busy, setBusy] = useState(false);
   const collections = useMemo(() => [...new Set(apis.filter(api => api.transport === 'http').map(api => api.collection))], [apis]);
-  useEffect(() => { let current = true; void window.workbench.artifacts.apis(id).then(config => { if (current) setApis(config.apis); }).catch(error => { if (current) setError(String(error)); }); return () => { current = false; }; }, [id]);
+  useEffect(() => {
+    let current = true;
+    void window.workbench.artifacts.apis(id).then(config => {
+      if (!current) return;
+      setApis(config.apis);
+      if (revision) {
+        const next = empty();
+        setSelected(-1); setDraft(next);
+        setRequest(JSON.stringify(next.requestSchema, null, 2)); setResponse(JSON.stringify(next.responseSchema, null, 2)); setHeaders(JSON.stringify(next.headerEnv, null, 2)); setExample(JSON.stringify(next.example, null, 2)); setTests(JSON.stringify(next.tests, null, 2)); setExtract(JSON.stringify(next.extract, null, 2)); setScripts(JSON.stringify(next.scripts, null, 2));
+        setError(''); setNotice('Blueprints updated by Blueprint mode.');
+      }
+    }).catch(error => { if (current) setError(String(error)); });
+    return () => { current = false; };
+  }, [id, revision]);
   function edit(index: number) { const api = apis[index] || empty(); setSelected(index); setDraft(api); setRequest(JSON.stringify(api.requestSchema, null, 2)); setResponse(JSON.stringify(api.responseSchema, null, 2)); setHeaders(JSON.stringify(api.headerEnv, null, 2)); setExample(JSON.stringify(api.example, null, 2)); setTests(JSON.stringify(api.tests, null, 2)); setExtract(JSON.stringify(api.extract, null, 2)); setScripts(JSON.stringify(api.scripts, null, 2)); setError(''); setNotice(''); }
   async function save(next: ArtifactApiConfig[]) { setBusy(true); setError(''); setNotice(''); try { const config = artifactApisSchema.parse({ version: 1, apis: next }); await window.workbench.artifacts.saveApis(id, config); setApis(config.apis); setNotice(running ? 'Blueprints saved. The running preview reads updates automatically.' : 'Blueprints saved. Start the preview to run collections.'); return true; } catch (error) { setError(String(error)); return false; } finally { setBusy(false); } }
   async function submit() { try { const value = { ...draft, requestSchema: JSON.parse(request), responseSchema: JSON.parse(response), headerEnv: JSON.parse(headers), example: JSON.parse(example), tests: JSON.parse(tests), extract: JSON.parse(extract), scripts: JSON.parse(scripts) }; const next = [...apis]; if (selected < 0) next.push(value); else next[selected] = value; if (await save(next)) setSelected(selected < 0 ? next.length - 1 : selected); } catch (error) { setError(`Invalid JSON: ${String(error)}`); } }

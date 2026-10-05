@@ -4,16 +4,28 @@ function origin(url: string): string {
   try { return new URL(url).origin; } catch { return ''; }
 }
 
+const fontStylesOrigin = 'https://fonts.googleapis.com';
+const fontFilesOrigin = 'https://fonts.gstatic.com';
+
+function fontRequest(url: string, resourceType: string): boolean {
+  try {
+    const target = new URL(url);
+    if (target.username || target.password) return false;
+    return (resourceType === 'stylesheet' && target.origin === fontStylesOrigin && ['/css', '/css2'].includes(target.pathname))
+      || (resourceType === 'font' && target.origin === fontFilesOrigin && target.pathname.startsWith('/s/'));
+  } catch { return false; }
+}
+
 // Appended as an additional policy, so an artifact cannot relax the host boundary.
 export function artifactFramePolicy(url: string): string {
   const http = origin(url), ws = http.replace('http:', 'ws:');
   return [
     "default-src 'none'",
     `script-src ${http} 'unsafe-inline' 'unsafe-eval' blob:`,
-    `style-src ${http} 'unsafe-inline'`,
+    `style-src ${http} ${fontStylesOrigin} 'unsafe-inline'`,
     `connect-src ${http} ${ws}`,
     `img-src ${http} data: blob:`,
-    `font-src ${http} data: blob:`,
+    `font-src ${http} ${fontFilesOrigin} data: blob:`,
     `media-src ${http} data: blob:`,
     `worker-src ${http} blob:`,
     "frame-src 'none'", "object-src 'none'", "base-uri 'self'", "form-action 'self'",
@@ -26,9 +38,9 @@ export function installArtifactFrameSecurity(contents: WebContents, previewOrigi
   const session = contents.session;
   const frames = new Map<number, string>();
   const allowed = (url: string): boolean => /^http:\/\/127\.0\.0\.1:\d+$/.test(url) && previewOrigins().includes(url);
-  const ownRequest = (url: string, owner: string): boolean => {
+  const ownRequest = (url: string, owner: string, resourceType: string): boolean => {
     const target = origin(url);
-    return allowed(owner) && (target === owner || target === owner.replace('http:', 'ws:') || url.startsWith('data:'));
+    return allowed(owner) && (target === owner || target === owner.replace('http:', 'ws:') || url.startsWith('data:') || fontRequest(url, resourceType));
   };
   session.webRequest.onBeforeRequest((details, callback) => {
     if (details.webContentsId !== contents.id) { callback({}); return; }
@@ -42,7 +54,7 @@ export function installArtifactFrameSecurity(contents: WebContents, previewOrigi
       callback({ cancel: !permit }); return;
     }
     if (frame && frame !== contents.mainFrame) {
-      callback({ cancel: !ownRequest(details.url, frames.get(frame.frameTreeNodeId) || '') }); return;
+      callback({ cancel: !ownRequest(details.url, frames.get(frame.frameTreeNodeId) || '', details.resourceType) }); return;
     }
     callback({});
   });

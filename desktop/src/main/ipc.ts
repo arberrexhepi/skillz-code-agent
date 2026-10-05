@@ -2,7 +2,7 @@ import path from 'node:path';
 import { promises as fs } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import type { ArtifactsService } from './services/artifacts';
-import { artifactSetupSelectionSchema, artifactId, artifactApisSchema, artifactAccessSchema, artifactAppSchema, createArtifactSchema, previewInputSchema } from '../shared/artifacts';
+import { artifactSetupSelectionSchema, artifactBlueprintChatMessageSchema, artifactVaultProviderSchema, artifactId, artifactApisSchema, artifactAccessSchema, artifactAppSchema, createArtifactSchema, previewInputSchema } from '../shared/artifacts';
 import { clipboard, dialog, ipcMain, Menu, shell, type BrowserWindow, type IpcMainEvent, type IpcMainInvokeEvent, type MenuItemConstructorOptions } from 'electron';
 import { isUntracked } from '../shared/gitStatus';
 import { z } from 'zod';
@@ -60,12 +60,13 @@ export function registerIpc(window: BrowserWindow, services: Services): void {
     });
   };
 
-  const artifactChannels = ['capabilities', 'install-capabilities', 'setup-progress', 'save-provider-key', 'setup-download', 'docker-cleanup-plan', 'clean-docker', 'library', 'prebuilts', 'install-prebuilt', 'choose-folder', 'choose-read-directory', 'access', 'process-scripts', 'save-access', 'create', 'apis', 'save-apis', 'run-api-collection', 'app', 'save-app', 'start', 'stop', 'install-browser', 'preview', 'input', 'reload', 'close-preview', 'reveal', 'git-status', 'git-initialize', 'git-history', 'git-file-diff', 'git-stage', 'git-stage-all', 'git-unstage', 'git-discard', 'git-commit', 'git-push', 'agent-start', 'agent-submit', 'agent-runtime', 'agent-planner', 'agent-worker', 'agent-reconfigure', 'agent-backoff', 'agent-stop'];
+  const artifactChannels = ['capabilities', 'install-capabilities', 'setup-progress', 'vault', 'save-provider-key', 'setup-download', 'docker-cleanup-plan', 'clean-docker', 'library', 'prebuilts', 'install-prebuilt', 'choose-folder', 'choose-read-directory', 'access', 'process-scripts', 'save-access', 'create', 'apis', 'save-apis', 'blueprint-agent', 'run-api-collection', 'app', 'save-app', 'start', 'stop', 'install-browser', 'preview', 'input', 'reload', 'close-preview', 'reveal', 'git-status', 'git-initialize', 'git-history', 'git-file-diff', 'git-stage', 'git-stage-all', 'git-unstage', 'git-discard', 'git-commit', 'git-push', 'agent-start', 'agent-submit', 'agent-runtime', 'agent-planner', 'agent-worker', 'agent-reconfigure', 'agent-backoff', 'agent-stop'];
   for (const name of artifactChannels) ipcMain.removeHandler(`artifacts:${name}`);
-  handle('artifacts:capabilities', (_event, selection: unknown) => services.artifacts.capabilities.status(artifactSetupSelectionSchema.parse(selection)));
-  handle('artifacts:install-capabilities', (_event, selection: unknown) => services.artifacts.capabilities.install(artifactSetupSelectionSchema.parse(selection)));
+  handle('artifacts:capabilities', (_event, selection: unknown, id: unknown) => services.artifacts.capabilityStatus(artifactSetupSelectionSchema.parse(selection), artifactId.optional().parse(id)));
+  handle('artifacts:install-capabilities', (_event, selection: unknown, id: unknown) => services.artifacts.installCapabilities(artifactSetupSelectionSchema.parse(selection), artifactId.optional().parse(id)));
   handle('artifacts:setup-progress', () => services.artifacts.capabilities.snapshot());
-  handle('artifacts:save-provider-key', (_event, provider: unknown, key: unknown) => services.artifacts.capabilities.saveKey(z.enum(['openai', 'gemini', 'anthropic', 'meta']).parse(provider), z.string().trim().min(1).max(8192).nullable().parse(key)));
+  handle('artifacts:vault', () => services.artifacts.capabilities.vault());
+  handle('artifacts:save-provider-key', (_event, provider: unknown, key: unknown) => services.artifacts.capabilities.saveKey(artifactVaultProviderSchema.parse(provider), z.string().trim().min(1).max(8192).nullable().parse(key)));
   handle('artifacts:setup-download', (_event, tool: unknown) => services.artifacts.capabilities.openDownload(z.enum(['python', 'git', 'docker']).parse(tool)));
   handle('artifacts:docker-cleanup-plan', () => services.artifacts.dockerCleanupPlan());
   handle('artifacts:clean-docker', () => services.artifacts.cleanDocker());
@@ -105,7 +106,13 @@ export function registerIpc(window: BrowserWindow, services: Services): void {
     return services.artifacts.create(options);
   });
   handle('artifacts:apis', (_event, id: unknown) => services.artifacts.library.apis(artifactId.parse(id)));
-  handle('artifacts:save-apis', (_event, id: unknown, config: unknown) => services.artifacts.library.saveApis(artifactId.parse(id), artifactApisSchema.parse(config)));
+  handle('artifacts:save-apis', (_event, id: unknown, config: unknown) => services.artifacts.saveApis(artifactId.parse(id), artifactApisSchema.parse(config)));
+  handle('artifacts:blueprint-agent', (_event, id: unknown, message: unknown, history: unknown, selection: unknown) => services.artifacts.blueprintAgent(
+    artifactId.parse(id),
+    z.string().trim().min(1).max(12000).parse(message),
+    z.array(artifactBlueprintChatMessageSchema).max(20).parse(history),
+    artifactSetupSelectionSchema.parse(selection),
+  ));
   handle('artifacts:run-api-collection', (_event, id: unknown, collection: unknown, variables: unknown = {}, approveMutations: unknown = false) => services.artifacts.runApiCollection(artifactId.parse(id), artifactId.parse(collection), z.record(z.string(), z.unknown()).parse(variables), z.boolean().parse(approveMutations)));
   handle('artifacts:app', (_event, id: unknown) => services.artifacts.library.app(artifactId.parse(id)));
   handle('artifacts:save-app', (_event, id: unknown, config: unknown) => services.artifacts.library.saveApp(artifactId.parse(id), artifactAppSchema.parse(config)));

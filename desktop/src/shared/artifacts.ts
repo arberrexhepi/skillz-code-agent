@@ -34,6 +34,9 @@ export const artifactApisSchema = z.object({ version: z.literal(1), apis: z.arra
 });
 export type ArtifactApiConfig = z.infer<typeof artifactApiSchema>;
 export type ArtifactApis = z.infer<typeof artifactApisSchema>;
+export const artifactBlueprintChatMessageSchema = z.object({ role: z.enum(['user', 'assistant']), content: z.string().min(1).max(12000) });
+export type ArtifactBlueprintChatMessage = z.infer<typeof artifactBlueprintChatMessageSchema>;
+export interface ArtifactBlueprintAgentResult { message: string; config: ArtifactApis; changes: string[]; }
 export const artifactDatabaseDialectSchema = z.enum(['sqlite', 'postgres', 'mysql', 'mariadb', 'mssql']);
 export const artifactAppSchema = z.object({
   version: z.literal(1),
@@ -60,19 +63,23 @@ export interface PrebuiltArtifact { id: string; title: string; description: stri
 export type ArtifactAccess = z.infer<typeof artifactAccessSchema>;
 export const createArtifactSchema = z.object({ title: z.string().trim().min(1).max(120), prompt: z.string().trim().min(1).max(20000), sourceRoot: z.string().max(4096), shareFacts: z.boolean(), shareMemory: z.boolean(), runtime: artifactAgentRuntimeSchema.optional(), access: artifactAccessSchema.optional(), app: artifactAppSchema.optional() });
 export type CreateArtifact = z.infer<typeof createArtifactSchema>;
-export interface ArtifactRecord extends CreateArtifact { id: string; root: string; createdAt: string; contextMode: 'links' | 'junction' | 'snapshot' | 'unavailable' | 'none'; contextWarning?: string }
+export interface ArtifactRecord extends CreateArtifact { id: string; root: string; createdAt: string; prebuiltId?: string; contextMode: 'links' | 'junction' | 'snapshot' | 'unavailable' | 'none'; contextWarning?: string }
 export interface ArtifactLibrary { root: string; artifacts: ArtifactRecord[] }
 export interface ArtifactRuntime { id: string; status: 'stopped' | 'installing' | 'starting' | 'running' | 'error'; url?: string; error?: string; logs: string }
 export const artifactSetupSelectionSchema = z.object({ provider: z.enum(['openai', 'codex-subscription', 'gemini', 'anthropic', 'meta', 'local', 'ollama', 'ollama-local', 'ollama-runpod']), model: z.string().min(1).max(200) });
 export type ArtifactSetupSelection = z.infer<typeof artifactSetupSelectionSchema>;
-export type ArtifactCapabilityId = 'python' | 'git' | 'docker' | 'provider' | 'credentials' | 'browser' | 'runtime';
+export const artifactVaultProviderSchema = z.enum(['openai', 'gemini', 'anthropic', 'meta']);
+export type ArtifactVaultProvider = z.infer<typeof artifactVaultProviderSchema>;
+export interface ArtifactVaultEntry { provider: ArtifactVaultProvider; label: string; keyName: string; source: 'saved' | 'environment' | 'missing'; }
+export interface ArtifactVaultStatus { canSaveKey: boolean; entries: ArtifactVaultEntry[]; }
+export type ArtifactCapabilityId = 'python' | 'git' | 'docker' | 'provider' | 'credentials' | 'browser' | 'runtime' | 'sqlite';
 export interface ArtifactCapability { id: ArtifactCapabilityId; label: string; ready: boolean; detail: string; installable?: boolean; optional?: boolean; download?: 'python' | 'git' | 'docker'; }
 export interface ArtifactCapabilities { selection: ArtifactSetupSelection; items: ArtifactCapability[]; ready: boolean; keyName?: string; keySaved: boolean; canSaveKey: boolean; }
 export interface ArtifactSetupProgress { running: boolean; step: string; log: string; error?: string; }
 export interface ArtifactDockerCleanupPlan { currentImage: string; obsoleteImages: string[]; orphanedVolumes: string[]; preservedImages: string[]; preservedVolumes: string[]; }
 export interface ArtifactDockerCleanupResult extends ArtifactDockerCleanupPlan { removedImages: string[]; removedVolumes: string[]; failures: string[]; }
 export interface ArtifactAppSaveResult { migrated: boolean; commit?: string; checkpointCommit?: string; }
-export type ArtifactEvent = { type: 'setup'; progress: ArtifactSetupProgress } | { type: 'runtime'; runtime: ArtifactRuntime } | { type: 'agent'; id: string; event: AgentEvent };
+export type ArtifactEvent = { type: 'setup'; progress: ArtifactSetupProgress } | { type: 'runtime'; runtime: ArtifactRuntime } | { type: 'apis'; id: string } | { type: 'agent'; id: string; event: AgentEvent };
 export const previewInputSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('click'), x: z.number().min(0).max(3000), y: z.number().min(0).max(3000) }),
   z.object({ type: z.literal('wheel'), dx: z.number().min(-3000).max(3000), dy: z.number().min(-3000).max(3000) }),
@@ -82,10 +89,11 @@ export const previewInputSchema = z.discriminatedUnion('type', [
 export type PreviewInput = z.infer<typeof previewInputSchema>;
 export interface PreviewFrame { image: string; width: number; height: number }
 export interface ArtifactsApi {
-  capabilities(selection: ArtifactSetupSelection): Promise<ArtifactCapabilities>;
-  installCapabilities(selection: ArtifactSetupSelection): Promise<ArtifactCapabilities>;
+  capabilities(selection: ArtifactSetupSelection, artifactId?: string): Promise<ArtifactCapabilities>;
+  installCapabilities(selection: ArtifactSetupSelection, artifactId?: string): Promise<ArtifactCapabilities>;
   setupProgress(): Promise<ArtifactSetupProgress>;
-  saveProviderKey(provider: ArtifactSetupSelection['provider'], key: string | null): Promise<void>;
+  vault(): Promise<ArtifactVaultStatus>;
+  saveProviderKey(provider: ArtifactVaultProvider, key: string | null): Promise<void>;
   openSetupDownload(tool: 'python' | 'git' | 'docker'): Promise<void>;
   dockerCleanupPlan(): Promise<ArtifactDockerCleanupPlan>;
   cleanDocker(): Promise<ArtifactDockerCleanupResult>;
@@ -100,6 +108,7 @@ export interface ArtifactsApi {
   saveAccess(id: string, access: ArtifactAccess): Promise<void>;
   apis(id: string): Promise<ArtifactApis>;
   saveApis(id: string, config: ArtifactApis): Promise<void>;
+  blueprintAgent(id: string, message: string, history: ArtifactBlueprintChatMessage[], selection: ArtifactSetupSelection): Promise<ArtifactBlueprintAgentResult>;
   runApiCollection(id: string, collection: string, variables?: JsonMap, approveMutations?: boolean): Promise<JsonMap>;
   app(id: string): Promise<ArtifactAppConfig>;
   saveApp(id: string, config: ArtifactAppConfig): Promise<ArtifactAppSaveResult>;

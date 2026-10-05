@@ -7,6 +7,7 @@ import { app } from 'electron';
 import { hostEnvironment } from './hostEnvironment';
 import { command, git, runLogged } from './artifactProcess';
 import { artifactProcessProxyScript } from './artifactProcessProxyScript';
+import { artifactDependenciesScript } from './artifactDependenciesScript';
 import type { ReadDirectory } from '../../shared/artifacts';
 
 export const containerRoot = '/repo';
@@ -31,8 +32,10 @@ async function sandboxDefinition(source: string) {
   }
   await collect(source);
   files.push({ name: 'process-proxy/npm-proxy.cjs', content: Buffer.from(artifactProcessProxyScript) });
+  files.push({ name: 'prepare-dependencies.cjs', content: Buffer.from(artifactDependenciesScript) });
   const dockerfile = `FROM node:22.20.0-bookworm
 RUN apt-get update && apt-get install -y --no-install-recommends python3 ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN command -v python3 && command -v make && command -v g++ && test -f /usr/local/include/node/node.h
 RUN mkdir -p /repo/node_modules && chmod 1777 /repo/node_modules
 COPY harness /opt/skillz
 RUN mkdir -p /opt/skillz/bin && ln -s /opt/skillz/process-proxy/npm-proxy.cjs /opt/skillz/bin/npm && chmod 755 /opt/skillz/process-proxy/npm-proxy.cjs

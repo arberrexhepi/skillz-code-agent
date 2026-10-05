@@ -30,6 +30,7 @@ async function writeText(file: string, value: string): Promise<void> {
 }
 export class ArtifactLibraryService {
   private queue: Promise<unknown> = Promise.resolve();
+  private legacyPrebuiltIds = new Map<string, string | undefined>();
   constructor(private readonly settingsFile: string, private readonly template: string, private readonly contextHome: string, private readonly prebuiltHome = path.join(path.dirname(template), 'prebuilt-artifacts')) {}
   private serial<T>(operation: () => Promise<T>): Promise<T> { const pending = this.queue.then(operation); this.queue = pending.catch(() => {}); return pending; }
   async library(): Promise<ArtifactLibrary> {
@@ -46,14 +47,32 @@ export class ArtifactLibraryService {
     for (const rawId of manifest.artifacts) {
       const id = artifactId.parse(rawId);
       const directory = await this.directory(root, id);
-      const meta = await readJson(path.join(directory, 'artifact.json')) as { title: string; prompt: string; createdAt: string };
+      const meta = await readJson(path.join(directory, 'artifact.json')) as { title: string; prompt: string; createdAt: string; prebuiltId?: unknown };
       // Imported/legacy repositories cannot grant themselves access by editing local JSON.
       const local = records[directory] || { sourceRoot: '', shareFacts: false, shareMemory: false, contextMode: 'none' };
       const access = permissions[directory] || { directories: [], allowWorkspaceRead: false };
       const app = await this.appForRoot(directory);
-      artifacts.push({ id, root: directory, title: meta.title, prompt: meta.prompt, createdAt: meta.createdAt, sourceRoot: local.sourceRoot || '', shareFacts: Boolean(local.shareFacts), shareMemory: Boolean(local.shareMemory), contextMode: local.contextMode || 'none', contextWarning: local.contextWarning, runtime: artifactAgentRuntimeSchema.optional().parse(local.runtime), access: artifactAccessSchema.parse(access), app });
+      const origin = artifactId.optional().safeParse(meta.prebuiltId ?? local.prebuiltId);
+      const prebuiltId = origin.success && origin.data ? origin.data : await this.legacyPrebuiltId(directory);
+      artifacts.push({ id, root: directory, prebuiltId, title: meta.title, prompt: meta.prompt, createdAt: meta.createdAt, sourceRoot: local.sourceRoot || '', shareFacts: Boolean(local.shareFacts), shareMemory: Boolean(local.shareMemory), contextMode: local.contextMode || 'none', contextWarning: local.contextWarning, runtime: artifactAgentRuntimeSchema.optional().parse(local.runtime), access: artifactAccessSchema.parse(access), app });
     }
     return { root, artifacts };
+  }
+  private async legacyPrebuiltId(root: string): Promise<string | undefined> {
+    if (this.legacyPrebuiltIds.has(root)) return this.legacyPrebuiltIds.get(root);
+    try {
+      // Older installs did not record their origin. Use the original install commit,
+      // rather than the current title, so renamed copies and personal namesakes work.
+      const first = (await git(root, 'rev-list', '--max-parents=0', 'HEAD')).split('\n')[0];
+      const subject = await git(root, 'show', '-s', '--format=%s', first);
+      let id: string | undefined;
+      if (subject === 'Install prebuilt artifact') {
+        const original = JSON.parse(await git(root, 'show', first + ':artifact.json')) as { title?: string; prompt?: string };
+        id = (await this.prebuilts()).find(item => item.title === original.title && item.description === original.prompt)?.id;
+      }
+      this.legacyPrebuiltIds.set(root, id);
+      return id;
+    } catch { return undefined; }
   }
   async find(id: string): Promise<ArtifactRecord> {
     artifactId.parse(id);
@@ -105,9 +124,9 @@ export class ArtifactLibraryService {
     const checked = artifactAccessSchema.parse(access);
     if (preset.requiresWriteAccess && !checked.directories.some(directory => directory.access === 'write')) throw new Error('Share at least one repository with Allow changes enabled.');
     if (preset.requiresProcessProxy && !checked.directories.some(directory => directory.allowProcessProxy)) throw new Error('Share at least one repository with Allow Process Proxy enabled.');
-    return this.createFrom({ title: preset.title, prompt: preset.description, sourceRoot: '', shareFacts: false, shareMemory: false, runtime, access: checked }, source, 'Install prebuilt artifact');
+    return this.createFrom({ title: preset.title, prompt: preset.description, sourceRoot: '', shareFacts: false, shareMemory: false, runtime, access: checked }, source, 'Install prebuilt artifact', preset.id);
   }
-  private createFrom(raw: CreateArtifact, source: string, initialCommit: string): Promise<ArtifactRecord> {
+  private createFrom(raw: CreateArtifact, source: string, initialCommit: string, prebuiltId?: string): Promise<ArtifactRecord> {
     return this.serial(async () => {
       const options = createArtifactSchema.parse(raw);
       const library = await this.library();
@@ -132,8 +151,8 @@ export class ArtifactLibraryService {
       const app = artifactAppSchema.parse(options.app || defaultArtifactApp());
       await this.writeAppForRoot(root, app);
       const createdAt = new Date().toISOString();
-      await writeJson(path.join(root, 'artifact.json'), { version: 1, id, title: options.title, prompt: options.prompt, createdAt });
-      let record: ArtifactRecord = { ...options, app, id, root, createdAt, contextMode: 'none' };
+      await writeJson(path.join(root, 'artifact.json'), { version: 1, id, title: options.title, prompt: options.prompt, createdAt, prebuiltId });
+      let record: ArtifactRecord = { ...options, app, id, root, createdAt, prebuiltId, contextMode: 'none' };
       record = await this.linkContext(record);
       const { access, app: _app, ...localRecord } = record;
       await writeJson(path.join(root, '.artifact-local.json'), localRecord);

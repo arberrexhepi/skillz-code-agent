@@ -4,9 +4,10 @@ import type { AgentEvent, TerminalEvent, WorkbenchApi } from '../shared/contract
 
 const api: WorkbenchApi = {
   artifacts: {
-    capabilities: (selection) => ipcRenderer.invoke('artifacts:capabilities', selection),
-    installCapabilities: (selection) => ipcRenderer.invoke('artifacts:install-capabilities', selection),
+    capabilities: (selection, artifactId) => ipcRenderer.invoke('artifacts:capabilities', selection, artifactId),
+    installCapabilities: (selection, artifactId) => ipcRenderer.invoke('artifacts:install-capabilities', selection, artifactId),
     setupProgress: () => ipcRenderer.invoke('artifacts:setup-progress'),
+    vault: () => ipcRenderer.invoke('artifacts:vault'),
     saveProviderKey: (provider, key) => ipcRenderer.invoke('artifacts:save-provider-key', provider, key),
     openSetupDownload: (tool) => ipcRenderer.invoke('artifacts:setup-download', tool),
     dockerCleanupPlan: () => ipcRenderer.invoke('artifacts:docker-cleanup-plan'),
@@ -22,6 +23,7 @@ const api: WorkbenchApi = {
     create: (options) => ipcRenderer.invoke('artifacts:create', options),
     apis: (id) => ipcRenderer.invoke('artifacts:apis', id),
     saveApis: (id, config) => ipcRenderer.invoke('artifacts:save-apis', id, config),
+    blueprintAgent: (id, message, history, selection) => ipcRenderer.invoke('artifacts:blueprint-agent', id, message, history, selection),
     runApiCollection: (id, collection, variables = {}, approveMutations = false) => ipcRenderer.invoke('artifacts:run-api-collection', id, collection, variables, approveMutations),
     app: (id) => ipcRenderer.invoke('artifacts:app', id),
     saveApp: (id, config) => ipcRenderer.invoke('artifacts:save-app', id, config),

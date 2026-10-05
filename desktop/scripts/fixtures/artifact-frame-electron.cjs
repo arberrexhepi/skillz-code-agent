@@ -28,6 +28,8 @@ async function until(fn, message) {
 }
 async function run() {
   let externalRequests = 0;
+  const fontRequests = [];
+  const fontFile = fs.readFileSync(path.resolve(__dirname, '../../node_modules/monaco-editor/esm/vs/base/browser/ui/codicons/codicon/codicon.ttf'));
   const external = await serve((_req, res) => { externalRequests++; res.setHeader('Access-Control-Allow-Origin', '*'); res.end('external'); });
   const artifact = await serve((req, res) => {
     if (req.url === '/redirect') { res.writeHead(302, { Location: external.url }); res.end(); return; }
@@ -37,13 +39,14 @@ async function run() {
       res.end(JSON.stringify({ value: 'Readable ë', origin: req.headers.origin || null })); return;
     }
     if (req.url === '/worker.js') { res.setHeader('Content-Type', 'text/javascript'); res.end("self.onmessage=()=>postMessage('worker ready')"); return; }
+    if (req.url === '/local-font.ttf') { res.setHeader('Content-Type', 'font/ttf'); res.end(fontFile); return; }
     if (req.url === '/module.js') {
       res.setHeader('Content-Type', 'text/javascript');
       res.end(`window.moduleReady = true; document.querySelector('#increment').onclick = () => document.querySelector('#count').textContent = Number(document.querySelector('#count').textContent)+1;`); return;
     }
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
     res.setHeader('Content-Security-Policy', "default-src * 'unsafe-inline' 'unsafe-eval' blob: data:");
-    res.end(`<!doctype html><meta charset="utf-8"><style>body{font:18px system-ui;margin:24px;background:#12251e;color:#e0fff1}input{width:75%;padding:12px}button{padding:12px}</style>
+    res.end(`<!doctype html><meta charset="utf-8"><style>@import url('https://fonts.googleapis.com/css2?family=PreviewFixture&display=swap'); @font-face{font-family:LocalFixture;src:url('/local-font.ttf')}body{font:18px system-ui;margin:24px;background:#12251e;color:#e0fff1}input{width:75%;padding:12px}button{padding:12px}</style>
       <h1>Live artifact</h1><label>Filter imports <input id="filter"></label><p><button id="increment">Expand graph</button> <output id="count">0</output></p><script type="module" src="/module.js"></script>`);
   });
   const websocket = new WebSocketServer({ server: artifact.server });
@@ -67,6 +70,15 @@ async function run() {
   });
   window = new BrowserWindow({ show: false, width: 1200, height: 900, webPreferences: { preload: path.join(root, 'preload.cjs'), sandbox: true, contextIsolation: true, nodeIntegration: false, nodeIntegrationInSubFrames: false } });
   const wc = window.webContents;
+  // Serve deterministic font bytes at the real allowlisted origins, without internet access.
+  // Chromium still applies CSP and the product's webRequest policy to these requests.
+  wc.session.protocol.handle('https', request => {
+    fontRequests.push(request.url);
+    const url = new URL(request.url);
+    if (url.origin === 'https://fonts.googleapis.com' && url.pathname === '/css2') return new Response('@font-face{font-family:PreviewFixture;src:url(https://fonts.gstatic.com/s/preview/fixture.ttf) format("truetype")}', { headers: { 'Content-Type': 'text/css' } });
+    if (url.origin === 'https://fonts.gstatic.com' && url.pathname === '/s/preview/fixture.ttf') return new Response(fontFile, { headers: { 'Content-Type': 'font/ttf', 'Access-Control-Allow-Origin': '*' } });
+    return new Response('Unexpected remote request', { status: 403 });
+  });
   wc.on('console-message', details => messages.push(details.message));
   dispose = installArtifactFrameSecurity(wc, () => [...live]);
   wc.setWindowOpenHandler(() => ({ action: 'deny' }));
@@ -76,6 +88,15 @@ async function run() {
     for (const frame of wc.mainFrame.frames) if (frame.url.startsWith(artifact.url) && await frame.executeJavaScript('window.moduleReady === true').catch(() => false)) return frame;
   }, 'Artifact module did not load');
   const js = code => frame.executeJavaScript(code);
+  assert.equal(await js(`document.fonts.load('20px PreviewFixture', '\\uea60').then(faces => faces.length === 1 && faces[0].status === 'loaded')`), true, 'Google Fonts stylesheet and font bytes must both load');
+  assert.equal(await js(`document.fonts.load('20px LocalFixture', '\\uea60').then(faces => faces.length === 1 && faces[0].status === 'loaded')`), true, 'Bundled local fonts must still load');
+  assert.ok(fontRequests.some(url => url.startsWith('https://fonts.googleapis.com/css2')));
+  assert.ok(fontRequests.some(url => url.startsWith('https://fonts.gstatic.com/s/preview/fixture.ttf')));
+  const allowedFontRequests = fontRequests.length;
+  assert.equal(await js(`fetch('https://fonts.googleapis.com/css2?family=BlockedFetch').then(()=>false,()=>true)`), true);
+  assert.equal(await js(`new Promise(resolve=>{const s=document.createElement('script');s.src='https://fonts.gstatic.com/s/preview/script.js';s.onerror=()=>resolve(true);s.onload=()=>resolve(false);document.head.append(s)})`), true);
+  assert.equal(await js(`new FontFace('BlockedFont', 'url(${external.url}/blocked.ttf)').load().then(()=>false,()=>true)`), true);
+  assert.equal(fontRequests.length, allowedFontRequests, 'Font exceptions must not allow fetch or scripts');
   assert.equal(await wc.executeJavaScript('typeof window.workbench'), 'object');
   for (const name of ['window.workbench', 'require', 'process']) assert.equal(await js(`typeof ${name}`), 'undefined');
   assert.equal(await js(`(()=>{try{return typeof parent.workbench}catch{return 'blocked'}})()`), 'blocked');
@@ -118,9 +139,10 @@ async function run() {
   assert.equal(await reloaded.executeJavaScript(`document.querySelector('#filter').value`), '');
   live.delete(artifact.url);
   assert.equal(await reloaded.executeJavaScript(`fetch('/api/data').then(()=>false,()=>true)`), true);
+  assert.equal(await reloaded.executeJavaScript(`new FontFace('RevokedFont', 'url(https://fonts.gstatic.com/s/preview/fixture.ttf?revoked=1)').load().then(()=>false,()=>true)`), true);
   await wc.executeJavaScript('window.setRunning(false)');
   await until(() => wc.executeJavaScript(`document.querySelector('iframe')===null`), 'Stopped preview remained mounted');
-  console.log('Live iframe checks passed: native input, resize, state, reload, HTTP/WebSocket, CSP, navigation, permissions, IPC boundary and revocation.');
+  console.log('Live iframe checks passed: native input, resize, state, reload, fonts, HTTP/WebSocket, CSP, navigation, permissions, IPC boundary and revocation.');
 }
 app.whenReady().then(run).then(() => finish(0), error => { console.error(error); console.error(messages.join('\n')); return finish(1); });
 async function finish(code) {

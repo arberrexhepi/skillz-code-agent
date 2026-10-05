@@ -3,6 +3,7 @@
   "displayName": "skillz Agent",
   "description": "VS Code shell for the skillz planner/worker agent runtime.",
   "version": "0.0.1",
+  "license": "Apache-2.0",
   "publisher": "local",
   "engines": {
     "vscode": "^1.88.0"

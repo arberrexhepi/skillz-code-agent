@@ -2,7 +2,7 @@ import { execFile } from 'node:child_process';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { safeStorage, shell } from 'electron';
-import type { ArtifactCapabilities, ArtifactCapability, ArtifactSetupProgress, ArtifactSetupSelection } from '../../shared/artifacts';
+import type { ArtifactCapabilities, ArtifactCapability, ArtifactSetupProgress, ArtifactSetupSelection, ArtifactVaultStatus } from '../../shared/artifacts';
 import type { AgentLaunch } from './artifactAgent';
 import type { ArtifactPreviewService } from './artifactPreview';
 import { dockerCommand, ensureSandboxImage, harnessRoot, sandboxImageReady } from './artifactSandbox';
@@ -10,9 +10,14 @@ import { command, runLogged, spawnModelHelper, terminate } from './artifactProce
 import { pythonEnvironment, resolvePythonCommand, type PythonCommand } from './python';
 import { readJson, writeJson } from './artifactLibrary';
 
-const providerKeys: Record<string, string> = { gemini: 'GEMINI_API_KEY', openai: 'OPENAI_API_KEY', anthropic: 'ANTHROPIC_API_KEY', meta: 'META_AI_API_KEY' };
+const providerKeys: Record<string, string> = { openai: 'OPENAI_API_KEY', gemini: 'GEMINI_API_KEY', anthropic: 'ANTHROPIC_API_KEY', meta: 'META_AI_API_KEY' };
+const providerLabels: Record<string, string> = { openai: 'OpenAI', gemini: 'Google Gemini', anthropic: 'Anthropic', meta: 'Meta AI' };
 const packages: Record<string, string> = { gemini: 'google-genai', openai: 'openai', anthropic: 'anthropic', meta: 'openai', local: 'openai', ollama: 'openai', 'ollama-local': 'openai', 'ollama-runpod': 'openai' };
 interface ProviderProbe { sdkReady: boolean; keyReady: boolean; keyName?: string; label: string; }
+export interface ArtifactDependencySetup {
+  status(): Promise<ArtifactCapability[]>;
+  install(log: (text: string) => void): Promise<void>;
+}
 export class ArtifactCapabilitiesService {
   private progress: ArtifactSetupProgress = { running: false, step: '', log: '' };
   private installation?: Promise<ArtifactCapabilities>;
@@ -31,6 +36,18 @@ export class ArtifactCapabilitiesService {
   private async keys(): Promise<Record<string, string>> {
     try { return await readJson(path.join(this.home, 'provider-keys.json')) as Record<string, string>; }
     catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return {}; throw error; }
+  }
+  async vault(): Promise<ArtifactVaultStatus> {
+    const keys = await this.keys();
+    return {
+      canSaveKey: this.canSaveKey(),
+      entries: Object.entries(providerKeys).map(([provider, keyName]) => ({
+        provider: provider as 'openai' | 'gemini' | 'anthropic' | 'meta',
+        label: providerLabels[provider],
+        keyName,
+        source: keys[keyName] ? 'saved' as const : process.env[keyName] ? 'environment' as const : 'missing' as const,
+      })),
+    };
   }
   async saveKey(provider: string, key: string | null): Promise<void> {
     const name = providerKeys[provider];
@@ -81,7 +98,7 @@ export class ArtifactCapabilitiesService {
       child.stdin?.end(JSON.stringify(selection));
     });
   }
-  async status(selection: ArtifactSetupSelection): Promise<ArtifactCapabilities> {
+  async status(selection: ArtifactSetupSelection, dependencies?: ArtifactDependencySetup): Promise<ArtifactCapabilities> {
     const source = this.source();
     const pythonItems = (async (): Promise<ArtifactCapability[]> => {
       let python: PythonCommand;
@@ -91,7 +108,7 @@ export class ArtifactCapabilitiesService {
       try {
         const probe = await this.probe(python, await this.environment(selection.provider), selection);
         items.push({ id: 'provider', label: `${probe.label} support`, ready: probe.sdkReady, detail: packages[selection.provider] ? (probe.sdkReady ? 'Provider SDK installed.' : `Install ${packages[selection.provider]} in a workbench-managed Python environment.`) : 'Uses the local Codex CLI; sign in under Agent runtime below.', installable: !probe.sdkReady && Boolean(packages[selection.provider]) });
-        if (probe.keyName) items.push({ id: 'credentials', label: 'API key', ready: probe.keyReady, detail: probe.keyReady ? 'Configured. The key has not been validated with the provider.' : `Add ${probe.keyName} below to connect this provider.` });
+        if (probe.keyName) items.push({ id: 'credentials', label: 'Provider key', ready: probe.keyReady, optional: true, detail: probe.keyReady ? 'Configured. The key has not been validated with the provider.' : `Add ${probe.keyName} in Vault to connect this provider.` });
       } catch (error) { items.push({ id: 'provider', label: 'Provider setup', ready: false, detail: String(error) }); }
       return items;
     })();
@@ -106,17 +123,18 @@ export class ArtifactCapabilitiesService {
     })();
     const [python, docker, browser, git] = await Promise.all([pythonItems, dockerItems, this.preview.browserReady(), this.tools.command('git', ['--version'], source).then(() => true, () => false)]);
     const items: ArtifactCapability[] = [...python, { id: 'git', label: 'Git', ready: git, detail: git ? 'Ready to version your artifacts.' : 'Install Git, then recheck.', ...(!git ? { download: 'git' as const } : {}) }, ...docker, { id: 'browser', label: 'Playwright inspection browser', ready: browser, optional: true, detail: browser ? 'Available for browser inspection. Live previews use the built-in browser.' : 'Optional browser for agent inspection tooling. Live previews work without this download.', installable: !browser }];
+    if (dependencies) items.push(...await dependencies.status());
     const keys = await this.keys();
     return { selection, items, ready: items.every(item => item.ready || item.optional), keyName: providerKeys[selection.provider], keySaved: Boolean(keys[providerKeys[selection.provider]]), canSaveKey: this.canSaveKey() };
   }
-  install(selection: ArtifactSetupSelection): Promise<ArtifactCapabilities> {
+  install(selection: ArtifactSetupSelection, dependencies?: ArtifactDependencySetup): Promise<ArtifactCapabilities> {
     if (this.installation) return Promise.reject(new Error('Artifact capabilities are already being installed.'));
     this.update({ running: true, step: 'Checking capabilities', log: '', error: undefined });
-    this.installation = this.performInstall(selection).catch(error => { this.update({ error: String(error), step: 'Setup needs attention' }); throw error; }).finally(() => { this.installation = undefined; this.update({ running: false }); });
+    this.installation = this.performInstall(selection, dependencies).catch(error => { this.update({ error: String(error), step: 'Setup needs attention' }); throw error; }).finally(() => { this.installation = undefined; this.update({ running: false }); });
     return this.installation;
   }
-  private async performInstall(selection: ArtifactSetupSelection): Promise<ArtifactCapabilities> {
-    const status = await this.status(selection);
+  private async performInstall(selection: ArtifactSetupSelection, dependencies?: ArtifactDependencySetup): Promise<ArtifactCapabilities> {
+    const status = await this.status(selection, dependencies);
     const needed = new Set(status.items.filter(item => item.installable && !item.optional).map(item => item.id));
     if (needed.has('provider')) {
       const pkg = packages[selection.provider];
@@ -130,8 +148,9 @@ export class ArtifactCapabilitiesService {
       await this.tools.runLogged(this.managedPython(), ['-m', 'pip', 'install', '--disable-pip-version-check', pkg], this.source(), this.log);
     }
     if (needed.has('runtime')) { this.update({ step: 'Preparing artifact runtime' }); await this.tools.ensureSandboxImage(this.log, this.source()); }
+    if (needed.has('sqlite') && dependencies) { this.update({ step: 'Repairing SQLite dependencies' }); await dependencies.install(this.log); }
     this.update({ step: 'Rechecking capabilities' });
-    const result = await this.status(selection);
+    const result = await this.status(selection, dependencies);
     this.update({ step: result.ready ? 'Capabilities ready' : 'Downloads complete — finish the remaining setup below' });
     return result;
   }

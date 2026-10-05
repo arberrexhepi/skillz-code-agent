@@ -10,6 +10,10 @@ Read .artifact/app.json for generated app capabilities. When `chatbot.enabled` i
 
 Optional source context is mounted read-only at /context; never expose other source-workspace files. This artifact's own repo_facts.md and memory_observability.md are separate. Do not change or commit the parent library or other artifacts. Run npm run build after edits; use the desktop Preview to view the result.
 
+## Typography in Preview
+
+Load the chosen typefaces explicitly; naming a font in CSS does not install it. Prefer bundled font assets (for example WOFF2 files served by Vite) for consistent offline rendering on Windows and macOS. Preview also permits Google Fonts stylesheets from `https://fonts.googleapis.com/css` and `/css2`, and font files from `https://fonts.gstatic.com/s/`. Other remote font providers must be bundled locally. These exceptions allow only stylesheets and fonts, not external scripts or API requests. Keep suitable fallback fonts and verify that the requested font faces actually load in Preview.
+
 ## File access
 
 The desktop runs this repository in a Docker container. `/repo` is the writable artifact repository. `/context` contains the selected, read-only source context snapshots. `SKILLZ_READ_ROOTS` lists additional approved folders and their access mode at `/reads/<id>`, including `/reads/workspace` only when the user enables workbench repository reads. `SKILLZ_WRITE_ROOTS` lists the explicit write grants. Folders remain read only unless the user enables Allow changes. No other host directories are available. Directory grants belong to desktop settings; never try to change them from generated code.
