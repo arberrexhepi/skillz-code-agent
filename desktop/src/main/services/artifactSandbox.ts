@@ -107,19 +107,36 @@ export class ArtifactSandbox {
   private docker = '';
   private cancelled = false;
   private stopping?: Promise<void>;
-  constructor(readonly root: string, readonly reads: ReadDirectory[], readonly context: string, private readonly processProxy?: { url: string; token: string }, private readonly modelBroker?: { url: string; token: string; provider: string; model: string }) {}
+  constructor(readonly root: string, readonly reads: ReadDirectory[], readonly context: string, private readonly processProxy?: { url: string; token: string }, private readonly modelBroker?: { url: string; token: string; provider: string; model: string }, readonly repository?: ReadDirectory) {}
   async prepare(log: (text: string) => void, source?: string): Promise<{ docker: string; args: string[] }> {
     const { docker, image } = await ensureSandboxImage(log, source);
     this.docker = docker;
     if (this.cancelled) throw new Error('Artifact start cancelled.');
-    const realRoot = await fs.realpath(this.root);
-    const args = ['run', '--rm', '--init', '--name', this.name, '--label', 'agency.aiam.skillz.artifact=true', '--label', 'agency.aiam.skillz.root=' + rootLabel(realRoot), '--cap-drop=ALL', '--security-opt=no-new-privileges', '--read-only', '--pids-limit=256', '--memory=2g', '--cpus=2', '--tmpfs', '/tmp:rw,nosuid,size=512m', '--add-host', 'host.docker.internal:host-gateway', '--workdir', containerRoot, '--mount', bindMount(realRoot, containerRoot, false)];
+    const ownerRoot = await fs.realpath(this.root);
+    const realRoot = await fs.realpath(this.repository?.path || this.root);
+    if (this.repository && (realRoot !== this.repository.path || !(await fs.stat(realRoot)).isDirectory())) throw new Error(`Shared folder changed. Select it again: ${this.repository.label}`);
+    const readOnly = this.repository?.access === 'read';
+    const args = ['run', '--rm', '--init', '--name', this.name, '--label', 'agency.aiam.skillz.artifact=true', '--label', 'agency.aiam.skillz.root=' + rootLabel(ownerRoot), '--cap-drop=ALL', '--security-opt=no-new-privileges', '--read-only', '--pids-limit=256', '--memory=2g', '--cpus=2', '--tmpfs', '/tmp:rw,nosuid,size=512m', '--add-host', 'host.docker.internal:host-gateway', '--workdir', containerRoot, '--mount', bindMount(realRoot, containerRoot, readOnly)];
     if (process.platform !== 'win32' && process.getuid && process.getgid) args.push('--user', `${process.getuid()}:${process.getgid()}`);
-    // Isolate Linux dependencies from packages installed on the host OS.
-    const volume = artifactDependencyVolume(realRoot);
-    args.push('--mount', `type=volume,src=${volume},dst=/repo/node_modules`);
-    const gitDir = await git(realRoot, 'rev-parse', '--absolute-git-dir');
-    args.push('--mount', bindMount(await fs.realpath(gitDir), '/artifact-git', false), '--env', 'GIT_DIR=/artifact-git', '--env', 'GIT_WORK_TREE=/repo', '--env', 'GIT_CONFIG_COUNT=1', '--env', 'GIT_CONFIG_KEY_0=safe.directory', '--env', 'GIT_CONFIG_VALUE_0=/repo');
+    // Only the artifact preview/editor receives its isolated dependency volume.
+    // A selected repository retains its File Access permission on every path.
+    if (!this.repository) {
+      const volume = artifactDependencyVolume(realRoot);
+      args.push('--mount', `type=volume,src=${volume},dst=/repo/node_modules`);
+    }
+    let gitDir: string | undefined;
+    try {
+      // A granted subfolder must not acquire its parent repository’s Git metadata.
+      if (!this.repository || await fs.realpath(await git(realRoot, 'rev-parse', '--show-toplevel')) === realRoot) gitDir = await git(realRoot, 'rev-parse', '--absolute-git-dir');
+    }
+    catch (error) { if (!this.repository) throw error; }
+    if (gitDir) {
+      args.push('--mount', bindMount(await fs.realpath(gitDir), '/artifact-git', readOnly), '--env', 'GIT_DIR=/artifact-git', '--env', 'GIT_WORK_TREE=/repo');
+      // Worktree metadata may live outside the selected checkout. Keep its access identical to the grant.
+      const common = await fs.realpath(path.resolve(realRoot, await git(realRoot, 'rev-parse', '--git-common-dir')));
+      if (common !== await fs.realpath(gitDir)) args.push('--mount', bindMount(common, '/artifact-git-common', readOnly), '--env', 'GIT_COMMON_DIR=/artifact-git-common');
+    }
+    args.push('--env', 'GIT_CONFIG_COUNT=1', '--env', 'GIT_CONFIG_KEY_0=safe.directory', '--env', 'GIT_CONFIG_VALUE_0=/repo');
     const reads: ReadDirectory[] = [];
     for (const directory of this.reads) {
       const real = await fs.realpath(directory.path);
@@ -128,7 +145,7 @@ export class ArtifactSandbox {
       args.push('--mount', bindMount(real, target, directory.access !== 'write')); reads.push({ ...directory, path: target });
     }
     args.push('--mount', bindMount(this.context, '/context', true));
-    args.push('--env', 'SKILLZ_READ_ROOTS=' + JSON.stringify(reads), '--env', 'SKILLZ_WRITE_ROOTS=' + JSON.stringify(reads.filter(root => root.access === 'write')), '--env', 'SKILLZ_ARTIFACT_READ_ROOTS=' + JSON.stringify(reads), '--env', 'SKILLZ_OBSERVABILITY_PATH=/repo/memory_observability.md', '--env', 'SKILLZ_CONTEXT_ROOT=/context');
+    args.push('--env', 'SKILLZ_READ_ROOTS=' + JSON.stringify(reads), '--env', 'SKILLZ_WRITE_ROOTS=' + JSON.stringify(reads.filter(root => root.access === 'write')), '--env', 'SKILLZ_ARTIFACT_READ_ROOTS=' + JSON.stringify(reads), '--env', 'SKILLZ_OBSERVABILITY_PATH=' + (this.repository ? '/tmp/skillz-observatory/memory_observability.md' : '/repo/memory_observability.md'), '--env', 'SKILLZ_CONTEXT_ROOT=/context');
     if (this.processProxy) args.push('--env', `SKILLZ_PROCESS_PROXY_URL=${this.processProxy.url}`, '--env', `SKILLZ_PROCESS_PROXY_TOKEN=${this.processProxy.token}`);
     if (this.modelBroker) args.push('--env', `SKILLZ_MODEL_BROKER_URL=${this.modelBroker.url}`, '--env', `SKILLZ_MODEL_BROKER_TOKEN=${this.modelBroker.token}`, '--env', `SKILLZ_APP_AGENT_PROVIDER=${this.modelBroker.provider}`, '--env', `SKILLZ_APP_AGENT_MODEL=${this.modelBroker.model}`);
     return { docker, args: [...args, image] };

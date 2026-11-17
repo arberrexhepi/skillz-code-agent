@@ -13,6 +13,8 @@
     "repo:publish": "node scripts/prebuilt-artifacts.cjs publish",
     "test:prebuilts": "node --test scripts/prebuilt-artifacts.test.cjs",
     "test:runtime": "node --test scripts/python.test.cjs scripts/agent-runtime.test.cjs scripts/terminal.test.cjs scripts/terminal-panel.test.cjs scripts/runtime-settings.test.cjs scripts/runtime-settings-ipc.test.cjs",
+    "test:runtime:selection": "node --test scripts/artifact-runtime-selection.test.cjs",
+    "test:artifacts:activity": "node --test scripts/artifact-agent-activity.test.cjs",
     "test:git": "node --test scripts/git.test.cjs scripts/git-initialize.test.cjs",
     "test:issues": "node --test scripts/issues.test.cjs scripts/issue-proposals.test.cjs scripts/workspace-issues.test.cjs",
     "test:paths": "node --test scripts/file-references.test.cjs scripts/file-explorer.test.cjs",
@@ -30,7 +32,7 @@
     "preview": "electron-vite preview",
     "package": "npm run build && electron-builder --dir",
     "dist": "npm run build && electron-builder",
-    "test:artifacts": "node --test scripts/artifacts.test.cjs scripts/artifact-blueprints.test.cjs scripts/artifact-blueprint-agent.test.cjs scripts/artifact-model-broker.test.cjs scripts/artifact-process.test.cjs scripts/artifact-process-proxy.test.cjs scripts/artifact-docker-cleanup.test.cjs",
+    "test:artifacts": "node --test scripts/artifact-prebuilt-updates.test.cjs scripts/artifacts.test.cjs scripts/artifact-blueprints.test.cjs scripts/artifact-blueprint-agent.test.cjs scripts/artifact-model-broker.test.cjs scripts/artifact-process.test.cjs scripts/artifact-process-proxy.test.cjs scripts/artifact-docker-cleanup.test.cjs",
     "test:artifacts:preview": "node --test scripts/artifact-frame.test.cjs",
     "test:artifacts:integration": "node --test scripts/artifacts-integration.test.cjs",
     "test:artifacts:sqlite": "node --test scripts/artifact-sqlite-integration.test.cjs",
@@ -41,7 +43,9 @@
     "notices:generate": "node scripts/third-party-notices.cjs generate",
     "notices:check": "node scripts/third-party-notices.cjs check",
     "notices:verify": "node scripts/third-party-notices.cjs verify",
-    "test:notices": "node --test scripts/third-party-notices.test.cjs"
+    "test:notices": "node --test scripts/third-party-notices.test.cjs",
+    "test:artifacts:runtime": "node --test scripts/artifact-runtime-bridge.test.cjs scripts/artifact-runtime-service.test.cjs",
+    "test:artifacts:runtime:integration": "node --test scripts/artifact-runtime-integration.test.cjs"
   },
   "build": {
     "appId": "agency.aiam.skillz-workbench",

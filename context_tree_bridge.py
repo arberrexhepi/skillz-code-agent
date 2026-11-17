@@ -26,9 +26,12 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from context_tree import ContextTree
+from command_extensions import ADVANCED_COMMAND_GRAMMAR
 from tree_commands import (
     Annotation,
     CommandResult,
+    CommandExecutor,
+    COMMAND_VERBS,
     TreeCommandParser,
     execute_multi,
     execute_strategy,
@@ -284,7 +287,7 @@ STRATEGIES (multi-step DAG pipelines):
         {s2.match(/needle: (.+)/)[1]}
   - Placeholder expressions are text transforms, not general code execution.
   - Steps with no deps execute in the first tier (parallel).
-""".strip()
+""" + ADVANCED_COMMAND_GRAMMAR.strip()
 
     # ------------------------------------------------------------------
     # Command execution
@@ -302,44 +305,41 @@ STRATEGIES (multi-step DAG pipelines):
         if stripped.startswith("{"):
             return False
         first_word = stripped.split(None, 1)[0].lower()
-        return first_word in {
-            "ls", "cat", "read-line-range", "read_line_range", "symbols", "find-symbol", "find_symbol", "stat", "find", "grep",
-            "read-diagnostics", "run-route-check", "run_route_check", "ingest-log", "list-run-issues", "list_run_issues", "list-issues", "show-run-issue", "show_run_issue", "show-issue", "resolve-run-issue", "resolve_run_issue", "resolve-issue", "reopen-run-issue", "reopen_run_issue", "reopen-issue", "run-check",
-            "write", "replace-lines", "replace_lines", "patch", "show-diff", "show_diff", "review-changes", "review_changes", "shell", "git",
-            "fact", "expand", "drop", "batch", "finish", "propose-issue",
-            "skill", "#",
-        }
+        return first_word in COMMAND_VERBS or first_word == "#"
 
-    def execute(self, raw: str) -> List[CommandResult]:
+    def execute(self, raw: str, *, command_executor: Optional[CommandExecutor] = None) -> List[CommandResult]:
         """Execute one or more tree commands, or a strategy DAG.
         
         Returns a list of CommandResult. The caller should:
         1. Return read results directly to the model (free).
         2. Dispatch needs_tool results through existing _execute_action handlers.
         3. After writes, call bridge.on_write_complete(path) to invalidate cache.
+
+        With command_executor, the executor owns parsing, dispatch and completion
+        of each command before the next runs; do not dispatch returned results again.
         
         Annotations (>>tag: lines) are captured and accessible via
         self.last_annotations after each call.
         """
         self.last_annotations: List[Annotation] = []
         if is_strategy(raw):
-            return self.execute_strategy(raw)
-        results, annotations = execute_multi(self.parser, raw)
+            return self.execute_strategy(raw, command_executor=command_executor)
+        results, annotations = execute_multi(self.parser, raw, command_executor=command_executor)
         self.last_annotations = annotations
         return results
 
-    def execute_strategy(self, raw: str) -> List[CommandResult]:
+    def execute_strategy(self, raw: str, *, command_executor: Optional[CommandExecutor] = None) -> List[CommandResult]:
         """Execute a strategy DAG and return flattened results."""
-        results_by_label = execute_strategy(self.parser, raw)
+        results_by_label = execute_strategy(self.parser, raw, command_executor=command_executor)
         # Flatten into a single list for uniform return type
         flat: List[CommandResult] = []
-        for label in sorted(results_by_label.keys()):
+        for label in results_by_label:
             flat.extend(results_by_label[label])
         return flat
 
-    def execute_strategy_full(self, raw: str) -> Dict[str, List[CommandResult]]:
+    def execute_strategy_full(self, raw: str, *, command_executor: Optional[CommandExecutor] = None) -> Dict[str, List[CommandResult]]:
         """Execute a strategy DAG and return per-label results dict."""
-        return execute_strategy(self.parser, raw)
+        return execute_strategy(self.parser, raw, command_executor=command_executor)
 
     def format_strategy(self, results: Dict[str, List[CommandResult]]) -> str:
         """Format strategy results for prompt or display."""

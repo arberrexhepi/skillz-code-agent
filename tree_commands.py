@@ -34,6 +34,7 @@ WRITE (real tool dispatch):
     show-diff [path]                 Show git diff for the workspace or one path
     review-changes [path] [limit=N]  Review changed files and surface risk summary
   shell <command>                  Run shell command
+  shell <<< ... >>>                Run one multi-line script block
   git status [--branch]            Git status
   git diff [--staged] [--stat|--name-only] [path]
   git log [-N] [ref|left..right] [-- path]  Recent/ahead commits
@@ -71,6 +72,8 @@ SKILLS (preloaded cache or handler):
 
 from __future__ import annotations
 
+from command_blocks import STRATEGY_LABEL_PATTERN, group_command_blocks
+
 import ast
 import json
 import re
@@ -79,6 +82,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from context_tree import ContextTree
+from command_extensions import EXTENSION_VERBS, extension_action
 from discovery import repo_map
 from discovery.dispatch import DISCOVERY_ACTION_TYPES
 from mutation_text import PARSE_ERROR_PREFIX, is_text_mutation, parse_patch_payload, parse_range_payload, split_path_payload
@@ -144,7 +148,7 @@ COMMAND_VERBS = frozenset({
     "stat",
     "symbols",
     "write",
-})
+}) | EXTENSION_VERBS
 
 
 # ---------------------------------------------------------------------------
@@ -158,12 +162,20 @@ class CommandResult:
     command_type: str  # "read" | "write" | "mutation" | "skill" | "error" | "finish" | "annotation"
     needs_tool: bool = False  # True if this must dispatch to ToolbeltRunner
     tool_action: Optional[Dict[str, Any]] = None  # Translated action dict for ToolbeltRunner
+    model_output: Optional[str] = None  # Exact delivered text; output retains the complete tool result.
 
     def to_dict(self) -> Dict[str, Any]:
         d: Dict[str, Any] = {"ok": self.ok, "output": self.output, "command_type": self.command_type}
         if self.tool_action:
             d["tool_action"] = self.tool_action
+        if self.model_output is not None:
+            d["model_output_chars"] = len(self.model_output)
+            d["model_output_truncated"] = self.model_output != self.output
         return d
+
+
+# Arguments are the command text and its strategy label (empty for plain commands).
+CommandExecutor = Callable[[str, str], CommandResult]
 
 
 # ---------------------------------------------------------------------------
@@ -317,6 +329,7 @@ class TreeCommandParser:
             "finish": self._cmd_finish,
             "skill": self._cmd_skill,
         }
+        dispatch.update({verb: (lambda rest, verb=verb: self._cmd_extension(verb, rest)) for verb in EXTENSION_VERBS})
 
         handler = dispatch.get(verb)
         if handler is None:
@@ -330,6 +343,12 @@ class TreeCommandParser:
     # ------------------------------------------------------------------
     # READ commands (free, in-context)
     # ------------------------------------------------------------------
+
+    def _cmd_extension(self, verb: str, rest: str) -> CommandResult:
+        action = extension_action(verb, rest)
+        read = action["type"] in DISCOVERY_ACTION_TYPES
+        return CommandResult(ok=True, output=f"[dispatch: {verb}]", command_type="read" if read else "write",
+                             needs_tool=True, tool_action=action)
 
     def _cmd_ls(self, rest: str) -> CommandResult:
         parts = rest.split()
@@ -1385,32 +1404,18 @@ def collapse_heredocs(lines: List[str]) -> List[str]:
     logical line no matter how many physical lines the block spans.
 
     Works for **every** prefix — ``write``, ``s2: write``, ``>>th:``, etc.
+    Native shell heredocs and quoted multiline shell arguments are grouped too,
+    while their own delimiters are left intact for the shell to interpret.
     """
     result: List[str] = []
-    i = 0
-    while i < len(lines):
-        stripped = lines[i].rstrip()
-        if stripped.rstrip().endswith("<<<"):
-            prefix = stripped[:-3].rstrip()
-            content_parts: List[str] = []
-            i += 1
-            closed = False
-            while i < len(lines):
-                if lines[i].strip() == ">>>":
-                    i += 1
-                    closed = True
-                    break
-                content_parts.append(lines[i])
-                i += 1
-            if not closed:
-                return [PARSE_ERROR_PREFIX + "Unterminated heredoc: missing >>>; no commands dispatched"]
-            content = "\n".join(content_parts)
-            # Keep a newline boundary even for a one-line/empty heredoc, so
-            # strategy parsing never treats payload commas as command separators.
+    for block in group_command_blocks(lines):
+        physical = block.split("\n")
+        if physical[0].rstrip().endswith("<<<"):
+            prefix = physical[0].rstrip()[:-3].rstrip()
+            content = "\n".join(physical[1:-1])
             result.append(f"{prefix}\n{content}" if prefix else content)
         else:
-            result.append(lines[i])
-            i += 1
+            result.append(block)
     return result
 
 
@@ -1487,10 +1492,12 @@ def _repo_tree_path_to_rel(path: str) -> str:
     return normalized.removeprefix("/repo/").removeprefix("repo/").strip() or "."
 
 
-def execute_multi(parser: TreeCommandParser, raw: str) -> Tuple[List[CommandResult], List[Annotation]]:
+def execute_multi(
+    parser: TreeCommandParser, raw: str, *, command_executor: Optional[CommandExecutor] = None,
+) -> Tuple[List[CommandResult], List[Annotation]]:
     """Execute multiple commands, returning results and annotations.
-    Read commands execute immediately. Write/mutation commands
-    are collected for dispatch. Annotation lines are captured separately."""
+    An executor completes each command before the next is evaluated. Without
+    one, tool actions are returned for the caller to dispatch separately."""
     commands = parse_multi_command(raw)
     results: List[CommandResult] = []
     annotations: List[Annotation] = []
@@ -1498,13 +1505,13 @@ def execute_multi(parser: TreeCommandParser, raw: str) -> Tuple[List[CommandResu
         ann = parse_annotation(cmd)
         if ann is not None:
             annotations.append(ann)
-            results.append(CommandResult(
+            results.append(command_executor(cmd, "") if command_executor else CommandResult(
                 ok=True,
                 output=ann.compact(),
                 command_type="annotation",
             ))
             continue
-        result = parser.parse_and_execute(cmd)
+        result = command_executor(cmd, "") if command_executor else parser.parse_and_execute(cmd)
         results.append(result)
     return results, annotations
 
@@ -1541,7 +1548,7 @@ def execute_multi(parser: TreeCommandParser, raw: str) -> Tuple[List[CommandResu
 # after both complete. s3's command can reference {s1} and {s2} to use their
 # output.
 
-_STRATEGY_LABEL_RE = r"s\w+(?:\.\w+)*"
+_STRATEGY_LABEL_RE = STRATEGY_LABEL_PATTERN
 _STRATEGY_LINE_RE = re.compile(
     rf"^(?:(?P<deps>[\w.\s,]+)->\s*)?(?P<label>{_STRATEGY_LABEL_RE})\s*:\s*(?P<body>.+?)(?:\s*->\s*(?P<targets>[\w.\s,]+))?\Z",
     re.IGNORECASE | re.DOTALL,
@@ -1989,21 +1996,16 @@ def _resolve_strategy_placeholders(command: str, steps: Dict[str, StrategyStep])
 
 def is_strategy(raw: str) -> bool:
     """Quick check if the input looks like a strategy block."""
-    in_heredoc = False
-    for line in raw.splitlines():
-        line = line.strip()
-        if in_heredoc:
-            if line == ">>>":
-                in_heredoc = False
-            continue
+    for block in group_command_blocks(raw.splitlines()):
+        line = block.split("\n", 1)[0].strip()
         if line and not line.startswith("#") and _STRATEGY_LINE_RE.match(line):
             return True
-        if line.endswith("<<<"):
-            in_heredoc = True
     return False
 
 
-def execute_strategy(parser: TreeCommandParser, raw: str) -> Dict[str, List[CommandResult]]:
+def execute_strategy(
+    parser: TreeCommandParser, raw: str, *, command_executor: Optional[CommandExecutor] = None,
+) -> Dict[str, List[CommandResult]]:
     """Parse and execute a strategy DAG.
 
     Returns a dict of label -> results. Commands within a tier execute
@@ -2011,10 +2013,13 @@ def execute_strategy(parser: TreeCommandParser, raw: str) -> Dict[str, List[Comm
     structure tells the caller what *could* be parallelized.
 
     Upstream outputs are injected into downstream commands via {sN} placeholders.
+    An executor must complete tool actions before returning, so downstream
+    reads and placeholders observe their actual results.
     """
+    run_command = command_executor or (lambda command, label: parser.parse_and_execute(command))
     plan = parse_strategy(raw)
     if plan is None:
-        return {"error": [CommandResult(ok=False, output="Not a valid strategy", command_type="error")]}
+        return {"error": [run_command(PARSE_ERROR_PREFIX + "Not a valid strategy", "error")]}
 
     all_results: Dict[str, List[CommandResult]] = {}
 
@@ -2022,30 +2027,17 @@ def execute_strategy(parser: TreeCommandParser, raw: str) -> Dict[str, List[Comm
         for label in tier:
             step = plan.steps[label]
             if step.results and all(result.command_type == "error" for result in step.results):
-                all_results[label] = step.results
+                all_results[label] = [run_command(PARSE_ERROR_PREFIX + result.output, label) for result in step.results]
                 continue
 
-            # Substitute upstream outputs into commands
-            resolved_commands: List[str] = []
+            step_results: List[CommandResult] = []
             for cmd in step.commands:
                 try:
                     resolved = _resolve_strategy_placeholders(cmd, plan.steps)
                 except ValueError as exc:
-                    step_results = [CommandResult(ok=False, output=f"placeholder error: {exc}", command_type="error")]
-                    step.results = step_results
-                    all_results[label] = step_results
-                    resolved_commands = []
+                    step_results.append(run_command(PARSE_ERROR_PREFIX + f"placeholder error: {exc}", label))
                     break
-                resolved_commands.append(resolved)
-
-            if label in all_results and all_results[label] and not all_results[label][0].ok:
-                continue
-
-            # Execute all commands in this step
-            step_results: List[CommandResult] = []
-            for cmd in resolved_commands:
-                result = parser.parse_and_execute(cmd)
-                step_results.append(result)
+                step_results.append(run_command(resolved, label))
 
             step.results = step_results
             all_results[label] = step_results

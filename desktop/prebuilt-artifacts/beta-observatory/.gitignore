@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.artifact-data/
+.context/
+.artifact-local.json
+.env
+.env.*
+repo_facts.md
+memory_observability.md
+.agent-issue-proposals*
+.DS_Store

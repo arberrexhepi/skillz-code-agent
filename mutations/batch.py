@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable
 
 from .filesystem_ops import copy_file, create_file, delete_file, fill_template, rename_file
 from .models import BatchMutationResult, MutationResult, make_mutation_result
+from .batch_state import BatchState
 from .structural_ops import insert_symbol_member, rename_symbol, replace_symbol
+from .regex_ops import replace_regex
 from .text_ops import (
     append_block,
     delete_range,
@@ -25,6 +27,7 @@ OperationHandler = Callable[..., MutationResult]
 _SINGLE_PATH_OPERATIONS = {
     "replace_range",
     "replace_snippet",
+    "replace_regex",
     "insert_before",
     "insert_after",
     "delete_range",
@@ -48,26 +51,49 @@ def batch_mutate(
     root: Path | str | None = None,
 ) -> BatchMutationResult:
     workspace_root = Path(root or Path.cwd()).resolve()
-    snapshots: dict[Path, tuple[bool, Optional[str]]] = {}
     results: list[MutationResult] = []
     rolled_back = False
+    try:
+        state = BatchState(workspace_root, operations, _SINGLE_PATH_OPERATIONS - {"create_file", "delete_file"})
+        preflight_error = state.validate_hashes(operations)
+    except (ValueError, OSError, RuntimeError) as exc:
+        error = make_mutation_result(operation_id="batch:preflight", file_path="", mutation_type="batch_mutate",
+                                     ok=False, applied=False, reason="invalid_path", diagnostics=[{"code": "INVALID_PATH", "message": str(exc)}])
+        return {"ok": False, "atomic": atomic, "operations": [error], "applied_count": 0, "failed_count": 1, "rolled_back": False}
+    if preflight_error:
+        return {"ok": False, "atomic": atomic, "operations": [preflight_error], "applied_count": 0, "failed_count": 1, "rolled_back": False}
     for index, operation in enumerate(operations):
-        op_type = str(operation.get("type", "") or "").strip()
-        file_paths = _operation_paths(operation)
-        for file_path in file_paths:
-            target = (workspace_root / file_path).resolve()
-            if target not in snapshots:
-                if target.exists() and target.is_file():
-                    snapshots[target] = (True, target.read_text(encoding="utf-8"))
-                else:
-                    snapshots[target] = (False, None)
-        result = _dispatch_operation(operation, root=workspace_root, index=index)
+        try:
+            result = state.guard(operation, index)
+            if result is None:
+                result = _dispatch_operation(state.prepare(operation), root=workspace_root, index=index)
+                post_error = state.record(operation, result, index)
+            else:
+                post_error = None
+        except (TypeError, ValueError, OSError) as exc:
+            result = make_mutation_result(operation_id=f"batch:{index}:guard", file_path=str(operation.get("file_path") or operation.get("path") or ""),
+                mutation_type="batch_mutate", ok=False, applied=False, reason="batch_state_unavailable",
+                diagnostics=[{"code": "BATCH_STATE_UNAVAILABLE", "message": str(exc)}], details={"operation_index": index + 1})
+            post_error = None
         results.append(result)
-        if result.get("ok"):
+        if post_error:
+            results.append(post_error)
+        if result.get("ok") and not post_error and index == len(operations) - 1:
+            for name in state.paths:
+                post_error = state.guard({"file_path": name}, index, phase="batch_completion")
+                if post_error:
+                    results.append(post_error)
+                    break
+        if result.get("ok") and not post_error:
             continue
         if atomic:
-            _rollback_snapshots(snapshots)
-            rolled_back = True
+            conflicts = state.rollback()
+            rolled_back = not conflicts
+            if conflicts:
+                results.append(make_mutation_result(operation_id="batch:rollback", file_path="", mutation_type="batch_mutate",
+                    ok=False, applied=False, reason="rollback_conflict", diagnostics=[
+                        {"code": "ROLLBACK_CONFLICT", "message": f"External change preserved during rollback: {path.relative_to(workspace_root)}"}
+                        for path in conflicts]))
         break
     applied_count = sum(1 for result in results if result.get("applied"))
     failed_count = sum(1 for result in results if not result.get("ok"))
@@ -98,7 +124,7 @@ def _dispatch_operation(operation: dict[str, Any], *, root: Path, index: int) ->
     kwargs["root"] = root
     try:
         return handler(**kwargs)
-    except TypeError as exc:
+    except (TypeError, ValueError, OSError) as exc:
         return make_mutation_result(
             operation_id=f"batch:{index}:{op_type}",
             file_path=str(operation.get("file_path") or operation.get("path") or ""),
@@ -125,6 +151,7 @@ def _handler_map() -> dict[str, OperationHandler]:
     return {
         "replace_range": replace_range,
         "replace_snippet": replace_snippet,
+        "replace_regex": replace_regex,
         "insert_before": insert_before,
         "insert_after": insert_after,
         "delete_range": delete_range,
@@ -141,26 +168,3 @@ def _handler_map() -> dict[str, OperationHandler]:
         "copy_file": copy_file,
         "fill_template": fill_template,
     }
-
-
-def _operation_paths(operation: dict[str, Any]) -> list[str]:
-    paths: list[str] = []
-    for key in ("file_path", "path", "old_path", "new_path", "source_path", "destination_path"):
-        value = operation.get(key)
-        if isinstance(value, str) and value.strip():
-            paths.append(value.strip())
-    unique: list[str] = []
-    for path in paths:
-        if path not in unique:
-            unique.append(path)
-    return unique
-
-
-def _rollback_snapshots(snapshots: dict[Path, tuple[bool, Optional[str]]]) -> None:
-    for path, (existed, content) in snapshots.items():
-        if existed:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(content or "", encoding="utf-8")
-        elif path.exists():
-            if path.is_file():
-                path.unlink()

@@ -19,6 +19,7 @@ const states = new Map<string, AgentBridgeState>();
 const emit = (event: ArtifactEvent) => listeners.forEach((listener) => listener(event));
 const state = (id: string) => states.get(id) || { planner: {}, transcript: [] };
 const response = (id: string) => ({ ok: true, state: state(id) });
+let prebuiltUpdate = new URLSearchParams(window.location.search).has('prebuiltUpdate');
 let installed = false, keySaved = false, inspectionInstalled = false;
 let setupProgress: import('../../src/shared/artifacts').ArtifactSetupProgress = { running: false, step: '', log: '' };
 function capabilities(selection: import('../../src/shared/artifacts').ArtifactSetupSelection): import('../../src/shared/artifacts').ArtifactCapabilities {
@@ -45,8 +46,15 @@ window.workbench.artifacts = {
   installPrebuilt: async (prebuiltId, access, runtime) => { const preset = prebuilts.find(item => item.id === prebuiltId)!; const id = preset.id + '-' + (library.artifacts.length + 1); const record = { id, prebuiltId, root: library.root + '/' + id, title: preset.title, prompt: preset.description, createdAt: new Date().toISOString(), sourceRoot: '', shareFacts: false, shareMemory: false, contextMode: 'none' as const, access, runtime }; library = { ...library, artifacts: [...library.artifacts, record] }; return record; },
   chooseFolder: async () => { library = { root: '/artifacts-library', artifacts: [] }; return library; },
   create: async (options) => { const id = `artifact-${library.artifacts.length + 1}`; const record = { ...options, id, root: `${library.root}/${id}`, createdAt: new Date().toISOString(), contextMode: options.shareFacts || options.shareMemory ? 'snapshot' as const : 'none' as const }; library = { ...library, artifacts: [...library.artifacts, record] }; return record; },
+  prebuiltUpdateStatus: async id => ({ available: prebuiltUpdate && id.startsWith('server-manager'), changedFiles: 2 }),
+  reviewPrebuiltUpdate: async () => ({ token: 'a'.repeat(64), files: [
+    { path: 'src/App.tsx', kind: 'changed', action: 'merge', installed: 'const title = "My custom manager";\nconst status = "old";', incoming: 'const title = "Server Manager";\nconst status = "ready";', result: 'const title = "My custom manager";\nconst status = "ready";', binary: false, truncated: false },
+    { path: 'server/index.ts', kind: 'changed', action: 'conflict', installed: 'const timeout = 30;', incoming: 'const timeout = 60;', binary: false, truncated: false },
+  ] }),
+  applyPrebuiltUpdate: async (id, request) => { if (!request.resolutions['server/index.ts']) throw new Error('Choose a conflict resolution.'); prebuiltUpdate = false; emit({ type: 'runtime', runtime: { id, status: 'stopped', logs: '' } }); emit({ type: 'prebuilt-updated', id }); return { updatedFiles: 2, backup: '/workbench/prebuilt-updates/backups/retained.json' }; },
   chooseReadDirectory: async () => ({ id: 'documents', label: 'Documents', path: 'C:\\Users\\example\\Documents', access: 'read' as const }),
   access: async (id) => library.artifacts.find((record) => record.id === id)?.access || { directories: [], allowWorkspaceRead: false },
+  saveRuntime: async (id, runtime) => { const record = library.artifacts.find(item => item.id === id)!; record.runtime = runtime; emit({ type: 'runtime-selection', record }); return record; },
   saveAccess: async (id, access) => { const record = library.artifacts.find((item) => item.id === id); if (record) record.access = access; emit({ type: 'runtime', runtime: { id, status: 'stopped', logs: '' } }); emit({ type: 'agent', id, event: { type: 'status', status: 'stopped' } }); },
   apis: async (id) => configs.get(id) || { version: 1, apis: [] }, saveApis: async (id, config) => { configs.set(id, config); emit({type:'apis',id}); },
   blueprintAgent: async (id, message) => ({ message: 'Blueprint mode handled: ' + message, config: configs.get(id) || { version: 1, apis: [] }, changes: [] }),

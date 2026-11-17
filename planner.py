@@ -1256,10 +1256,10 @@ class PlannerAgent:
     @staticmethod
     def _history_has_successful_workspace_mutation(history_slice: List[Dict[str, Any]] | List[Any]) -> bool:
         mutation_actions = {
-            "write_file", "patch_file", "replace_range", "replace_snippet", "insert_before",
+            "write_file", "patch_file", "replace_lines", "replace_range", "replace_snippet", "replace_regex", "insert_before",
             "insert_after", "delete_range", "delete_snippet", "append_block", "prepend_block",
             "move_block", "replace_symbol", "insert_symbol_member", "rename_symbol", "create_file",
-            "delete_file", "rename_file", "copy_file", "fill_template", "batch_mutate",
+            "delete_file", "rename_file", "copy_file", "fill_template", "batch_mutate", "npm_command",
         }
         candidates: List[tuple[Any, Any]] = []
         for item in history_slice:
@@ -1276,14 +1276,18 @@ class PlannerAgent:
                 for nested in nested_results:
                     candidates.append((getattr(nested, "tool_action", None), nested))
         for action, result in candidates:
-            if not isinstance(action, dict) or str(action.get("type", "") or "") not in mutation_actions:
+            if not isinstance(action, dict):
                 continue
             if isinstance(result, dict):
                 result_ok = bool(result.get("ok", False))
             else:
                 result_ok = bool(getattr(result, "ok", False))
             if result_ok:
-                return True
+                if "_changed_paths" in action:
+                    if action["_changed_paths"]:
+                        return True
+                elif str(action.get("type", "") or "") in mutation_actions:
+                    return True
         return False
 
     def _subscription_write_goal_is_unverified_noop(
@@ -1735,8 +1739,8 @@ class PlannerAgent:
                     self.session.executing_goal_id = goal.goal_id
                     self.session.executing_goal_title = goal.title
                     self._fire_goal_callback("goal_start", index, goal.goal_id, goal.title)
-                    # On the main worker, preserve facts from earlier goals in
-                    # the same plan so context accumulates across the sequence.
+                    # Preserve evidence/outcomes across the sequence. The beta
+                    # worker starts a bounded handoff, not a raw transcript chain.
                     effective_preserve = goal.preserve_context or bool(completed_ids) or resumed
                     result = self._execute_goal_with_worker(
                         self.worker, plan,
@@ -3205,6 +3209,8 @@ class PlannerAgent:
             lines = [
                 "Execution Summary",
                 f"- Plan execution stopped after a failed goal: {failed_result.title}.",
+                f"- Stop reason: {failed_result.final_message or 'The worker did not reach a validated completion.'}",
+                *([f"- Validation: {failed_result.validation_summary}"] if failed_result.validation_summary else []),
                 (
                     "- The failed attempt left partial repository changes; retry continues by inspecting and repairing the current diff."
                     if partial_changes

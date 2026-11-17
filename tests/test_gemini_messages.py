@@ -73,6 +73,7 @@ class GeminiMessageTests(unittest.TestCase):
         self.assertEqual(request["contents"][1].parts[0].text, "second")
         self.assertEqual(request["config"].kwargs["system_instruction"], "system rules")
         self.assertEqual(request["config"].kwargs["automatic_function_calling"], {"disable": True})
+        self.assertEqual(request["config"].kwargs["tool_config"], {"function_calling_config": {"mode": "NONE"}})
         usage = client.get_last_metrics()["usage"]
         self.assertEqual(usage["input_tokens"], 300)
         self.assertEqual(usage["output_tokens"], 25)
@@ -89,11 +90,12 @@ class GeminiMessageTests(unittest.TestCase):
         response = SimpleNamespace(text="done", usage_metadata=None)
         try:
             for messages in (False, True):
-                with self.subTest(messages=messages), patch.object(Models, "_logged_afc_warning", False), patch.object(Models, "_generate_content", return_value=response) as generate, self.assertNoLogs("google_genai.models", level="WARNING"):
+                with self.subTest(messages=messages), patch.object(Models, "_generate_content", return_value=response) as generate, self.assertNoLogs("google_genai.models", level="WARNING"):
                     text = client._do_complete_messages("rules", [{"role": "user", "content": "hello"}]) if messages else client._do_complete("rules", "hello")
                     self.assertEqual(text, "done")
                     generate.assert_called_once()
                     self.assertTrue(generate.call_args.kwargs["config"].automatic_function_calling.disable)
+                    self.assertEqual(generate.call_args.kwargs["config"].tool_config.function_calling_config.mode.value, "NONE")
         finally:
             client.client.close()
 

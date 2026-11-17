@@ -58,3 +58,13 @@ test('no stale decision is shown without a pending or paused plan', () => {
   const html = render({});
   assert.doesNotMatch(html, /Approve plan|Review full plan|Suggest plan changes/);
 });
+test('paused plan shows the actual stop reason and validation blocker before review', () => {
+  const html = render({ execution_paused: true, paused_plan: reviewPlan,
+    paused_failed_goal_id: 'goal-2', paused_failure_reason: 'Turn limit reached: 100 model turns in this attempt.',
+    last_completed_results: [{ goal_id: 'goal-2', status: 'failed', validation_summary: 'An edit batch is still open.' }],
+    resume_checkpoint: { next_goal_index: 2, completed_goal_count: 1 } });
+  assert.match(html, /Stop reason/);
+  assert.match(html, /100 model turns in this attempt/);
+  assert.match(html, /An edit batch is still open/);
+  assert.match(html, /Completed goals are saved/);
+});

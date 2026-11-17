@@ -237,6 +237,7 @@ class PlannerRecoveryTests(unittest.TestCase):
         worker._observability_metrics = {}
         worker.loop = SimpleNamespace(
             history=[],
+            _read_working_set=SimpleNamespace(packets=[]),
             run=lambda _task: (_ for _ in ()).throw(HttpError(500, "internal server error")),
         )
         finalized: list[str] = []

@@ -1,8 +1,9 @@
 import { PathChip, PathText } from './PathText';
 import { useMemo, useState } from 'react';
-import { currentReview, describeProgress, groupDiagnostics, primaryReviewPath } from '../../../shared/agentCore';
+import { currentReview, groupDiagnostics, primaryReviewPath } from '../../../shared/agentCore';
 import { useAgentWorkspace } from '../agent/agentWorkspace';
 import { TerminalPanel } from './TerminalPanel';
+import { AgentActivityView } from './agent/AgentActivityView';
 
 type DockMode = 'terminal' | 'activity' | 'problems' | 'review';
 
@@ -23,7 +24,7 @@ export function WorkspaceDock({ onOpenDiff }: { onOpenDiff: (path: string, stage
     <div className="dock-tabs">{tabs.map((tab) => <button type="button" key={tab.key} className={mode === tab.key ? 'active' : ''} onClick={() => { setMode(tab.key); setCollapsed(false); }}>{tab.label}{tab.count ? <span>{tab.count}</span> : null}</button>)}<button type="button" className="icon-button push-right" onClick={() => setCollapsed((value) => !value)}>{collapsed ? '⌃' : '⌄'}</button></div>
     {!collapsed && <div className="dock-body">
       <div className={`dock-pane ${mode === 'terminal' ? '' : 'hidden'}`}><TerminalPanel embedded onSendToAgent={(output) => agent.submit(terminalAgentPrompt(output))} /></div>
-      {mode === 'activity' && <div className="dock-pane"><ActivityView /></div>}
+      {mode === 'activity' && <div className="dock-pane"><AgentActivityView /></div>}
       {mode === 'problems' && <div className="dock-pane"><ProblemsView diagnostics={diagnostics} /></div>}
       {mode === 'review' && <div className="dock-pane"><ReviewView onOpenDiff={onOpenDiff} /></div>}
     </div>}
@@ -32,17 +33,6 @@ export function WorkspaceDock({ onOpenDiff }: { onOpenDiff: (path: string, stage
 
 export function terminalAgentPrompt(output: string): string {
   return `Investigate this terminal output from the active workspace. Explain the cause and make the appropriate repository changes if a fix is needed.\n\n<terminal_output>\n${output}\n</terminal_output>`;
-}
-
-function ActivityView(): React.JSX.Element {
-  const { state } = useAgentWorkspace();
-  const activity = [...state.activity].reverse();
-  const llm = state.bridge.planner.worker_state?.llm_activity;
-  return <div className="dock-scroll activity-view">
-    {llm?.in_flight && <div className="live-activity"><i /><strong>Model working</strong><span><PathText>{llm.last_event || `Turn ${llm.turn || ''}`}</PathText></span>{llm.elapsed_s !== undefined && <small>{llm.elapsed_s}s</small>}</div>}
-    {!activity.length && <DockEmpty title="No activity yet" body="Model calls, skills, tools, patches, and goal transitions will appear here." />}
-    {activity.map((item, index) => { const line = describeProgress(item); return <div className={`activity-row ${line.tone}`} key={`${item.type}-${item.step}-${index}`}><i /><div><strong><PathText>{line.title}</PathText></strong><span>{item.path && <PathChip path={item.path} />}<PathText>{[item.command, item.elapsed_s !== undefined ? `${item.elapsed_s}s` : ''].filter(Boolean).join(' · ') || (!item.path ? String(item.action_type || item.type).replaceAll('_', ' ') : '')}</PathText></span></div><small>{item.step !== undefined ? `#${item.step}` : item.type.replace('_', ' ')}</small></div>; })}
-  </div>;
 }
 
 function ProblemsView({ diagnostics }: { diagnostics: ReturnType<typeof groupDiagnostics> }): React.JSX.Element {

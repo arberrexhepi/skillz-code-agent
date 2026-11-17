@@ -1,0 +1,26 @@
+import type { Run, RunEvent } from './types';
+const rows: [number, string, Record<string, unknown>][] = [
+  [0, 'input', { prompt: 'Add a health endpoint and verify its response.' }],
+  [500, 'request', { action: 'submit', text: 'Add a health endpoint and verify its response.' }],
+  [1100, 'progress', { action_type: 'discovery_start', summary: 'Inspect server routes and the existing test suite.' }],
+  [2100, 'progress', { action_type: 'read_file', path: 'server/index.ts', summary: 'Found the Express app and current route registration.', ok: true }],
+  [3500, 'progress', { action_type: 'discovery_finish', summary: 'One server entry point. Existing tests use node:test.' }],
+  [4400, 'response', { status: 'awaiting-input', message: 'Plan: add GET /health and verify status plus response body.' }],
+  [6100, 'request', { action: 'approve_plan', text: 'Approve the proposed implementation.' }],
+  [6900, 'progress', { type: 'goal_start', summary: 'Implement and verify the health endpoint.' }],
+  [7500, 'progress', { action_type: 'skill', summary: 'Load repository development conventions.', ok: true }],
+  [8400, 'progress', { action_type: 'model_call_start', turn: 1, summary: 'Model receives goal, context, and command grammar.' }],
+  [11000, 'progress', { action_type: 'model_call_finish', turn: 1, summary: 'Executable patch strategy returned.', ok: true }],
+  [12000, 'progress', { action_type: 'patch_file', path: 'server/index.ts', summary: 'Patch rejected: anchor differs from current source.', ok: false }],
+  [12900, 'progress', { action_type: 'read_file', path: 'server/index.ts', summary: 'Read the affected route block for exact patch context.', ok: true }],
+  [14100, 'progress', { action_type: 'model_call_start', turn: 2, summary: 'Retry with current source and patch diagnostics.' }],
+  [16700, 'progress', { action_type: 'model_call_finish', turn: 2, summary: 'Revised patch matches current source.', ok: true }],
+  [17500, 'progress', { action_type: 'patch_file', path: 'server/index.ts', summary: 'Added GET /health with status and uptime fields.', added_lines: 4, ok: true }],
+  [18300, 'state', { pendingVerification: { path: 'server/index.ts', mode: 'test' }, status: 'executing' }],
+  [19300, 'progress', { action_type: 'run_check', summary: 'Health endpoint: HTTP 200 and response shape verified.', ok: true }],
+  [20600, 'progress', { action_type: 'set_fact', summary: 'Retained the endpoint contract on the active issue.', ok: true }],
+  [21700, 'progress', { action_type: 'finish', summary: 'Goal satisfied. Verification passed.', ok: true }],
+  [22500, 'progress', { type: 'goal_finish', summary: 'Implementation checkpoint saved.', ok: true }],
+  [23800, 'response', { status: 'completed', ok: true, message: 'Health endpoint implemented and verified. All planned goals completed.' }],
+];
+export const sampleRun: Run = { id: 'sample', sample: true, prompt: 'Add a health endpoint and verify its response.', startedAt: '2026-09-06T12:00:00.000Z', status: 'completed', selection: { provider: 'Illustrative', model: 'Sample trace' }, message: 'Illustrative recording — no model or tools were executed.', events: rows.map(([at, type, data], i): RunEvent => ({ seq: i + 1, at, type, data })) };

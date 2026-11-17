@@ -2,6 +2,7 @@ from .batch import batch_mutate
 from .filesystem_ops import copy_file, create_file, delete_file, fill_template, rename_file
 from .models import BatchMutationResult, MutationPrecondition, MutationResult, make_mutation_result
 from .structural_ops import insert_symbol_member, rename_symbol, replace_symbol
+from .regex_ops import replace_regex
 from .text_ops import (
     append_block,
     delete_range,
@@ -36,5 +37,6 @@ __all__ = [
     "rename_symbol",
     "replace_range",
     "replace_snippet",
+    "replace_regex",
     "replace_symbol",
 ]

@@ -27,7 +27,7 @@ export function RuntimeDrawer({ onClose }: { onClose: () => void }): React.JSX.E
     <label>Backend<select value={agent.runtime.backendScript} disabled={running || busy} onChange={(event) => agent.setRuntime({ backendScript: event.target.value })}><option value="main.py">Stable runtime</option><option value="main_v2.py">Beta TreeLoop</option><option value="live_test_loop.py">Live TreeLoop</option></select></label>
     <div className="runtime-backoff"><label>Token backoff (K)<input type="number" min="0" value={limit} onChange={(event) => setLimit(Math.max(0, Number(event.target.value)))} /></label><button type="button" onClick={() => void agent.setBackoff(limit > 0, limit)}>{limit > 0 ? 'Enable' : 'Disable'}</button></div>
     {agent.backoff && <small>{agent.backoff.window_tokens_used.toLocaleString()} tokens used in current window</small>}
-    <div className="runtime-actions">{running ? <button type="button" onClick={() => void agent.stop().then(() => agent.setRuntime(selection))}>Stop agent</button> : <button type="button" className="primary-button" disabled={!ready || busy} onClick={() => void agent.start()}>Start agent</button>}</div>
+    <div className="runtime-actions">{running ? <button type="button" onClick={() => void agent.stop().then(() => { if (changed) agent.setRuntime(selection); })}>Stop agent</button> : <button type="button" className="primary-button" disabled={!ready || busy} onClick={() => void agent.start()}>Start agent</button>}</div>
   </section>;
 }
 

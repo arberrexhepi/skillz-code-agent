@@ -2,7 +2,7 @@ import path from 'node:path';
 import { promises as fs } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import type { ArtifactsService } from './services/artifacts';
-import { artifactSetupSelectionSchema, artifactBlueprintChatMessageSchema, artifactVaultProviderSchema, artifactId, artifactApisSchema, artifactAccessSchema, artifactAppSchema, createArtifactSchema, previewInputSchema } from '../shared/artifacts';
+import { prebuiltUpdateRequestSchema, artifactAgentRuntimeSchema, artifactSetupSelectionSchema, artifactBlueprintChatMessageSchema, artifactVaultProviderSchema, artifactId, artifactApisSchema, artifactAccessSchema, artifactAppSchema, createArtifactSchema, previewInputSchema } from '../shared/artifacts';
 import { clipboard, dialog, ipcMain, Menu, shell, type BrowserWindow, type IpcMainEvent, type IpcMainInvokeEvent, type MenuItemConstructorOptions } from 'electron';
 import { isUntracked } from '../shared/gitStatus';
 import { z } from 'zod';
@@ -60,7 +60,7 @@ export function registerIpc(window: BrowserWindow, services: Services): void {
     });
   };
 
-  const artifactChannels = ['capabilities', 'install-capabilities', 'setup-progress', 'vault', 'save-provider-key', 'setup-download', 'docker-cleanup-plan', 'clean-docker', 'library', 'prebuilts', 'install-prebuilt', 'choose-folder', 'choose-read-directory', 'access', 'process-scripts', 'save-access', 'create', 'apis', 'save-apis', 'blueprint-agent', 'run-api-collection', 'app', 'save-app', 'start', 'stop', 'install-browser', 'preview', 'input', 'reload', 'close-preview', 'reveal', 'git-status', 'git-initialize', 'git-history', 'git-file-diff', 'git-stage', 'git-stage-all', 'git-unstage', 'git-discard', 'git-commit', 'git-push', 'agent-start', 'agent-submit', 'agent-runtime', 'agent-planner', 'agent-worker', 'agent-reconfigure', 'agent-backoff', 'agent-stop'];
+  const artifactChannels = ['capabilities', 'install-capabilities', 'setup-progress', 'vault', 'save-provider-key', 'setup-download', 'docker-cleanup-plan', 'clean-docker', 'library', 'prebuilts', 'install-prebuilt', 'prebuilt-update-status', 'review-prebuilt-update', 'apply-prebuilt-update', 'choose-folder', 'choose-read-directory', 'access', 'process-scripts', 'save-access', 'save-runtime', 'create', 'apis', 'save-apis', 'blueprint-agent', 'run-api-collection', 'app', 'save-app', 'start', 'stop', 'install-browser', 'preview', 'input', 'reload', 'close-preview', 'reveal', 'git-status', 'git-initialize', 'git-history', 'git-file-diff', 'git-stage', 'git-stage-all', 'git-unstage', 'git-discard', 'git-commit', 'git-push', 'agent-start', 'agent-submit', 'agent-runtime', 'agent-planner', 'agent-worker', 'agent-reconfigure', 'agent-backoff', 'agent-stop'];
   for (const name of artifactChannels) ipcMain.removeHandler(`artifacts:${name}`);
   handle('artifacts:capabilities', (_event, selection: unknown, id: unknown) => services.artifacts.capabilityStatus(artifactSetupSelectionSchema.parse(selection), artifactId.optional().parse(id)));
   handle('artifacts:install-capabilities', (_event, selection: unknown, id: unknown) => services.artifacts.installCapabilities(artifactSetupSelectionSchema.parse(selection), artifactId.optional().parse(id)));
@@ -73,6 +73,9 @@ export function registerIpc(window: BrowserWindow, services: Services): void {
   handle('artifacts:library', () => services.artifacts.library.library());
   handle('artifacts:prebuilts', () => services.artifacts.library.prebuilts());
   handle('artifacts:install-prebuilt', (_event, id: unknown, access: unknown, runtime: unknown) => services.artifacts.library.installPrebuilt(artifactId.parse(id), artifactAccessSchema.parse(access), runtime == null ? undefined : createArtifactSchema.shape.runtime.parse(runtime)));
+  handle('artifacts:prebuilt-update-status', (_event, id: unknown) => services.artifacts.prebuiltUpdates.status(artifactId.parse(id)));
+  handle('artifacts:review-prebuilt-update', (_event, id: unknown) => services.artifacts.prebuiltUpdates.review(artifactId.parse(id)));
+  handle('artifacts:apply-prebuilt-update', (_event, id: unknown, request: unknown) => services.artifacts.applyPrebuiltUpdate(artifactId.parse(id), prebuiltUpdateRequestSchema.parse(request)));
   handle('artifacts:choose-folder', async () => {
     const result = await dialog.showOpenDialog(window, { title: 'Choose an empty folder or existing artifact library', properties: ['openDirectory', 'createDirectory'] });
     return result.canceled || !result.filePaths[0] ? null : services.artifacts.configure(result.filePaths[0]);
@@ -95,6 +98,7 @@ export function registerIpc(window: BrowserWindow, services: Services): void {
     return { id: `folder-${randomUUID().slice(0, 8)}`, label: path.basename(directory) || directory, path: directory, access: 'read' as const, packageScripts };
   });
   handle('artifacts:access', (_event, id: unknown) => services.artifacts.library.access(artifactId.parse(id)));
+  handle('artifacts:save-runtime', (_event, id: unknown, selection: unknown) => services.artifacts.saveRuntime(artifactId.parse(id), artifactAgentRuntimeSchema.parse(selection)));
   handle('artifacts:process-scripts', (_event, id: unknown) => services.artifacts.processScripts(artifactId.parse(id)));
   handle('artifacts:save-access', async (_event, id: unknown, raw: unknown) => {
     const checkedId = artifactId.parse(id);
@@ -115,7 +119,7 @@ export function registerIpc(window: BrowserWindow, services: Services): void {
   ));
   handle('artifacts:run-api-collection', (_event, id: unknown, collection: unknown, variables: unknown = {}, approveMutations: unknown = false) => services.artifacts.runApiCollection(artifactId.parse(id), artifactId.parse(collection), z.record(z.string(), z.unknown()).parse(variables), z.boolean().parse(approveMutations)));
   handle('artifacts:app', (_event, id: unknown) => services.artifacts.library.app(artifactId.parse(id)));
-  handle('artifacts:save-app', (_event, id: unknown, config: unknown) => services.artifacts.library.saveApp(artifactId.parse(id), artifactAppSchema.parse(config)));
+  handle('artifacts:save-app', (_event, id: unknown, config: unknown) => services.artifacts.saveApp(artifactId.parse(id), artifactAppSchema.parse(config)));
   handle('artifacts:start', (_event, id: unknown) => services.artifacts.start(artifactId.parse(id)));
   handle('artifacts:stop', (_event, id: unknown) => services.artifacts.stop(artifactId.parse(id)));
   handle('artifacts:install-browser', () => services.artifacts.preview.installBrowser());

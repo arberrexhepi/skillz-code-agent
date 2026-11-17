@@ -62,12 +62,17 @@ from bridge_presentation import bridge_exchange  # noqa: E402
 from tree_loop import TreeLoop, Turn  # noqa: E402
 from discovery.dispatch import DISCOVERY_ACTION_TYPES, execute_discovery_action  # noqa: E402
 from discovery_budget import DiscoveryBudget as TreeLoopDiscoveryBudget  # noqa: E402
-from execution_evidence import repository_observation  # noqa: E402
+from execution_evidence import SourceCoverage, repository_observation  # noqa: E402
+from validation_evidence import ValidationEvidence  # noqa: E402
+from model_result_delivery import prepare_model_result  # noqa: E402
+from execution_progress import ExecutionProgress  # noqa: E402
+from run_observability import archive_snapshot, clear_archives  # noqa: E402
+from mutation_runtime import EXPLICIT_MUTATION_TYPES  # noqa: E402
 
 
 REPO_FACTS_FILENAME = "repo_facts.md"
 OBSERVABILITY_TRACE_BLOCK_LIMIT = 24
-DISCOVERY_REMEDIATION_READ_SATISFIERS = {"read_file", "read_line_range", "read-line-range", "grep", "repo-map", "repo_map"}
+DISCOVERY_REMEDIATION_READ_SATISFIERS = {"read_file", "read_symbol", "read_context", "inspect_file", "find_symbol_references", "find_regex", "read_line_range", "read-line-range", "grep", "repo-map", "repo_map"}
 EXECUTION_EXPLORATION_ACTION_LIMIT = 14
 EXECUTION_EMPTY_SEARCH_LIMIT = 3
 EXECUTION_RECOVERY_FOCUSED_READ_LIMIT = 1
@@ -234,6 +239,8 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
         self._edit_batch_last_failure: Optional[Dict[str, Any]] = None
         self._has_mutation = False
         self._validation_after_mutation = False
+        self._validation_evidence = ValidationEvidence()
+        self._execution_delivery = ExecutionProgress()
         self._execution_non_mutating_actions = 0
         self._execution_empty_searches = 0
         self._execution_seen_evidence: Set[str] = set()
@@ -379,6 +386,8 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
             verbose=self.verbose,
             tool_dispatcher=self._dispatch_tool_action,
             command_observer=self._observe_command_result,
+            read_context_observer=self._replace_retained_read_context,
+            turn_observer=self._observe_execution_turn,
             model_event_observer=self._observe_model_event,
         )
         loop.register_skill(
@@ -446,6 +455,7 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
         self._refresh_loop_steering()
 
     def _delete_session_artifacts(self) -> None:
+        clear_archives(self._observability_path())
         targets = [self._repo_facts_path(), self._observability_path()]
         seen: set[str] = set()
         for target in targets:
@@ -488,9 +498,12 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
         self._edit_batch_last_failure = None
         self._has_mutation = False
         self._validation_after_mutation = False
+        self._validation_evidence = ValidationEvidence()
+        self._execution_delivery = ExecutionProgress()
         self._execution_non_mutating_actions = 0
         self._execution_empty_searches = 0
         self._execution_seen_evidence = set()
+        self._execution_source_coverage = SourceCoverage()
         self._execution_stagnation = None
         self._run_sequence = 0
         self._active_run_id = 0
@@ -552,6 +565,8 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
             self.loop.reset_conversation()
             self.loop._total_reads = 0
             self.loop._total_writes = 0
+        else:
+            self.loop.begin_goal_handoff()
         self.history = self.loop.history
         self._current_task = ""
 
@@ -818,6 +833,10 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
         if self._patch_resolution is not None:
             path = str(self._patch_resolution.get("path", "") or "").strip()
             repo_path = f"/repo/{path}" if path else "/repo"
+            regex_preview = self._patch_resolution.get("regex_preview")
+            if isinstance(regex_preview, dict):
+                block = [f"s1: find-regex {json.dumps(repo_path)} {json.dumps(regex_preview)}"]
+                return {"mode": "patch_resolution", "steps": block, "strategy_blocks": [block]}
             return {
                 "mode": "patch_resolution",
                 "steps": [
@@ -852,7 +871,9 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
             repo_path = f"/repo/{path}" if path else ""
             focused_block: List[str] = []
             if path:
-                focused_block.append(f"s{len(focused_block) + 1}: cat {repo_path}")
+                start = int(self._discovery_remediation.get("start_line", 1))
+                end = int(self._discovery_remediation.get("end_line", start + 39))
+                focused_block.append(f"s{len(focused_block) + 1}: read-line-range {shlex.quote(repo_path)} {start}-{end}")
             elif diagnostic_issue_id:
                 focused_block.append(f"s{len(focused_block) + 1}: show-run-issue {diagnostic_issue_id}")
             elif issue_id:
@@ -878,6 +899,19 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
                     "Do not finish until the batch exits cleanly and validation state clears.",
                 ],
             }
+        evidence = getattr(self, "_validation_evidence", None)
+        if evidence is not None and evidence.failures:
+            return {
+                "mode": "failed_validation",
+                "steps": [
+                    "Use current diagnostics to repair the identified target; request exact missing context only when needed.",
+                    "Rerun the failed check after repair: " + json.dumps(evidence.retry_actions(), ensure_ascii=False),
+                    "A source read or diff review does not clear a failing check. Finish with an explicit blocker if repair is unavailable.",
+                ],
+            }
+        delivery = getattr(self, "_execution_delivery", None)
+        if delivery is not None and delivery.recovering:
+            return {"mode": "execution_delivery", "steps": [delivery.guidance()]}
         if self._pending_verification is not None:
             path = str(self._pending_verification.get("path", "") or "").strip()
             repo_path = f"/repo/{path}" if path else "/repo"
@@ -916,7 +950,8 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
                 "mode": "execution_recovery",
                 "steps": [
                     "Stop repeating empty searches or already inspected evidence.",
-                    "Read the identified source or a new line range needed for a safe edit; new evidence resumes normal execution.",
+                    "Use the identified target and current diagnostics to make the needed repair, then validate it.",
+                    "If context is missing, request the exact symbol, anchor or line range. Evicted or undelivered source remains readable.",
                     "Preserve failed-edit diagnostics and inspect the affected file before retrying. Never mutate just to satisfy recovery.",
                     "If no edit is appropriate, validate and finish with the result or an explicit blocker.",
                 ],
@@ -972,6 +1007,8 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
                 "goal_start_skill_mode": True,
                 "approved_npm_commands": True,
                 "execution_stagnation_guard": True,
+                "execution_delivery_guard": True,
+                "regex_find_replace": True,
             },
             "current_task": self._current_task,
             "task_satisfied": self._task_satisfied,
@@ -986,6 +1023,7 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
             "patch_resolution": self.patch_resolution_state(),
             "discovery_remediation": self.discovery_remediation_state(),
             "execution_stagnation": self.execution_stagnation_state(),
+            "execution_delivery": self._execution_delivery.state(),
             "pending_npm_command": dict(self._pending_npm_command) if isinstance(self._pending_npm_command, dict) else None,
             "active_mode_strategy": self._active_mode_strategy(),
             "pending_verification": dict(self._pending_verification) if isinstance(self._pending_verification, dict) else None,
@@ -1041,6 +1079,10 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
             try:
                 target = self._resolve_repo_path(path)
                 content = target.read_text(encoding="utf-8")
+                if action.get("start_line") is not None or action.get("end_line") is not None:
+                    start = max(1, int(action.get("start_line", 1)))
+                    end = max(start, int(action.get("end_line", start + 39)))
+                    content = "\n".join(content.splitlines()[start - 1:end])
             except Exception as exc:
                 return ActionResult(ok=False, name=action_type, payload={"error": str(exc), "path": path})
             self._mark_path_validated(path)
@@ -1181,7 +1223,7 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
                 payload["error"] = message or "finish blocked"
             return ActionResult(ok=command_result.ok, name=action_type, payload=payload)
 
-        executor = getattr(self, f"_exec_{action_type}", None)
+        executor = self.loop._exec_explicit_mutation if action_type in EXPLICIT_MUTATION_TYPES else getattr(self, f"_exec_{action_type}", None)
         if not callable(executor):
             return ActionResult(ok=False, name=action_type, payload={"error": f"Unsupported operator action: {action_type}"})
         message = str(executor(action) or "")
@@ -1346,6 +1388,7 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
         self._reload_repo_facts()
         self._current_task = str(task or "").strip()
         self._reset_guard_state(clear_budget_usage=False)
+        self._replace_retained_read_context(self.loop._read_working_set.packets, replacement=False)
         self._run_sequence += 1
         self._active_run_id = self._run_sequence
         self._bridge_step_counter = 0
@@ -1480,6 +1523,7 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
         }
 
     def _emit_step_progress(self, command: str, result: CommandResult) -> None:
+        prepare_model_result(command, result)
         self._append_observability_command(command, result)
         if not callable(self.on_step_callback):
             return
@@ -1609,17 +1653,54 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
             "fresh_context_retry": fresh_context_retry,
             "repair_attempt": repair_attempt,
             "output_valid": output_valid,
+            "empty_response": bool(payload.get("empty_response", False)),
+            "provider_response": payload.get("provider_response", {}),
+            "empty_response_recovery_exhausted": bool(payload.get("empty_response_recovery_exhausted", False)),
+            "recovery_reason": str(payload.get("recovery_reason", "")),
+            "provider_protocol_failure": bool(payload.get("provider_protocol_failure", False)),
+            "provider_recovery_attempts": int(payload.get("provider_recovery_attempts", 0)),
+            "provider_recovery_exhausted": bool(payload.get("provider_recovery_exhausted", False)),
+            "preserved_source_context": bool(payload.get("preserved_source_context", False)),
         }
         if event == "model_call_finish":
             turn_record = self._record_model_usage_turn(turn=turn, elapsed_s=elapsed_s, output_chars=output_chars)
             self._record_recovered_model_errors(turn_record)
             if self._observability_metrics:
                 self._observability_metrics["usage_accounting"] = self.usage_accounting_state()
+                if payload.get("empty_response"):
+                    self._observability_metrics["empty_provider_responses"] = int(
+                        self._observability_metrics.get("empty_provider_responses", 0) or 0
+                    ) + 1
+                if payload.get("provider_protocol_failure"):
+                    self._observability_metrics["provider_protocol_failures"] = int(
+                        self._observability_metrics.get("provider_protocol_failures", 0)
+                    ) + 1
+                if payload.get("empty_response") or payload.get("provider_protocol_failure"):
+                    heading = "Provider protocol recovery" if payload.get("provider_protocol_failure") else "Empty provider response"
+                    self._append_observability_block(
+                        "## " + heading + "\n\n```json\n"
+                        + json.dumps(payload, indent=2, ensure_ascii=False) + "\n```\n\n---\n\n"
+                    )
+                    if payload.get("provider_recovery_exhausted"):
+                        self._observability_metrics["last_model_error"] = {
+                            "turn": turn,
+                            "error": "provider_protocol_recovery_exhausted" if payload.get("provider_protocol_failure") else "empty_provider_response_recovery_exhausted",
+                            "provider_response": payload.get("provider_response", {}),
+                        }
                 if repair_pending:
                     self._observability_metrics["model_output_repairs"] = int(
                         self._observability_metrics.get("model_output_repairs", 0) or 0
                     ) + 1
+                    self._append_observability_block(
+                        "## Model output format repair\n\n```json\n"
+                        + json.dumps({"turn": turn, "attempt": repair_attempt,
+                                      "invalid_output_excerpt": str(payload.get("invalid_output_excerpt", ""))[:8000]},
+                                     indent=2, ensure_ascii=False)
+                        + "\n```\n\n---\n\n"
+                    )
                 self._write_observability_snapshot(final_message="Run in progress.", finished=False)
+        elif event == "model_call_start" and self._observability_metrics:
+            self._write_observability_snapshot(final_message="Run in progress.", finished=False)
         elif event == "model_call_error" and self._observability_metrics:
             error_record = {
                 "turn": turn,
@@ -1668,6 +1749,9 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
 
     def _compose_steering(self) -> str:
         parts: List[str] = []
+        delivery = getattr(self, "_execution_delivery", None)
+        if self.discovery_budget is None and delivery is not None:
+            parts.append(delivery.guidance())
         if self.steering_prompt:
             parts.append(self.steering_prompt)
         if self._goal_skill_mode_pending and not self._goal_skill_mode_used:
@@ -1753,6 +1837,13 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
                 f"Host-managed edit batch is active. Queued files: {', '.join(queued_paths[:4]) or 'none yet'}. "
                 "Keep related writes grouped, end the batch to trigger host verification, and only finish after the batch closes cleanly."
             )
+        elif getattr(getattr(self, "_validation_evidence", None), "failures", None):
+            parts.append(
+                self._validation_evidence.failure_summary()
+                + ". Use the current target and diagnostics to repair the failure, then rerun the failed check: "
+                + json.dumps(self._validation_evidence.retry_actions(), ensure_ascii=False)
+                + ". Request only exact missing source context. A read or diff review cannot clear the failed check."
+            )
         elif self._pending_verification is not None:
             path = str(self._pending_verification.get("path", "") or "").strip()
             strategy = self._active_mode_strategy() or {}
@@ -1771,16 +1862,20 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
             parts.append(
                 "EXECUTION RECOVERY MODE is active because "
                 + reason
-                + ". Stop repeating empty searches and unchanged evidence. Inspect identified source or a new line range "
-                "needed for a safe edit; new repository evidence resumes execution. A failed patch's affected file remains "
-                "readable for repair. One repeated focused read is also allowed to restore context. "
+                + ". Use the identified target and current diagnostics to make the needed repair, then validate it. "
+                "If specific context is missing, request the exact symbol, anchor or line range; evicted or undelivered "
+                "source remains readable. A failed patch's affected file remains readable for repair. "
+                "One repeated focused read is also allowed to restore context. Do not search unrelated files to clear recovery. "
                 "Do not make a mutation merely to escape recovery. Validate or `finish <explicit blocker>` if appropriate."
             )
         if self._completion_check_pending and self._completion_check_reason:
             parts.append(self._completion_check_reason)
-            parts.append(
-                "COMPLETION CHECK FORMAT: Do not return a numbered prose plan. After >>th: and >>pl:, emit one executable validation command such as `run-check typecheck`, `show-diff`, or `review-changes`; use `finish <summary>` only after validation passes."
-            )
+            if getattr(getattr(self, "_validation_evidence", None), "failures", None):
+                parts.append("COMPLETION CHECK FORMAT: After >>th: and >>pl:, repair the failure or rerun the failed check above. Finish after it passes.")
+            else:
+                parts.append(
+                    "COMPLETION CHECK FORMAT: Do not return a numbered prose plan. After >>th: and >>pl:, emit one executable validation command such as `run-check typecheck`, `show-diff`, or `review-changes`; use `finish <summary>` only after validation passes."
+                )
         return "\n".join(part for part in parts if part)
 
     def _refresh_loop_steering(self) -> None:
@@ -1791,11 +1886,13 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
         return Path(os.environ["SKILLZ_OBSERVABILITY_PATH"]) if os.environ.get("SKILLZ_OBSERVABILITY_PATH") else Path(__file__).parent / "memory_observability.md"
 
     def _reset_run_observability(self, task: str) -> None:
+        previous = archive_snapshot(self._observability_path())
         self._observability_started_at = time.time()
         self._observability_buffer = []
         self._active_run_usage_totals = self._empty_usage_totals()
         self._observability_metrics = {
             "task": str(task or ""),
+            "previous_attempt_report": str(previous) if previous else "",
             "outcome": "running",
             "provider": self.provider,
             "model": self.model_name,
@@ -1805,6 +1902,11 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
             "successful_actions": 0,
             "failed_actions": 0,
             "model_output_repairs": 0,
+            "empty_provider_responses": 0,
+            "provider_protocol_failures": 0,
+            "goal_handoff": {"history_start": self.loop._conversation_history_start,
+                             "summary_chars": len(self.loop._handoff_summary),
+                             "retained_read_context": self.loop._read_working_set.manifest()},
             "recovered_model_errors": [],
             "usage_accounting": self.usage_accounting_state(),
         }
@@ -1835,6 +1937,8 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
                         "ok": bool(result.ok),
                         "needs_tool": bool(result.needs_tool),
                         "tool_action": result.tool_action,
+                        "model_output_chars": len(result.model_output or ""),
+                        "model_output_truncated": result.model_output != result.output,
                     },
                     indent=2,
                     ensure_ascii=False,
@@ -1842,6 +1946,8 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
                 "\n```\n\n",
                 "**Output**\n```text\n",
                 str(result.output or ""),
+                ("\n```\n\n**Model-visible output**\n```text\n" + result.model_output
+                 if result.model_output is not None and result.model_output != result.output else ""),
                 "\n```\n\n---\n\n",
             ]
         )
@@ -1858,7 +1964,7 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
         )
         return [summary, *blocks[-OBSERVABILITY_TRACE_BLOCK_LIMIT:]]
 
-    def _render_observability_report(self, final_message: str, *, finished: bool) -> str:
+    def _render_observability_report(self, final_message: str, *, finished: bool, full_trace: bool = False) -> str:
         metrics = dict(self._observability_metrics) if isinstance(self._observability_metrics, dict) else {}
         now = time.time()
         if finished:
@@ -1872,7 +1978,7 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
                 json.dumps(metrics, indent=2, ensure_ascii=False),
                 "\n```\n\n",
                 "## Trace\n\n",
-                *self._compacted_observability_blocks(),
+                *(self._observability_buffer if full_trace else self._compacted_observability_blocks()),
             ]
         )
 
@@ -1887,6 +1993,9 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
             return
 
     def _flush_observability(self, final_message: str) -> None:
+        report = archive_snapshot(self._observability_path(), self._render_observability_report(final_message, finished=True, full_trace=True))
+        if report:
+            self._observability_metrics["attempt_report"] = str(report)
         self._write_observability_snapshot(final_message=final_message, finished=True)
 
     def _status_payload(self) -> Dict[str, Any]:
@@ -1898,6 +2007,7 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
             "patch_resolution": self.patch_resolution_state(),
             "discovery_remediation": self.discovery_remediation_state(),
             "execution_stagnation": self.execution_stagnation_state(),
+            "execution_delivery": self._execution_delivery.state(),
             "active_mode_strategy": self._active_mode_strategy(),
             "pending_verification": dict(self._pending_verification) if isinstance(self._pending_verification, dict) else None,
             "edit_batch": self.edit_batch_state(),
@@ -1905,10 +2015,16 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
                 "ordered_mutation_batches": True,
                 "max_mutation_commands_per_turn": 4,
                 "host_enforced_edit_batch": True,
+                "deferred_batch_diagnostics": True,
+                "structured_inspection": ["inspect-file", "read-symbol", "references", "read-context", "find-regex"],
+                "guarded_symbol_edits": True,
+                "atomic_edit_batches": True,
                 "discovery_remediation": True,
                 "deterministic_pending_verification": True,
                 "goal_start_skill_mode": True,
                 "execution_stagnation_guard": True,
+                "execution_delivery_guard": True,
+                "regex_find_replace": True,
             },
             "goal_start_skill_mode": {
                 "pending": self._goal_skill_mode_pending,
@@ -1939,6 +2055,8 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
         return sorted(skills, key=lambda item: (-int(item.get("priority", 0)), str(item.get("name", ""))))
 
     def _reset_guard_state(self, *, clear_budget_usage: bool = False) -> None:
+        self.loop._signal_state["edit_batch_mode"] = False
+        self.loop._deferred_diagnostic_paths.clear()
         self._proposal_validation_checkpoint = None
         self._task_satisfied = False
         self._completion_check_pending = False
@@ -1952,9 +2070,12 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
         self._edit_batch_last_failure = None
         self._has_mutation = False
         self._validation_after_mutation = False
+        self._validation_evidence = ValidationEvidence()
+        self._execution_delivery = ExecutionProgress()
         self._execution_non_mutating_actions = 0
         self._execution_empty_searches = 0
         self._execution_seen_evidence = set()
+        self._execution_source_coverage = SourceCoverage()
         self._execution_stagnation = None
         self._last_validation = WorkerValidationResult(kind="none", passed=True, summary="No mutating actions required validation.")
         self._latest_review = None
@@ -2065,7 +2186,7 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
         if not self._is_patch_resolution_active():
             return None
 
-        if action_type in {"drop_context", "read_file", "git_diff", "show_diff", "review_changes"}:
+        if action_type in {"drop_context", "read_file", "read_symbol", "read_context", "inspect_file", "find_symbol_references", "find_regex", "git_diff", "show_diff", "review_changes"}:
             return None
 
         path = str((self._patch_resolution or {}).get("path", "") or "").strip() or "the affected file"
@@ -2111,6 +2232,15 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
             return
         focus = issues[0]
         path = str(focus.get("file", "") or "").strip().removeprefix("/repo/").removeprefix("repo/")
+        line_match = re.search(r"\d+", str(focus.get("line") or ""))
+        line = int(line_match[0]) if line_match else 1
+        start_line, end_line = max(1, line - 8), line + 12
+        delivery = getattr(self, "_execution_delivery", None)
+        if delivery is not None and source_action in {"diagnose", "run_check", "run_route_check"}:
+            delivery.focus_diagnostic(focus)
+        working_set = getattr(getattr(self, "loop", None), "_read_working_set", None)
+        if working_set is not None and line_match:
+            working_set.focus_diagnostic(path, line)
         diagnostic_issue_id = str(focus.get("id", "") or "").strip()
         active_issue = self.issue_ledger.active_issue()
         current_issue_id = (
@@ -2121,7 +2251,7 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
         issue_id = current_issue_id
         next_required_action: Dict[str, Any]
         if path:
-            next_required_action = {"type": "read_file", "path": path}
+            next_required_action = {"type": "read_file", "path": path, "start_line": start_line, "end_line": end_line}
         elif diagnostic_issue_id:
             next_required_action = {"type": "show_run_issue", "issue_id": diagnostic_issue_id}
         elif issue_id:
@@ -2134,6 +2264,9 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
             "issue_id": issue_id,
             "diagnostic_issue_id": diagnostic_issue_id,
             "path": path,
+            "line": line,
+            "start_line": start_line,
+            "end_line": end_line,
             "classification": str(focus.get("classification", "") or "").strip(),
             "summary": str(focus.get("summary", "") or focus.get("message", "") or "").strip(),
             "next_required_action": next_required_action,
@@ -2142,6 +2275,11 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
         self._task_satisfied = False
         self._completion_check_pending = False
         self._completion_check_reason = ""
+        # A diagnostic in source still retained by the model is already grounded.
+        # Do not order a redundant reread before allowing the corrective edit.
+        coverage = getattr(self, "_execution_source_coverage", None)
+        if line_match and coverage is not None and any(number == line for number, _ in coverage.lines.get(path, set())):
+            self._discovery_remediation = None
         self._refresh_loop_steering()
 
     def _discovery_remediation_blocks_action(self, action_type: str) -> Optional[str]:
@@ -2205,6 +2343,8 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
         return normalized.split(None, 1)[0].strip().lower() if normalized else ""
 
     def _is_successful_execution_mutation(self, result: CommandResult) -> bool:
+        if "_changed_paths" in (result.tool_action or {}):
+            return bool(result.tool_action["_changed_paths"])
         if not result.ok:
             return False
         action_type = str((result.tool_action or {}).get("type", "") or "").strip()
@@ -2213,13 +2353,14 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
             "patch_file",
             "replace_lines",
             "write_file",
-        } | GIT_MUTATION_ACTION_TYPES
+        } | GIT_MUTATION_ACTION_TYPES | EXPLICIT_MUTATION_TYPES
 
     def _reset_execution_stagnation(self, *, clear_evidence: bool = False) -> None:
         self._execution_non_mutating_actions = 0
         self._execution_empty_searches = 0
         if clear_evidence:
             self._execution_seen_evidence = set()
+            self._execution_source_coverage = SourceCoverage()
         self._execution_stagnation = None
         self._refresh_loop_steering()
 
@@ -2242,6 +2383,36 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
                 break
         return targets
 
+    def _replace_retained_read_context(self, packets: Sequence[Tuple[str, CommandResult]], *, replacement: bool = True) -> None:
+        """Compaction forgets source; the reread guard must forget it as well."""
+        self._execution_seen_evidence = set()
+        self._execution_source_coverage = SourceCoverage()
+        delivery = getattr(self, "_execution_delivery", None)
+        if delivery is not None and replacement:
+            delivery.context_replacements += 1
+        for command, result in packets:
+            observation = repository_observation(command, result)
+            if observation is not None:
+                self._execution_seen_evidence.add(observation.fingerprint)
+                self._execution_source_coverage.record(observation)
+
+    def _observe_execution_turn(self, turn: Turn) -> None:
+        if self.discovery_budget is not None or turn.has_finish:
+            return
+        mutation_types = {"write_file", "replace_lines", "patch_file", "npm_command"} | GIT_MUTATION_ACTION_TYPES | EXPLICIT_MUTATION_TYPES
+        edit_attempted = any(str((result.tool_action or {}).get("type", "")) in mutation_types
+                             and result.command_type != "skipped" for result in turn.results)
+        edit_attempted = edit_attempted or any((result.tool_action or {}).get("_changed_paths") for result in turn.results)
+        self._execution_delivery.observe_turn(turn.commands_issued, turn.results, edit_attempted=edit_attempted)
+        if self._execution_delivery.exhausted:
+            self.loop.request_stop(self._execution_delivery.stop_reason())
+        self._refresh_loop_steering()
+        if getattr(self, "_observability_metrics", None):
+            self._observability_metrics["execution_delivery"] = self._execution_delivery.state()
+            self._observability_metrics["context_compactions"] = self.loop._conversation_compaction_count
+            self._observability_metrics["retained_read_context"] = self.loop._read_working_set.manifest()
+            self._write_observability_snapshot(final_message="Run in progress.", finished=False)
+
     def _track_execution_progress(self, command: str, result: CommandResult) -> None:
         if getattr(self, "discovery_budget", None) is not None:
             return
@@ -2254,10 +2425,10 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
 
         seen = getattr(self, "_execution_seen_evidence", set())
         self._execution_seen_evidence = seen
-        if self._execution_read_resolves_patch(observation.source_path) or (
-            not observation.empty_search and observation.fingerprint not in seen
-        ):
-            seen.add(observation.fingerprint)
+        novel = self._execution_observation_is_new(observation)
+        self._execution_source_coverage.record(observation)
+        seen.add(observation.fingerprint)
+        if self._execution_read_resolves_patch(observation.source_path) or novel:
             self._reset_execution_stagnation()
             return
 
@@ -2293,7 +2464,30 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
         self._refresh_loop_steering()
         self._request_same_turn_halt(f"execution recovery active: {reason}")
 
+    def _execution_observation_is_new(self, observation: Any) -> bool:
+        if not hasattr(self, "_execution_source_coverage"):
+            self._execution_source_coverage = SourceCoverage()
+        if observation.empty_search:
+            return False
+        if observation.source_lines:
+            return self._execution_source_coverage.has_new_evidence(observation)
+        return observation.fingerprint not in getattr(self, "_execution_seen_evidence", set())
+
     def _apply_execution_stagnation_guard(self, command: str, result: CommandResult) -> bool:
+        delivery = getattr(self, "_execution_delivery", None)
+        if delivery is not None and delivery.recovering and getattr(self, "discovery_budget", None) is None:
+            # Preserve actual errors and edits; no novelty/eviction reset applies here.
+            if not result.ok or self._is_successful_execution_mutation(result) or result.command_type in {"annotation", "finish"}:
+                return False
+            observation = repository_observation(command, result)
+            if observation is not None:
+                if delivery.allow_focused_read(command, observation, result):
+                    return False
+                result.ok = False
+                result.output = "Execution delivery recovery blocked another broad or excess read. " + delivery.guidance()
+                self._request_same_turn_halt("execution delivery requires the bounded repair or a concrete blocker")
+                self._refresh_loop_steering()
+                return True
         state = getattr(self, "_execution_stagnation", None)
         if not isinstance(state, dict) or getattr(self, "discovery_budget", None) is not None:
             return False
@@ -2307,7 +2501,7 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
         observation = repository_observation(command, result)
         if observation is not None and (
             self._execution_read_resolves_patch(observation.source_path)
-            or (not observation.empty_search and observation.fingerprint not in getattr(self, "_execution_seen_evidence", set()))
+            or self._execution_observation_is_new(observation)
         ):
             return False
         verb = self._execution_command_verb(command)
@@ -2335,8 +2529,9 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
         result.ok = False
         result.output = (
             "execution recovery blocked repeated or empty exploration after sustained no-progress activity. "
-            "Read identified source or a new line range, repair the failed edit using its diagnostic, "
-            "run a targeted validation, or finish with an explicit blocker."
+            "Use the current target and diagnostics to apply the needed repair, then validate. "
+            "If context is missing, request the exact symbol, anchor or line range; undelivered or evicted source remains readable. "
+            "Do not search unrelated evidence to clear recovery. Otherwise finish with an explicit blocker."
         )
         self._refresh_loop_steering()
         self._request_same_turn_halt("execution recovery blocked another exploratory action")
@@ -2379,7 +2574,7 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
         )
         self._edit_batch_last_failure = None
 
-    def _verify_and_close_edit_batch(self, *, source: str) -> Tuple[bool, str]:
+    def _verify_and_close_edit_batch(self, *, source: str, diagnostics: str = "") -> Tuple[bool, str]:
         queued_paths = sorted(self._edit_batch_pending.keys())
         if not queued_paths:
             self._edit_batch_mode = False
@@ -2420,6 +2615,15 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
         self._edit_batch_pending = {}
         self._edit_batch_last_failure = None
         self._pending_verification = None
+        reported = CommandResult(ok=True, output=diagnostics, command_type="write")
+        if self._command_reported_issue_count(reported) > 0 or "backend_diagnostics_warning" in diagnostics:
+            self._validation_after_mutation = False
+            self._pending_verification = {"path": queued_paths[0], "mode": "validation", "source": "edit_batch"}
+            self._completion_check_pending = True
+            self._completion_check_reason = "The completed edit batch has diagnostics. Repair them and validate before finish."
+            self._enter_discovery_remediation(source_action=source)
+            self._refresh_loop_steering()
+            return False, f"edit batch diagnostics failed:\n{diagnostics}"
         self._validation_after_mutation = True
         self._completion_check_pending = True
         self._completion_check_reason = "Host verified the queued edit batch. Finish if the goal is complete or run one more concrete check."
@@ -2469,7 +2673,7 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
                 return f"propose_issue failed: {exc}"
 
         if self.discovery_budget is not None and result.needs_tool:
-            if action_type in {"write_file", "replace_lines", "patch_file", "npm_command"} | GIT_MUTATION_ACTION_TYPES:
+            if action_type in {"write_file", "replace_lines", "patch_file", "npm_command"} | GIT_MUTATION_ACTION_TYPES | EXPLICIT_MUTATION_TYPES:
                 result.ok = False
                 return "Discovery mode is read-only. Finish discovery before mutating repository state."
             if self.discovery_budget.exhausted and action_type != "finish" and not fact_action:
@@ -2501,6 +2705,13 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
                 self._completion_check_reason = "An edit batch is still open. End the batch before finish."
                 self._refresh_loop_steering()
                 return "finish blocked: end the active edit batch before finish"
+            evidence = getattr(self, "_validation_evidence", None)
+            if evidence is not None and evidence.failures:
+                result.ok = False
+                self._completion_check_pending = True
+                self._completion_check_reason = evidence.failure_summary() + ". Repair and rerun the failed check."
+                self._refresh_loop_steering()
+                return "finish blocked: " + self._completion_check_reason
             if self._is_discovery_remediation_active():
                 result.ok = False
                 self._completion_check_pending = True
@@ -2534,7 +2745,7 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
             result.ok = bool(payload.get("ok", True))
             return json.dumps(payload, indent=2)
 
-        executor = getattr(self, f"_exec_{action_type}", None)
+        executor = self.loop._exec_explicit_mutation if action_type in EXPLICIT_MUTATION_TYPES else getattr(self, f"_exec_{action_type}", None)
         if not callable(executor):
             result.ok = False
             return f"unsupported tool action: {action_type}"
@@ -2547,7 +2758,20 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
         return message
 
     def _observe_command_result(self, command: str, result: CommandResult) -> None:
+        if not hasattr(self, "_validation_evidence"):
+            self._validation_evidence = ValidationEvidence()
         action_type = str((result.tool_action or {}).get("type") or "")
+        if result.ok and action_type in {"run_check", "diagnose", "run_route_check"} and TreeLoop._tool_message_indicates_failure(action_type, result.output):
+            result.ok = False
+        changed_paths = (result.tool_action or {}).get("_changed_paths", [])
+        if not result.ok and changed_paths:
+            self._has_mutation = True
+            self._task_satisfied = False
+            self._validation_after_mutation = False
+            self._pending_verification = self._build_pending_verification(changed_paths[0], mode="validation", source=action_type)
+            if self._edit_batch_mode:
+                for path in changed_paths:
+                    self._queue_edit_batch_verification(path)
         if action_type == "propose_issue":
             self._emit_step_progress(command, result)
             return
@@ -2561,6 +2785,7 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
                     "validation": self._validation_after_mutation,
                     "pending": self._pending_verification,
                     "diagnostics": diagnostics,
+                    "evidence": self._validation_evidence.copy(),
                 }
             elif diagnostics:
                 checkpoint = self._proposal_validation_checkpoint
@@ -2569,6 +2794,11 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
             # A later unstructured/tool failure is independent evidence. An
             # earlier diagnostic proposal must not restore over its gate.
             self._proposal_validation_checkpoint = None
+        self._validation_evidence.observe(result, has_mutation=getattr(self, "_has_mutation", False))
+        if result.ok and action_type in {"run_check", "diagnose", "run_route_check"} and not self._validation_evidence.failures:
+            working_set = getattr(getattr(self, "loop", None), "_read_working_set", None)
+            if working_set is not None:
+                working_set.focus = None
         guarded_by_stagnation = self._apply_execution_stagnation_guard(command, result)
         if not guarded_by_stagnation:
             self._track_execution_progress(command, result)
@@ -2581,9 +2811,12 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
         if not result.ok:
             action = result.tool_action or {}
             action_type = str(action.get("type", "") or "")
-            if action_type in {"patch_file", "replace_lines"}:
+            if action_type in {"patch_file", "replace_lines", "replace_regex"}:
                 path = str(action.get("path", "") or "").strip()
                 self._enter_patch_resolution(action_type=action_type, path=path, reason=str(result.output or "").strip())
+                if action_type == "replace_regex" and self._patch_resolution is not None:
+                    self._patch_resolution["regex_preview"] = {key: action[key] for key in ("pattern", "replacement", "flags") if key in action}
+                    self._patch_resolution["regex_preview"]["limit"] = 5
                 self._request_same_turn_halt(str(result.output or "patch resolution required"))
             if action_type in {"diagnose", "run_check", "run_route_check"} and self._command_reported_issue_count(result) > 0:
                 self._enter_discovery_remediation(source_action=action_type)
@@ -2615,28 +2848,26 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
             self._refresh_loop_steering()
             self._emit_step_progress(command, result)
             return
-        if action_type in {"write_file", "replace_lines", "patch_file", "npm_command"} | GIT_MUTATION_ACTION_TYPES:
+        if self._is_successful_execution_mutation(result):
             self._proposal_validation_checkpoint = None
             path_value = action.get("path") or action.get("paths") or action.get("source") or action.get("destination")
-            pending_path = ""
+            pending_path = changed_paths[0] if changed_paths else ""
             if isinstance(path_value, list):
-                pending_path = str(path_value[0] or "") if path_value else ""
-            else:
+                pending_path = pending_path or (str(path_value[0] or "") if path_value else "")
+            elif path_value:
                 pending_path = str(path_value or "")
             self._has_mutation = True
             self._validation_after_mutation = False
             self._task_satisfied = False
             self._completion_check_pending = False
             self._completion_check_reason = ""
-            if pending_path and self._edit_batch_mode:
-                self._queue_edit_batch_verification(pending_path)
+            changed_paths = action.get("_changed_paths") or ([pending_path] if pending_path else [])
+            if self._edit_batch_mode:
+                for path in changed_paths:
+                    self._queue_edit_batch_verification(path)
                 self._pending_verification = None
-            elif pending_path:
-                self._pending_verification = self._build_pending_verification(
-                    pending_path,
-                    mode="read",
-                    source=action_type,
-                )
+            elif changed_paths:
+                self._pending_verification = self._build_pending_verification(changed_paths[0], mode="read", source=action_type)
             else:
                 self._pending_verification = {"path": "", "mode": "validation", "source": action_type}
             self._refresh_loop_steering()
@@ -2644,7 +2875,7 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
                 self._enter_discovery_remediation(source_action=action_type)
                 focus = str((self._discovery_remediation or {}).get("path", "") or (self._discovery_remediation or {}).get("issue_id", "") or "the surfaced issue")
                 self._request_same_turn_halt(f"discovery remediation active for {focus}")
-            if not self._edit_batch_mode:
+            if not self._edit_batch_mode and action_type != "run_shell":
                 focus_path = pending_path or "the latest mutation"
                 self._request_same_turn_halt(f"pending verification active after mutation on {focus_path}")
             self._emit_step_progress(command, result)
@@ -2705,9 +2936,13 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
     def _finalize_validation(self, loop_result: Any) -> WorkerValidationResult:
         if self._edit_batch_mode:
             validation = WorkerValidationResult(kind="missing", passed=False, summary="An edit batch is still open and must be ended before completion.")
+        elif getattr(self, "_validation_evidence", None) is not None and self._validation_evidence.failures:
+            validation = WorkerValidationResult(kind="check", passed=False, summary=self._validation_evidence.failure_summary())
         elif self._is_discovery_remediation_active():
             target = str((self._discovery_remediation or {}).get("path", "") or (self._discovery_remediation or {}).get("issue_id", "") or "the surfaced issue")
             validation = WorkerValidationResult(kind="missing", passed=False, summary=f"Discovery remediation is still active for {target}.")
+        elif not self._has_mutation and getattr(getattr(self, "_validation_evidence", None), "passed", False):
+            validation = WorkerValidationResult(kind="check", passed=True, summary="A concrete validation check succeeded; no mutations were made.")
         elif not self._has_mutation:
             validation = WorkerValidationResult(kind="none", passed=True, summary="No mutating actions required validation.")
         elif self._validation_after_mutation and self._pending_verification is None:
@@ -2728,10 +2963,15 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
         deferred_ids = {item['id'] for item in diagnostics if item.get('status') == 'deferred'}
         if (self._discovery_remediation or {}).get('diagnostic_issue_id') in deferred_ids:
             self._discovery_remediation = None
+        delivery = getattr(self, "_execution_delivery", None)
+        if delivery is not None and delivery.diagnostic_repair is not None and delivery.diagnostic_repair.issue_id in deferred_ids:
+            delivery.diagnostic_repair = None
         checkpoint = getattr(self, '_proposal_validation_checkpoint', None)
         if checkpoint and all(item.get('status') in {'resolved', 'deferred'} for item in self._apply_proposal_deferrals(checkpoint['diagnostics'])):
             self._validation_after_mutation = checkpoint['validation']
             self._pending_verification = checkpoint['pending']
+            if 'evidence' in checkpoint:
+                self._validation_evidence = checkpoint['evidence']
             self._completion_check_pending = not checkpoint['validation'] or checkpoint['pending'] is not None
             self._proposal_validation_checkpoint = None
             self._completion_check_reason = 'Unrelated validation findings are deferred. Validate the current change only; do not rerun baseline checks to clear them.'
@@ -2837,6 +3077,9 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
         seen: List[str] = []
         for turn in turns:
             for command, result in zip(turn.commands_issued, turn.results):
+                for changed in (result.tool_action or {}).get("_changed_paths", []):
+                    if changed not in seen:
+                        seen.append(changed)
                 path = self._extract_result_path(command, result)
                 if path and path not in seen:
                     seen.append(path)
@@ -2892,12 +3135,8 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
         lowered = str(message or "").strip().lower()
         if not lowered:
             return False
-        if action_type == "run_shell":
-            return lowered.startswith("run_shell: timed out") or lowered.startswith("run_shell: error executing")
-        if action_type == "run_check":
-            return lowered.startswith("run_check:")
-        if action_type == "diagnose":
-            return lowered.startswith("diagnose:") or self._diagnostic_message_has_issues(message)
+        if action_type in {"run_shell", "run_check", "diagnose", "run_route_check"}:
+            return TreeLoop._tool_message_indicates_failure(action_type, message)
         if action_type.startswith("git_"):
             return lowered.startswith("git ") and "failed" in lowered
         return lowered.startswith(f"{action_type}:")
@@ -3027,7 +3266,8 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
         issue_id = str((self._discovery_remediation or {}).get("issue_id", "") or "").strip()
         diagnostic_issue_id = str((self._discovery_remediation or {}).get("diagnostic_issue_id", "") or "").strip()
         if path:
-            suggestions.append({"type": "read_file", "path": path})
+            required = (self._discovery_remediation or {}).get("next_required_action")
+            suggestions.append(dict(required) if isinstance(required, dict) else {"type": "read_file", "path": path})
             suggestions.append({"type": "show_diff", "path": path})
             suggestions.append({"type": "review_changes", "path": path, "limit": 20})
         if issue_id and issue_id not in self._stale_issue_ids:
@@ -3072,6 +3312,7 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
 
     def runtime_suggested_next_actions(self) -> List[Dict[str, Any]]:
         suggestions: List[Dict[str, Any]] = []
+        evidence = getattr(self, "_validation_evidence", None)
         if self._pending_npm_command is not None:
             suggestions.extend(self._npm_command_suggestions())
         elif self._patch_resolution is not None:
@@ -3080,6 +3321,8 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
             suggestions.extend(self._discovery_remediation_suggestions())
         elif self._edit_batch_mode or self._edit_batch_pending or self._edit_batch_last_failure is not None:
             suggestions.extend(self._edit_batch_suggestions())
+        elif evidence is not None and evidence.failures:
+            suggestions.extend(self._decorate_runtime_action(action) for action in evidence.retry_actions())
         elif self._pending_verification or (self._has_mutation and not self._validation_after_mutation):
             suggestions.extend(self._finish_validation_suggestions())
         elif self._latest_review is not None:
@@ -3120,7 +3363,12 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
             "command": str(pending.get("command", "") or ""),
             "path": str(pending.get("path", "package.json") or "package.json"),
         }
-        return self._exec_npm_command(run_action)
+        message = self._exec_npm_command(run_action)
+        self.loop.record_external_command("npm " + run_action["command"], CommandResult(
+            ok=not self._message_indicates_failure("npm_command", message), output=message,
+            command_type="mutation", tool_action=run_action,
+        ))
+        return message
 
     def _exec_reject_npm_command(self, action: Dict[str, Any]) -> str:
         pending = dict(self._pending_npm_command) if isinstance(self._pending_npm_command, dict) else {}
@@ -3152,8 +3400,8 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
         return message
 
     def _exec_end_edit_batch(self, action: Dict[str, Any]) -> str:
-        self.loop._exec_end_edit_batch()
-        ok, message = self._verify_and_close_edit_batch(source="end_edit_batch")
+        diagnostics = self.loop._exec_end_edit_batch()
+        ok, message = self._verify_and_close_edit_batch(source="end_edit_batch", diagnostics=diagnostics)
         if not ok:
             return f"end_edit_batch: {message}"
         return message

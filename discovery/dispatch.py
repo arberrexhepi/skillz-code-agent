@@ -9,6 +9,8 @@ from typing import Any
 from file_access import read_scope, qualify_read_paths
 
 from . import suite
+from .inspection import inspect_file, read_context
+from .regex_search import find_regex
 from .common import read_text, safe_join
 
 
@@ -18,7 +20,7 @@ DISCOVERY_ACTION_TYPES = frozenset({
     "find_related_files", "find_related_tests", "find_related_configs",
     "find_canonical_implementation", "find_similar_code", "find_entry_points",
     "find_ownership", "recent_changes", "get_changed_files", "semantic_search",
-    "repo_map", "investigate",
+    "repo_map", "investigate", "inspect_file", "read_context", "find_regex",
 })
 
 
@@ -46,7 +48,9 @@ def execute_discovery_action(action: dict[str, Any], *, root: Path) -> dict[str,
             raise ValueError(f"Unsupported read-only discovery action: {action_type}")
         if "root" in action:
             raise ValueError("Discovery cannot override the mounted workspace root")
-        handler = _read_file if action_type == "read_file" else getattr(suite, action_type)
+        handler = {"read_file": _read_file, "inspect_file": inspect_file, "read_context": read_context, "find_regex": find_regex}.get(action_type)
+        if handler is None:
+            handler = getattr(suite, action_type)
         parameters = inspect.signature(handler).parameters
         kwargs = {key: value for key, value in action.items() if key != "type"}
         if "hidden" in kwargs and "include_hidden" in parameters:

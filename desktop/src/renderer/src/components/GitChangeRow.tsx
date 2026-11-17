@@ -17,7 +17,12 @@ export function GitChangeRow({ file, busy, onDiff, onStage, onUnstage, onDiscard
   const status = gitStatusLabel(file);
   const discardLabel = isUntracked(file) ? 'Move untracked file to Trash' : 'Discard unstaged changes';
   return <div className="git-file-row">
-    <div className="git-file-reference"><PathChip path={file.path} /></div>
+    <div className="git-file-reference"><PathChip path={file.path} />{file.lineChanges && (
+      'binary' in file.lineChanges ? <span className="git-line-binary" title="Binary file — line counts do not apply">Binary</span>
+        : <span className="git-line-changes" title="Total line changes compared with the last commit" aria-label={`${file.lineChanges.additions} lines added, ${file.lineChanges.deletions} lines deleted`}>
+          <span className="git-lines-added">+{file.lineChanges.additions}</span><span className="git-lines-deleted">−{file.lineChanges.deletions}</span>
+        </span>
+    )}</div>
     <button type="button" className="icon-button" title="Open diff" aria-label={`Open diff: ${file.path}`} onClick={() => onDiff(file.path, staged && !unstaged)}>Δ</button>
     <span className="git-code" data-status={status.code} title={status.title} aria-label={status.title}>{status.code}</span>
     {canDiscard(file) && <button

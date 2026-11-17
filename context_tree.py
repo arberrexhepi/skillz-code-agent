@@ -347,7 +347,9 @@ class ContextTree:
 
         for dirpath, dirnames, filenames in os.walk(root_str):
             # Prune excluded dirs in-place
-            dirnames[:] = [d for d in dirnames if d not in exclude_dirs and not is_directory_link(Path(dirpath) / d)]
+            dirnames[:] = [d for d in dirnames if d not in exclude_dirs
+                           and (Path(dirpath) / d) != self.workspace_root / ".context" / "observability"
+                           and not is_directory_link(Path(dirpath) / d)]
 
             rel_dir = os.path.relpath(dirpath, root_str)
             if rel_dir == ".":
@@ -409,19 +411,20 @@ class ContextTree:
             return normalized.removeprefix("repo/")
         return None
 
-    def _safe_repo_target(self, rel_path: str) -> Optional[Path]:
+    def _safe_repo_target(self, rel_path: str, *, explicit: bool = False) -> Optional[Path]:
         """Resolve a workspace-relative target without allowing system access."""
         relative = Path(rel_path)
         if relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts):
             return None
-        if any(part in self._repo_exclude_dirs for part in relative.parts):
+        excluded = {".git"} if explicit else self._repo_exclude_dirs
+        if any(part in excluded for part in relative.parts):
             return None
         try:
             target = (self.workspace_root / relative).resolve()
             resolved_relative = target.relative_to(self.workspace_root)
         except (ValueError, OSError, RuntimeError):
             return None
-        if any(part in self._repo_exclude_dirs for part in resolved_relative.parts):
+        if any(part in excluded for part in resolved_relative.parts):
             return None
         return target
 
@@ -469,7 +472,8 @@ class ContextTree:
         visible_names: set[str] = set()
         for child in children:
             child_rel = str(Path(rel_path) / child.name)
-            safe_child = self._safe_repo_target(child_rel)
+            explicit = any(part in self._repo_exclude_dirs for part in Path(rel_path).parts)
+            safe_child = self._safe_repo_target(child_rel, explicit=explicit)
             if safe_child is None:
                 continue
             if safe_child.is_dir():
@@ -491,7 +495,7 @@ class ContextTree:
         if rel_path is None:
             return node
 
-        target = self.workspace_root if not rel_path else self._safe_repo_target(rel_path)
+        target = self.workspace_root if not rel_path else self._safe_repo_target(rel_path, explicit=True)
         if target is None or not target.exists():
             return None
         if target.is_dir():
@@ -517,6 +521,8 @@ class ContextTree:
             safe_dirs: List[str] = []
             for dirname in sorted(dirnames):
                 candidate_rel = (current_rel / dirname).as_posix()
+                if candidate_rel == ".context/observability":
+                    continue
                 candidate = self._safe_repo_target(candidate_rel)
                 if candidate is None or is_directory_link(current / dirname):
                     continue

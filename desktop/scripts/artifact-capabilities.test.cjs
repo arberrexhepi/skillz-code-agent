@@ -112,3 +112,36 @@ test('missing optional Playwright browser does not block artifact creation or re
   state.image = false;
   assert.equal((await service.status(selection)).ready, false);
 });
+
+test('model-only helpers, host agents, and readiness probes share the saved CLI override', async t => {
+  const { service, root, state } = fixture(t); state.image = true;
+  const { RuntimeSettingsService } = load(() => require('../src/main/services/runtimeSettings.ts'));
+  const saved = path.join(root, 'preferences.json');
+  const firstCli = path.join(root, 'CLI with spaces', 'codex.exe');
+  fs.writeFileSync(saved, JSON.stringify({ codexCliPath: firstCli }));
+  service.runtimeSettings = new RuntimeSettingsService(saved);
+  const selected = { provider: 'codex-subscription', model: 'fixture' };
+  let auth = false;
+  const environments = [];
+  t.mock.method(service, 'probe', async (_python, env) => { environments.push(env); return { sdkReady: true, keyReady: auth, label: 'Codex', detail: auth ? undefined : 'Sign in to Codex' }; });
+  assert.equal((await service.modelReadiness(selected)).ready, false);
+  const status = await service.status(selected);
+  assert.equal(status.items.find(item => item.id === 'credentials').optional, undefined);
+  assert.equal(status.ready, false);
+  assert.equal(environments[0].CODEX_CLI_PATH, firstCli);
+  const context = { agentRoot: root, scriptName: 'main.py', python: { executable: 'base', args: [] }, env: { KEEP: 'yes' }, options: selected };
+  assert.deepEqual((await service.hostContext(context)).env, { KEEP: 'yes', CODEX_CLI_PATH: firstCli });
+  const { EventEmitter } = require('node:events'); const { PassThrough } = require('node:stream');
+  let modelEnv;
+  t.mock.method(require('node:child_process'), 'spawn', (_exe, _args, options) => {
+    modelEnv = options.env;
+    const child = new EventEmitter(); child.stdout = new PassThrough(); child.stderr = new PassThrough(); child.stdin = new PassThrough();
+    child.stdin.on('finish', () => { child.stdout.write(JSON.stringify({ text: 'Ready' }) + '\n'); child.emit('close', 0); });
+    return child;
+  });
+  const secondCli = path.join(root, 'updated', 'codex.exe'); fs.writeFileSync(saved, JSON.stringify({ codexCliPath: secondCli }));
+  assert.equal((await service.modelRequest(selected, { messages: [] })).text, 'Ready');
+  assert.equal(modelEnv.CODEX_CLI_PATH, secondCli);
+  auth = true; assert.equal((await service.modelReadiness(selected)).ready, true);
+  assert.equal(environments.at(-1).CODEX_CLI_PATH, secondCli);
+});
