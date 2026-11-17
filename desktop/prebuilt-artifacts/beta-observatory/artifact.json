@@ -1,0 +1,7 @@
+{
+  "version": 1,
+  "id": "beta-observatory",
+  "title": "Agent Observatory",
+  "prompt": "Document the beta TreeLoop as an interactive showcase with atomic inputs, outputs, contracts and connections; visualize real runtime events on a node map and replay saved runs with speed and step controls.",
+  "createdAt": "2026-09-06T00:00:00.000Z"
+}

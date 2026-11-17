@@ -7,7 +7,7 @@ test('native picker supports cancellation and validated settings IPC rejects unt
   const handlers = new Map();
   let selection = { canceled: true, filePaths: [] };
   let dialogOptions;
-  const saved = [];
+  const saved = [], artifactSelections = [], sourceUpdates = [];
   const electron = {
     ipcMain: { removeHandler: () => {}, removeAllListeners: () => {}, on: () => {}, handle: (channel, listener) => handlers.set(channel, listener) },
     dialog: { showOpenDialog: async (_parent, options) => { dialogOptions = options; return selection; } },
@@ -19,7 +19,7 @@ test('native picker supports cancellation and validated settings IPC rejects unt
   });
   const { registerIpc } = load(() => require('../src/main/ipc.ts'));
   const mainFrame = {};
-  registerIpc({ webContents: { id: 42, mainFrame } }, { agent: { setCodexCliPath: (value) => { saved.push(value); return {}; } } });
+  registerIpc({ webContents: { id: 42, mainFrame } }, { agent: { setCodexCliPath: (value) => { saved.push(value); return {}; } }, artifacts: { prebuiltUpdates: { status: () => ({}), review: () => ({}) }, applyPrebuiltUpdate: (id, value) => { sourceUpdates.push({ id, value }); return {}; }, saveRuntime: (id, value) => { artifactSelections.push({ id, value }); return {}; } } });
   const event = { sender: { id: 42 }, senderFrame: mainFrame };
   const choose = handlers.get('agent:choose-codex-cli');
   assert.equal(await choose(event), null);
@@ -37,4 +37,19 @@ test('native picker supports cancellation and validated settings IPC rejects unt
   await save(event, selection.filePaths[0]);
   await save(event, null);
   assert.deepEqual(saved, [selection.filePaths[0], null]);
+  const saveRuntime = handlers.get('artifacts:save-runtime');
+  const runtime = { provider: 'codex-subscription', model: 'fixture', backendScript: 'main_v2.py' };
+  assert.throws(() => saveRuntime({ sender: { id: 42 }, senderFrame: {} }, 'beta-observatory', runtime), /Untrusted IPC sender/);
+  assert.throws(() => saveRuntime(event, '../another-artifact', runtime));
+  assert.throws(() => saveRuntime(event, 'beta-observatory', { ...runtime, backendScript: 'arbitrary.py' }));
+  await saveRuntime(event, 'beta-observatory', runtime);
+  assert.deepEqual(artifactSelections, [{ id: 'beta-observatory', value: runtime }]);
+  const applyUpdate = handlers.get('artifacts:apply-prebuilt-update');
+  const request = { token: 'a'.repeat(64), resolutions: { 'src/App.tsx': 'incoming' } };
+  assert.throws(() => applyUpdate({ sender: { id: 42 }, senderFrame: {} }, 'beta-observatory', request), /Untrusted IPC sender/);
+  assert.throws(() => applyUpdate(event, '../other', request));
+  assert.throws(() => applyUpdate(event, 'beta-observatory', { ...request, token: 'bad' }));
+  assert.throws(() => applyUpdate(event, 'beta-observatory', { ...request, resolutions: { 'src/App.tsx': 'anything' } }));
+  await applyUpdate(event, 'beta-observatory', request);
+  assert.deepEqual(sourceUpdates, [{ id: 'beta-observatory', value: request }]);
 });

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import re
+import hashlib
 from collections import defaultdict, deque
 from pathlib import Path
 from typing import Any, Iterable, Optional
+from symbol_ranges import exact_symbol_range
 
 from .analysis import (
     collect_symbols_for_file,
@@ -225,15 +227,34 @@ def outline_file(file_path: str, *, root: Path | str | None = None) -> FileOutli
     }
 
 
-def read_symbol(file_path: str, symbol_name: str, symbol_kind: Optional[str] = None, *, root: Path | str | None = None) -> DiscoveryResult:
+def read_symbol(file_path: str, symbol_name: str, symbol_kind: Optional[str] = None, *, limit: int = 200, offset: int = 0, root: Path | str | None = None) -> DiscoveryResult:
     workspace_root = resolve_root(root)
     target = safe_join(workspace_root, file_path)
     text = read_text(target)
-    symbol_range = locate_symbol_range(target, text, symbol_name, symbol_kind)
+    symbol_range = exact_symbol_range(target, text, symbol_name, symbol_kind or "", root=workspace_root)
+    if symbol_range is None:
+        symbol_range = locate_symbol_range(target, text, symbol_name, symbol_kind)
     if symbol_range is None:
         return _discovery_result(False, symbol_name, "read_symbol", [], {"error": "symbol not found"}, path=file_path)
     start_line, end_line = symbol_range
-    content = "\n".join(text.splitlines()[start_line - 1:end_line])
+    symbol_start, symbol_end = start_line, end_line
+    start_line += max(0, int(offset))
+    if start_line > end_line:
+        return _discovery_result(False, symbol_name, "read_symbol", [], {"error": "offset is outside the symbol"}, path=file_path)
+    end_line = min(end_line, start_line + max(1, min(400, int(limit))) - 1)
+    selected = text.splitlines()[start_line - 1:end_line]
+    returned = []
+    budget = 24000
+    for line in selected:
+        if len(line) + 1 > budget:
+            if not returned:
+                returned.append(line[:budget])
+            break
+        returned.append(line)
+        budget -= len(line) + 1
+    content = "\n".join(returned)
+    end_line = start_line + len(returned) - 1
+    truncated = end_line < symbol_end or returned != selected
     hit: DiscoveryHit = {
         "file_path": normalize_relpath(workspace_root, target),
         "start_line": start_line,
@@ -244,7 +265,9 @@ def read_symbol(file_path: str, symbol_name: str, symbol_kind: Optional[str] = N
         "preview": shorten(content, 500),
         "score": 1.0,
         "is_definition": True,
-        "details": {"content": content},
+        "details": {"content": content, "symbol_start_line": symbol_start, "symbol_end_line": symbol_end,
+                    "truncated": truncated, "next_offset": end_line - symbol_start + 1 if end_line < symbol_end else None,
+                    "file_hash": hashlib.sha256(text.encode("utf-8")).hexdigest()},
     }
     return _discovery_result(True, symbol_name, "read_symbol", [hit], {"count": 1}, path=file_path)
 

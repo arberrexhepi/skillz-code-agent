@@ -131,6 +131,13 @@ button { color: inherit; }
 .commit-box textarea:focus, .prompt-box:focus-within { border-color: #466857; }
 .git-file-row { height: 31px; display: flex; align-items: center; padding: 0 7px 0 12px; gap: 4px; }
 .git-file-row:hover { background: #171c22; }
+.git-file-reference { display: flex; align-items: center; gap: 5px; }
+.git-file-reference > .path-chip { min-width: 0; flex: 0 1 auto; }
+.git-file-reference .path-chip-name { flex-shrink: 1; }
+.git-line-changes { display: inline-flex; flex-shrink: 0; gap: 4px; white-space: nowrap; font: 9px ui-monospace, monospace; font-variant-numeric: tabular-nums; }
+.git-lines-added { color: #80d9ab; }
+.git-lines-deleted { color: #ef8c8c; }
+.git-line-binary { flex-shrink: 0; border-radius: 3px; padding: 1px 4px; background: #1b242d; color: #8b9caf; font-size: 8px; }
 .git-file-name { flex: 1; min-width: 0; display: flex; align-items: baseline; gap: 6px; border: 0; background: transparent; padding: 0; text-align: left; cursor: pointer; }
 .git-file-name span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; color: #bdc4cc; }
 .git-file-name small { overflow: hidden; text-overflow: ellipsis; color: #5f6874; font-size: 9px; }

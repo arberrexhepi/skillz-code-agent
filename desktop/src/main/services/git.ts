@@ -5,6 +5,7 @@ import type { GitCommit, GitDiscardResult, GitFileDiff, GitFileStatus, GitStatus
 import { canDiscard, isUntracked } from '../../shared/gitStatus';
 import { discardFileFingerprint } from './gitDiscardSafety';
 import { languageForPath } from './workspace';
+import { lineChangesForFile, parseNumstat, populateLineChanges } from './gitLineChanges';
 
 interface GitResult {
   stdout: string;
@@ -61,6 +62,18 @@ export class GitService {
         index += 1;
       }
       files.push(item);
+    }
+    if (files.length) {
+      const unborn = /^## (?:No commits yet on|Initial commit on) /.test(header);
+      const diffArgs = ['diff', '--numstat', '-z', '--no-ext-diff', '--no-textconv'];
+      const numstat = unborn ? '' : await this.run([...diffArgs, '--no-renames', 'HEAD', '--'], 0, root)
+        .then(result => result.stdout).catch(() => undefined);
+      await populateLineChanges(root, files, numstat, unborn, async file => {
+        // Compare each known rename pair. Other added/deleted rows must retain
+        // their own counts even when Git's rename detection is disabled.
+        const result = await this.run(['--literal-pathspecs', ...diffArgs, '--find-renames', 'HEAD', '--', file.originalPath!, file.path], 0, root).catch(() => undefined);
+        return result ? lineChangesForFile(parseNumstat(result.stdout), file) : undefined;
+      });
     }
     return { isRepository: true, ...branch, files };
   }

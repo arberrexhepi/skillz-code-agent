@@ -10,7 +10,7 @@ const { RuntimeSettingsService } = load(() => require('../src/main/services/runt
 function fixture(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'skillz cli settings '));
   t.after(() => {
-    assert.equal(path.dirname(root), fs.realpathSync(os.tmpdir()));
+    assert.equal(fs.realpathSync(path.dirname(root)), fs.realpathSync(os.tmpdir()));
     assert.ok(path.basename(root).startsWith('skillz cli settings '));
     fs.rmSync(root, { recursive: true, force: true });
   });
@@ -81,4 +81,14 @@ test('storage failure preserves previous settings and cleans temporary files', a
   await assert.rejects(settings.setCodexCliPath(null), /disk is read only/);
   assert.equal(await settings.codexCliPath(), executable);
   assert.deepEqual(fs.readdirSync(path.dirname(settingsPath)), ['runtime-settings.json']);
+});
+
+test('shared helper environment refreshes saved CLI settings without modifying the base environment', async t => {
+  const { executable, settings } = fixture(t);
+  version(t); await settings.setCodexCliPath(executable);
+  const base = { KEEP: 'value', CODEX_CLI_PATH: 'environment-cli' };
+  assert.deepEqual(await settings.environment(base), { KEEP: 'value', CODEX_CLI_PATH: executable });
+  assert.equal(base.CODEX_CLI_PATH, 'environment-cli');
+  await settings.setCodexCliPath(null);
+  assert.deepEqual(await settings.environment(base), base);
 });

@@ -1,0 +1,147 @@
+.observatory {
+  max-width:1800px;
+  margin:auto;
+}
+.masthead {
+  height:80px;
+  border-bottom:1px solid var(--line);
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  padding:0 42px;
+}
+.brand {
+  display:flex;
+  align-items:center;
+  gap:13px;
+  font-size:19px;
+  letter-spacing:-.6px;
+}
+.brand strong {
+  font-weight:400;
+  color:#a6b5b3;
+}
+.brand-symbol {
+  color:var(--accent);
+  display:flex;
+}
+.brand-separator {
+  padding:0 11px;
+  color:#43534f;
+}
+.beta-tag,.sample-tag {
+  font-size:8px;
+  letter-spacing:1.5px;
+  border:1px solid #426052;
+  border-radius:4px;
+  color:var(--accent);
+  padding:4px 6px;
+}
+.header-right {
+  display:flex;
+  gap:26px;
+  align-items:center;
+}
+.edition {
+  color:#61716e;
+  letter-spacing:1.3px;
+}
+.header-status {
+  display:flex;
+  gap:8px;
+  align-items:center;
+  font-size:11px;
+  color:#a8bab4;
+}
+main {
+  padding:0 42px;
+}
+.intro {
+  display:flex;
+  justify-content:space-between;
+  align-items:flex-end;
+  padding:52px 0 40px;
+  gap:32px;
+}
+.intro h1 {
+  font-size:clamp(40px,4.2vw,63px);
+  letter-spacing:-2.8px;
+  line-height:1.04;
+  font-weight:450;
+  margin:17px 0 17px;
+}
+.intro h1>span {
+  color:var(--accent);
+}
+.intro p {
+  color:#93a3a0;
+  font-size:13px;
+  line-height:1.8;
+  margin-bottom:0;
+}
+.intro-stats {
+  display:flex;
+  padding-bottom:6px;
+}
+.intro-stats>div {
+  padding:0 24px;
+  border-left:1px solid var(--line);
+  display:flex;
+  flex-direction:column;
+  gap:7px;
+}
+.intro-stats>div:last-child {
+  padding-right:0;
+}
+.intro-stats strong {
+  font-family:var(--mono);
+  font-size:29px;
+  font-weight:400;
+  color:#c8d9d3;
+}
+.intro-stats span {
+  font-size:10px;
+  color:#738780;
+}
+.section-nav {
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  margin-bottom:21px;
+  border-bottom:1px solid var(--line);
+}
+.section-nav nav {
+  display:flex;
+  gap:20px;
+}
+.section-nav nav button {
+  padding:14px 2px 17px;
+  display:flex;
+  align-items:center;
+  gap:8px;
+  font-size:12px;
+  color:#7f9290;
+  border-bottom:2px solid transparent;
+  margin-bottom:-1px;
+}
+.section-nav nav button.selected {
+  color:#d5f5e8;
+  border-bottom-color:var(--accent);
+}
+.section-nav nav button:hover {
+  color:#e1eee9;
+}
+.count {
+  font-size:9px;
+  background:#24342e;
+  min-width:17px;
+  padding:3px;
+  border-radius:3px;
+}
+.launch-link {
+  display:flex;
+  align-items:center;
+  gap:8px;
+  font-size:11px;
+  color:#b3c6bd;
+}

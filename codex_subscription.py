@@ -13,6 +13,7 @@ PYTHONIOENCODING only configures this Python process's own standard streams.
 
 import json
 import os
+import platform
 import queue
 import shutil
 import subprocess
@@ -27,6 +28,39 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Seque
 
 CODEX_SUBSCRIPTION_PROVIDER = "codex-subscription"
 _MACOS_BUNDLED_CODEX = Path("/Applications/ChatGPT.app/Contents/Resources/codex")
+_MACOS_APPLICATIONS = Path('/Applications')
+
+
+def _macos_codex_candidates() -> List[str]:
+    candidates = []
+    for directory in (_MACOS_APPLICATIONS, Path.home() / 'Applications'):
+        for app in ('ChatGPT.app', 'Codex.app'):
+            resources = directory / app / 'Contents' / 'Resources'
+            candidates.extend((
+                str(resources / 'codex-cli' / 'CodexCLI.app' / 'Contents' / 'MacOS' / 'codex'),
+                str(resources / 'codex'),
+            ))
+    return candidates + [str(_MACOS_BUNDLED_CODEX), '/opt/homebrew/bin/codex', '/usr/local/bin/codex']
+
+
+def _windows_npm_codex_candidates(prefix: Path) -> List[str]:
+    # Windows npm launchers cannot be exec'd directly without a shell. Resolve
+    # only Codex's known native package layouts, never execute or parse the shim.
+    machine = (os.environ.get('PROCESSOR_ARCHITEW6432') or platform.machine()).lower()
+    architectures = [('x64', 'x86_64-pc-windows-msvc')]
+    if machine in ('arm64', 'aarch64'):
+        architectures.insert(0, ('arm64', 'aarch64-pc-windows-msvc'))
+    elif machine not in ('amd64', 'x86_64', 'x64'):
+        return []
+    scope = prefix / 'node_modules' / '@openai'
+    package = scope / 'codex'
+    candidates = []
+    for architecture, triple in architectures:
+        native = 'codex-win32-' + architecture
+        candidates.extend(str(root / 'vendor' / triple / 'bin' / 'codex.exe') for root in (
+            package / 'node_modules' / '@openai' / native, scope / native, package,
+        ))
+    return candidates
 
 
 def _windows_bundled_codex_candidates() -> List[str]:
@@ -47,23 +81,41 @@ def _windows_bundled_codex_candidates() -> List[str]:
     # Hash directory names aren't versions. Prefer the newest installed binary,
     # then the legacy unversioned layout; don't persist a path across app updates.
     versioned.sort(reverse=True)
-    return [candidate for _mtime, candidate in versioned] + [str(bin_dir / "codex.exe")]
+    candidates = [candidate for _mtime, candidate in versioned] + [str(bin_dir / "codex.exe")]
+    candidates.append(str(Path(local_app_data) / 'Programs' / 'OpenAI' / 'Codex' / 'bin' / 'codex.exe'))
+    roaming = Path(os.environ.get('APPDATA') or Path.home() / 'AppData' / 'Roaming')
+    candidates.extend(_windows_npm_codex_candidates(roaming / 'npm'))
+    return candidates
 
 
 def resolve_codex_executable() -> str:
     configured = str(os.environ.get("CODEX_CLI_PATH", "") or "").strip()
     if configured:
+        if sys.platform == 'win32' and Path(configured).suffix.lower() != '.exe':
+            raise RuntimeError('Choose codex.exe on Windows, rather than a .cmd or .ps1 launcher, or use automatic discovery.')
         if Path(configured).is_file():
             return configured
         raise RuntimeError("The configured Codex CLI was not found at " + configured + ". Choose another executable or use automatic discovery.")
-    candidates = [shutil.which("codex") or ""]
+    on_path = shutil.which("codex") or ""
+    candidates = [on_path]
+    if sys.platform == 'win32' and on_path and Path(on_path).suffix.lower() != '.exe':
+        candidates = _windows_npm_codex_candidates(Path(on_path).parent)
+    install_dir = os.environ.get('CODEX_INSTALL_DIR')
+    if install_dir:
+        candidates.append(str(Path(install_dir) / ('codex.exe' if sys.platform == 'win32' else 'codex')))
     if sys.platform == "darwin":
-        candidates.append(str(_MACOS_BUNDLED_CODEX))
+        candidates.append(str(Path.home() / '.local' / 'bin' / 'codex'))
+        candidates.extend(_macos_codex_candidates())
     elif sys.platform == "win32":
         candidates.extend(_windows_bundled_codex_candidates())
+    else:
+        candidates.append(str(Path.home() / '.local' / 'bin' / 'codex'))
     for candidate in candidates:
-        if candidate and Path(candidate).is_file():
-            return candidate
+        try:
+            if candidate and Path(candidate).is_file():
+                return candidate
+        except OSError:
+            continue
     raise RuntimeError(
         "Codex CLI was not found. Install Codex or set CODEX_CLI_PATH to the local executable."
     )

@@ -27,6 +27,9 @@ function WorkbenchApp(): React.JSX.Element {
   const agent = useAgentWorkspace();
   const [artifactsVisible, setArtifactsVisible] = useState(false);
   const [artifactsLoaded, setArtifactsLoaded] = useState(false);
+  useEffect(() => window.workbench.artifacts.onEvent(event => {
+    if (event.type === 'runtime-setup') { setArtifactsLoaded(true); setArtifactsVisible(true); }
+  }), []);
   const [workspace, setWorkspace] = useState<WorkspaceInfo | null>(null);
   const [recentWorkspaces, setRecentWorkspaces] = useState<RecentWorkspace[]>([]);
   const { view, showEditor, toggleEditor, setAgentWidth, reset: resetView } = useWorkspaceView(workspace?.root || '');

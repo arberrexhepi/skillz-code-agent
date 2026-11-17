@@ -36,33 +36,18 @@ from typing import Any, Callable, Dict, List, Optional, Protocol, Sequence, Tupl
 
 from context_tree_bridge import ContextTreeBridge
 from discovery.dispatch import DISCOVERY_ACTION_TYPES, execute_discovery_action
-from mutation_text import is_text_mutation
-from mutations import (
-    append_block,
-    batch_mutate,
-    copy_file,
-    create_file,
-    delete_file,
-    delete_range,
-    delete_snippet,
-    fill_template,
-    insert_after,
-    insert_before,
-    insert_symbol_member,
-    move_block,
-    prepend_block,
-    rename_file,
-    rename_symbol,
-    replace_range,
-    replace_snippet,
-    replace_symbol,
-)
+from mutation_text import PARSE_ERROR_PREFIX, is_text_mutation
+from mutation_runtime import EXPLICIT_MUTATION_TYPES, execute_mutation, compact_mutation_result
 from project_diagnostics import run_backend_diagnostics
+from model_result_delivery import ReadWorkingSet, prepare_model_result, render_packet
+from goal_handoff import HANDOFF_READ_CHARS, summarize_handoff
+from repository_changes import RepositorySnapshot
+from provider_response import PROTOCOL_FAILURES, ProviderResponseError, ProviderResponseRecovery
+from command_blocks import group_command_blocks
 from tree_commands import (
     Annotation,
     COMMAND_VERBS,
     CommandResult,
-    format_strategy_results,
     is_annotation,
     is_strategy,
     parse_multi_command,
@@ -254,7 +239,7 @@ def _normalize_command_candidate(line: str) -> str:
     candidate = _MARKDOWN_COMMAND_PREFIX_RE.sub("", candidate, count=1).lstrip()
     if len(candidate.rstrip()) >= 2 and candidate.startswith("`") and candidate.rstrip().endswith("`"):
         candidate = candidate.rstrip()[1:-1].lstrip()
-    command_label = re.match(r"^(?:command|action)\s*:\s*(.+)$", candidate, re.IGNORECASE)
+    command_label = re.match(r"^(?:command|action)\s*:\s*(.+)$", candidate, re.IGNORECASE | re.DOTALL)
     if command_label:
         candidate = command_label.group(1).lstrip()
     return candidate if is_text_mutation(candidate) or is_strategy(candidate) else candidate.rstrip()
@@ -275,14 +260,15 @@ def _build_output_repair_instruction() -> str:
         [
             "FORMAT REPAIR REQUIRED: your previous response contained no executable Playground OS command.",
             "Rewrite it as an executable turn using the same intent and current context.",
+            "If you proposed a code change, emit that edit as patch, replace-lines, edit-symbol, or edit-batch now. Do not replace the intended edit with another broad read.",
             "Return only this shape:",
             ">>th: <brief reasoning>",
             ">>pl: <one concrete action>",
             "<at least one executable command>",
             "Put each annotation and each executable command on its own line; never attach prose before `>>th:`.",
-            "Valid commands include `repo-map /repo topic=\"...\" limit=20`, `cat /repo/path`, "
-            "`read-line-range /repo/path 1-120`, `s1: cat /repo/path`, and `finish <summary>`.",
-            "Do not return bullets, a numbered plan, a promise to act later, JSON, or a fenced code block.",
+            "Valid commands include `patch /repo/path \"exact source\" -> \"replacement\"`, "
+            "`run-check build`, `read-context /repo/path \"exact anchor\" before=4 after=8 limit=1`, and `finish <summary>`.",
+            "Do not return bullets, a numbered plan, a promise to act later, a bare JSON action, or a fenced code block. Command arguments may contain JSON where the grammar permits it.",
         ]
     )
 
@@ -330,7 +316,12 @@ ANNOTATIONS (>> feed-forward metadata — free, no tool call):
 RULES:
 1. READ commands (ls, cat, read-line-range, repo-map, symbols, find-symbol, stat, find, grep, read-diagnostics) run locally without tool dispatch.
     /repo reads and discovery use the real mounted workspace, independent of the bounded metadata preview or loaded file cache.
+    Explicit paths can inspect dependency types under /repo/node_modules, including build directories; broad searches omit dependencies.
     Other mounts remain in-memory. Keep all reads focused and bounded even though they do NOT count as tool calls.
+    Multi-line shell scripts use `shell <<<` followed by the script and a standalone `>>>` terminator.
+    Native shell heredocs (`shell python3 <<'CHECK'` ... `CHECK`) and multi-line quoted shell arguments also stay one command.
+    Script bodies are opaque: commands, annotations, commas and strategy labels inside them are source, not agent actions.
+    Close all script delimiters and quotes before the next agent command; incomplete blocks dispatch nothing.
 1c. For broad or unfamiliar codebase work, start with `repo-map /repo topic="<task topic>" limit=20` before line-by-line reads.
     Treat it as the structural layer of a retrieval funnel: use the ranked files, symbols, imports, and drill-down suggestions to
     choose targeted `symbols`, `find-symbol`, `grep`, `cat`, or `read-line-range` commands.
@@ -342,6 +333,8 @@ RULES:
      proactively check available skills and load the best match yourself instead of waiting for the operator to force it.
 2. WRITE commands (write, replace-lines, patch, shell, git, diagnose, run-check, run-route-check) dispatch to real tools. Use them
    deliberately after you have enough context from reads.
+   Commands in a turn complete in order: a read after a write or shell command sees its changes.
+   Strategy dependencies complete before downstream reads or output substitution. A failed command skips the rest of the turn.
 3. HEREDOC (<<< ... >>>) works on ANY line. End the line with <<<, put the
    content on the next lines, and close with >>> on its own line:
      write /repo/path/file.md <<<
@@ -380,6 +373,7 @@ RULES:
 12c. For patch, prefer two JSON-quoted string operands separated by ` -> `. Escapes decode exactly once, and arrows within quoted source are not separators. Include enough source context for exactly one match; never copy displayed line numbers into search text. Missing or ambiguous matches make no changes.
 12d. Put each text mutation in its own strategy step. Use left-side dependencies such as `s1 -> s2: patch ...`; mutation payload commas and trailing arrows are literal content, not strategy wiring.
 13. Avoid rereading an entire large file after a localized edit unless you need whole-file structure. Verify the edited range first.
+13a. Context compaction retains at most 48,000 characters of recent read packets. Large scans can evict earlier source; requesting them cannot pin previous ranges. Keep one bounded edit surface in view. Use read-symbol or read-context for a specific missing identifier instead of reloading every declaration before editing. Novel reads and context restoration are not task delivery; heed the execution delivery checkpoint and its focused-read allowance.
 14. If a bounded edit fails twice or keeps duplicating content, stop stretching the same range edit. Re-read the surrounding region, widen the inspected range, and either do one clean `replace-lines` pass or rewrite the full file with `write`.
 15. Strategy placeholders like `{{s1}}` are raw upstream text plus a few safe text transforms. You may use `.stdout`, `.trim()`, `.replace("old", "new")`, `.split('\n').filter(line => ...).join('\n')`, numeric indexing like `.split('\n')[0]`, and regex capture extraction like `.match(/pattern/)[1]`, but do not invent arbitrary code execution inside placeholders.
 16. Use `batch start` before a cluster of related file fixes and `batch end` after the cluster is landed and verified. Batch related edits together, then run one finite verification step such as `diagnose /repo/src/file.tsx`, `run-check typecheck`, or `run-check build`.
@@ -487,7 +481,10 @@ def _build_initial_context_message(task: str, os_state: str, *, steering: str = 
 def _build_turn_result_message(turn: Turn) -> str:
     return "\n\n".join([
         "═══ LATEST PLAYGROUND OS RESULT ═══",
-        turn.compact(),
+        f"── Turn {turn.turn_number} ──\n" + "\n\n".join(
+            render_packet(command, result) for command, result in zip(turn.commands_issued, turn.results)
+            if result.command_type != "annotation"
+        ),
         "═══ YOUR TURN ═══",
         "Continue from the latest result. Start with brief >>th: and >>pl:, then emit executable tree commands or `finish <summary>`.",
     ])
@@ -519,7 +516,7 @@ def _merge_adjacent_messages(messages: Sequence[ChatMessage]) -> List[ChatMessag
     return merged
 
 
-def _build_context_summary_message(task: str, history: Sequence[Turn], os_state: str, *, steering: str = "", max_chars: int = 50000) -> str:
+def _build_context_summary_message(task: str, history: Sequence[Turn], os_state: str, *, steering: str = "", max_chars: int = 10000, retained_reads: str = "") -> str:
     parts: List[str] = [
         "═══ COMPACTED WORK SUMMARY ═══",
         "Older transcript messages were compacted to keep the stable system prompt cacheable.",
@@ -532,7 +529,12 @@ def _build_context_summary_message(task: str, history: Sequence[Turn], os_state:
         budget = max_chars
         compact_parts: List[str] = []
         for turn in reversed(history):
-            compact = turn.compact(max_result_chars=1200)
+            # Activity is a summary, never evidence of having read omitted code.
+            compact = f"── Turn {turn.turn_number} ──\n" + "\n".join(
+                f"[{'✓' if result.ok else '✗'} {result.command_type.upper()}] {_truncate_command_for_cli(command)}"
+                + (f"\n{result.output[:800]}" if result.command_type in {"finish", "error"} or not result.ok else "")
+                for command, result in zip(turn.commands_issued, turn.results)
+            )
             if len(compact) > budget:
                 compact = compact[:budget] + "\n… (older compacted work omitted)"
                 compact_parts.insert(0, compact)
@@ -540,6 +542,9 @@ def _build_context_summary_message(task: str, history: Sequence[Turn], os_state:
             compact_parts.insert(0, compact)
             budget -= len(compact)
         parts.append("\n\n".join(compact_parts))
+    parts.extend(["", "═══ RETAINED REPOSITORY READS ═══",
+                  "Only the complete packets below remain read context. Other source may be requested again.",
+                  retained_reads or "(none)"])
     parts.extend(["", "═══ PLAYGROUND OS STATE REFRESH ═══", os_state])
     if steering:
         parts.extend(["", "═══ OPERATOR STEERING ═══", steering])
@@ -566,19 +571,14 @@ def extract_commands(raw: str) -> str:
 
     Free-form prose is ignored rather than being sent to the command parser.
     """
-    lines = _strip_leading_control_preamble(raw).splitlines()
+    lines = group_command_blocks(_strip_leading_control_preamble(raw).splitlines())
+    if lines and lines[0].startswith(PARSE_ERROR_PREFIX):
+        return lines[0]
     extracted: List[str] = []
     pending_annotations: List[str] = []
-    collecting_heredoc = False
 
     for line in lines:
         stripped = line.strip()
-
-        if collecting_heredoc:
-            extracted.append(line)
-            if stripped == ">>>":
-                collecting_heredoc = False
-            continue
 
         if stripped.startswith("```"):
             continue
@@ -597,8 +597,6 @@ def extract_commands(raw: str) -> str:
                 extracted.extend(pending_annotations)
                 pending_annotations = []
             extracted.append(candidate)
-            if candidate.rstrip().endswith("<<<"):
-                collecting_heredoc = True
             continue
 
     if extracted:
@@ -671,6 +669,8 @@ class TreeLoop:
         verbose: bool = True,
         tool_dispatcher: Optional[Callable[[CommandResult], Any]] = None,
         command_observer: Optional[Callable[[str, CommandResult], None]] = None,
+        read_context_observer: Optional[Callable[[Sequence[Tuple[str, CommandResult]]], None]] = None,
+        turn_observer: Optional[Callable[[Turn], None]] = None,
         model_event_observer: Optional[Callable[[Dict[str, Any]], None]] = None,
         allow_shell: Optional[bool] = None,
     ) -> None:
@@ -682,6 +682,10 @@ class TreeLoop:
         self.verbose = verbose
         self.tool_dispatcher = tool_dispatcher
         self.command_observer = command_observer
+        self.read_context_observer = read_context_observer
+        self.turn_observer = turn_observer
+        self._read_working_set = ReadWorkingSet()
+        self._repository_snapshot: Optional[RepositorySnapshot] = None
         self.model_event_observer = model_event_observer
         self.allow_shell = _env_flag_enabled("SHELL_ACCESS", True) if allow_shell is None else bool(allow_shell)
         self.workspace_root = workspace_root.resolve()
@@ -713,12 +717,15 @@ class TreeLoop:
         self._recent_reads: List[RecentRead] = []
         self._conversation_messages: List[ChatMessage] = []
         self._conversation_task = ""
+        self._conversation_history_start = 0
+        self._handoff_summary = ""
         self.bridge.tree.diagnostic_disposition = lambda diagnostics: IssueProposalStore(self.workspace_root).apply_deferrals(
             diagnostics, scope='task:' + hashlib.sha256(getattr(self, '_proposal_task', self._conversation_task).encode()).hexdigest())
         self._conversation_compaction_count = 0
         self._conversation_char_budget = int(os.getenv("TREELOOP_MESSAGE_CONTEXT_CHARS", "120000") or "120000")
         self._total_reads = 0
         self._total_writes = 0
+        self._deferred_diagnostic_paths: set[str] = set()
         self._same_turn_halt_reason = ""
         self._external_stop_reason = ""
         self._inspected_run_issue_ids: set[str] = set()
@@ -740,6 +747,8 @@ class TreeLoop:
     def run(self, task: str) -> LoopResult:
         """Run the agent loop until finish or max turns."""
         self._proposal_task = str(task or "").strip()
+        if self._conversation_task and self._proposal_task != self._conversation_task:
+            self.begin_goal_handoff()
         if not self.bridge._indexed:
             self.setup()
 
@@ -756,16 +765,9 @@ class TreeLoop:
             before_turn = getattr(self, "before_turn", None)
             if before_turn is not None:
                 before_turn()
-            # Build prompt with current OS state + history
+            # Both provider APIs consume this one model-visible transcript.
             os_state = self.bridge.render_for_prompt(repo_depth=2)
             prompt_steering = self._compose_steering()
-            prompt = _build_user_prompt(
-                task=task,
-                os_state=os_state,
-                history=self.history,
-                recent_reads=self._recent_reads,
-                steering=prompt_steering,
-            )
             self._ensure_conversation_task(task, os_state, steering=prompt_steering)
             self._compact_conversation_if_needed(task, os_state, steering=prompt_steering)
             call_messages: List[ChatMessage] = list(self._conversation_messages)
@@ -780,6 +782,7 @@ class TreeLoop:
             t0 = time.time()
             active_model_call_started = t0
             repair_attempts = 0
+            provider_recovery = ProviderResponseRecovery()
             command_block = ""
             if self.model_event_observer is not None:
                 try:
@@ -787,7 +790,9 @@ class TreeLoop:
                 except Exception:
                     pass
             try:
-                raw_output = self._complete_model(system, prompt, messages)
+                raw_output, active_model_call_started, messages = self._complete_with_provider_recovery(
+                    system, messages, turn_num, active_model_call_started, provider_recovery,
+                )
                 command_block = extract_commands(raw_output)
                 while (
                     not _has_executable_command(command_block)
@@ -805,6 +810,7 @@ class TreeLoop:
                                     "output_valid": False,
                                     "repair_pending": True,
                                     "repair_attempt": repair_attempts,
+                                    "invalid_output_excerpt": raw_output[:8000],
                                 }
                             )
                             self.model_event_observer(
@@ -827,18 +833,14 @@ class TreeLoop:
                             {"role": "user", "content": repair_instruction},
                         ]
                     )
-                    repair_prompt = "\n\n".join(
-                        [
-                            prompt,
-                            "═══ INVALID MODEL OUTPUT ═══",
-                            repair_output_excerpt,
-                            "═══ REQUIRED FORMAT REPAIR ═══",
-                            repair_instruction,
-                        ]
-                    )
                     active_model_call_started = time.time()
-                    raw_output = self._complete_model(system, repair_prompt, repair_messages)
+                    raw_output, active_model_call_started, messages = self._complete_with_provider_recovery(
+                        system, repair_messages, turn_num, active_model_call_started, provider_recovery,
+                    )
                     command_block = extract_commands(raw_output)
+            except ProviderResponseError as exc:
+                finish_message = f"stopped: {exc}"
+                break
             except KeyboardInterrupt:
                 if self.model_event_observer is not None:
                     try:
@@ -908,6 +910,7 @@ class TreeLoop:
             commands_issued: List[str] = []
             results: List[CommandResult] = []
             turn_annotations: List[Annotation] = []
+            batch_executed = False
 
             if command_block:
                 parsed_commands = _executable_commands(command_block)
@@ -932,43 +935,9 @@ class TreeLoop:
                         "Do not enumerate speculative filenames. Use one repo-map, find, grep, cat, or finish command, "
                         "or a small bounded group of directly relevant reads."
                     )
-                elif is_strategy(command_block):
-                    # Execute as strategy DAG
-                    # First extract any annotations from the block
-                    strategy_plan = parse_strategy(command_block)
-                    for line in command_block.splitlines():
-                        stripped = line.strip()
-                        if is_annotation(stripped):
-                            ann = parse_annotation(stripped)
-                            if ann:
-                                turn_annotations.append(ann)
-                    by_label = self.bridge.execute_strategy_full(command_block)
-                    for label in sorted(by_label.keys()):
-                        step_commands = strategy_plan.steps[label].commands if strategy_plan and label in strategy_plan.steps else []
-                        for index, r in enumerate(by_label[label]):
-                            command_preview = step_commands[index] if index < len(step_commands) else r.command_type
-                            commands_issued.append(f"[{label}] {command_preview}")
-                            results.append(r)
-                    if self.verbose:
-                        for ann in turn_annotations:
-                            _log(f"  {ann.compact()}")
-                        _log(format_strategy_results(by_label))
                 else:
-                    # Execute as plain commands (annotations extracted automatically)
-                    results = self.bridge.execute(command_block)
-                    turn_annotations = self.bridge.last_annotations
-                    commands_issued = parse_multi_command(command_block)
-                    if self.verbose:
-                        for ann in turn_annotations:
-                            _log(f"  {ann.compact()}")
-                        for cmd, r in zip(commands_issued, results):
-                            if r.command_type == "annotation":
-                                continue
-                            ok = "✓" if r.ok else "✗"
-                            tag = "READ" if r.command_type == "read" else (
-                                "TOOL" if r.needs_tool else r.command_type.upper()
-                            )
-                            _log(f"  [{ok} {tag}] {_truncate_command_for_cli(cmd)}")
+                    commands_issued, results, turn_annotations = self._execute_command_batch(command_block)
+                    batch_executed = True
             else:
                 if self.verbose:
                     _log("  (no commands extracted)")
@@ -1017,74 +986,18 @@ class TreeLoop:
             else:
                 commandless_turns = 0
 
-            # Dispatch tool-requiring results and surface every command result.
-            self._same_turn_halt_reason = ""
-            blocked_reason = ""
-            bounded_mutation_count = 0
-            last_executable_index = -1
-            for idx, candidate in enumerate(results):
-                if candidate.command_type != "annotation":
-                    last_executable_index = idx
-
-            for index, r in enumerate(results):
-                if r.command_type == "annotation":
-                    if self.command_observer is not None:
-                        try:
-                            command_preview = commands_issued[index] if index < len(commands_issued) else ""
-                            self.command_observer(command_preview, r)
-                        except Exception:
-                            pass
-                    continue
-
-                if blocked_reason:
-                    r.ok = False
-                    r.output = f"skipped after prior command failure: {blocked_reason}"
-                    continue
-
-                if r.command_type == "finish" and index != last_executable_index:
-                    r.ok = False
-                    r.output = "finish must be the final executable command in a turn"
-
-                if not r.ok:
-                    if self.command_observer is not None:
-                        try:
-                            command_preview = commands_issued[index] if index < len(commands_issued) else ""
-                            self.command_observer(command_preview, r)
-                        except Exception:
-                            pass
-                    blocked_reason = r.output or "command failed"
-                    continue
-
-                if r.command_type == "read":
-                    self._total_reads += 1
-                if r.needs_tool:
-                    if self._is_bounded_mutation_result(r):
-                        bounded_mutation_count += 1
-                        if bounded_mutation_count > MAX_MUTATION_COMMANDS_PER_TURN:
-                            r.ok = False
-                            r.output = (
-                                f"mutation batch limit exceeded: at most {MAX_MUTATION_COMMANDS_PER_TURN} "
-                                "mutating commands are allowed in one turn"
-                            )
-                            blocked_reason = r.output
-                            continue
-                    if r.command_type != "read":
-                        self._total_writes += 1
-                    executed = self._execute_tool(r)
-                    if executed:
-                        r.output = executed  # feed back into history
-                        if self.verbose:
-                            _log(f"  ⟶ {_truncate_for_cli(executed)}")
-                if self.command_observer is not None:
+            if not batch_executed and self.command_observer is not None:
+                for command, result in zip(commands_issued, results):
+                    prepare_model_result(command, result)
                     try:
-                        command_preview = commands_issued[index] if index < len(commands_issued) else ""
-                        self.command_observer(command_preview, r)
+                        self.command_observer(command, result)
                     except Exception:
                         pass
-                if not r.ok and not blocked_reason:
-                    blocked_reason = r.output or "command failed"
-                if self._same_turn_halt_reason and not blocked_reason:
-                    blocked_reason = self._same_turn_halt_reason
+
+            for command, result in zip(commands_issued, results):
+                if not batch_executed:
+                    prepare_model_result(command, result)
+                    self._read_working_set.record(command, result)
 
             elapsed = time.time() - t0
             turn = Turn(
@@ -1103,6 +1016,8 @@ class TreeLoop:
                 {"role": "assistant", "content": raw_output},
                 {"role": "user", "content": _build_turn_result_message(turn)},
             ])
+            if self.turn_observer is not None:
+                self.turn_observer(turn)
 
             if self._external_stop_reason:
                 finish_message = f"stopped: {self._external_stop_reason}"
@@ -1161,6 +1076,8 @@ class TreeLoop:
         if interrupted:
             finished = False
 
+        if not finished and not finish_message:
+            finish_message = f"Turn limit reached: {self.max_turns} model turns in this attempt."
         total_elapsed = time.time() - start_time
         result = LoopResult(
             turns=self.history,
@@ -1183,26 +1100,60 @@ class TreeLoop:
     def reset_conversation(self) -> None:
         self._conversation_messages.clear()
         self._conversation_task = ""
+        self._conversation_history_start = len(self.history)
+        self._handoff_summary = ""
+        self._checkpoint_steering = ""
+        self._recovery_steering = ""
         self._conversation_compaction_count = 0
         self._inspected_run_issue_ids.clear()
+        self._read_working_set = ReadWorkingSet()
+        if self.read_context_observer is not None:
+            self.read_context_observer([])
+
+    def begin_goal_handoff(self) -> None:
+        """Retain bounded evidence and outcomes, never the prior goal's raw dialogue."""
+        self._handoff_summary = summarize_handoff(self.history[self._conversation_history_start:])
+        self._conversation_history_start = len(self.history)
+        self._conversation_messages.clear()
+        self._conversation_task = ""
+        self._checkpoint_steering = ""
+        self._recovery_steering = ""
+        self._inspected_run_issue_ids.clear()
+        packets = self._read_working_set.compact(budget=HANDOFF_READ_CHARS)
+        self._recent_reads.clear()
+        if self.read_context_observer is not None:
+            self.read_context_observer(packets)
+
+    def record_external_command(self, command: str, result: CommandResult) -> None:
+        """Deliver operator-approved tool work through the same evidence path."""
+        prepare_model_result(command, result)
+        if self.command_observer is not None:
+            self.command_observer(command, result)
+        prepare_model_result(command, result)
+        turn = Turn(turn_number=0, raw_output="", commands_issued=[command], results=[result], elapsed_s=0)
+        self.history.append(turn)
+        if self._conversation_task:
+            self._conversation_messages.append({"role": "user", "content": "Operator-approved command result:\n" + render_packet(command, result)})
+        else:
+            self._handoff_summary = summarize_handoff(self.history[self._conversation_history_start:])
+        if (result.tool_action or {}).get("_changed_paths"):
+            self._total_writes += 1
+            if self.turn_observer is not None:
+                self.turn_observer(turn)
 
     def _ensure_conversation_task(self, task: str, os_state: str, *, steering: str = "") -> None:
         normalized = str(task or "").strip()
+        if normalized and self._conversation_task and normalized != self._conversation_task:
+            self.begin_goal_handoff()
         if not self._conversation_messages:
             self._inspected_run_issue_ids.clear()
             self._conversation_messages.append({
                 "role": "user",
-                "content": _build_initial_context_message(normalized, os_state, steering=steering),
+                "content": self._compacted_context(normalized, os_state, steering=steering, notify=False)
+                           if self._handoff_summary else _build_initial_context_message(normalized, os_state, steering=steering),
             })
             self._conversation_task = normalized
             return
-        if normalized and normalized != self._conversation_task:
-            self._inspected_run_issue_ids.clear()
-            self._conversation_messages.append({
-                "role": "user",
-                "content": _build_initial_context_message(normalized, os_state, steering=steering).replace("═══ TASK ═══", "═══ NEW TASK ═══", 1),
-            })
-            self._conversation_task = normalized
 
     def _compact_conversation_if_needed(self, task: str, os_state: str, *, steering: str = "") -> None:
         if self._conversation_char_budget <= 0:
@@ -1212,9 +1163,21 @@ class TreeLoop:
         self._conversation_compaction_count += 1
         self._conversation_messages = [{
             "role": "user",
-            "content": _build_context_summary_message(task, self.history, os_state, steering=steering),
+            "content": self._compacted_context(task, os_state, steering=steering),
         }]
         self._conversation_task = str(task or "").strip()
+
+    def _compacted_context(self, task: str, os_state: str, *, steering: str = "", notify: bool = True) -> str:
+        packets = self._read_working_set.compact()
+        summary = _build_context_summary_message(
+            task, self.history[self._conversation_history_start:], os_state, steering=steering,
+            retained_reads=("Host-retained context manifest (exact ranges; additional broad reads may evict these):\n"
+                            + json.dumps(self._read_working_set.manifest(), ensure_ascii=False)
+                            + "\n\n" + "\n\n".join(render_packet(*packet) for packet in packets)),
+        )
+        if notify and self.read_context_observer is not None:
+            self.read_context_observer(packets)
+        return (self._handoff_summary + "\n\n" if self._handoff_summary else "") + summary
 
     def _compact_messages_for_final_retry(
         self,
@@ -1226,20 +1189,78 @@ class TreeLoop:
         self._conversation_compaction_count += 1
         self._conversation_messages = [{
             "role": "user",
-            "content": _build_context_summary_message(
+            "content": self._compacted_context(
                 self._conversation_task,
-                self.history,
                 os_state,
                 steering=steering,
             ),
         }]
         return list(self._conversation_messages)
 
-    def _complete_model(self, system: str, prompt: str, messages: Sequence[ChatMessage]) -> str:
+    def _complete_model(self, system: str, messages: Sequence[ChatMessage]) -> str:
         complete_messages = getattr(self.model, "complete_messages", None)
         if callable(complete_messages):
             return str(complete_messages(system, list(messages)) or "")
-        return self.model.complete(system, prompt)
+        # Legacy providers receive exactly the same retained context as chat providers.
+        transcript = "\n\n".join(f"═══ {item['role'].upper()} HISTORY ═══\n{item['content']}" for item in messages)
+        return str(self.model.complete(system, transcript) or "")
+
+    def _complete_with_provider_recovery(
+        self, system: str, messages: Sequence[ChatMessage], turn: int,
+        started: float, recovery: ProviderResponseRecovery,
+    ) -> Tuple[str, float, Sequence[ChatMessage]]:
+        """Retry provider delivery in place without evicting source or spending execution turns."""
+        retry_system = system
+        base_messages = list(messages)
+        while True:
+            output = self._complete_model(retry_system, messages)
+            metrics_getter = getattr(self.model, "get_last_metrics", None)
+            try:
+                metrics = metrics_getter() if callable(metrics_getter) else {}
+            except Exception:
+                metrics = {}
+            metadata = (metrics or {}).get("response", {})
+            reason = recovery.failure_reason(output, metadata)
+            if not reason:
+                return output, started, messages
+            protocol_failure = reason in PROTOCOL_FAILURES
+            retry = recovery.claim_retry(reason)
+            if self.model_event_observer is not None:
+                try:
+                    self.model_event_observer({
+                        "event": "model_call_finish", "turn": turn,
+                        "elapsed_s": round(time.time() - started, 3), "output_chars": len(output),
+                        "output_valid": False, "empty_response": not output.strip(), "provider_response": metadata,
+                        "provider_protocol_failure": protocol_failure, "recovery_reason": reason,
+                        "rejected_output_excerpt": output[:4000] if protocol_failure else "",
+                        "provider_retry_pending": retry, "provider_recovery_attempts": recovery.retries,
+                        "provider_recovery_exhausted": not retry, "preserved_source_context": True,
+                        "empty_response_retry_pending": retry and not protocol_failure,
+                        "empty_response_recovery_exhausted": not retry and not protocol_failure,
+                    })
+                except Exception:
+                    pass
+            if not retry:
+                detail = f"; provider response: {json.dumps(metadata, ensure_ascii=False)}" if metadata else ""
+                message = (
+                    f"provider command delivery failed with {reason} after {recovery.protocol_retries} targeted retries; current goal and source preserved"
+                    if protocol_failure else "provider returned empty text twice; one retry preserving context was exhausted"
+                )
+                raise ProviderResponseError(message + detail)
+            instruction = recovery.instruction(reason)
+            # Retry the same delivered context. Refreshing the request must not
+            # compact the active goal's source merely because the provider erred.
+            messages = [*base_messages, {"role": "user", "content": instruction}]
+            messages = _merge_adjacent_messages(messages)
+            retry_system = system + "\n\nPROVIDER RECOVERY OVERRIDE FOR THIS REQUEST:\n" + instruction if protocol_failure else system
+            started = time.time()
+            if self.model_event_observer is not None:
+                try:
+                    self.model_event_observer({"event": "model_call_start", "turn": turn,
+                                               "fresh_context_retry": False, "preserved_source_context": True,
+                                               "provider_recovery_attempts": recovery.retries, "recovery_reason": reason})
+                except Exception:
+                    pass
 
     def _capture_recent_reads(self, turn: Turn, *, max_items: int = 8) -> None:
         captured: List[RecentRead] = []
@@ -1321,6 +1342,7 @@ class TreeLoop:
         normalized_path = str(rel_path or "").strip().removeprefix("/repo/").removeprefix("repo/")
         if not normalized_path:
             return
+        self._read_working_set.invalidate(normalized_path)
 
         refreshed: List[RecentRead] = []
         for item in self._recent_reads:
@@ -1371,7 +1393,7 @@ class TreeLoop:
     def _is_bounded_mutation_result(self, result: CommandResult) -> bool:
         action = result.tool_action or {}
         action_type = str(action.get("type", "") or "")
-        return action_type in {
+        return action_type in EXPLICIT_MUTATION_TYPES | {
             "write_file",
             "replace_lines",
             "patch_file",
@@ -1537,6 +1559,81 @@ class TreeLoop:
     # Built-in tool execution (writes to disk)
     # ------------------------------------------------------------------
 
+    def _execute_command_batch(self, raw: str) -> Tuple[List[str], List[CommandResult], List[Annotation]]:
+        """Complete commands in execution order, including tools and observers."""
+        commands: List[str] = []
+        results: List[CommandResult] = []
+        remaining = len(_executable_commands(raw))
+        bounded_mutations = 0
+        blocked_reason = ""
+        self._same_turn_halt_reason = ""
+
+        def execute(command: str, label: str) -> CommandResult:
+            nonlocal remaining, bounded_mutations, blocked_reason
+            annotation = parse_annotation(command)
+            if annotation is not None:
+                result = CommandResult(ok=True, output=annotation.compact(), command_type="annotation")
+            else:
+                remaining -= 1
+                if blocked_reason:
+                    result = CommandResult(ok=False, output=f"skipped after prior command failure: {blocked_reason}", command_type="skipped")
+                else:
+                    result = self.bridge.execute_single(command)
+                    if result.command_type == "finish" and remaining > 0:
+                        result.ok = False
+                        result.output = "finish must be the final executable command in a turn"
+                    if result.ok and result.command_type == "read":
+                        self._total_reads += 1
+                    if result.ok and result.needs_tool:
+                        if self._is_bounded_mutation_result(result):
+                            bounded_mutations += 1
+                            if bounded_mutations > MAX_MUTATION_COMMANDS_PER_TURN:
+                                result.ok = False
+                                result.output = f"mutation batch limit exceeded: at most {MAX_MUTATION_COMMANDS_PER_TURN} mutating commands are allowed in one turn"
+                        if result.ok:
+                            if result.command_type != "read" and (result.tool_action or {}).get("type") != "run_shell":
+                                self._total_writes += 1
+                            executed = self._execute_tool(result)
+                            if (result.tool_action or {}).get("type") == "run_shell" and (result.tool_action or {}).get("_changed_paths"):
+                                self._total_writes += 1
+                            if executed:
+                                result.output = executed
+
+            preview = f"[{label}] {command}" if label else command
+            commands.append(preview)
+            results.append(result)
+            prepare_model_result(preview, result)
+            if self.command_observer is not None:
+                try:
+                    self.command_observer(preview, result)
+                except Exception:
+                    pass
+            # Observers may replace output with a real failure or a recovery block.
+            prepare_model_result(preview, result)
+            self._read_working_set.record(preview, result)
+            if annotation is None and not blocked_reason:
+                if not result.ok:
+                    blocked_reason = result.output or "command failed"
+                elif self._same_turn_halt_reason:
+                    blocked_reason = self._same_turn_halt_reason
+            if self.verbose:
+                if annotation is not None:
+                    _log(f"  {annotation.compact()}")
+                else:
+                    ok = "✓" if result.ok else "✗"
+                    _log(f"  [{ok} {result.command_type.upper()}] {_truncate_command_for_cli(preview)}")
+                    _log(f"  ⟶ {_truncate_for_cli(result.output)}")
+            return result
+
+        if is_strategy(raw):
+            self.bridge.execute_strategy_full(raw, command_executor=execute)
+            annotations = [annotation for command in parse_multi_command(raw)
+                           if (annotation := parse_annotation(command)) is not None]
+        else:
+            self.bridge.execute(raw, command_executor=execute)
+            annotations = self.bridge.last_annotations
+        return commands, results, annotations
+
     def _execute_tool(self, r: CommandResult) -> str:
         """Execute a tool action. Returns a status string.
 
@@ -1544,13 +1641,21 @@ class TreeLoop:
         Otherwise uses the built-in executor for write_file, replace_lines, patch_file,
         and shell commands.
         """
+        if r.tool_action:
+            # These fields are host evidence, never model-supplied assertions.
+            r.tool_action.pop("_changed_paths", None)
+            r.tool_action.pop("_change_accounting", None)
         if self.tool_dispatcher:
             try:
                 dispatched = self.tool_dispatcher(r)
                 if dispatched is None:
                     return "dispatched to custom handler"
-                return str(dispatched)
+                message = str(dispatched)
+                if self._tool_message_indicates_failure(str((r.tool_action or {}).get("type", "")), message):
+                    r.ok = False
+                return message
             except Exception as e:
+                r.ok = False
                 return f"dispatch error: {e}"
 
         action = r.tool_action
@@ -1579,26 +1684,7 @@ class TreeLoop:
             message = self._exec_replace_lines(action)
         elif action_type == "patch_file":
             message = self._exec_patch_file(action)
-        elif action_type in {
-            "replace_range",
-            "replace_snippet",
-            "insert_before",
-            "insert_after",
-            "delete_range",
-            "delete_snippet",
-            "append_block",
-            "prepend_block",
-            "replace_symbol",
-            "insert_symbol_member",
-            "rename_symbol",
-            "move_block",
-            "create_file",
-            "delete_file",
-            "rename_file",
-            "copy_file",
-            "fill_template",
-            "batch_mutate",
-        }:
+        elif action_type in EXPLICIT_MUTATION_TYPES:
             message = self._exec_explicit_mutation(action)
         elif action_type == "run_shell":
             message = self._exec_run_shell(action)
@@ -1623,17 +1709,20 @@ class TreeLoop:
             r.ok = False
         return message
 
-    def _tool_message_indicates_failure(self, action_type: str, message: str) -> bool:
+    @staticmethod
+    def _tool_message_indicates_failure(action_type: str, message: str) -> bool:
         lowered = str(message or "").strip().lower()
         if not lowered:
             return False
         if action_type == "run_shell":
-            return lowered.startswith("run_shell: timed out") or lowered.startswith("run_shell: error executing")
-        if action_type == "diagnose":
+            exit_code = re.match(r"exit_code=(-?\d+)\b", lowered)
+            return lowered.startswith("run_shell:") or bool(exit_code and int(exit_code.group(1)) != 0)
+        if action_type in {"diagnose", "run_check", "run_route_check"}:
             match = re.search(r"\bissues=(\d+)\b", str(message or ""), re.IGNORECASE)
-            return lowered.startswith("diagnose:") or bool(match and int(match.group(1)) > 0)
-        if action_type == "run_check":
-            return lowered.startswith("run_check:")
+            exit_code = re.search(r"^exit_code=(-?\d+)\s*$", lowered, re.MULTILINE)
+            return lowered.startswith(f"{action_type}:") or bool(match and int(match.group(1)) > 0) or bool(exit_code and int(exit_code.group(1)) != 0)
+        if action_type == "end_edit_batch":
+            return bool(re.search(r"\bissues=[1-9]\d*", lowered)) or "backend_diagnostics_warning" in lowered
         return lowered.startswith(f"{action_type}:")
 
     def _exec_begin_edit_batch(self) -> str:
@@ -1642,7 +1731,10 @@ class TreeLoop:
 
     def _exec_end_edit_batch(self) -> str:
         self._signal_state["edit_batch_mode"] = False
-        return "edit batch ended; run a finite verification step if the related fixes are ready"
+        paths = sorted(self._deferred_diagnostic_paths)
+        self._deferred_diagnostic_paths.clear()
+        diagnostics = [self._run_backend_diagnostics_for_path(path, trigger_action="batch end") for path in paths]
+        return "\n".join(["edit batch ended; deferred diagnostics completed", *filter(None, diagnostics)])
 
     def _exec_write_file(self, action: Dict[str, Any]) -> str:
         rel_path = action.get("path", "")
@@ -1756,83 +1848,28 @@ class TreeLoop:
         return self._append_backend_diagnostics(f"patched {rel_path}", rel_path, trigger_action="patch")
 
     def _exec_explicit_mutation(self, action: Dict[str, Any]) -> str:
-        action_type = str(action.get("type", "") or "")
-        root = self.workspace_root
-        result: Dict[str, Any]
-
-        if action_type == "replace_range":
-            result = replace_range(str(action.get("path", "")), int(action.get("start_line", 0)), int(action.get("end_line", 0)), str(action.get("new_text", "") or ""), root=root)
-        elif action_type == "replace_snippet":
-            result = replace_snippet(str(action.get("path", "")), str(action.get("old_text", "") or ""), str(action.get("new_text", "") or ""), expected_occurrences=int(action.get("expected_occurrences", 1) or 1), replace_all=bool(action.get("all")), root=root)
-        elif action_type == "insert_before":
-            result = insert_before(str(action.get("path", "")), str(action.get("anchor_text", "") or ""), str(action.get("new_text", "") or ""), expected_occurrences=int(action.get("expected_occurrences", 1) or 1), root=root)
-        elif action_type == "insert_after":
-            result = insert_after(str(action.get("path", "")), str(action.get("anchor_text", "") or ""), str(action.get("new_text", "") or ""), expected_occurrences=int(action.get("expected_occurrences", 1) or 1), root=root)
-        elif action_type == "delete_range":
-            result = delete_range(str(action.get("path", "")), int(action.get("start_line", 0)), int(action.get("end_line", 0)), root=root)
-        elif action_type == "delete_snippet":
-            result = delete_snippet(str(action.get("path", "")), str(action.get("text", "") or ""), expected_occurrences=int(action.get("expected_occurrences", 1) or 1), root=root)
-        elif action_type == "append_block":
-            result = append_block(str(action.get("path", "")), str(action.get("new_text", "") or ""), root=root)
-        elif action_type == "prepend_block":
-            result = prepend_block(str(action.get("path", "")), str(action.get("new_text", "") or ""), root=root)
-        elif action_type == "replace_symbol":
-            result = replace_symbol(str(action.get("path", "")), str(action.get("symbol_name", "") or ""), str(action.get("symbol_kind", "") or ""), str(action.get("new_text", "") or ""), root=root)
-        elif action_type == "insert_symbol_member":
-            result = insert_symbol_member(str(action.get("path", "")), str(action.get("container_symbol", "") or ""), str(action.get("member_text", "") or ""), position=str(action.get("position", "end") or "end"), root=root)
-        elif action_type == "rename_symbol":
-            result = rename_symbol(str(action.get("path", "")), str(action.get("old_name", "") or ""), str(action.get("new_name", "") or ""), scope=str(action.get("scope", "file") or "file"), root=root)
-        elif action_type == "move_block":
-            result = move_block(str(action.get("path", "")), int(action.get("start_line", 0)), int(action.get("end_line", 0)), str(action.get("destination_anchor", "") or ""), position=str(action.get("position", "after") or "after"), root=root)
-        elif action_type == "create_file":
-            result = create_file(str(action.get("path", "")), str(action.get("content", "") or ""), overwrite=bool(action.get("overwrite")), root=root)
-        elif action_type == "delete_file":
-            result = delete_file(str(action.get("path", "")), root=root)
-        elif action_type == "rename_file":
-            result = rename_file(str(action.get("old_path", "") or ""), str(action.get("new_path", "") or ""), root=root)
-        elif action_type == "copy_file":
-            result = copy_file(str(action.get("source_path", "") or ""), str(action.get("destination_path", "") or ""), overwrite=bool(action.get("overwrite")), root=root)
-        elif action_type == "fill_template":
-            slots = action.get("slots")
-            result = fill_template(str(action.get("path", "")), slots if isinstance(slots, dict) else {}, root=root)
-        elif action_type == "batch_mutate":
-            operations = action.get("operations")
-            result = batch_mutate(operations if isinstance(operations, list) else [], atomic=bool(action.get("atomic")), root=root)
-        else:
-            return f"{action_type}: unsupported mutation action"
-
-        if not bool(result.get("ok")):
-            diagnostics = result.get("diagnostics") or []
-            if isinstance(diagnostics, list) and diagnostics and isinstance(diagnostics[0], dict):
-                message = str(diagnostics[0].get("message", result.get("reason", "mutation failed")) or "mutation failed")
-            else:
-                message = str(result.get("reason", "mutation failed") or "mutation failed")
-            return f"{action_type}: {message}"
-
-        if action_type == "batch_mutate":
-            applied_count = int(result.get("applied_count", 0) or 0)
-            return f"batch_mutate: applied {applied_count} operation(s)"
-
-        rel_path = str(result.get("file_path", "") or action.get("path", "") or action.get("new_path", "") or action.get("destination_path", "") or "")
-        if rel_path:
-            self.bridge.on_write_complete(rel_path)
-            self._refresh_recent_file_context(rel_path)
-
-        summary = action_type.replace("_", " ")
-        if action_type == "delete_file":
-            return f"deleted {rel_path}"
-        if action_type == "rename_file":
-            return f"renamed {action.get('old_path')} -> {action.get('new_path')}"
-        if action_type == "copy_file":
-            destination = str(action.get("destination_path", "") or rel_path)
-            return self._append_backend_diagnostics(f"copied {action.get('source_path')} -> {destination}", destination, trigger_action="copy")
-        if action_type == "create_file":
-            return self._append_backend_diagnostics(f"created {rel_path}", rel_path, trigger_action="create")
-        if rel_path:
-            return self._append_backend_diagnostics(f"{summary} {rel_path}", rel_path, trigger_action=action_type)
-        return f"{summary} completed"
+        action_type = str(action.get("type", ""))
+        try:
+            result, paths = execute_mutation(action, self.workspace_root)
+        except (ValueError, TypeError, OSError) as exc:
+            return f"{action_type}: {exc}"
+        action["_changed_paths"] = paths
+        for path in paths:
+            self.bridge.on_write_complete(path)
+            self._refresh_recent_file_context(path)
+        detail = json.dumps(compact_mutation_result(result), ensure_ascii=False)
+        if not result["ok"]:
+            return f"{action_type}: mutation failed; rolled_back={result['rolled_back']}\n{detail}"
+        message = f"applied {action_type.replace('_', ' ')}: {result['applied_count']} operation(s)\n{detail}"
+        for path in paths:
+            if (self.workspace_root / path).is_file():
+                message = self._append_backend_diagnostics(message, path, trigger_action=action_type)
+        return message
 
     def _append_backend_diagnostics(self, message: str, rel_path: str, *, trigger_action: str) -> str:
+        if self._signal_state.get("edit_batch_mode"):
+            self._deferred_diagnostic_paths.add(rel_path)
+            return f"{message}; diagnostics deferred until batch end"
         diagnostic_message = self._run_backend_diagnostics_for_path(rel_path, trigger_action=trigger_action)
         if not diagnostic_message:
             return message
@@ -1878,22 +1915,25 @@ class TreeLoop:
         return "\n".join(lines)
 
     def _rewrite_repo_shell_paths(self, command: str) -> str:
-        try:
-            tokens = shlex.split(command, posix=True)
-        except Exception:
+        if self.workspace_root == Path("/repo"):
             return command
 
-        rewritten: List[str] = []
-        for token in tokens:
-            if token == "/repo":
-                rewritten.append(str(self.workspace_root))
-                continue
-            if token.startswith("/repo/"):
-                repo_rel = token.removeprefix("/repo/")
-                rewritten.append(str((self.workspace_root / repo_rel).resolve()))
-                continue
-            rewritten.append(token)
-        return shlex.join(rewritten)
+        # Keep shell syntax and quoted scripts intact; rewriting every token
+        # through shlex.join turns &&, pipes and redirects into literal arguments.
+        words = r'''(?:[^\s|&;()<>\\'"]+|'[^']*'|"(?:\\.|[^"\\])*"|\\.)+'''
+
+        def rewrite(match: re.Match[str]) -> str:
+            word = match.group(0)
+            for quote in ("", "'", '"'):
+                prefix = quote + "/repo"
+                if not word.startswith(prefix):
+                    continue
+                suffix = word[len(prefix):]
+                if not suffix or suffix.startswith("/") or (quote and suffix.startswith(quote)):
+                    return shlex.quote(str(self.workspace_root)) + quote + suffix
+            return word
+
+        return re.sub(words, rewrite, command)
 
     def _maybe_git_rm_hint(self, command: str, result: subprocess.CompletedProcess[str]) -> str:
         normalized = str(command or "").strip()
@@ -1904,6 +1944,21 @@ class TreeLoop:
         if "pathspec" in lowered or "did not match any files" in lowered or "fatal:" in lowered:
             return "Hint: if the file is already untracked or already gone, use `shell rm -f <path>` instead."
         return ""
+
+    def _record_repository_changes(self, action: Dict[str, Any], before: RepositorySnapshot) -> None:
+        after = RepositorySnapshot.capture(self.workspace_root, previous=before)
+        self._repository_snapshot = after
+        action["_changed_paths"] = after.changed_since(before)
+        action["_change_accounting"] = {"complete": not (before.errors or after.errors),
+                                        "errors": (before.errors + after.errors)[:5]}
+        for path in action["_changed_paths"]:
+            self.bridge.on_write_complete(path)
+            self._refresh_recent_file_context(path)
+        if action.get("type") == "npm_command" or any(
+            Path(path).name in {"package.json", "package-lock.json", "pnpm-lock.yaml", "yarn.lock"}
+            for path in action["_changed_paths"]
+        ):
+            self._read_working_set.invalidate_dependencies()
 
     def _exec_run_shell(self, action: Dict[str, Any]) -> str:
         if not self.allow_shell:
@@ -1918,7 +1973,7 @@ class TreeLoop:
         command = str(action.get("command", "") or "").strip()
         if not command:
             return "run_shell: missing command"
-        if re.search(r"(?:^|(?:&&|\|\||;|\|)\s*)(?:/usr/bin/)?git(?:\s|$)", command):
+        if re.search(r"(?:^|(?:&&|\|\||;|\||\n)\s*)(?:/usr/bin/)?git(?:\s|$)", command):
             return (
                 "run_shell: direct git commands are disabled; use the typed `git <subcommand>` beta grammar "
                 "so path, history-rewrite, and push authorization policies are enforced"
@@ -1933,6 +1988,7 @@ class TreeLoop:
 
         command = self._rewrite_repo_shell_paths(command)
 
+        before = RepositorySnapshot.capture(self.workspace_root, previous=self._repository_snapshot)
         try:
             result = subprocess.run(
                 command,
@@ -1949,10 +2005,14 @@ class TreeLoop:
             return f"run_shell: timed out after 60s: {command}"
         except Exception as exc:
             return f"run_shell: error executing command: {exc}"
+        finally:
+            self._record_repository_changes(action, before)
 
         stdout = _strip_ansi(result.stdout).strip()
         stderr = _strip_ansi(result.stderr).strip()
         parts: List[str] = [f"exit_code={result.returncode}"]
+        if action["_changed_paths"]:
+            parts.append("observed_file_changes=" + json.dumps(action["_changed_paths"], ensure_ascii=False))
         if stdout:
             parts.append(f"stdout:\n{stdout}")
         if stderr:
@@ -2009,6 +2069,7 @@ class TreeLoop:
         except ValueError as exc:
             return str(exc)
 
+        before = RepositorySnapshot.capture(self.workspace_root, previous=self._repository_snapshot)
         try:
             result = subprocess.run(
                 argv,
@@ -2024,10 +2085,14 @@ class TreeLoop:
             return f"npm_command: timed out after 180s: {' '.join(argv)}"
         except Exception as exc:
             return f"npm_command: error executing command: {exc}"
+        finally:
+            self._record_repository_changes(action, before)
 
         stdout = _strip_ansi(result.stdout).strip()
         stderr = _strip_ansi(result.stderr).strip()
         parts: List[str] = [f"manager={manager}", f"exit_code={result.returncode}"]
+        if action["_changed_paths"]:
+            parts.append("observed_file_changes=" + json.dumps(action["_changed_paths"], ensure_ascii=False))
         if stdout:
             parts.append(f"stdout:\n{stdout}")
         if stderr:

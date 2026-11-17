@@ -17,13 +17,19 @@ import { createServer } from 'node:net';
 import { ArtifactProcessProxy } from './artifactProcessProxy';
 import { ArtifactModelBroker } from './artifactModelBroker';
 import { ArtifactGitService } from './artifactGit';
+import { ArtifactPrebuiltUpdates } from './artifactPrebuiltUpdates';
 import { runArtifactBlueprintTurn } from './artifactBlueprintAgent';
 import { sqliteCapability } from './artifactDependencies';
+import { createArtifactRunBridge } from './artifactRunRuntime';
+import type { ArtifactRuntimeBridge } from './artifactRuntimeBridge';
 
-interface Running { state: ArtifactRuntime; child?: ChildProcess; sandbox?: ArtifactSandbox; processProxy?: ArtifactProcessProxy; modelBroker?: ArtifactModelBroker; start?: Promise<ArtifactRuntime>; cancelled: boolean }
+interface Running { state: ArtifactRuntime; child?: ChildProcess; sandbox?: ArtifactSandbox; processProxy?: ArtifactProcessProxy; modelBroker?: ArtifactModelBroker; runtimeBridge?: ArtifactRuntimeBridge; start?: Promise<ArtifactRuntime>; cancelled: boolean }
 export class ArtifactsService {
   readonly preview = new ArtifactPreviewService();
   readonly git: ArtifactGitService;
+  readonly prebuiltUpdates: ArtifactPrebuiltUpdates;
+  private updatingPrebuilts = new Set<string>();
+  private changingApp = new Set<string>();
   readonly capabilities: ArtifactCapabilitiesService;
   private runtimes = new Map<string, Running>();
   private agentCreations = new Map<string, Promise<AgentService>>();
@@ -32,10 +38,12 @@ export class ArtifactsService {
   private contextTimer: NodeJS.Timeout;
   private syncing = false;
   private changingAccess = new Set<string>();
+  private changingRuntime = new Set<string>();
   private dependencyRepairs = new Map<string, ArtifactSandbox>();
   constructor(readonly library: ArtifactLibraryService, private readonly settings: RuntimeSettingsService, private readonly emit: (event: ArtifactEvent) => void, private readonly activeWorkspace: () => string = () => '') {
     this.git = new ArtifactGitService(library);
-    this.capabilities = new ArtifactCapabilitiesService(settings.artifactSetupDirectory(), this.preview, (progress) => this.emit({ type: 'setup', progress }));
+    this.prebuiltUpdates = new ArtifactPrebuiltUpdates(library, library.prebuiltUpdateHome());
+    this.capabilities = new ArtifactCapabilitiesService(settings.artifactSetupDirectory(), this.preview, (progress) => this.emit({ type: 'setup', progress }), undefined, undefined, undefined, settings);
     this.contextTimer = setInterval(() => { if (!this.syncing) void this.syncContexts(); }, 2000);
     this.contextTimer.unref();
   }
@@ -58,6 +66,7 @@ export class ArtifactsService {
     return {
       status: async () => [await sqliteCapability(artifact.root)],
       install: async (log: (text: string) => void) => {
+        if (this.updatingPrebuilts.has(id)) throw new Error('Wait for this prebuilt update to finish.');
         if (this.dependencyRepairs.has(id)) throw new Error('Artifact dependency repair is already running.');
         const sandbox = new ArtifactSandbox(artifact.root, [], await this.library.contextDirectory(id));
         this.dependencyRepairs.set(id, sandbox);
@@ -87,6 +96,8 @@ export class ArtifactsService {
     return this.capabilities.install(selection, await this.dependencySetup(id));
   }
   async start(id: string): Promise<ArtifactRuntime> {
+    if (this.updatingPrebuilts.has(id)) throw new Error('This prebuilt is being updated. Retry when the update finishes.');
+    if (this.changingRuntime.has(id)) throw new Error('Artifact runtime settings are being saved. Retry when saving finishes.');
     if (this.dependencyRepairs.has(id)) throw new Error('Artifact dependencies are being repaired. Retry when repair finishes.');
     if (this.changingAccess.has(id)) throw new Error('File permissions are changing. Retry when saving finishes.');
     const prior = this.runtimes.get(id);
@@ -94,7 +105,7 @@ export class ArtifactsService {
     if (prior?.state.status === 'running') return prior.state;
     const runtime: Running = { state: { id, status: 'starting', logs: '' }, cancelled: false };
     this.runtimes.set(id, runtime);
-    runtime.start = this.launch(id, runtime).catch(async (error) => { await runtime.processProxy?.close(); await runtime.modelBroker?.close(); if (!runtime.cancelled) this.update(runtime, { status: 'error', error: String(error) }); throw error; }).finally(() => { runtime.start = undefined; });
+    runtime.start = this.launch(id, runtime).catch(async (error) => { await runtime.runtimeBridge?.close(); await runtime.processProxy?.close(); await runtime.modelBroker?.close(); if (!runtime.cancelled) this.update(runtime, { status: 'error', error: String(error) }); throw error; }).finally(() => { runtime.start = undefined; });
     return runtime.start;
   }
   private update(runtime: Running, change: Partial<ArtifactRuntime>): void { Object.assign(runtime.state, change); this.emit({ type: 'runtime', runtime: { ...runtime.state } }); }
@@ -126,9 +137,27 @@ export class ArtifactsService {
     const variables = new Set((await this.library.apis(id)).apis.flatMap(api => Object.values(api.headerEnv).map(setting => typeof setting === 'string' ? setting : setting.env)));
     if (app.database.enabled && app.database.dialect !== 'sqlite') variables.add(app.database.connectionEnv);
     const secretEnv = [...variables].filter((name) => process.env[name] !== undefined).flatMap((name) => ['--env', name]);
+    const runtimeEnv: string[] = [];
+    if (artifact.access?.allowAgentRuntime) {
+      if (!artifact.runtime) throw new Error('Choose a provider and model before enabling the recorded beta runtime.');
+      const bridge = createArtifactRunBridge({
+        directory: path.join(this.settings.artifactSetupDirectory(), 'run-history', id),
+        selection: { ...artifact.runtime, backendScript: 'main_v2.py' },
+        settings: this.settings,
+        // Pin the preview’s granted paths, including its Workbench repository, for this bridge.
+        sandbox: async () => new ArtifactSandbox(baseSandbox.root, baseSandbox.reads, baseSandbox.context),
+        prepareHost: context => this.capabilities.hostContext(context),
+        log,
+        readiness: () => this.capabilities.modelReadiness(artifactSetupSelectionSchema.parse(artifact.runtime)),
+        configure: () => this.emit({ type: 'runtime-setup', id }),
+      });
+      runtime.runtimeBridge = bridge;
+      const connection = await bridge.start();
+      runtimeEnv.push('--env', `SKILLZ_RUNTIME_URL=${connection.url}`, '--env', `SKILLZ_RUNTIME_TOKEN=${connection.token}`);
+    }
     check(); this.update(runtime, { status: 'starting', error: undefined });
     return new Promise<ArtifactRuntime>((resolve, reject) => {
-      const child = sandbox.spawn(prepared.docker, prepared.args, ['sh', '-c', 'node /opt/skillz/prepare-dependencies.cjs && exec node --import tsx server/index.ts'], [...secretEnv, '--publish', `127.0.0.1::${port}`, '--env', `SKILLZ_ARTIFACT_PORT=${port}`, '--env', 'SKILLZ_ARTIFACT_HOST=0.0.0.0']);
+      const child = sandbox.spawn(prepared.docker, prepared.args, ['sh', '-c', 'node /opt/skillz/prepare-dependencies.cjs && exec node --import tsx server/index.ts'], [...secretEnv, ...runtimeEnv, '--publish', `127.0.0.1::${port}`, '--env', `SKILLZ_ARTIFACT_PORT=${port}`, '--env', 'SKILLZ_ARTIFACT_HOST=0.0.0.0']);
       runtime.child = child;
       let buffer = '', ready = false;
       const timeout = setTimeout(() => { void sandbox.stop(); reject(new Error('Artifact server did not become ready within three minutes. See logs.')); }, 180000);
@@ -151,7 +180,7 @@ export class ArtifactsService {
       child.on('error', (error) => { clearTimeout(timeout); reject(error); });
       child.on('exit', (code) => {
         clearTimeout(timeout);
-        void processProxy.close(); void runtime.modelBroker?.close();
+        void processProxy.close(); void runtime.modelBroker?.close(); void runtime.runtimeBridge?.close();
         if (runtime.cancelled) { if (!ready) reject(new Error('Artifact start cancelled.')); return; }
         const error = /EAI_AGAIN|ENOTFOUND/.test(runtime.state.logs) ? 'Docker could not resolve the package registry. Check Docker Desktop network/DNS settings and retry.' : `Artifact server exited with code ${code}. See Server logs.`;
         this.update(runtime, { status: 'error', url: undefined, error });
@@ -161,14 +190,46 @@ export class ArtifactsService {
   }
   async stop(id: string): Promise<void> {
     const runtime = this.runtimes.get(id);
-    if (runtime) { runtime.cancelled = true; await runtime.sandbox?.stop(); await runtime.processProxy?.close(); await runtime.modelBroker?.close(); if (runtime.child) await terminate(runtime.child); this.update(runtime, { status: 'stopped', url: undefined }); this.runtimes.delete(id); }
+    if (runtime) { runtime.cancelled = true; await runtime.runtimeBridge?.close(); await runtime.sandbox?.stop(); await runtime.processProxy?.close(); await runtime.modelBroker?.close(); if (runtime.child) await terminate(runtime.child); this.update(runtime, { status: 'stopped', url: undefined }); this.runtimes.delete(id); }
     await this.preview.close(id);
   }
+  async saveRuntime(id: string, selection: NonNullable<CreateArtifact['runtime']>): Promise<ArtifactRecord> {
+    if (this.updatingPrebuilts.has(id) || this.changingRuntime.has(id) || this.changingAccess.has(id) || this.dependencyRepairs.has(id) || this.runtimes.get(id)?.start) throw new Error('Wait for the current artifact operation to finish before saving runtime settings.');
+    this.changingRuntime.add(id);
+    try {
+      await this.library.find(id);
+      await this.stop(id);
+      const record = await this.library.saveRuntime(id, selection);
+      this.emit({ type: 'runtime-selection', record });
+      return record;
+    } finally { this.changingRuntime.delete(id); }
+  }
+  async saveApp(id: string, config: import('../../shared/artifacts').ArtifactAppConfig) {
+    if (this.updatingPrebuilts.has(id) || this.changingApp.has(id)) throw new Error('Wait for the current artifact update to finish.');
+    this.changingApp.add(id);
+    try { return await this.library.saveApp(id, config); }
+    finally { this.changingApp.delete(id); }
+  }
+  async applyPrebuiltUpdate(id: string, request: import('../../shared/artifacts').PrebuiltUpdateRequest) {
+    if (this.updatingPrebuilts.has(id) || this.changingApp.has(id) || this.changingRuntime.has(id) || this.changingAccess.has(id) || this.dependencyRepairs.has(id) || this.runtimes.get(id)?.start || this.agentStarts.has(id)) throw new Error('Wait for the current artifact operation to finish before updating this prebuilt.');
+    this.updatingPrebuilts.add(id);
+    try {
+      await this.library.find(id);
+      await this.stop(id);
+      await (await this.agentCreations.get(id))?.stop();
+      await this.agents.get(id)?.agent.stop();
+      const result = await this.prebuiltUpdates.apply(id, request);
+      this.emit({ type: 'prebuilt-updated', id });
+      return result;
+    } finally { this.updatingPrebuilts.delete(id); }
+  }
   async saveApis(id: string, config: ArtifactApis): Promise<void> {
+    if (this.updatingPrebuilts.has(id)) throw new Error('Wait for this prebuilt update to finish.');
     await this.library.saveApis(id, config);
     this.emit({ type: 'apis', id });
   }
   async blueprintAgent(id: string, message: string, history: ArtifactBlueprintChatMessage[], selection: ArtifactSetupSelection): Promise<ArtifactBlueprintAgentResult> {
+    if (this.updatingPrebuilts.has(id)) throw new Error('Wait for this prebuilt update to finish.');
     const current = await this.library.apis(id);
     const result = await runArtifactBlueprintTurn({
       current,
@@ -203,6 +264,7 @@ export class ArtifactsService {
     return this.preview.frame(id, runtime.url);
   }
   async agent(id: string): Promise<AgentService> {
+    if (this.updatingPrebuilts.has(id)) throw new Error('This prebuilt is being updated. Retry when the update finishes.');
     const existing = this.agents.get(id); if (existing) return existing.agent;
     const inFlight = this.agentCreations.get(id); if (inFlight) return inFlight;
     const creation = (async () => {
@@ -216,6 +278,7 @@ export class ArtifactsService {
     try { return await creation; } finally { this.agentCreations.delete(id); }
   }
   async startAgent(id: string, options: AgentStartOptions) {
+    if (this.updatingPrebuilts.has(id)) throw new Error('This prebuilt is being updated. Retry when the update finishes.');
     if (this.dependencyRepairs.has(id)) throw new Error('Artifact dependencies are being repaired. Retry when repair finishes.');
     if (this.changingAccess.has(id)) throw new Error('File permissions are changing. Retry when saving finishes.');
     if (this.agentStarts.has(id)) throw new Error('Artifact agent is already starting.');
@@ -224,6 +287,7 @@ export class ArtifactsService {
     try { return await pending; } finally { this.agentStarts.delete(id); }
   }
   async submit(id: string, text: string) {
+    if (this.updatingPrebuilts.has(id)) throw new Error('This prebuilt is being updated. Retry when the update finishes.');
     const artifact = await this.library.find(id);
     const app = await this.library.app(id); const apis = await this.library.apis(id);
     const grants = [...(artifact.access?.directories || []).map(({ id, label, access, allowProcessProxy, processProxyAllowlist }) => ({ path: `/reads/${id}`, label, access, allowProcessProxy: Boolean(allowProcessProxy), processProxyAllowlist })), ...(artifact.access?.allowWorkspaceRead ? [{ path: '/reads/workspace', label: 'Workbench repository, when open at session start', access: 'read', allowProcessProxy: Boolean(artifact.access.allowWorkspaceProcessProxy), processProxyAllowlist: artifact.access.workspaceProcessProxyAllowlist }] : [])];
@@ -255,6 +319,8 @@ export class ArtifactsService {
     return new ArtifactSandbox(artifact.root, reads, await this.library.contextDirectory(id));
   }
   async saveAccess(id: string, access: import('../../shared/artifacts').ArtifactAccess): Promise<void> {
+    if (this.updatingPrebuilts.has(id)) throw new Error('Wait for this prebuilt update to finish.');
+    if (this.changingRuntime.has(id)) throw new Error('Wait for runtime settings to finish saving.');
     if (this.changingAccess.has(id)) throw new Error('File permissions are already being saved.');
     this.changingAccess.add(id);
     try {

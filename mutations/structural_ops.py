@@ -18,6 +18,7 @@ from .common import (
     write_text,
 )
 from .models import MutationResult, make_mutation_result
+from symbol_ranges import exact_symbol_range
 
 
 def replace_symbol(
@@ -39,7 +40,7 @@ def replace_symbol(
     hash_result = with_expected_hash(workspace_root, rel_path, original, mutation_type, expected_hash)
     if hash_result is not None:
         return hash_result
-    symbol_range = _locate_symbol_range(rel_path, original, symbol_name, symbol_kind)
+    symbol_range = exact_symbol_range(Path(rel_path), original, symbol_name, symbol_kind, root=workspace_root)
     if symbol_range is None:
         return make_mutation_result(
             operation_id=f"{mutation_type}:{rel_path}",
@@ -49,7 +50,7 @@ def replace_symbol(
             applied=False,
             reason="symbol_not_found",
             before_hash=sha256_text(original),
-            diagnostics=[{"code": "SYMBOL_NOT_FOUND", "message": f"Could not resolve {symbol_kind} {symbol_name}."}],
+            diagnostics=[{"code": "SYMBOL_NOT_FOUND", "message": f"Could not resolve an unambiguous exact declaration for {symbol_name}. Script edits require a local TypeScript compiler. Use a unique snippet edit if the source cannot be parsed."}],
             preconditions={"symbol_resolves": False},
         )
     start_line, end_line = symbol_range

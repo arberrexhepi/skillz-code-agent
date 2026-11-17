@@ -23,11 +23,14 @@ export interface FileDocument {
   modifiedAt: number;
 }
 
+export type GitLineChanges = { additions: number; deletions: number } | { binary: true };
+
 export interface GitFileStatus {
   path: string;
   indexStatus: string;
   workTreeStatus: string;
   originalPath?: string;
+  lineChanges?: GitLineChanges;
 }
 
 export interface GitStatus {

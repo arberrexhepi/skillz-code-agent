@@ -81,6 +81,35 @@ Open a project folder, open **Runtime**, select the provider, model, and backend
 
 Submit a concrete request, such as “Add a ten-second countdown before the first drill.” Choose the discovery depth if prompted, review the plan, and approve execution. Follow the resulting changes, diagnostics, and validation report; pause or resume through the agent controls.
 
+The beta agent can inspect files with `inspect-file`, read declarations with `read-symbol`, search token usages with `references`, and read merged windows around a literal anchor with `read-context`. Inspection returns file hashes for guarded edits. `edit-symbol` replaces an unambiguous declaration; `edit-batch` applies up to 32 coordinated operations and defaults to rollback on failure. Python symbol edits use AST, and JS/TS/JSX/TSX symbol edits use the installed TypeScript compiler API.
+
+`find-regex <path> {"pattern":"...","replacement":"..."}` returns bounded Python regex matches, capture groups, file hashes and an optional replacement diff without editing. `replace-regex <path> {"pattern":"...","replacement":"...","expected_matches":1,"expected_hash":"..."}` applies an exact expected number of matches (default one) with an optional file-hash guard. JSON preserves multiline patterns and replacement escapes; capture references use `\\1` or `\\g<name>`, and flags are `imsxa`. Each command targets one file; multi-file changes use atomic `edit-batch` operations of type `replace_regex`. Evaluation runs in a text-only subprocess with a two-second deadline and file/output bounds.
+
+Related edits between `batch start` and `batch end` defer automatic diagnostics until completion. Repeated overlapping reads of unchanged source trigger recovery. A paused plan shows its actual stop reason and validation blocker; completed goals remain checkpointed. The compact live trace stays in `memory_observability.md`, while completed attempt reports with full traces are preserved in `.context/observability/` and cleared when the agent session is deleted.
+
+In `edit-batch`, each supplied `expected_hash` refers to the file at batch start, so multiple edits to one file can reuse the same inspected hash. Every declared hash is validated before any edits. Operations still run sequentially against the evolving source, with host guards advanced after internal writes; external edits are rejected and preserved during rollback. Prefer anchors, symbols or descending line ranges when earlier edits shift line numbers.
+
+Multiline shell programs can use a `shell <<<` / `>>>` block, native POSIX heredocs, or a quoted multiline argument such as `shell npx tsx -e '…'`. The body is delivered as one shell command; its lines are never separate agent actions. Unterminated blocks reject the command batch before dispatch. Existing shell permissions, execution timeouts and failure handling still apply. For example:
+
+```text
+shell <<<
+set -eu
+node -e '
+  console.log("finite verification");
+'
+>>>
+```
+
+Model results are separate from CLI previews: reads up to 30,000 characters are delivered whole, and larger outputs have explicit continuation guidance (structured results remain valid JSON). Compaction retains complete recent read packets within a 48,000-character budget and rebuilds reread coverage from that retained context. Recovery directs the agent toward the grounded repair and validation, with exact reads available for missing context. Failed checks remain validation failures even when the attempt made no edits; rerunning the same check successfully or explicitly deferring unrelated findings clears that evidence. Attempt traces record delivery size and include the model-visible output when it differs from the full tool result.
+
+Execution also has a delivery checkpoint independent of read freshness: after four turns without an edit attempt the host warns; after eight it permits only two focused reads of at most 120 lines and 6,000 characters each. Three further turns without an edit attempt or completed answer stop with an explicit delivery-stall reason. New ranges, restored context and passing checks do not renew this allowance. Discovery uses its existing planner budget. Compacted prompts and attempt metrics show the exact retained ranges and retention budget so the agent can work on a bounded edit surface instead of repeatedly scanning a large file.
+
+A newly surfaced source diagnostic opens one bounded repair window, even when exploration reads are exhausted. Remediation recommends a small window around the diagnostic line and keeps that source packet through compaction; source already retained satisfies the inspection gate. Repeating the same diagnostic does not renew recovery. Build, diagnose and route-check results treat nonzero exit codes or reported issues as failures in both raw and planner-backed execution. Format repair preserves the model's intended edit and archives the rejected response excerpt for inspection.
+
+Beta goal and phase transitions start a fresh conversation with at most 4,000 characters of outcomes and 32,000 characters of complete retained read packets. Durable facts and full audit history remain available; later compaction only summarizes the current goal's turns. Shell and structured dependency commands record content changes (including already-dirty files, additions and deletions), invalidate cached source, and require verification when files changed. Dependency/generated directories are excluded from this repository change accounting. Explicit `cat`, `read-line-range`, and `ls` can inspect dependency files under `/repo/node_modules/`; broad repository searches still skip dependencies, and workspace containment and `.git` protections still apply.
+
+Provider recovery preserves the current conversation and retained source; a retry does not trigger compaction. Blank replies receive one retry, while Gemini `MALFORMED_FUNCTION_CALL` / `UNEXPECTED_TOOL_CALL` replies receive up to two targeted retries requesting one small text command, with a total ceiling of three recovery requests per execution turn. These requests retain usage accounting without spending execution turns or restarting discovery. Gemini native function calling is explicitly disabled (`mode=NONE`); host text commands remain available. Persistent failure pauses the current goal with its provider reason. Traces record response IDs, finish/block reasons, part types, and rejected protocol output; hidden reasoning content is excluded.
+
 An illustrative CLI exchange using the same planner workflow:
 
 ```text

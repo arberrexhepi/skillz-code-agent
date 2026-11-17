@@ -15,6 +15,7 @@ goal_runner.md
 .venv
 /.vscode/
 memory_observability.md
+.context/observability/
 .recent_repositories.md
 .DS_Store
 vscode-extension/dist/

@@ -53,13 +53,13 @@ export const defaultArtifactApp = (): ArtifactAppConfig => artifactAppSchema.par
 export const artifactAgentRuntimeSchema = z.object({ provider: z.string().min(1).max(80), model: z.string().min(1).max(200), backendScript: z.enum(['main.py', 'main_v2.py', 'live_test_loop.py']) });
 export const packageScriptName = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9:._-]{0,127}$/);
 export const readDirectorySchema = z.object({ id: artifactId.refine((id) => !['workspace', 'repo', 'context'].includes(id), 'This ID is reserved.'), label: z.string().min(1).max(200), path: z.string().min(1).max(4096), access: z.enum(['read', 'write']).default('read'), allowProcessProxy: z.boolean().optional(), processProxyAllowlist: z.array(packageScriptName).max(100).optional() });
-export const artifactAccessSchema = z.object({ directories: z.array(readDirectorySchema).max(30).default([]), allowWorkspaceRead: z.boolean().default(false), allowWorkspaceProcessProxy: z.boolean().optional(), workspaceProcessProxyAllowlist: z.array(packageScriptName).max(100).optional() }).superRefine((value, context) => {
+export const artifactAccessSchema = z.object({ allowAgentRuntime: z.boolean().optional(), directories: z.array(readDirectorySchema).max(30).default([]), allowWorkspaceRead: z.boolean().default(false), allowWorkspaceProcessProxy: z.boolean().optional(), workspaceProcessProxyAllowlist: z.array(packageScriptName).max(100).optional() }).superRefine((value, context) => {
   if (new Set(value.directories.map((item) => item.id)).size !== value.directories.length) context.addIssue({ code: 'custom', message: 'Folder IDs must be unique.' });
   if (value.allowWorkspaceProcessProxy && !value.allowWorkspaceRead) context.addIssue({ code: 'custom', message: 'Process Proxy for the active repository requires repository read access.' });
 });
 export type ReadDirectory = z.infer<typeof readDirectorySchema>;
 export type ReadDirectoryChoice = ReadDirectory & { packageScripts: string[] };
-export interface PrebuiltArtifact { id: string; title: string; description: string; requiresWriteAccess: boolean; requiresProcessProxy?: boolean; }
+export interface PrebuiltArtifact { id: string; title: string; description: string; previousTitles?: string[]; requiresWriteAccess: boolean; requiresProcessProxy?: boolean; usesAgentRuntime?: boolean; }
 export type ArtifactAccess = z.infer<typeof artifactAccessSchema>;
 export const createArtifactSchema = z.object({ title: z.string().trim().min(1).max(120), prompt: z.string().trim().min(1).max(20000), sourceRoot: z.string().max(4096), shareFacts: z.boolean(), shareMemory: z.boolean(), runtime: artifactAgentRuntimeSchema.optional(), access: artifactAccessSchema.optional(), app: artifactAppSchema.optional() });
 export type CreateArtifact = z.infer<typeof createArtifactSchema>;
@@ -79,7 +79,25 @@ export interface ArtifactSetupProgress { running: boolean; step: string; log: st
 export interface ArtifactDockerCleanupPlan { currentImage: string; obsoleteImages: string[]; orphanedVolumes: string[]; preservedImages: string[]; preservedVolumes: string[]; }
 export interface ArtifactDockerCleanupResult extends ArtifactDockerCleanupPlan { removedImages: string[]; removedVolumes: string[]; failures: string[]; }
 export interface ArtifactAppSaveResult { migrated: boolean; commit?: string; checkpointCommit?: string; }
-export type ArtifactEvent = { type: 'setup'; progress: ArtifactSetupProgress } | { type: 'runtime'; runtime: ArtifactRuntime } | { type: 'apis'; id: string } | { type: 'agent'; id: string; event: AgentEvent };
+export interface PrebuiltUpdateStatus { available: boolean; changedFiles: number; error?: string }
+export interface PrebuiltUpdateFile {
+  path: string;
+  kind: 'added' | 'changed' | 'removed';
+  action: 'replace' | 'merge' | 'keep' | 'current' | 'conflict';
+  installed?: string;
+  incoming?: string;
+  result?: string;
+  binary: boolean;
+  truncated: boolean;
+}
+export interface PrebuiltUpdateReview { token: string; files: PrebuiltUpdateFile[] }
+export const prebuiltUpdateRequestSchema = z.object({
+  token: z.string().regex(/^[a-f0-9]{64}$/),
+  resolutions: z.record(z.string().min(1).max(4096), z.enum(['installed', 'incoming'])).default({}),
+});
+export type PrebuiltUpdateRequest = z.infer<typeof prebuiltUpdateRequestSchema>;
+export interface PrebuiltUpdateResult { updatedFiles: number; backup: string }
+export type ArtifactEvent = { type: 'setup'; progress: ArtifactSetupProgress } | { type: 'runtime'; runtime: ArtifactRuntime } | { type: 'runtime-setup'; id: string } | { type: 'runtime-selection'; record: ArtifactRecord } | { type: 'prebuilt-updated'; id: string } | { type: 'apis'; id: string } | { type: 'agent'; id: string; event: AgentEvent };
 export const previewInputSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('click'), x: z.number().min(0).max(3000), y: z.number().min(0).max(3000) }),
   z.object({ type: z.literal('wheel'), dx: z.number().min(-3000).max(3000), dy: z.number().min(-3000).max(3000) }),
@@ -102,10 +120,14 @@ export interface ArtifactsApi {
   create(options: CreateArtifact): Promise<ArtifactRecord>;
   prebuilts(): Promise<PrebuiltArtifact[]>;
   installPrebuilt(id: string, access: ArtifactAccess, runtime?: z.infer<typeof artifactAgentRuntimeSchema>): Promise<ArtifactRecord>;
+  prebuiltUpdateStatus(id: string): Promise<PrebuiltUpdateStatus>;
+  reviewPrebuiltUpdate(id: string): Promise<PrebuiltUpdateReview>;
+  applyPrebuiltUpdate(id: string, request: PrebuiltUpdateRequest): Promise<PrebuiltUpdateResult>;
   chooseReadDirectory(): Promise<ReadDirectoryChoice | null>;
   access(id: string): Promise<ArtifactAccess>;
   processScripts(id: string): Promise<Record<string, string[]>>;
   saveAccess(id: string, access: ArtifactAccess): Promise<void>;
+  saveRuntime(id: string, runtime: z.infer<typeof artifactAgentRuntimeSchema>): Promise<ArtifactRecord>;
   apis(id: string): Promise<ArtifactApis>;
   saveApis(id: string, config: ArtifactApis): Promise<void>;
   blueprintAgent(id: string, message: string, history: ArtifactBlueprintChatMessage[], selection: ArtifactSetupSelection): Promise<ArtifactBlueprintAgentResult>;

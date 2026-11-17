@@ -14,12 +14,13 @@ BASE_RUNTIME_PROVIDER_CATALOG: Dict[str, Dict[str, Any]] = {
         "env_var": "OPENAI_API_KEY",
         "default_model": "gpt-5.4",
         "models": [
+            "gpt-5.6-terra",
+            "gpt-5.6-sol",
+            "gpt-5.6-luna",
+            "gpt-5.5",
             "gpt-5.4",
-            "gpt-5.4-mini",
-            "gpt-5.4-nano",
-            "gpt-4.1",
-            "gpt-4.1-mini",
-            "o4-mini",
+            "gpt-6.1-sol",
+            "gpt-6-astra"
         ],
         "notes": "Uses the Responses API. Any compatible OpenAI model string is allowed.",
     },
@@ -34,6 +35,8 @@ BASE_RUNTIME_PROVIDER_CATALOG: Dict[str, Dict[str, Any]] = {
             "gpt-5.6-luna",
             "gpt-5.5",
             "gpt-5.4",
+            "gpt-6.1-sol",
+            "gpt-6-astra"
         ],
         "notes": (
             "Uses the locally installed Codex CLI and its ChatGPT-managed subscription session. "
@@ -82,6 +85,10 @@ BASE_RUNTIME_PROVIDER_CATALOG: Dict[str, Dict[str, Any]] = {
             "gemini-2.5-pro",
             "gemini-2.5-flash",
             "gemini-2.5-flash-lite",
+            "gemini-3.8-flash",
+            "gemini-4-argon",
+            "gemini-4-carbon",
+            "gemini-4-hydrogen",
         ],
         "notes": "Any valid Gemini model string is allowed.",
     },

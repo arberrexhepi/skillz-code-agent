@@ -2,7 +2,9 @@
 
 import json
 import os
+import shlex
 import subprocess
+import sys
 import tempfile
 import textwrap
 import unittest
@@ -615,6 +617,62 @@ class TestTreeLoop(unittest.TestCase):
         first_turn_output = "\n".join(r.output for r in result.turns[0].results)
         self.assertIn("exit_code=0", first_turn_output)
         self.assertIn(self.tmpdir, first_turn_output)
+
+    def test_shell_mutation_is_visible_to_the_next_read_in_the_same_turn(self):
+        manifest = Path(self.tmpdir, "package.json")
+        manifest.write_text('{"dependencies": {}}\n', encoding="utf-8")
+        script = "from pathlib import Path; Path('package.json').write_text('{\"dependencies\": {\"three\": \"installed\"}}\\n')"
+        install = f"shell {shlex.quote(sys.executable)} -c {shlex.quote(script)}"
+        model = FakeModel([f"{install}\ncat /repo/package.json\nfinish done"])
+        loop = TreeLoop(model=model, workspace_root=Path(self.tmpdir), verbose=False, allow_shell=True)
+        loop.setup()
+        loop.bridge.tree.preload_files(["package.json"])
+
+        result = loop.run("Install and verify a dependency")
+
+        self.assertTrue(result.finished)
+        self.assertIn('"three": "installed"', result.turns[0].results[1].output)
+
+    def test_strategy_dispatches_dependencies_before_reading_or_substituting_outputs(self):
+        model = FakeModel([
+            "s2: write /repo/installed.txt ready\n"
+            "s2 -> s1: cat /repo/installed.txt\n"
+            "s1 -> s3: write /repo/verified.txt {s1}",
+            "finish done",
+        ])
+        observed = []
+        loop = TreeLoop(model=model, workspace_root=Path(self.tmpdir), verbose=False,
+                        command_observer=lambda command, result: observed.append(command))
+
+        result = loop.run("Write then read a dependency")
+
+        self.assertTrue(result.finished)
+        self.assertIn("ready", result.turns[0].results[1].output)
+        self.assertIn("ready", Path(self.tmpdir, "verified.txt").read_text())
+        self.assertTrue(observed[0].startswith("[s2]"), observed)
+        self.assertTrue(observed[1].startswith("[s1]"), observed)
+
+    def test_shell_preserves_operators_and_quoted_arguments_when_mapping_repo_paths(self):
+        loop = TreeLoop(model=FakeModel([]), workspace_root=Path(self.tmpdir), verbose=False, allow_shell=True)
+
+        output = loop._exec_run_shell({
+            "type": "run_shell",
+            "command": "cd /repo && printf '%s\\n' 'literal && text' > /repo/note.txt && cat /repo/note.txt | cat",
+        })
+
+        self.assertIn("exit_code=0", output)
+        self.assertIn("literal && text", output)
+        self.assertEqual(Path(self.tmpdir, "note.txt").read_text(), "literal && text\n")
+
+    def test_failed_shell_stops_later_commands_before_they_execute(self):
+        model = FakeModel(["shell false\nfact test/state/after should-not-exist\nfinish done", "finish done"])
+        loop = TreeLoop(model=model, workspace_root=Path(self.tmpdir), verbose=False, allow_shell=True)
+
+        result = loop.run("Stop on failure")
+
+        self.assertFalse(result.turns[0].results[0].ok)
+        self.assertIn("skipped after prior command failure", result.turns[0].results[1].output)
+        self.assertIsNone(loop.bridge.tree.get_fact("test", "state", "after"))
 
     def test_run_shell_action_is_disabled_when_env_flag_is_false(self):
         model = FakeModel([

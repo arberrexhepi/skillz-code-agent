@@ -4,6 +4,7 @@ import { continuousIsActive } from '../../../../shared/agentCore';
 import type { PlannerPlan } from '../../../../shared/agentTypes';
 import { useAgentWorkspace } from '../../agent/agentWorkspace';
 import { PlanDetails } from './PlanDetails';
+import { PlanPauseReason } from './PlanPauseReason';
 
 export function PlanDecisionCard(): React.JSX.Element {
   const agent = useAgentWorkspace();
@@ -86,6 +87,7 @@ export function PlanDecisionCard(): React.JSX.Element {
     {plan && <section className="agent-decision plan-decision">
       <header><span>DECISION</span><strong>{title}</strong><small>{plan.goals?.length || 0} goals</small></header>
       {plan.summary && <p className="plan-preview-summary"><PathText>{plan.summary}</PathText></p>}
+      <PlanPauseReason planner={planner} />
       <div className="decision-buttons"><button type="button" className="primary-button" onClick={() => openReview()}>Review full plan ↗</button><button type="button" disabled={busy} onClick={() => openReview(true)}>Suggest plan changes</button></div>
       {!review && error && <p role="alert" className="plan-error"><PathText>{error}</PathText></p>}
     </section>}
@@ -101,6 +103,7 @@ export function PlanDecisionCard(): React.JSX.Element {
         </header>
         <div className="plan-review-body" tabIndex={0} role="region" aria-label="Full plan details"><PlanDetails plan={review} /></div>
         <footer>
+          <PlanPauseReason planner={planner} />
           {changed && !sending && <p role="status">The plan has changed. Close this review and open the current plan before deciding.</p>}
           {error && <p role="alert" className="plan-error"><PathText>{agent.state.notice || error}</PathText> Your feedback is preserved.</p>}
           {editing ? <form onSubmit={(event) => { event.preventDefault(); if (!changed) void act('revise_plan', review); }}>

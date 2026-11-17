@@ -16,7 +16,10 @@ class CodexDiscoveryTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.bin = self.root / "OpenAI" / "Codex" / "bin"
         self.addCleanup(patch.stopall)
-        patch.dict(os.environ, {"LOCALAPPDATA": str(self.root), "CODEX_CLI_PATH": ""}).start()
+        patch.dict(os.environ, {"LOCALAPPDATA": str(self.root), "APPDATA": str(self.root / 'Roaming'), "CODEX_CLI_PATH": "", "CODEX_INSTALL_DIR": "", "PROCESSOR_ARCHITEW6432": ""}).start()
+        patch.object(Path, 'home', return_value=self.root / 'home').start()
+        patch.object(codex_subscription.platform, 'machine', return_value='AMD64').start()
+        patch.object(codex_subscription, '_MACOS_APPLICATIONS', self.root / 'Applications').start()
         patch.object(codex_subscription.sys, "platform", "win32").start()
         self.which = patch.object(codex_subscription.shutil, "which", return_value=None).start()
 
@@ -100,6 +103,73 @@ class CodexDiscoveryTests(unittest.TestCase):
         with patch.object(codex_subscription.sys, "platform", "linux"):
             with self.assertRaisesRegex(RuntimeError, "Codex CLI was not found"):
                 codex_subscription.resolve_codex_executable()
+
+    def create_file(self, candidate):
+        candidate.parent.mkdir(parents=True, exist_ok=True)
+        candidate.write_bytes(b'fixture')
+        return str(candidate)
+
+    def test_current_macos_bundle_without_shell_path(self):
+        expected = self.create_file(self.root / 'Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex')
+        with patch.object(codex_subscription.sys, 'platform', 'darwin'):
+            self.assertEqual(codex_subscription.resolve_codex_executable(), expected)
+
+    def test_macos_user_applications_and_legacy_layout(self):
+        expected = self.create_file(Path.home() / 'Applications/Codex.app/Contents/Resources/codex')
+        with patch.object(codex_subscription.sys, 'platform', 'darwin'):
+            self.assertEqual(codex_subscription.resolve_codex_executable(), expected)
+
+    def test_macos_standalone_default_without_shell_path(self):
+        expected = self.create_file(Path.home() / '.local/bin/codex')
+        with patch.object(codex_subscription.sys, 'platform', 'darwin'):
+            self.assertEqual(codex_subscription.resolve_codex_executable(), expected)
+
+    def test_windows_standalone_default_without_shell_path(self):
+        expected = self.create_file(self.root / 'Programs/OpenAI/Codex/bin/codex.exe')
+        self.assertEqual(codex_subscription.resolve_codex_executable(), expected)
+
+    def test_custom_standalone_install_dir(self):
+        directory = self.root / 'custom standalone'
+        os.environ['CODEX_INSTALL_DIR'] = str(directory)
+        expected = self.create_file(directory / 'codex.exe')
+        self.assertEqual(codex_subscription.resolve_codex_executable(), expected)
+
+    def test_windows_npm_path_shim_resolves_optional_native_package(self):
+        prefix = self.root / 'npm prefix'
+        self.which.return_value = self.create_file(prefix / 'codex.cmd')
+        expected = self.create_file(prefix / 'node_modules/@openai/codex-win32-x64/vendor/x86_64-pc-windows-msvc/bin/codex.exe')
+        self.assertEqual(codex_subscription.resolve_codex_executable(), expected)
+
+    def test_windows_npm_nested_optional_native_package(self):
+        prefix = self.root / 'Roaming/npm'
+        expected = self.create_file(prefix / 'node_modules/@openai/codex/node_modules/@openai/codex-win32-x64/vendor/x86_64-pc-windows-msvc/bin/codex.exe')
+        self.assertEqual(codex_subscription.resolve_codex_executable(), expected)
+
+    def test_windows_npm_arm64_legacy_vendor_layout(self):
+        prefix = self.root / 'Roaming/npm'
+        expected = self.create_file(prefix / 'node_modules/@openai/codex/vendor/aarch64-pc-windows-msvc/bin/codex.exe')
+        with patch.object(codex_subscription.platform, 'machine', return_value='ARM64'):
+            self.assertEqual(codex_subscription.resolve_codex_executable(), expected)
+
+    def test_incomplete_npm_shim_falls_back_to_native_desktop_install(self):
+        self.which.return_value = self.create_file(self.root / 'npm/codex.cmd')
+        expected = self.executable('desktop/codex.exe')
+        self.assertEqual(codex_subscription.resolve_codex_executable(), expected)
+
+    def test_windows_arm64_can_use_x64_npm_install(self):
+        expected = self.create_file(self.root / 'Roaming/npm/node_modules/@openai/codex-win32-x64/vendor/x86_64-pc-windows-msvc/bin/codex.exe')
+        with patch.object(codex_subscription.platform, 'machine', return_value='ARM64'):
+            self.assertEqual(codex_subscription.resolve_codex_executable(), expected)
+
+    def test_windows_arm64_discovery_from_an_emulated_x64_host(self):
+        os.environ['PROCESSOR_ARCHITEW6432'] = 'ARM64'
+        expected = self.create_file(self.root / 'Roaming/npm/node_modules/@openai/codex-win32-arm64/vendor/aarch64-pc-windows-msvc/bin/codex.exe')
+        self.assertEqual(codex_subscription.resolve_codex_executable(), expected)
+
+    def test_windows_rejects_explicit_shell_launcher(self):
+        os.environ['CODEX_CLI_PATH'] = self.create_file(self.root / 'codex.cmd')
+        with self.assertRaisesRegex(RuntimeError, 'Choose codex.exe'):
+            codex_subscription.resolve_codex_executable()
 
 
 if __name__ == "__main__":

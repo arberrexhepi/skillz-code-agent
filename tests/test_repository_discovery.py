@@ -169,7 +169,8 @@ class WorkspaceDiscoveryTests(unittest.TestCase):
             excluded = self.root / folder
             excluded.mkdir()
             (excluded / "secret.py").write_text("def HiddenMarker(): pass\n", encoding="utf-8")
-        self.assert_marker_is_inaccessible("/repo/node_modules/secret.py")
+        self.assert_marker_is_inaccessible("/repo/.git/secret.py")
+        self.assertIn("HiddenMarker", ContextTree(self.root).cat("/repo/node_modules/secret.py"))
 
     def test_workspace_searches_do_not_follow_external_file_symlinks(self) -> None:
         outside = tempfile.TemporaryDirectory()

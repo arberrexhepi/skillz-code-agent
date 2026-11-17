@@ -12,12 +12,22 @@ const defaultRuntime: RuntimeSelection = {
   backendScript: 'main.py',
 };
 
-export function AgentWorkspaceProvider({ children, api = window.workbench.agent, initialRuntime = defaultRuntime }: { children: React.ReactNode; api?: WorkbenchApi['agent']; initialRuntime?: RuntimeSelection }): React.JSX.Element {
+interface AgentWorkspaceProviderProps {
+  children: React.ReactNode;
+  api?: WorkbenchApi['agent'];
+  initialRuntime?: RuntimeSelection;
+  savedRuntime?: RuntimeSelection;
+}
+
+export function AgentWorkspaceProvider({ children, api = window.workbench.agent, initialRuntime = defaultRuntime, savedRuntime }: AgentWorkspaceProviderProps): React.JSX.Element {
   const [state, dispatch] = useReducer(reduceAgentUi, initialAgentUiState);
   const [runtime, setRuntimeState] = useState(initialRuntime);
   const [backoff, setBackoffState] = useState<AgentBackoff>();
   const starting = useRef<Promise<boolean> | null>(null);
   const runtimeOptionsRequest = useRef(0);
+  // Config saves are explicit selections for the next launch. Keep the active
+  // process identity until stopped, without remounting its conversation.
+  const appliedSavedRuntime = useRef(savedRuntime);
 
   useEffect(() => api.onEvent((event: AgentEvent) => {
     if (event.type === 'state') dispatch({ type: 'bridge-state', state: event.state });
@@ -67,12 +77,23 @@ export function AgentWorkspaceProvider({ children, api = window.workbench.agent,
     return () => { runtimeOptionsRequest.current++; };
   }, [loadRuntimeOptions]);
 
+  useEffect(() => {
+    if (!savedRuntime || savedRuntime === appliedSavedRuntime.current || state.status === 'running' || state.status === 'starting' || state.pendingAction) return;
+    appliedSavedRuntime.current = savedRuntime;
+    setRuntimeState({ ...savedRuntime });
+    void loadRuntimeOptions(savedRuntime.provider, savedRuntime.model);
+  }, [savedRuntime, state.status, state.pendingAction, loadRuntimeOptions]);
+
   const start = useCallback(async (): Promise<boolean> => {
     dispatch({ type: 'pending', action: 'start' });
     dispatch({ type: 'notice', message: '' });
     try {
-      const ok = accept(await api.start(runtime));
-      if (ok) await loadRuntimeOptions(runtime.provider, runtime.model);
+      // Resolve a pending Config save here too: Start may precede the idle sync.
+      const selection = savedRuntime && savedRuntime !== appliedSavedRuntime.current ? savedRuntime : runtime;
+      appliedSavedRuntime.current = savedRuntime;
+      setRuntimeState({ ...selection });
+      const ok = accept(await api.start(selection));
+      if (ok) await loadRuntimeOptions(selection.provider, selection.model);
       return ok;
     } catch (cause) {
       dispatch({ type: 'status', status: 'error', message: cleanError(cause) });
@@ -80,7 +101,7 @@ export function AgentWorkspaceProvider({ children, api = window.workbench.agent,
     } finally {
       dispatch({ type: 'pending', action: '' });
     }
-  }, [accept, loadRuntimeOptions, runtime, api]);
+  }, [accept, loadRuntimeOptions, runtime, savedRuntime, api]);
 
   const ensureRunning = useCallback(async (): Promise<boolean> => {
     if (state.status === 'running') return true;
