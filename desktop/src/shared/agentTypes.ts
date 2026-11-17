@@ -241,6 +241,9 @@ export interface PlannerState extends JsonMap {
   last_execution_summary?: string;
   last_next_steps?: string[];
   execution_paused?: boolean;
+  paused_failed_goal_id?: string;
+  paused_failed_goal_title?: string;
+  paused_failure_reason?: string;
   paused_plan?: PlannerPlan | null;
   paused_completed_results?: GoalExecutionResult[];
   resume_checkpoint?: { mode?: string; total_goal_count?: number; completed_goal_count?: number; completed_goal_ids?: string[]; next_goal_index?: number; next_goal?: PlannerGoal | null; remaining_goals?: Array<{ goal_id?: string; title?: string; index?: number }> } | null;

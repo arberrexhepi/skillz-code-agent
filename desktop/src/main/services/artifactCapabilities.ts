@@ -9,11 +9,12 @@ import { dockerCommand, ensureSandboxImage, harnessRoot, sandboxImageReady } fro
 import { command, runLogged, spawnModelHelper, terminate } from './artifactProcess';
 import { pythonEnvironment, resolvePythonCommand, type PythonCommand } from './python';
 import { readJson, writeJson } from './artifactLibrary';
+import type { RuntimeSettingsService } from './runtimeSettings';
 
 const providerKeys: Record<string, string> = { openai: 'OPENAI_API_KEY', gemini: 'GEMINI_API_KEY', anthropic: 'ANTHROPIC_API_KEY', meta: 'META_AI_API_KEY' };
 const providerLabels: Record<string, string> = { openai: 'OpenAI', gemini: 'Google Gemini', anthropic: 'Anthropic', meta: 'Meta AI' };
 const packages: Record<string, string> = { gemini: 'google-genai', openai: 'openai', anthropic: 'anthropic', meta: 'openai', local: 'openai', ollama: 'openai', 'ollama-local': 'openai', 'ollama-runpod': 'openai' };
-interface ProviderProbe { sdkReady: boolean; keyReady: boolean; keyName?: string; label: string; }
+interface ProviderProbe { sdkReady: boolean; keyReady: boolean; keyName?: string; label: string; detail?: string; }
 export interface ArtifactDependencySetup {
   status(): Promise<ArtifactCapability[]>;
   install(log: (text: string) => void): Promise<void>;
@@ -22,7 +23,7 @@ export class ArtifactCapabilitiesService {
   private progress: ArtifactSetupProgress = { running: false, step: '', log: '' };
   private installation?: Promise<ArtifactCapabilities>;
   private keyQueue: Promise<unknown> = Promise.resolve();
-  constructor(private readonly home: string, private readonly preview: ArtifactPreviewService, private readonly emit: (progress: ArtifactSetupProgress) => void, private readonly source = harnessRoot, private readonly storage = safeStorage, private readonly tools = { resolvePythonCommand, command, runLogged, dockerCommand, sandboxImageReady, ensureSandboxImage }) {}
+  constructor(private readonly home: string, private readonly preview: ArtifactPreviewService, private readonly emit: (progress: ArtifactSetupProgress) => void, private readonly source = harnessRoot, private readonly storage = safeStorage, private readonly tools = { resolvePythonCommand, command, runLogged, dockerCommand, sandboxImageReady, ensureSandboxImage }, private readonly runtimeSettings?: RuntimeSettingsService) {}
   snapshot(): ArtifactSetupProgress { return { ...this.progress }; }
   private update(change: Partial<ArtifactSetupProgress>): void { this.progress = { ...this.progress, ...change }; this.emit(this.snapshot()); }
   private log = (text: string): void => { this.update({ log: (this.progress.log + text).slice(-12000) }); };
@@ -64,6 +65,7 @@ export class ArtifactCapabilitiesService {
     await pending;
   }
   private async environment(provider: string, base = pythonEnvironment()): Promise<NodeJS.ProcessEnv> {
+    base = await this.runtimeSettings?.environment(base) || base;
     const name = providerKeys[provider];
     if (!name) return base;
     const saved = (await this.keys())[name];
@@ -98,6 +100,13 @@ export class ArtifactCapabilitiesService {
       child.stdin?.end(JSON.stringify(selection));
     });
   }
+  async modelReadiness(selection: ArtifactSetupSelection): Promise<{ ready: boolean; detail?: string }> {
+    try {
+      const env = await this.environment(selection.provider);
+      const probe = await this.probe(await this.python(this.source(), env), env, selection);
+      return { ready: probe.sdkReady && probe.keyReady, detail: probe.detail || (!probe.sdkReady ? 'Install the selected provider SDK in Setup.' : !probe.keyReady ? 'Configure the selected provider credentials in Setup or Vault.' : undefined) };
+    } catch (error) { return { ready: false, detail: String(error) }; }
+  }
   async status(selection: ArtifactSetupSelection, dependencies?: ArtifactDependencySetup): Promise<ArtifactCapabilities> {
     const source = this.source();
     const pythonItems = (async (): Promise<ArtifactCapability[]> => {
@@ -107,7 +116,8 @@ export class ArtifactCapabilitiesService {
       const items: ArtifactCapability[] = [{ id: 'python', label: 'Python', ready: true, detail: [python.executable, ...python.args].join(' ') }];
       try {
         const probe = await this.probe(python, await this.environment(selection.provider), selection);
-        items.push({ id: 'provider', label: `${probe.label} support`, ready: probe.sdkReady, detail: packages[selection.provider] ? (probe.sdkReady ? 'Provider SDK installed.' : `Install ${packages[selection.provider]} in a workbench-managed Python environment.`) : 'Uses the local Codex CLI; sign in under Agent runtime below.', installable: !probe.sdkReady && Boolean(packages[selection.provider]) });
+        items.push({ id: 'provider', label: `${probe.label} support`, ready: probe.sdkReady, detail: probe.detail || (packages[selection.provider] ? (probe.sdkReady ? 'Provider SDK installed.' : `Install ${packages[selection.provider]} in a workbench-managed Python environment.`) : 'Uses the local Codex CLI; sign in under Agent runtime below.'), installable: !probe.sdkReady && Boolean(packages[selection.provider]) });
+        if (selection.provider === 'codex-subscription') items.push({ id: 'credentials', label: 'ChatGPT sign-in', ready: probe.keyReady, detail: probe.keyReady ? 'Signed in to Codex with ChatGPT.' : 'Use the Codex sign-in controls under Agent runtime.' });
         if (probe.keyName) items.push({ id: 'credentials', label: 'Provider key', ready: probe.keyReady, optional: true, detail: probe.keyReady ? 'Configured. The key has not been validated with the provider.' : `Add ${probe.keyName} in Vault to connect this provider.` });
       } catch (error) { items.push({ id: 'provider', label: 'Provider setup', ready: false, detail: String(error) }); }
       return items;

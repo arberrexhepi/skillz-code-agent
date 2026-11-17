@@ -7,6 +7,16 @@ modes:
   - deep
 ---
 
+Playground OS shortcuts:
+- `inspect-file /repo/src/App.tsx` returns imports, exports, symbol locations, sections, and a `file_hash`.
+- `read-symbol /repo/src/App.tsx handleProduce limit=120` reads a named declaration. Use its `next_offset` for continuation.
+- `references handleProduce path=/repo/src limit=40` distinguishes token references from definitions.
+- `read-context /repo/src/App.tsx "composerMode" before=8 after=12` merges matching source windows.
+- `find-regex /repo/src/App.tsx {"pattern":"\\bcomposerMode\\b","flags":"m","limit":20}` returns bounded matches, captures, line windows, and a file hash. Add `replacement` to preview a replacement diff without editing. Python regex flags `imsxa` and capture references apply; use offset/limit to page results.
+- Explicit `cat` and `read-line-range` paths can inspect installed dependency declarations under `/repo/node_modules/`, including `build` directories. These directories remain excluded from broad discovery. Prefer the exact declaration path to repeated searches or shell-only reads so its source remains available through compaction.
+
+Prefer named declarations and literal anchors to repeatedly shifting line ranges. Once the target is grounded, make the required edit or validate it; overlapping rereads of unchanged source do not count as progress.
+
 >[global: reasoning_rules]
   invariants:
     - Never treat search hits as truth; always resolve definition vs reference

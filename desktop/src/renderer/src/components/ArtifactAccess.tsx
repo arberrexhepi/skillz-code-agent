@@ -58,7 +58,9 @@ export function ArtifactAccessFields({ value, onChange, sourceRoot, disabled = f
     </li>;
   }
   return <fieldset className="artifact-access" disabled={disabled || choosing}>
-    <legend>Allowed system directories</legend>
+    <legend>Artifact capabilities</legend>
+    <label><input type="checkbox" checked={Boolean(value.allowAgentRuntime)} onChange={event => onChange({ ...value, allowAgentRuntime: event.target.checked })} /> Allow agent runtime</label>
+    <p className="muted">Lets the artifact start a separate beta agent using its saved provider and model. Runs use the same container file grants and consume model usage.</p>
     <p>Every folder starts read only. Enable changes only when this artifact should be able to modify files in that folder.</p>
     {!value.directories.length && <p className="muted">No additional folders shared.</p>}
     <ul>{value.directories.map(directoryRow)}</ul>

@@ -1,0 +1,192 @@
+.showcase-layout {
+  display:grid;
+  grid-template-columns:minmax(0,1fr) 300px;
+  border:1px solid var(--line);
+  border-radius:12px;
+  overflow:hidden;
+  background:var(--panel);
+  align-items:stretch;
+}
+.stage {
+  min-width:0;
+  background:#0e1517;
+}
+.stage-top {
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
+  padding:23px 25px 0;
+}
+.stage-top .eyebrow {
+  color:#687f76;
+  font-size:8px;
+}
+.stage-top h2 {
+  font-size:16px;
+  letter-spacing:-.3px;
+  margin:7px 0 0;
+}
+.stage-version {
+  color:#6d8479;
+  background:#17211f;
+  border:1px solid #293b33;
+  padding:5px 7px;
+  border-radius:5px;
+  font-size:9px;
+}
+.map-canvas {
+  background-image:radial-gradient(#40564b45 .6px,transparent .6px);
+  background-size:18px 18px;
+  margin-top:12px;
+}
+.map-canvas svg {
+  display:block;
+  width:100%;
+  max-height:680px;
+  min-height:380px;
+}
+.map-group {
+  font:8px var(--mono);
+  fill:#51685e;
+  letter-spacing:2px;
+}
+.edge {
+  fill:none;
+  stroke:#40564d;
+  stroke-width:1.1;
+  opacity:.55;
+}
+.edge.feedback {
+  stroke-dasharray:4 5;
+  stroke-width:.8;
+  opacity:.35;
+}
+.edge.connected {
+  opacity:.8;
+  stroke:#607f6d;
+}
+.edge.lit {
+  stroke:var(--accent);
+  stroke-width:1.5;
+  opacity:.9;
+  stroke-dasharray:6 6;
+  animation:flow 2s linear infinite;
+}
+.graph-node {
+  cursor:pointer;
+  outline:none;
+}
+.node-box {
+  fill:#14201e;
+  stroke:#33493f;
+  stroke-width:.9;
+  transition:stroke .2s,fill .2s;
+}
+.node-halo {
+  fill:none;
+  stroke:transparent;
+  stroke-width:1;
+}
+.node-name {
+  font:500 12px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+  fill:#b6c8bf;
+}
+.node-short {
+  font:9px var(--mono);
+  fill:#668577;
+}
+.node-number {
+  font:8px var(--mono);
+  fill:#698376;
+}
+.node-dot {
+  fill:#425b4c;
+}
+.graph-node.selected .node-box {
+  stroke:#afbf89;
+  fill:#1e2c25;
+  stroke-width:1.2;
+}
+.graph-node.selected .node-halo {
+  stroke:#a3bc8524;
+}
+.graph-node.selected .node-name {
+  fill:#e8f0d4;
+}
+.graph-node.active .node-box {
+  stroke:var(--accent);
+  fill:#173c30;
+  stroke-width:1.5;
+}
+.graph-node.active .node-dot {
+  fill:var(--accent);
+  filter:drop-shadow(0 0 5px #8cedd0);
+}
+.graph-node.active .node-name {
+  fill:#c9ffeb;
+}
+.graph-node.active .node-halo {
+  stroke:#8cedd026;
+  filter:drop-shadow(0 0 8px #8cedd022);
+}
+.graph-node.inferred .node-box {
+  stroke:#77b8a5;
+  stroke-dasharray:3 3;
+}
+.graph-node.visited .node-number {
+  fill:#a4cbb7;
+}
+.graph-node.failed .node-box {
+  stroke:#eaaa85;
+  fill:#392a23;
+}
+.graph-node.failed .node-dot {
+  fill:#eaaa85;
+}
+.graph-node:hover .node-box,.graph-node:focus-visible .node-box {
+  stroke:#ddf3d9;
+  fill:#233b2e;
+}
+.map-note {
+  font:11px -apple-system,BlinkMacSystemFont,sans-serif;
+  fill:#a3b9ab;
+}
+.map-note.muted {
+  font-size:9px;
+  fill:#596e63;
+}
+.map-legend {
+  padding:11px 23px 18px;
+  display:flex;
+  gap:17px;
+  align-items:center;
+  font-size:9px;
+  color:#7a9185;
+  flex-wrap:wrap;
+}
+.map-legend>span {
+  display:flex;
+  gap:7px;
+  align-items:center;
+}
+.map-legend label {
+  margin-left:auto;
+  white-space:nowrap;
+  font-size:9px;
+}
+.legend-dot {
+  width:6px;
+  height:6px;
+  border:1px solid var(--accent);
+  border-radius:50%;
+}
+.legend-dot.observed {
+  background:var(--accent);
+}
+.legend-dot.inferred {
+  border-style:dashed;
+}
+.legend-line {
+  width:14px;
+  border-top:1px dashed #677c71;
+}

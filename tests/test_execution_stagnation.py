@@ -198,6 +198,74 @@ class ExecutionStagnationGuardTests(unittest.TestCase):
             self.assertTrue(result.ok)
             self.assertIsNone(worker._execution_stagnation)
 
+    def test_shifted_overlapping_windows_do_not_reset_no_progress(self):
+        worker = self._worker()
+        for offset in range(EXECUTION_EXPLORATION_ACTION_LIMIT + 2):
+            output = "\n".join(f"{line} | source line {line}" for line in range(1 + offset, 101 + offset))
+            worker._track_execution_progress(f"read-line-range /repo/src/App.tsx {1 + offset}-{100 + offset}",
+                                             CommandResult(ok=True, output=output, command_type="read"))
+        self.assertIsNotNone(worker._execution_stagnation)
+
+    def test_changed_line_resets_recovery_inside_an_overlapping_window(self):
+        worker = self._worker()
+        original = "\n".join(f"{line} | source line {line}" for line in range(1, 101))
+        worker._track_execution_progress("cat /repo/src/App.tsx", CommandResult(ok=True, output=original, command_type="read"))
+        worker._execution_stagnation = {"focused_reads_used": 1}
+        changed = original.replace("50 | source line 50", "50 | repaired source")
+        worker._observe_command_result("cat /repo/src/App.tsx", CommandResult(ok=True, output=changed, command_type="read"))
+        self.assertIsNone(worker._execution_stagnation)
+
+    def test_context_and_line_reads_share_source_coverage(self):
+        worker = self._worker()
+        content = "\n".join(f"line {line}" for line in range(1, 101))
+        result = CommandResult(ok=True, output=json.dumps({"ok": True, "blocks": [{"start_line": 1, "content": content}]}),
+                               command_type="read", tool_action={"type": "read_context", "path": "/repo/src/App.tsx"})
+        worker._track_execution_progress('read-context /repo/src/App.tsx "line"', result)
+        for offset in range(EXECUTION_EXPLORATION_ACTION_LIMIT):
+            output = "\n".join(f"{line} | line {line}" for line in range(1 + offset, 81 + offset))
+            worker._track_execution_progress(f"read-line-range /repo/src/App.tsx {1+offset}-{80+offset}",
+                                             CommandResult(ok=True, output=output, command_type="read"))
+        self.assertIsNotNone(worker._execution_stagnation)
+
+    def test_undelivered_source_survives_recovery_with_no_read_allowance(self):
+        from model_result_delivery import prepare_model_result
+
+        worker = self._worker()
+        command = "read-line-range /repo/src/App.tsx 1-400"
+        result = CommandResult(True, "\n".join(f"{n} | source {n} {'x' * 80}" for n in range(1, 401)), "read")
+        prepare_model_result(command, result, limit=5000)
+        worker._track_execution_progress(command, result)
+        worker._execution_stagnation = {"focused_reads_used": 1, "blocked_actions": 2}
+        tail = CommandResult(True, "\n".join(f"{n} | source {n} {'x' * 80}" for n in range(301, 401)), "read")
+        worker._observe_command_result("read-line-range /repo/src/App.tsx 301-400", tail)
+        self.assertTrue(tail.ok)
+        self.assertIsNone(worker._execution_stagnation)
+
+    def test_evicted_source_survives_recovery_but_retained_repeats_do_not(self):
+        worker = self._worker()
+        old = ("cat /repo/src/old.ts", CommandResult(True, "1 | old source", "read"))
+        retained = ("cat /repo/src/current.ts", CommandResult(True, "1 | current source", "read"))
+        worker._track_execution_progress(*old)
+        worker._track_execution_progress(*retained)
+        worker._replace_retained_read_context([retained])
+        worker._execution_stagnation = {"focused_reads_used": 1, "blocked_actions": 0}
+        self.assertTrue(worker._apply_execution_stagnation_guard(*retained))
+        self.assertFalse(retained[1].ok)
+        worker._observe_command_result(*old)
+        self.assertTrue(old[1].ok)
+        self.assertIsNone(worker._execution_stagnation)
+
+    def test_recovery_guidance_targets_repairs_instead_of_novelty(self):
+        worker = self._worker()
+        worker._edit_batch_mode = False
+        worker._edit_batch_pending = {}
+        worker._completion_check_pending = False
+        worker._execution_stagnation = {"reason": "repeated retained source"}
+        steps = " ".join(worker._active_mode_strategy()["steps"])
+        self.assertIn("current diagnostics", steps)
+        self.assertIn("exact symbol", steps)
+        self.assertNotIn("new evidence resumes", steps)
+
     def test_typed_read_resolves_patch_recovery(self):
         worker = self._worker()
         worker._patch_resolution = {"path": "src/app.ts"}

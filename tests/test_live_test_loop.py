@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import io
 import json
+import shlex
+import sys
 import tempfile
 import unittest
 import unittest.mock as mock
@@ -145,6 +147,36 @@ class LiveTestLoopCliTests(unittest.TestCase):
 
 
 class TreeLoopPlannerWorkerTests(unittest.TestCase):
+    def test_shell_install_and_read_share_ordered_execution_through_dispatcher(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "package.json").write_text('{"dependencies": {}}\n', encoding="utf-8")
+            script = "from pathlib import Path; Path('package.json').write_text('{\"dependencies\": {\"three\": \"installed\"}}\\n')"
+            command = f"shell {shlex.quote(sys.executable)} -c {shlex.quote(script)}"
+            worker = TreeLoopPlannerWorker(
+                model=FakeModelClient([f"{command}\ncat /repo/package.json", "finish done"]),
+                root=root, max_turns=3, checkpoint_interval=0, thinking_mode="low", verbose=False,
+            )
+            worker.loop.allow_shell = True
+
+            result = worker.run_task("Install and verify a dependency")
+
+            self.assertTrue(result.ok)
+            self.assertIn('"three": "installed"', worker.loop.history[0].results[1].output)
+
+    def test_shell_nonzero_exit_is_a_failure_through_dispatcher(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            worker = TreeLoopPlannerWorker(
+                model=FakeModelClient([]), root=Path(tmpdir), max_turns=2,
+                checkpoint_interval=0, thinking_mode="low", verbose=False,
+            )
+            result = CommandResult(ok=True, output="", command_type="write", needs_tool=True,
+                                   tool_action={"type": "run_shell", "command": "unavailable-command"})
+            with mock.patch.object(worker, "_exec_run_shell", return_value="exit_code=1\nstderr:\ninstallation failed"):
+                worker._dispatch_tool_action(result)
+
+            self.assertFalse(result.ok)
+
     def test_run_task_returns_structured_result(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -192,6 +224,23 @@ class TreeLoopPlannerWorkerTests(unittest.TestCase):
             self.assertIn("Auto-compacted observability trace", content)
             self.assertIn("output-29", content)
             self.assertNotIn("output-0", content)
+
+    def test_finished_attempt_archive_keeps_full_trace_when_a_retry_resets_live_view(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            worker = TreeLoopPlannerWorker(model=FakeModelClient([]), root=root, max_turns=2,
+                                           checkpoint_interval=0, thinking_mode="low", verbose=False)
+            path = root / "memory_observability.md"
+            with mock.patch.object(worker, "_observability_path", return_value=path):
+                worker._reset_run_observability("First attempt")
+                for index in range(30):
+                    worker._append_observability_command(f"cat /repo/{index}.ts", CommandResult(ok=True, output=f"original-source-{index}", command_type="read"))
+                worker._flush_observability("Turn limit reached")
+                report = Path(worker._observability_metrics["attempt_report"])
+                worker._reset_run_observability("Retry")
+            self.assertIn("original-source-0", report.read_text())
+            self.assertIn("Turn limit reached", report.read_text())
+            self.assertNotIn("original-source-0", path.read_text())
 
     def test_run_task_supports_diagnose_command(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -319,7 +368,10 @@ finish done""",
             self.assertTrue(any("Available skills:" in output for output in first_turn_outputs))
             self.assertTrue(any("codebase-discovery" in output for output in first_turn_outputs))
             self.assertTrue(any("mode: standard" in output for output in first_turn_outputs))
-            self.assertNotIn("GOAL-START SKILL MODE", model.calls[1]["prompt"])
+            # Legacy providers now retain the same transcript as chat providers;
+            # consumed instructions remain historical, absent from current steering.
+            current_steering = model.calls[1]["prompt"].rsplit("═══ CURRENT STEERING ═══", 1)[-1]
+            self.assertNotIn("GOAL-START SKILL MODE", current_steering)
             state = worker.export_runtime_state()
             self.assertEqual(state["goal_start_skill_mode"]["pending"], False)
             self.assertEqual(state["goal_start_skill_mode"]["used"], True)
@@ -572,10 +624,10 @@ finish done""",
 
             self.assertEqual(strategy["mode"], "discovery_remediation")
             self.assertIn("Choose the remediation strategy path", steering)
-            self.assertIn("s1: cat /repo/main.py", steering)
+            self.assertIn("s1: read-line-range /repo/main.py 1-13", steering)
             self.assertIn("s1: list-issues", steering)
             self.assertIn("Do not return numbered prose steps", steering)
-            self.assertIn(["s1: cat /repo/main.py"], strategy["strategy_blocks"])
+            self.assertIn(["s1: read-line-range /repo/main.py 1-13"], strategy["strategy_blocks"])
 
     def test_failed_patch_enters_patch_resolution_and_blocks_follow_up_edit(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

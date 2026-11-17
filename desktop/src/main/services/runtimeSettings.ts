@@ -8,6 +8,11 @@ export class RuntimeSettingsService {
 
   artifactSetupDirectory(): string { return path.join(path.dirname(this.filePath), 'artifact-setup'); }
 
+  async environment(base: NodeJS.ProcessEnv): Promise<NodeJS.ProcessEnv> {
+    const savedPath = await this.codexCliPath();
+    return savedPath ? { ...base, CODEX_CLI_PATH: savedPath } : { ...base };
+  }
+
   async codexCliPath(): Promise<string> {
     try {
       const settings: unknown = JSON.parse(await fs.readFile(this.filePath, 'utf8'));

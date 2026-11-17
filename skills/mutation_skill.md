@@ -8,6 +8,15 @@ modes:
   - coordinated_batch
 ---
 
+Playground OS shortcuts:
+- `edit-symbol /repo/src/App.tsx handleProduce hash=<file_hash> <<<` followed by a complete replacement declaration and `>>>` edits by name. Python uses AST; script files require the local TypeScript parser. Ambiguous spans and stale hashes leave source unchanged.
+- `edit-batch {"atomic":true,"operations":[...]}` runs up to 32 existing mutation operations with rollback if any operation fails. Each supplied `expected_hash` describes the file at batch start: reuse the same inspected hash for multiple edits to that file. All declared hashes are checked before any write; the host advances its own guards after each internal edit. Concurrent changes are rejected, and rollback preserves external edits and reports a conflict rather than overwriting them. Do not calculate or supply intermediate hashes for later operations.
+- Use `batch start` / `batch end` for linked edits across commands. Automatic diagnostics are deferred until the batch closes; close the batch and repair any resulting diagnostics before finishing.
+- `find-regex /repo/file.ts {"pattern":"\\boldName\\b","replacement":"newName"}` previews a regex replacement without editing.
+- `replace-regex /repo/file.ts {"pattern":"\\boldName\\b","replacement":"newName","expected_matches":3,"expected_hash":"<file_hash>"}` applies only when its count and optional hash match. Use the hash returned by find-regex. The count defaults to 1; multi-match edits require an explicit exact count. Python replacement captures are `\\1` or `\\g<name>` in JSON; flags are `imsxa`. Invalid patterns, capture templates, stale hashes and evaluation timeouts leave source unchanged. `replace_regex` also works inside atomic edit-batch operations.
+
+For example, use `replace_snippet` with `path`, `old_text`, `new_text`, and `expected_hash`, or `insert_before` / `insert_after` with `path`, `anchor_text`, and `new_text`. Source payloads are literal; do not substitute placeholder strings for existing code.
+
 >[global: mutation_rules]
   invariants:
     - Always prefer the smallest mutation surface that fully satisfies the change
@@ -80,6 +89,7 @@ Use this mode for small, local, bounded edits.
 Valid operations include:
 - replace_range
 - replace_snippet
+- replace_regex
 - insert_before
 - insert_after
 - delete_range

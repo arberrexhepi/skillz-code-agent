@@ -28,6 +28,18 @@ def capabilities(request):
     from runtime_catalog import BASE_RUNTIME_PROVIDER_CATALOG, normalize_provider
     provider = normalize_provider(request['provider'])
     info = BASE_RUNTIME_PROVIDER_CATALOG[provider]
+    if provider == 'codex-subscription':
+        from codex_subscription import resolve_codex_executable, quick_chatgpt_auth_status
+        try:
+            executable = resolve_codex_executable()
+        except Exception as error:
+            return {'sdkReady': False, 'keyReady': False, 'label': info['label'], 'detail': str(error)}
+        try:
+            authenticated = quick_chatgpt_auth_status(executable)['authenticated']
+            return {'sdkReady': True, 'keyReady': authenticated, 'label': info['label'],
+                    'detail': 'Codex CLI discovered.' if authenticated else 'Sign in to Codex with ChatGPT under Agent runtime.'}
+        except Exception as error:
+            return {'sdkReady': False, 'keyReady': False, 'label': info['label'], 'detail': str(error)}
     package = info.get('package')
     if provider in {'local', 'ollama', 'ollama-local', 'ollama-runpod'}:
         package = 'openai'

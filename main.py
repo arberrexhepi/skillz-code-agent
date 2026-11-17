@@ -164,6 +164,7 @@ TEXT_MUTATION_ACTION_TYPES = {
     "patch_file",
     "replace_range",
     "replace_snippet",
+    "replace_regex",
     "insert_before",
     "insert_after",
     "delete_range",
@@ -193,6 +194,7 @@ DISCOVERY_ACTION_TYPES = {
     "summarize_files",
     "find_files",
     "search_in_files",
+    "find_regex",
     "outline_file",
     "read_symbol",
     "find_symbol_definitions",
@@ -1870,6 +1872,9 @@ class GeminiModelClient(BaseModelClient):
             "temperature": 0.1,
             # The harness dispatches tools through its own approval loop.
             "automatic_function_calling": {"disable": True},
+            # Disabling SDK auto-execution alone still permits native calls.
+            # This client uses text command/JSON protocols with no native tools.
+            "tool_config": {"function_calling_config": {"mode": "NONE"}},
         }
         thinking_config = self._build_thinking_config()
         if thinking_config is not None:
@@ -1930,26 +1935,33 @@ class GeminiModelClient(BaseModelClient):
         return usage_dict
 
     def _record_gemini_metrics(self, response: Any) -> None:
+        from provider_response import gemini_response_metadata
         usage_meta = getattr(response, "usage_metadata", None) or getattr(response, "usageMetadata", None)
         self._set_last_metrics(
             {
                 "provider": "gemini",
                 "model": self.model,
                 "usage": self._gemini_usage_dict(usage_meta),
+                "response": gemini_response_metadata(response),
             }
         )
 
     def _gemini_response_text(self, response: Any) -> str:
-        text = getattr(response, "text", None)
-        if text:
-            return str(text).strip()
+        candidates = getattr(response, "candidates", None) or []
+        if not candidates:
+            try:
+                return str(getattr(response, "text", None) or "").strip()
+            except (AttributeError, ValueError):
+                return ""
 
         parts: List[str] = []
-        for cand in getattr(response, "candidates", []) or []:
+        for cand in candidates:
             content = getattr(cand, "content", None)
             if not content:
                 continue
             for part in getattr(content, "parts", []) or []:
+                if getattr(part, "thought", False):
+                    continue
                 txt = getattr(part, "text", None)
                 if txt:
                     parts.append(str(txt))
@@ -6623,6 +6635,7 @@ class WorkingFolderAgent(ProposalRuntimeMixin):
                 1. You may ONLY act within the root path provided by the user.
                 2. All file paths must be relative to that root.
                 3. Prefer reading files before editing them, but once enough evidence exists, prefer patching over more exploration.
+                3a. Regex actions: find_regex uses path, pattern, optional replacement (read-only diff preview), flags=imsxa, limit and offset; replace_regex uses path, pattern, replacement, expected_matches (default 1, exact), and optional expected_hash from the find file_hash. Use Python capture references and preview before multi-match edits. Invalid patterns, stale hashes, count mismatches and evaluation timeouts make no edits. Atomic batch_mutate operations also accept replace_regex.
                 4. Keep edits minimal and targeted.
                 5. {shell_rule}
                 6. Never ask for tools; choose the next action yourself. Use a short ordered batch only when the steps are tightly coupled and clearly higher-yield than waiting for another turn.
@@ -6649,7 +6662,7 @@ class WorkingFolderAgent(ProposalRuntimeMixin):
                 {{
                     "thought": "brief reasoning summary visible to the operator; for read_file actions, include what you want to learn from the read and any line range referencing avoiding already verified changes and reads. If a problem anchor has gone cold and produced no goal progress or durable facts, say that plainly and finish with a summary that tells the goal planner a change of strategy is needed. If satisfied move to finish: Done.",
                     "action": {{
-                        "type": "list_files" | "read_file" | "inspect_files" | "summarize_files" | "find_files" | "search_in_files" | "outline_file" | "read_symbol" | "find_symbol_definitions" | "find_symbol_references" | "trace_dependencies" | "find_related_files" | "find_related_tests" | "find_related_configs" | "find_canonical_implementation" | "find_similar_code" | "find_entry_points" | "find_ownership" | "recent_changes" | "get_changed_files" | "semantic_search" | "investigate" | "write_file" | "patch_file" | "replace_range" | "replace_snippet" | "insert_before" | "insert_after" | "delete_range" | "delete_snippet" | "append_block" | "prepend_block" | "replace_symbol" | "insert_symbol_member" | "rename_symbol" | "move_block" | "create_file" | "delete_file" | "rename_file" | "copy_file" | "fill_template" | "batch_mutate" | "begin_edit_batch" | "end_edit_batch" | "grep" | "symbol_search" | "run_shell" | "diagnose" | "changed_files_check" | "project_problems" | "skill" | "show_diff" | "meta" | "git_status" | "git_diff" | "review_changes" | "git_add" | "git_restore" | "git_commit" | "git_log" | "git_branch" | "history_expand" | "memory_expand" | "set_fact" | "update_fact" | "drop_context" | "finish",
+                        "type": "list_files" | "read_file" | "inspect_files" | "summarize_files" | "find_files" | "search_in_files" | "find_regex" | "outline_file" | "read_symbol" | "find_symbol_definitions" | "find_symbol_references" | "trace_dependencies" | "find_related_files" | "find_related_tests" | "find_related_configs" | "find_canonical_implementation" | "find_similar_code" | "find_entry_points" | "find_ownership" | "recent_changes" | "get_changed_files" | "semantic_search" | "investigate" | "write_file" | "patch_file" | "replace_range" | "replace_snippet" | "replace_regex" | "insert_before" | "insert_after" | "delete_range" | "delete_snippet" | "append_block" | "prepend_block" | "replace_symbol" | "insert_symbol_member" | "rename_symbol" | "move_block" | "create_file" | "delete_file" | "rename_file" | "copy_file" | "fill_template" | "batch_mutate" | "begin_edit_batch" | "end_edit_batch" | "grep" | "symbol_search" | "run_shell" | "diagnose" | "changed_files_check" | "project_problems" | "skill" | "show_diff" | "meta" | "git_status" | "git_diff" | "review_changes" | "git_add" | "git_restore" | "git_commit" | "git_log" | "git_branch" | "history_expand" | "memory_expand" | "set_fact" | "update_fact" | "drop_context" | "finish",
                         "... action-specific fields ..."
                     }}
                 }}
@@ -8105,6 +8118,11 @@ class WorkingFolderAgent(ProposalRuntimeMixin):
         text_files: List[Tuple[str, str, str]] = []
         subcommand = action_type.replace("_", "-")
 
+        if action_type == "replace_regex":
+            payload = self._call_tool_with_temp_files("replace-regex", [], action=action, json_payload=action)
+            return self._finalize_generic_mutation_action(action=action, payload=payload,
+                success_summary=f"Applied regex replacement in {path}", failure_summary=f"Could not replace regex in {path}", record_path=path)
+
         if action_type in {"replace_range", "delete_range"}:
             if not path:
                 return self._error_action_result(action_type, {"code": "BAD_REQUEST", "message": f"{action_type} requires a non-empty path."})
@@ -8451,6 +8469,11 @@ class WorkingFolderAgent(ProposalRuntimeMixin):
         action_type = str(action.get("type", "") or "")
         subcommand = action_type.replace("_", "-")
         args: List[str] = []
+
+        if action_type == "find_regex":
+            payload = self._call_tool_with_temp_files("find-regex", [], action=action, json_payload=action)
+            return self._finalize_tool_action(action_type=action_type, payload=payload,
+                success_summary="Read regex matches and preview", failure_summary="Could not evaluate regex", next_hint="replace_regex")
 
         if action_type == "search_in_files":
             query = str(action.get("query", "") or "").strip()
@@ -9125,6 +9148,7 @@ class WorkingFolderAgent(ProposalRuntimeMixin):
                 "inspect_files": self._handle_inspect_files_action,
                 "summarize_files": self._handle_summarize_files_action,
                 "search_in_files": self._handle_explicit_discovery_action,
+                "find_regex": self._handle_explicit_discovery_action,
                 "outline_file": self._handle_explicit_discovery_action,
                 "read_symbol": self._handle_explicit_discovery_action,
                 "find_symbol_definitions": self._handle_explicit_discovery_action,
@@ -9145,6 +9169,7 @@ class WorkingFolderAgent(ProposalRuntimeMixin):
                 "patch_file": self._handle_patch_file_action,
                 "replace_range": self._handle_explicit_mutation_action,
                 "replace_snippet": self._handle_explicit_mutation_action,
+                "replace_regex": self._handle_explicit_mutation_action,
                 "insert_before": self._handle_explicit_mutation_action,
                 "insert_after": self._handle_explicit_mutation_action,
                 "delete_range": self._handle_explicit_mutation_action,

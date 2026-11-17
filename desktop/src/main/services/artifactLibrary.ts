@@ -3,6 +3,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { artifactId, artifactApisSchema, artifactAgentRuntimeSchema, artifactAccessSchema, artifactAppSchema, defaultArtifactApp, type ArtifactAccess, createArtifactSchema, type ArtifactApis, type ArtifactAppConfig, type ArtifactAppSaveResult, type ArtifactLibrary, type ArtifactRecord, type CreateArtifact, type PrebuiltArtifact } from '../../shared/artifacts';
 import { git } from './artifactProcess';
+import { managedPrebuiltPath, prebuiltBaselineFile, readBundledSource, writeSourceSnapshot } from './artifactPrebuiltSource';
 
 const manifestName = '.skillz-artifacts.json';
 const author = ['-c', 'user.name=skillz Workbench', '-c', 'user.email=workbench@localhost'];
@@ -54,7 +55,9 @@ export class ArtifactLibraryService {
       const app = await this.appForRoot(directory);
       const origin = artifactId.optional().safeParse(meta.prebuiltId ?? local.prebuiltId);
       const prebuiltId = origin.success && origin.data ? origin.data : await this.legacyPrebuiltId(directory);
-      artifacts.push({ id, root: directory, prebuiltId, title: meta.title, prompt: meta.prompt, createdAt: meta.createdAt, sourceRoot: local.sourceRoot || '', shareFacts: Boolean(local.shareFacts), shareMemory: Boolean(local.shareMemory), contextMode: local.contextMode || 'none', contextWarning: local.contextWarning, runtime: artifactAgentRuntimeSchema.optional().parse(local.runtime), access: artifactAccessSchema.parse(access), app });
+      const preset = prebuiltId ? (await this.prebuilts()).find(item => item.id === prebuiltId) : undefined;
+      const title = preset?.previousTitles?.includes(meta.title) ? preset.title : meta.title;
+      artifacts.push({ id, root: directory, prebuiltId, title, prompt: meta.prompt, createdAt: meta.createdAt, sourceRoot: local.sourceRoot || '', shareFacts: Boolean(local.shareFacts), shareMemory: Boolean(local.shareMemory), contextMode: local.contextMode || 'none', contextWarning: local.contextWarning, runtime: artifactAgentRuntimeSchema.optional().parse(local.runtime), access: artifactAccessSchema.parse(access), app });
     }
     return { root, artifacts };
   }
@@ -68,7 +71,7 @@ export class ArtifactLibraryService {
       let id: string | undefined;
       if (subject === 'Install prebuilt artifact') {
         const original = JSON.parse(await git(root, 'show', first + ':artifact.json')) as { title?: string; prompt?: string };
-        id = (await this.prebuilts()).find(item => item.title === original.title && item.description === original.prompt)?.id;
+        id = (await this.prebuilts()).find(item => (item.title === original.title || item.previousTitles?.includes(original.title || '')))?.id;
       }
       this.legacyPrebuiltIds.set(root, id);
       return id;
@@ -111,9 +114,15 @@ export class ArtifactLibraryService {
   create(raw: CreateArtifact): Promise<ArtifactRecord> { return this.createFrom(raw, this.template, 'Scaffold artifact'); }
   async prebuilts(): Promise<PrebuiltArtifact[]> {
     return [
+      { id: 'beta-observatory', title: 'Agent Observatory', previousTitles: ['Beta Observatory'], description: 'Explore the beta agent loop, launch isolated runs, and replay every recorded event through an interactive node map.', requiresWriteAccess: false, usesAgentRuntime: true },
       { id: 'server-manager', title: 'Server Manager', description: 'Detect, launch, stop, and inspect explicitly whitelisted repository scripts and their listening ports.', requiresWriteAccess: false, requiresProcessProxy: true },
       { id: 'repo-issue-manager', title: 'Repository issue manager', description: 'Review, create, activate, close, and reopen Skillz issues in any repository you explicitly share.', requiresWriteAccess: true },
     ];
+  }
+  prebuiltUpdateHome(): string { return path.dirname(this.settingsFile); }
+  async prebuiltSource(id: string): Promise<string> {
+    if (!(await this.prebuilts()).some(item => item.id === artifactId.parse(id))) throw new Error('Unknown prebuilt artifact.');
+    return path.join(this.prebuiltHome, id);
   }
   async installPrebuilt(id: string, access: ArtifactAccess, runtime?: import('../../shared/artifacts').CreateArtifact['runtime']): Promise<ArtifactRecord> {
     const preset = (await this.prebuilts()).find(item => item.id === artifactId.parse(id));
@@ -141,12 +150,19 @@ export class ArtifactLibraryService {
       if (!destination.isDirectory() || destination.isSymbolicLink() || !(await emptyArtifactDirectory(root))) {
         throw new Error(`Artifact destination must be an empty directory: ${root}`);
       }
+      const sourceBaseline = prebuiltId ? await readBundledSource(source) : undefined;
       // Preserve incomplete scaffolds on failure; never delete user files to retry.
       // Newer Node runtimes reject an existing directory with errorOnExist, even when empty.
       // Copy each entry into the reserved directory, retaining exclusive creation for every entry.
       for (const entry of await fs.readdir(source)) {
-        if (entry === ".git") continue;
-        await fs.cp(path.join(source, entry), path.join(root, entry), { recursive: true, errorOnExist: true, force: false, filter: (entry) => !['node_modules', '.DS_Store'].includes(path.basename(entry)) && (source !== this.template || path.basename(entry) !== 'package-lock.json') });
+        if (entry === ".git" || (prebuiltId && !managedPrebuiltPath(entry))) continue;
+        await fs.cp(path.join(source, entry), path.join(root, entry), { recursive: true, errorOnExist: true, force: false, filter: (entry) => (!prebuiltId || managedPrebuiltPath(path.relative(source, entry).split(path.sep).join('/'))) && !['node_modules', '.DS_Store'].includes(path.basename(entry)) && (source !== this.template || path.basename(entry) !== 'package-lock.json') });
+      }
+      if (prebuiltId) {
+        for (const relative of ['.artifact/app.json', '.artifact/apis.json']) {
+          const from = path.join(source, relative);
+          if (await fs.lstat(from).then(stat => stat.isFile() && !stat.isSymbolicLink(), () => false)) { await fs.mkdir(path.dirname(path.join(root, relative)), { recursive: true }); await fs.copyFile(from, path.join(root, relative)); }
+        }
       }
       const app = artifactAppSchema.parse(options.app || defaultArtifactApp());
       await this.writeAppForRoot(root, app);
@@ -162,6 +178,7 @@ export class ArtifactLibraryService {
       await git(root, 'init');
       await git(root, 'add', '--', '.');
       await git(root, ...author, 'commit', '-m', initialCommit);
+      if (sourceBaseline) await writeSourceSnapshot(prebuiltBaselineFile(path.dirname(this.settingsFile), root), { version: 1, root, prebuiltId, files: sourceBaseline });
       // Existing child repository is registered as a gitlink, not added as ordinary files.
       await git(library.root, '-c', 'protocol.file.allow=always', 'submodule', 'add', `./${id}`, id);
       await git(library.root, 'submodule', 'absorbgitdirs', '--', id);
@@ -222,6 +239,16 @@ export class ArtifactLibraryService {
     await writeJson(path.join(path.dirname(this.settingsFile), 'artifact-permissions.json'), data);
   }
   async access(id: string): Promise<ArtifactAccess> { return (await this.find(id)).access || { directories: [], allowWorkspaceRead: false }; }
+  saveRuntime(id: string, runtime: NonNullable<CreateArtifact['runtime']>): Promise<ArtifactRecord> {
+    return this.serial(async () => {
+      const record = await this.find(id);
+      const checked = artifactAgentRuntimeSchema.parse(runtime);
+      const records = await this.readLocalRecords();
+      records[record.root] = { ...records[record.root], runtime: checked };
+      await writeJson(path.join(path.dirname(this.settingsFile), 'artifact-records.json'), records);
+      return { ...record, runtime: checked };
+    });
+  }
   saveAccess(id: string, access: ArtifactAccess): Promise<void> { return this.serial(async () => { const record = await this.find(id); await this.writePermissions(record.root, access); }); }
   async apis(id: string): Promise<ArtifactApis> { const record = await this.find(id); return artifactApisSchema.parse(await readJson(path.join(record.root, '.artifact/apis.json'))); }
   async saveApis(id: string, config: ArtifactApis): Promise<void> {

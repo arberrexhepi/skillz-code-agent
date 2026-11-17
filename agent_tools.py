@@ -77,6 +77,7 @@ from mutations import (
     rename_symbol,
     replace_range,
     replace_snippet,
+    replace_regex,
     replace_symbol,
 )
 
@@ -1085,6 +1086,29 @@ def cmd_batch_mutate(args: argparse.Namespace) -> None:
     ok("batch_mutate", cast(Dict[str, Any], result))
 
 
+def cmd_regex(args: argparse.Namespace) -> None:
+    from discovery.dispatch import execute_discovery_action
+
+    action_type = args.subcommand.replace("-", "_")
+    root = resolve_root(args.root)
+    try:
+        spec = json.loads(safe_join(root, args.spec_file).read_text(encoding="utf-8"))
+        if not isinstance(spec, dict) or "root" in spec or spec.get("type", action_type) != action_type:
+            raise ValueError("Expected a regex action object without a root override")
+        if action_type == "find_regex":
+            result = execute_discovery_action({**spec, "type": action_type}, root=root)
+            if not result.get("ok"):
+                err(action_type, str(result.get("reason", "REGEX_FAILED")).upper(), str(result.get("error", "Regex search failed")))
+            ok(action_type, result)
+        else:
+            spec.pop("type", None)
+            if "path" in spec:
+                spec["file_path"] = spec.pop("path")
+            _emit_mutation_ok(action_type, replace_regex(root=root, **spec))
+    except (ValueError, TypeError, OSError) as error:
+        err(action_type, "BAD_REGEX_REQUEST", str(error))
+
+
 def cmd_grep(args: argparse.Namespace) -> None:
     tool = "grep"
     root = resolve_root(args.root)
@@ -1966,6 +1990,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--expected-occurrences", type=int, default=1)
     p.add_argument("--all", action="store_true")
     p.set_defaults(func=cmd_replace_snippet)
+
+    for command in ("find-regex", "replace-regex"):
+        p = sub.add_parser(command)
+        p.add_argument("--root", required=True)
+        p.add_argument("--spec-file", required=True)
+        p.set_defaults(func=cmd_regex)
 
     p = sub.add_parser("insert-before")
     p.add_argument("--root", required=True)

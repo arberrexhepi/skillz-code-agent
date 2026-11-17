@@ -7,7 +7,7 @@ import json
 import re
 
 
-TEXT_MUTATION_VERBS = {"write", "replace-lines", "replace_lines", "patch"}
+TEXT_MUTATION_VERBS = {"write", "replace-lines", "replace_lines", "patch", "edit-symbol", "edit-batch", "replace-regex"}
 PARSE_ERROR_PREFIX = "__command_parse_error__ "
 
 

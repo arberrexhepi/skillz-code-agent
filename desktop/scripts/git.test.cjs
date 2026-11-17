@@ -9,15 +9,17 @@ const React = require('react');
 const { renderToStaticMarkup } = require('react-dom/server');
 
 // Load the desktop's actual TS modules without starting Electron or a renderer.
-const { GitService, WorkspaceService, GitChangeRow, gitStatusLabel, canDiscard } = loadTypeScript(() => ({
+const { GitService, ArtifactGitService, WorkspaceService, GitChangeRow, gitStatusLabel, canDiscard, parseNumstat, populateLineChanges } = loadTypeScript(() => ({
   ...require('../src/main/services/git.ts'),
+  ...require('../src/main/services/artifactGit.ts'),
+  ...require('../src/main/services/gitLineChanges.ts'),
   ...require('../src/main/services/workspace.ts'),
   ...require('../src/renderer/src/components/GitChangeRow.tsx'),
   ...require('../src/shared/gitStatus.ts'),
 }));
 
 async function fixture(t) {
-  const container = fs.mkdtempSync(path.join(os.tmpdir(), 'workbench-git-test-'));
+  const container = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'workbench-git-test-')));
   const root = path.join(container, 'repo');
   fs.mkdirSync(root);
   const git = (...args) => execFileSync('git', args, { cwd: root, encoding: 'utf8' });
@@ -219,4 +221,111 @@ test('untracked, staged, deleted, renamed, and conflict badges are explicit', ()
     assert.equal(gitStatusLabel(file).code, code);
     assert.equal(canDiscard(file), discard);
   }
+});
+
+test('workspace and artifact rows receive net line counts, including staged plus unstaged edits', async t => {
+  const { root, service, git } = await fixture(t);
+  const artifact = new ArtifactGitService({ find: async () => ({ root }) });
+  const counts = async expected => {
+    for (const status of await Promise.all([service.status(), artifact.status('fixture')])) {
+      assert.deepEqual(status.files.find(file => file.path === 'notes.md').lineChanges, expected);
+    }
+  };
+  fs.writeFileSync(path.join(root, 'notes.md'), 'one\ntwo\n');
+  await counts({ additions: 2, deletions: 1 });
+  git('add', '--', 'notes.md');
+  fs.writeFileSync(path.join(root, 'notes.md'), 'one\ntwo\nthree\n');
+  await counts({ additions: 3, deletions: 1 });
+  // Summing staged and unstaged stats would overcount a change reverted to HEAD.
+  fs.writeFileSync(path.join(root, 'notes.md'), 'committed\n');
+  await counts({ additions: 0, deletions: 0 });
+});
+
+test('new, empty, binary and deleted files get truthful deltas', async t => {
+  const { root, service } = await fixture(t);
+  fs.writeFileSync(path.join(root, 'new file.md'), 'first\r\nsecond');
+  fs.writeFileSync(path.join(root, 'empty.txt'), '');
+  fs.writeFileSync(path.join(root, 'image.bin'), Buffer.from([1, 0, 2, 10]));
+  fs.unlinkSync(path.join(root, 'notes.md'));
+  const files = (await service.status()).files;
+  const changes = name => files.find(file => file.path === name).lineChanges;
+  assert.deepEqual(changes('new file.md'), { additions: 2, deletions: 0 });
+  assert.deepEqual(changes('empty.txt'), { additions: 0, deletions: 0 });
+  assert.deepEqual(changes('image.bin'), { binary: true });
+  assert.deepEqual(changes('notes.md'), { additions: 0, deletions: 1 });
+});
+
+test('rename counts use the destination and combine a full rewrite with the original deletion', async t => {
+  const { root, service, git } = await fixture(t);
+  git('mv', 'notes.md', 'renamed notes.md');
+  let file = (await service.status()).files.find(file => file.path === 'renamed notes.md');
+  assert.deepEqual(file.lineChanges, { additions: 0, deletions: 0 });
+  fs.writeFileSync(path.join(root, 'renamed notes.md'), 'new first\nnew second\n');
+  file = (await service.status()).files.find(file => file.path === 'renamed notes.md');
+  assert.deepEqual(file.lineChanges, { additions: 2, deletions: 1 });
+});
+
+test('tracked binary changes are labelled without inventing line counts', async t => {
+  const { root, service, git } = await fixture(t);
+  fs.writeFileSync(path.join(root, 'image.bin'), Buffer.from([0, 1, 2]));
+  git('add', '--', 'image.bin');
+  git('-c', 'user.name=Workbench Test', '-c', 'user.email=workbench@example.invalid', 'commit', '-qm', 'Binary fixture');
+  fs.writeFileSync(path.join(root, 'image.bin'), Buffer.from([0, 3, 4, 5]));
+  assert.deepEqual((await service.status()).files.find(file => file.path === 'image.bin').lineChanges, { binary: true });
+});
+
+test('separate added and deleted rows retain counts when status rename detection is disabled', async t => {
+  const { service, git } = await fixture(t);
+  git('config', 'status.renames', 'false');
+  git('mv', 'notes.md', 'renamed notes.md');
+  const files = (await service.status()).files;
+  assert.deepEqual(files.find(file => file.path === 'notes.md').lineChanges, { additions: 0, deletions: 1 });
+  assert.deepEqual(files.find(file => file.path === 'renamed notes.md').lineChanges, { additions: 1, deletions: 0 });
+});
+
+test('initial repository counts include the actual working content of newly staged files', async t => {
+  const { root, service, git } = await fixture(t);
+  fs.rmSync(path.join(root, '.git'), { recursive: true, force: true });
+  git('init', '-q');
+  git('config', 'core.autocrlf', 'false');
+  git('add', '--', 'notes.md');
+  fs.writeFileSync(path.join(root, 'notes.md'), 'first\nsecond\nthird');
+  assert.deepEqual((await service.status()).files.find(file => file.path === 'notes.md').lineChanges, { additions: 3, deletions: 0 });
+});
+
+test('untracked symlinks count their link blob and never the external target', async t => {
+  const { root, container, service } = await fixture(t);
+  fs.writeFileSync(path.join(container, 'external.txt'), 'external\nprivate\ncontent\n');
+  try { fs.symlinkSync(path.join(container, 'external.txt'), path.join(root, 'link.txt'), 'file'); }
+  catch (error) { if (process.platform === 'win32' && error.code === 'EPERM') { t.skip('Symlinks require Windows Developer Mode'); return; } throw error; }
+  assert.deepEqual((await service.status()).files.find(file => file.path === 'link.txt').lineChanges, { additions: 1, deletions: 0 });
+});
+
+test('numstat preserves tabs, newlines, binary markers and NUL-separated renames', () => {
+  const parsed = parseNumstat(['2\t1\tfile\twith\nwhitespace.ts', '-\t-\timage.bin', '0\t0\t', 'old\tname', 'new\nname', ''].join('\0'));
+  assert.deepEqual(parsed.get('file\twith\nwhitespace.ts'), { additions: 2, deletions: 1 });
+  assert.deepEqual(parsed.get('image.bin'), { binary: true });
+  assert.deepEqual(parsed.get('new\nname'), { additions: 0, deletions: 0 });
+  assert.equal(parsed.has('old\tname'), false);
+});
+
+test('unresolved conflicts and unavailable stats omit the numeric badge', async t => {
+  const { root } = await fixture(t);
+  const conflict = { path: 'notes.md', indexStatus: 'U', workTreeStatus: 'U' };
+  await populateLineChanges(root, [conflict], '3\t2\tnotes.md\0', false);
+  assert.equal(conflict.lineChanges, undefined);
+  const unavailable = { path: 'notes.md', indexStatus: ' ', workTreeStatus: 'M' };
+  await populateLineChanges(root, [unavailable], undefined, false);
+  assert.equal(unavailable.lineChanges, undefined);
+});
+
+test('shared file row renders accessible addition/deletion badges and a distinct binary label', () => {
+  const props = { file: { path: 'notes.md', indexStatus: ' ', workTreeStatus: 'M', lineChanges: { additions: 12, deletions: 3 } }, busy: false,
+    onDiff: () => {}, onStage: () => {}, onUnstage: () => {}, onDiscard: () => {} };
+  const html = renderToStaticMarkup(React.createElement(GitChangeRow, props));
+  assert.match(html, /12 lines added, 3 lines deleted/);
+  assert.match(html, />\+12<.*>−3</);
+  const binary = renderToStaticMarkup(React.createElement(GitChangeRow, { ...props, file: { ...props.file, lineChanges: { binary: true } } }));
+  assert.match(binary, />Binary</);
+  assert.doesNotMatch(binary, /lines added/);
 });

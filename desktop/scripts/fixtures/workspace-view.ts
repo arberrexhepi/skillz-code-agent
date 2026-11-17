@@ -129,5 +129,5 @@ window.workbench = {
 
 (window as typeof window & { sendFixtureEditorCommand?: (command: 'undo' | 'redo' | 'find') => void }).sendFixtureEditorCommand = (command) => emitEditorCommand?.(command);
 
-if (new URLSearchParams(window.location.search).has('artifacts')) await import('./artifacts-fixture');
+await import('./artifacts-fixture');
 void import('../../src/renderer/src/main');
