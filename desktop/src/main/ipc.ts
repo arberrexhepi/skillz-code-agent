@@ -10,6 +10,8 @@ import type { AgentService } from './services/agent';
 import type { GitService } from './services/git';
 import type { TerminalService } from './services/terminal';
 import type { WorkspaceService } from './services/workspace';
+import type { McpHost, McpScope } from './services/mcp';
+import type { McpServerSettings } from '../shared/mcp';
 
 interface Services {
   artifacts: ArtifactsService;
@@ -17,6 +19,7 @@ interface Services {
   git: GitService;
   terminal: TerminalService;
   agent: AgentService;
+  mcp: McpHost;
 }
 
 const relativePath = z.string().min(1).max(4096);
@@ -44,6 +47,7 @@ export function registerIpc(window: BrowserWindow, services: Services): void {
     'agent:reconfigure-runtime', 'agent:configure-backoff', 'agent:runtime-options',
     'agent:codex-subscription-status', 'agent:codex-subscription-login', 'agent:stop',
     'agent:choose-codex-cli', 'agent:set-codex-cli-path',
+    'mcp:profile', 'mcp:save', 'mcp:manage', 'mcp:inspect', 'mcp:setup',
   ]) ipcMain.removeHandler(channel);
   for (const channel of ['terminal:write', 'terminal:resize', 'terminal:dispose']) ipcMain.removeAllListeners(channel);
 
@@ -61,6 +65,24 @@ export function registerIpc(window: BrowserWindow, services: Services): void {
   };
 
   const artifactChannels = ['capabilities', 'install-capabilities', 'setup-progress', 'vault', 'save-provider-key', 'setup-download', 'docker-cleanup-plan', 'clean-docker', 'library', 'prebuilts', 'install-prebuilt', 'prebuilt-update-status', 'review-prebuilt-update', 'apply-prebuilt-update', 'choose-folder', 'choose-read-directory', 'access', 'process-scripts', 'save-access', 'save-runtime', 'create', 'apis', 'save-apis', 'blueprint-agent', 'run-api-collection', 'app', 'save-app', 'start', 'stop', 'install-browser', 'preview', 'input', 'reload', 'close-preview', 'reveal', 'git-status', 'git-initialize', 'git-history', 'git-file-diff', 'git-stage', 'git-stage-all', 'git-unstage', 'git-discard', 'git-commit', 'git-push', 'agent-start', 'agent-submit', 'agent-runtime', 'agent-planner', 'agent-worker', 'agent-reconfigure', 'agent-backoff', 'agent-stop'];
+  const mcpScope = async (value: unknown): Promise<McpScope> => {
+    const id = artifactId.optional().parse(value);
+    return id ? { root: (await services.artifacts.library.find(id)).root, profile: `artifact:${id}` }
+      : { root: services.workspace.requireRoot(), profile: 'repo' };
+  };
+  const mcpName = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$/);
+  handle('mcp:profile', async (_event, id) => services.mcp.profile(await mcpScope(id)));
+  handle('mcp:save', async (_event, name, settings, id) => {
+    const config = z.record(z.string(), z.unknown()).parse(settings);
+    if (JSON.stringify(config).length > 24_000) throw new Error('MCP server settings are too large.');
+    return services.mcp.save(await mcpScope(id), mcpName.parse(name), config as unknown as McpServerSettings);
+  });
+  handle('mcp:manage', async (_event, action, name, id) => services.mcp.manage(await mcpScope(id),
+    z.enum(['enable', 'disable', 'remove', 'login', 'logout']).parse(action), mcpName.parse(name)));
+  handle('mcp:inspect', async (_event, name, kind, id, query, offset) => services.mcp.inspect(await mcpScope(id),
+    mcpName.parse(name), z.enum(['tools', 'resources', 'templates', 'prompts']).parse(kind), z.string().max(200).optional().parse(query),
+    z.number().int().min(0).optional().parse(offset)));
+  handle('mcp:setup', () => services.mcp.setup());
   for (const name of artifactChannels) ipcMain.removeHandler(`artifacts:${name}`);
   handle('artifacts:capabilities', (_event, selection: unknown, id: unknown) => services.artifacts.capabilityStatus(artifactSetupSelectionSchema.parse(selection), artifactId.optional().parse(id)));
   handle('artifacts:install-capabilities', (_event, selection: unknown, id: unknown) => services.artifacts.installCapabilities(artifactSetupSelectionSchema.parse(selection), artifactId.optional().parse(id)));
@@ -72,7 +94,10 @@ export function registerIpc(window: BrowserWindow, services: Services): void {
   handle('artifacts:clean-docker', () => services.artifacts.cleanDocker());
   handle('artifacts:library', () => services.artifacts.library.library());
   handle('artifacts:prebuilts', () => services.artifacts.library.prebuilts());
-  handle('artifacts:install-prebuilt', (_event, id: unknown, access: unknown, runtime: unknown) => services.artifacts.library.installPrebuilt(artifactId.parse(id), artifactAccessSchema.parse(access), runtime == null ? undefined : createArtifactSchema.shape.runtime.parse(runtime)));
+  handle('artifacts:install-prebuilt', (_event, id: unknown, access: unknown, runtime: unknown, playwrightMcp: unknown) => services.artifacts.library.installPrebuilt(
+    artifactId.parse(id), artifactAccessSchema.parse(access), runtime == null ? undefined : createArtifactSchema.shape.runtime.parse(runtime),
+    createArtifactSchema.shape.playwrightMcp.parse(playwrightMcp),
+  ));
   handle('artifacts:prebuilt-update-status', (_event, id: unknown) => services.artifacts.prebuiltUpdates.status(artifactId.parse(id)));
   handle('artifacts:review-prebuilt-update', (_event, id: unknown) => services.artifacts.prebuiltUpdates.review(artifactId.parse(id)));
   handle('artifacts:apply-prebuilt-update', (_event, id: unknown, request: unknown) => services.artifacts.applyPrebuiltUpdate(artifactId.parse(id), prebuiltUpdateRequestSchema.parse(request)));

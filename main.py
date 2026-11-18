@@ -38,6 +38,9 @@ from skill_loader import MarkdownSkill, load_markdown_skills_from_dir
 from codex_subscription import run_codex_subscription_completion
 from bridge_presentation import bridge_exchange
 from discovery_budget import DiscoveryBudget
+from mcp_runtime import invoke_mcp, mcp_guidance, model_mcp_result
+from artifact_preview import preview_guidance, start_artifact_preview
+from shell_processes import PACKAGE_SHELL_GUIDANCE, install_shell_process_cleanup, run_managed_shell
 from proposal_runtime import ProposalRuntimeMixin
 from issue_proposals import PROPOSAL_GUIDANCE
 
@@ -224,6 +227,8 @@ TOOL_BACKED_ACTION_TYPES = {
     "batch_mutate",
     "show_diff",
     "meta",
+    "mcp",
+    "artifact_preview",
     "git_status",
     "git_diff",
     "review_changes",
@@ -816,11 +821,15 @@ def run_shell(root: Path, command: str, timeout: int = 60) -> Dict[str, Any]:
             "stdout": "",
             "stderr": "Shell access is disabled by SHELL_ACCESS=false.",
         }
+    env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
+    managed = run_managed_shell(root, {"command": command}, env)
+    if managed is not None:
+        return managed
     result = subprocess.run(
         command,
         cwd=str(root),
         shell=True,
-        env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+        env=env,
         text=True,
         encoding="utf-8",
         errors="replace",
@@ -3974,7 +3983,7 @@ class WorkingFolderAgent(ProposalRuntimeMixin):
             if action_type == "run_shell":
                 payload = step.result.payload if isinstance(step.result.payload, dict) else {}
                 returncode = payload.get("returncode")
-                if isinstance(returncode, int) and returncode == 0:
+                if not payload.get("managed_process") and isinstance(returncode, int) and returncode == 0:
                     return WorkerValidationResult(
                         kind="run_shell",
                         passed=True,
@@ -4762,6 +4771,8 @@ class WorkingFolderAgent(ProposalRuntimeMixin):
         validation_type = str(validation_step.action.get("type", ""))
 
         if validation_type not in {"read_file", "run_shell", "show_diff", "git_diff", "diagnose", "changed_files_check", "project_problems"}:
+            return False
+        if validation_type == "run_shell" and validation_step.result.payload.get("managed_process"):
             return False
 
         if mutation_type != "patch_file":
@@ -6629,6 +6640,9 @@ class WorkingFolderAgent(ProposalRuntimeMixin):
                 Do not chase things you've already verified. Mark as finish: done.
                 {shell_note}
                 {PROPOSAL_GUIDANCE}
+                {mcp_guidance(self.root)}
+                {preview_guidance()}
+                {PACKAGE_SHELL_GUIDANCE if self._shell_access_enabled() else ""}
                 For this JSON runtime emit action.type="propose_issue" with summary, reason, evidence, run_issue_ids, and optional paths.
                                        
                 Rules:
@@ -8631,6 +8645,12 @@ class WorkingFolderAgent(ProposalRuntimeMixin):
                 action_type,
                 {"code": "SHELL_DISABLED", "message": "Shell access is disabled by SHELL_ACCESS=false."},
             )
+        managed = run_managed_shell(self.root, action, {**os.environ, "PYTHONIOENCODING": "utf-8"},
+                                    allow_changes=self.discovery_budget is None)
+        if managed is not None:
+            self._invalidate_fast_caches()
+            return ActionResult(ok="error" not in managed, name=action_type,
+                                payload={**managed, "managed_process": True})
         cmd_list, error_result = self._run_shell_command_list(action)
         if error_result is not None or cmd_list is None:
             return cast(ActionResult, error_result)
@@ -8643,6 +8663,12 @@ class WorkingFolderAgent(ProposalRuntimeMixin):
             *cmd_list,
             action=action,
         )
+        data = payload.get("data")
+        if payload.get("ok") and isinstance(data, dict) and data.get("returncode") not in (None, 0):
+            payload = {**payload, "ok": False, "error": {
+                "code": "SHELL_EXIT",
+                "message": f"Shell command exited with code {data['returncode']}.",
+            }}
         if payload.get("ok"):
             command = action["command"]
             label = command if isinstance(command, str) else " ".join(cmd_list)
@@ -9138,10 +9164,20 @@ class WorkingFolderAgent(ProposalRuntimeMixin):
             if blocked_result is not None:
                 return blocked_result
 
+            if self.discovery_budget is not None and action_type == "artifact_preview":
+                return self._error_action_result(action_type, {"error": "Starting an artifact preview is available during goal execution."})
+            if self.discovery_budget is not None and action_type == "mcp" and action.get("operation") == "call":
+                return self._error_action_result(action_type, {"error": "MCP tool execution is available during goal execution."})
             blocked_result = self._enforce_budget_and_mode(action_type)
             if blocked_result is not None:
                 return blocked_result
 
+            if action_type == "artifact_preview":
+                payload = start_artifact_preview()
+                return ActionResult(ok=payload["ok"], name=action_type, payload=payload)
+            if action_type == "mcp":
+                payload = model_mcp_result(invoke_mcp(self.root, action))
+                return ActionResult(ok=payload["ok"], name="mcp", payload=payload)
             handlers: Dict[str, Callable[[Dict[str, Any]], ActionResult]] = {
                 "list_files": self._handle_list_files_action,
                 "read_file": self._handle_read_file_action,
@@ -10271,7 +10307,12 @@ def _run_extension_bridge(args: argparse.Namespace) -> int:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    args = parse_args(argv)
+    actual_args = list(sys.argv[1:] if argv is None else argv)
+    if actual_args[:1] == ["mcp"]:
+        from skillz_mcp import main as mcp_main
+        return mcp_main(actual_args[1:])
+    args = parse_args(actual_args)
+    install_shell_process_cleanup()
     root = Path(args.root).expanduser().resolve()
     if not root.exists():
         eprint(f"Root does not exist: {root}")

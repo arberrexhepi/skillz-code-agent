@@ -17,6 +17,7 @@ import { WorkspaceDock } from './components/WorkspaceDock';
 import { WorkspaceLayout } from './components/WorkspaceLayout';
 import { WorkspaceViewControls } from './components/WorkspaceViewControls';
 import { applyEditorRefresh, type EditorTab, type RefreshedEditorTab } from './editorTypes';
+import { McpPanel } from './components/McpPanel';
 import { useWorkspaceView } from './useWorkspaceView';
 
 export default function App(): React.JSX.Element {
@@ -37,7 +38,7 @@ function WorkbenchApp(): React.JSX.Element {
   const [savingIds, setSavingIds] = useState<Set<string>>(() => new Set());
   const [activeId, setActiveId] = useState('');
   const [explorerReveal, setExplorerReveal] = useState<{ path: string; request: number }>();
-  const [sidebarMode, setSidebarMode] = useState<'files' | 'git' | 'issues' | 'facts'>('files');
+  const [sidebarMode, setSidebarMode] = useState<'files' | 'git' | 'issues' | 'facts' | 'mcp'>('files');
   const [revision, setRevision] = useState(0);
   const [focusedIssueId, setFocusedIssueId] = useState('');
   const [gitStatus, setGitStatus] = useState<GitStatus | null>(null);
@@ -257,17 +258,19 @@ function WorkbenchApp(): React.JSX.Element {
             </button>
             <button type="button" className={sidebarMode === 'issues' ? 'active' : ''} onClick={() => setSidebarMode('issues')}>Issues</button>
             <button type="button" className={sidebarMode === 'facts' ? 'active' : ''} onClick={() => setSidebarMode('facts')}>Repo Facts</button>
+            <button type="button" className={sidebarMode === 'mcp' ? 'active' : ''} onClick={() => setSidebarMode('mcp')}>MCP</button>
           </div>
-          <div className="panel-heading">
+          {sidebarMode !== 'mcp' && <div className="panel-heading">
             <span>{sidebarMode === 'files' ? workspace?.name.toUpperCase() || 'EXPLORER' : sidebarMode === 'git' ? 'SOURCE CONTROL' : sidebarMode === 'facts' ? 'REPOSITORY FACTS' : 'ISSUES'}</span>
             <button type="button" className="icon-button push-right" aria-label={sidebarMode === 'facts' ? 'Refresh repo facts' : 'Refresh sidebar'} onClick={refreshWorkspace}>↻</button>
-          </div>
+          </div>}
           <div className="sidebar-content" key={`${workspace?.root}:${sidebarMode}`}>
             {!workspace && <div className="panel-message">Open a repository to begin.</div>}
             {workspace && sidebarMode === 'files' && <FileExplorer revision={revision} activePath={activePath} reveal={explorerReveal} onOpenFile={(path) => void openFile(path)} />}
             {workspace && sidebarMode === 'git' && <GitPanel key={workspace.root} workspaceRoot={workspace.root} revision={revision} onOpenDiff={(path, staged) => void openDiff(path, staged)} onStatus={handleGitStatus} onBeforeDiscard={canDiscardPath} onDiscard={refreshDiscardedPath} />}
             {workspace && sidebarMode === 'issues' && <AgentIssues key={workspace.root} workspaceRoot={workspace.root} revision={revision} focusedIssueId={focusedIssueId} onOpenPath={(path) => void openFile(path)} />}
             {workspace && sidebarMode === 'facts' && <RepoFactsPanel onOpenIssue={(id) => { setFocusedIssueId(id); setSidebarMode('issues'); }} key={workspace.root} workspaceRoot={workspace.root} revision={revision} onOpenPath={(path) => void openFile(path)} />}
+            {workspace && sidebarMode === 'mcp' && <McpPanel revision={revision} />}
           </div>
         </aside>
       } editor={

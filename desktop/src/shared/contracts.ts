@@ -1,4 +1,5 @@
 import type { ArtifactsApi } from './artifacts';
+import type { McpApi } from './mcp';
 import type { WorkspaceIssuesSnapshot } from './workspaceIssues';
 import type { RepoFactsSnapshot } from './repoFacts';
 
@@ -101,6 +102,7 @@ export interface TerminalCreateOptions {
 
 export interface WorkbenchApi {
   artifacts: ArtifactsApi;
+  mcp: McpApi;
   workspace: {
     current(): Promise<WorkspaceInfo | null>;
     recent(): Promise<RecentWorkspace[]>;

@@ -149,6 +149,7 @@ class PlannerControlTests(unittest.TestCase):
 <summary>Execution completed successfully.</summary>
 <next_step>Run a quick UI validation pass.</next_step>
 <next_step>Review any responsive layout edge cases.</next_step>
+<optional_next_step>Fix the reported mobile popover overflow.</optional_next_step>
 </final_summary>
 """.strip()
 
@@ -159,6 +160,7 @@ class PlannerControlTests(unittest.TestCase):
             payload["next_steps"],
             ["Run a quick UI validation pass.", "Review any responsive layout edge cases."],
         )
+        self.assertEqual(payload["optional_next_steps"], ["Fix the reported mobile popover overflow."])
 
     def test_parse_planner_intake_response_salvages_orphan_goal_fields(self) -> None:
         raw = """

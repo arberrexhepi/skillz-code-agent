@@ -35,13 +35,16 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Protocol, Sequence, Tuple, TypedDict
 
 from context_tree_bridge import ContextTreeBridge
+from artifact_preview import preview_guidance, start_artifact_preview
 from discovery.dispatch import DISCOVERY_ACTION_TYPES, execute_discovery_action
+from mcp_runtime import invoke_mcp, mcp_guidance, model_mcp_result
 from mutation_text import PARSE_ERROR_PREFIX, is_text_mutation
 from mutation_runtime import EXPLICIT_MUTATION_TYPES, execute_mutation, compact_mutation_result
 from project_diagnostics import run_backend_diagnostics
 from model_result_delivery import ReadWorkingSet, prepare_model_result, render_packet
 from goal_handoff import HANDOFF_READ_CHARS, summarize_handoff
 from repository_changes import RepositorySnapshot
+from shell_processes import PACKAGE_SHELL_GUIDANCE, npm_script, run_managed_shell
 from provider_response import PROTOCOL_FAILURES, ProviderResponseError, ProviderResponseRecovery
 from command_blocks import group_command_blocks
 from tree_commands import (
@@ -1409,7 +1412,9 @@ class TreeLoop:
     def _system_prompt(self) -> str:
         grammar = self.bridge.render_command_grammar()
         shell_note = "\nSHELL ACCESS POLICY: SHELL_ACCESS=false. Do not emit `shell <command>` or any action that dispatches to `run_shell`. Prefer structured file, git, and diagnostics commands.\n" if not self.allow_shell else ""
-        return (_SYSTEM_PROMPT_TEMPLATE + shell_note).format(command_grammar=grammar) + "\n" + PROPOSAL_GUIDANCE
+        return "\n".join(filter(None, [(_SYSTEM_PROMPT_TEMPLATE + shell_note).format(command_grammar=grammar),
+                                       PROPOSAL_GUIDANCE, mcp_guidance(self.workspace_root, tree=True), preview_guidance(tree=True),
+                                       "For the shell command: " + PACKAGE_SHELL_GUIDANCE if self.allow_shell else ""]))
 
     def _combined_status(self) -> Dict[str, Any]:
         status = {
@@ -1591,7 +1596,7 @@ class TreeLoop:
                                 result.ok = False
                                 result.output = f"mutation batch limit exceeded: at most {MAX_MUTATION_COMMANDS_PER_TURN} mutating commands are allowed in one turn"
                         if result.ok:
-                            if result.command_type != "read" and (result.tool_action or {}).get("type") != "run_shell":
+                            if result.command_type != "read" and (result.tool_action or {}).get("type") not in {"run_shell", "mcp", "artifact_preview"}:
                                 self._total_writes += 1
                             executed = self._execute_tool(result)
                             if (result.tool_action or {}).get("type") == "run_shell" and (result.tool_action or {}).get("_changed_paths"):
@@ -1664,6 +1669,14 @@ class TreeLoop:
 
         action_type = action.get("type", "")
 
+        if action_type == "artifact_preview":
+            payload = start_artifact_preview()
+            r.ok = payload["ok"]
+            return json.dumps(payload, ensure_ascii=False)
+        if action_type == "mcp":
+            payload = model_mcp_result(invoke_mcp(self.workspace_root, action))
+            r.ok = payload["ok"]
+            return json.dumps(payload, ensure_ascii=False)
         if action_type in DISCOVERY_ACTION_TYPES:
             payload = execute_discovery_action(action, root=self.workspace_root)
             r.ok = bool(payload.get("ok", True))
@@ -1960,7 +1973,8 @@ class TreeLoop:
         ):
             self._read_working_set.invalidate_dependencies()
 
-    def _exec_run_shell(self, action: Dict[str, Any]) -> str:
+    def _exec_run_shell(self, action: Dict[str, Any], *, allow_process_changes: bool = True) -> str:
+        action.pop("_managed_process", None)
         if not self.allow_shell:
             command = str(action.get("command", "") or "").strip().lower()
             if command.startswith(_PACKAGE_MANAGER_INSTALL_HINT_PREFIXES):
@@ -1971,25 +1985,39 @@ class TreeLoop:
                 )
             return "run_shell: disabled by SHELL_ACCESS=false"
         command = str(action.get("command", "") or "").strip()
-        if not command:
+        if not command and action.get("operation") not in ("status", "stop"):
             return "run_shell: missing command"
         if re.search(r"(?:^|(?:&&|\|\||;|\||\n)\s*)(?:/usr/bin/)?git(?:\s|$)", command):
             return (
                 "run_shell: direct git commands are disabled; use the typed `git <subcommand>` beta grammar "
                 "so path, history-rewrite, and push authorization policies are enforced"
             )
-        if _is_long_running_shell_command(command):
+        script_command = command.removeprefix("--background ")
+        if _is_long_running_shell_command(command) and npm_script(script_command) is None:
             return (
                 "run_shell: refused long-running dev/watch command: "
                 f"{command}\n"
-                "Use a finite diagnostic command instead, such as `npm run build`, "
-                "`npm run lint`, or a targeted test command."
+                "Invoke a declared npm server script on its own or use a finite diagnostic command such as `npm run build`."
             )
 
         command = self._rewrite_repo_shell_paths(command)
 
         before = RepositorySnapshot.capture(self.workspace_root, previous=self._repository_snapshot)
         try:
+            managed = run_managed_shell(self.workspace_root, {**action, "command": command}, _subprocess_env_no_color(),
+                                        allow_changes=allow_process_changes)
+            if managed is not None:
+                action["_managed_process"] = managed.get("process_state", "error")
+                lines = []
+                if managed.get("error"):
+                    lines.append(f"run_shell: {managed['error']}")
+                if managed.get("process_id"):
+                    lines.extend([f"process_id={managed['process_id']}", f"process_state={managed['process_state']}"])
+                    if "returncode" in managed:
+                        lines.append(f"exit_code={managed['returncode']}")
+                if managed.get("stdout"):
+                    lines.append("stdout:\n" + _strip_ansi(managed["stdout"]))
+                return "\n".join(lines)
             result = subprocess.run(
                 command,
                 cwd=str(self.workspace_root),
@@ -2262,6 +2290,7 @@ class TreeLoop:
         return "\n".join(parts)
 
     def _exec_run_route_check(self, action: Dict[str, Any]) -> str:
+        action.pop("_validation_unavailable", None)
         target = str(action.get("target", "") or "").strip()
         if not target:
             return "run_route_check: missing target route or URL"
@@ -2371,9 +2400,11 @@ main().catch((error) => {
         if result.returncode != 0:
             stderr = result.stderr.strip()
             if "Cannot find module 'playwright'" in stderr or "Cannot find package 'playwright'" in stderr:
+                action["_validation_unavailable"] = True
                 return (
                     f"run_route_check: playwright is not installed in {self.workspace_root}\n"
-                    "Install Playwright in the target app workspace or provide a workspace that already has it."
+                    f"For browser execution, use the configured Playwright MCP on {url} if it can reach that URL, "
+                    "then inspect the rendered page for the goal's success conditions."
                 )
             return f"run_route_check: failed for {url}\nstderr:\n{stderr or '(no stderr)'}"
 

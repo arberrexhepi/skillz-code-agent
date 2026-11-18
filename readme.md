@@ -220,6 +220,7 @@ Packaged builds currently include the agent source but still require host Python
 | Generated dependency notices and release verification | [Third-party licenses](docs/third-party-licenses.md) |
 | Detailed implementation updates and compatibility behavior | [Development notes](docs/development-notes.md) |
 | Bundled and workspace-local skills | [Skills](skills/README.md) |
+| CLI, repository, and artifact MCP connections | [MCP](docs/mcp.md) |
 | Existing VS Code integration | [Extension](vscode-extension/README.md) |
 
 ## License and acknowledgments

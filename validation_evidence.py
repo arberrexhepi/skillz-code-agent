@@ -24,6 +24,8 @@ class ValidationEvidence:
 
     def observe(self, result: CommandResult, *, has_mutation: bool = False) -> None:
         action = result.tool_action or {}
+        if action.get("_managed_process"):
+            return
         kind = action.get("type", "")
         scope_field = {"diagnose": "path", "run_check": "kind", "run_route_check": "target", "run_shell": "command"}.get(kind)
         if scope_field is None or (kind == "run_shell" and not has_mutation):

@@ -60,7 +60,9 @@ from skill_loader import load_markdown_skills_from_dir  # noqa: E402
 from tree_commands import CommandResult  # noqa: E402
 from bridge_presentation import bridge_exchange  # noqa: E402
 from tree_loop import TreeLoop, Turn  # noqa: E402
+from artifact_preview import start_artifact_preview  # noqa: E402
 from discovery.dispatch import DISCOVERY_ACTION_TYPES, execute_discovery_action  # noqa: E402
+from mcp_runtime import invoke_mcp, model_mcp_result  # noqa: E402
 from discovery_budget import DiscoveryBudget as TreeLoopDiscoveryBudget  # noqa: E402
 from execution_evidence import SourceCoverage, repository_observation  # noqa: E402
 from validation_evidence import ValidationEvidence  # noqa: E402
@@ -68,6 +70,7 @@ from model_result_delivery import prepare_model_result  # noqa: E402
 from execution_progress import ExecutionProgress  # noqa: E402
 from run_observability import archive_snapshot, clear_archives  # noqa: E402
 from mutation_runtime import EXPLICIT_MUTATION_TYPES  # noqa: E402
+from shell_processes import install_shell_process_cleanup  # noqa: E402
 
 
 REPO_FACTS_FILENAME = "repo_facts.md"
@@ -2403,7 +2406,8 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
         edit_attempted = any(str((result.tool_action or {}).get("type", "")) in mutation_types
                              and result.command_type != "skipped" for result in turn.results)
         edit_attempted = edit_attempted or any((result.tool_action or {}).get("_changed_paths") for result in turn.results)
-        self._execution_delivery.observe_turn(turn.commands_issued, turn.results, edit_attempted=edit_attempted)
+        self._execution_delivery.observe_turn(turn.commands_issued, turn.results, edit_attempted=edit_attempted,
+                                              allow_external_progress=getattr(self, "_goal_scope", "") in {"", "execute"})
         if self._execution_delivery.exhausted:
             self.loop.request_stop(self._execution_delivery.stop_reason())
         self._refresh_loop_steering()
@@ -2412,6 +2416,9 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
             self._observability_metrics["context_compactions"] = self.loop._conversation_compaction_count
             self._observability_metrics["retained_read_context"] = self.loop._read_working_set.manifest()
             self._write_observability_snapshot(final_message="Run in progress.", finished=False)
+
+    def set_goal_scope(self, scope: str) -> None:
+        self._goal_scope = scope
 
     def _track_execution_progress(self, command: str, result: CommandResult) -> None:
         if getattr(self, "discovery_budget", None) is not None:
@@ -2673,6 +2680,12 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
                 return f"propose_issue failed: {exc}"
 
         if self.discovery_budget is not None and result.needs_tool:
+            if action_type == "artifact_preview":
+                result.ok = False
+                return "Starting an artifact preview is available during goal execution."
+            if action_type == "mcp" and action.get("operation") == "call":
+                result.ok = False
+                return "MCP tool execution is available during goal execution. Use discovery to inspect inputs."
             if action_type in {"write_file", "replace_lines", "patch_file", "npm_command"} | GIT_MUTATION_ACTION_TYPES | EXPLICIT_MUTATION_TYPES:
                 result.ok = False
                 return "Discovery mode is read-only. Finish discovery before mutating repository state."
@@ -2740,6 +2753,14 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
             self._refresh_loop_steering()
             return ""
 
+        if action_type == "artifact_preview":
+            payload = start_artifact_preview()
+            result.ok = payload["ok"]
+            return json.dumps(payload, ensure_ascii=False)
+        if action_type == "mcp":
+            payload = model_mcp_result(invoke_mcp(self.root, action))
+            result.ok = payload["ok"]
+            return json.dumps(payload, ensure_ascii=False)
         if action_type in DISCOVERY_ACTION_TYPES:
             payload = execute_discovery_action(action, root=self.root)
             result.ok = bool(payload.get("ok", True))
@@ -2761,6 +2782,9 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
         if not hasattr(self, "_validation_evidence"):
             self._validation_evidence = ValidationEvidence()
         action_type = str((result.tool_action or {}).get("type") or "")
+        managed_process = bool((result.tool_action or {}).get("_managed_process"))
+        unavailable_check = (action_type == "run_route_check" and getattr(self, "_goal_scope", "") == "execute"
+                             and bool((result.tool_action or {}).get("_validation_unavailable")))
         if result.ok and action_type in {"run_check", "diagnose", "run_route_check"} and TreeLoop._tool_message_indicates_failure(action_type, result.output):
             result.ok = False
         changed_paths = (result.tool_action or {}).get("_changed_paths", [])
@@ -2790,11 +2814,12 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
             elif diagnostics:
                 checkpoint = self._proposal_validation_checkpoint
                 checkpoint['diagnostics'] = list({item['id']: item for item in checkpoint['diagnostics'] + diagnostics}.values())
-        elif not result.ok and action_type in {"diagnose", "run_check", "run_route_check", "run_shell"}:
+        elif not result.ok and not (managed_process or unavailable_check) and action_type in {"diagnose", "run_check", "run_route_check", "run_shell"}:
             # A later unstructured/tool failure is independent evidence. An
             # earlier diagnostic proposal must not restore over its gate.
             self._proposal_validation_checkpoint = None
-        self._validation_evidence.observe(result, has_mutation=getattr(self, "_has_mutation", False))
+        if not unavailable_check:
+            self._validation_evidence.observe(result, has_mutation=getattr(self, "_has_mutation", False))
         if result.ok and action_type in {"run_check", "diagnose", "run_route_check"} and not self._validation_evidence.failures:
             working_set = getattr(getattr(self, "loop", None), "_read_working_set", None)
             if working_set is not None:
@@ -2822,7 +2847,7 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
                 self._enter_discovery_remediation(source_action=action_type)
                 focus = str((self._discovery_remediation or {}).get("path", "") or (self._discovery_remediation or {}).get("issue_id", "") or "the surfaced issue")
                 self._request_same_turn_halt(f"discovery remediation active for {focus}")
-            if action_type in {"diagnose", "run_check", "run_route_check", "run_shell"} and self._has_mutation:
+            if not (managed_process or unavailable_check) and action_type in {"diagnose", "run_check", "run_route_check", "run_shell"} and self._has_mutation:
                 path = str(action.get("path", "") or "").strip()
                 self._validation_after_mutation = False
                 self._pending_verification = {
@@ -2908,7 +2933,7 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
             self._emit_step_progress(command, result)
             return
 
-        if action_type in {"run_check", "show_diff", "review_changes", "run_shell"} | GIT_READ_ACTION_TYPES and self._has_mutation:
+        if not managed_process and action_type in {"run_check", "show_diff", "review_changes", "run_shell"} | GIT_READ_ACTION_TYPES and self._has_mutation:
             self._proposal_validation_checkpoint = None
             self._pending_verification = None
             self._validation_after_mutation = True
@@ -3348,7 +3373,7 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
         return self.loop._exec_patch_file(action)
 
     def _exec_run_shell(self, action: Dict[str, Any]) -> str:
-        return self.loop._exec_run_shell(action)
+        return self.loop._exec_run_shell(action, allow_process_changes=self.discovery_budget is None)
 
     def _exec_npm_command(self, action: Dict[str, Any]) -> str:
         return self.loop._exec_npm_command(action)
@@ -4079,7 +4104,12 @@ def interactive_treeloop_worker_loop(worker: TreeLoopPlannerWorker) -> None:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    args = parse_args(argv)
+    actual_args = list(sys.argv[1:] if argv is None else argv)
+    if actual_args[:1] == ["mcp"]:
+        from skillz_mcp import main as mcp_main
+        return mcp_main(actual_args[1:])
+    args = parse_args(actual_args)
+    install_shell_process_cleanup()
     root = args.root.expanduser().resolve()
     if not root.exists():
         print(f"Error: {root} does not exist", file=sys.stderr)

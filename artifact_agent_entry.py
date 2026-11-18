@@ -21,7 +21,7 @@ def receive() -> None:
             except ValueError:
                 requests.put(line)
                 continue
-            if message.get("type") == "artifact_model_response":
+            if message.get("type") in {"artifact_model_response", "mcp_response", "artifact_preview_response"}:
                 with lock:
                     target = pending.get(message.get("id", ""))
                 if target is not None:
@@ -44,8 +44,40 @@ class BridgeInput:
             yield line
 
 
+def request_tool(kind: str, data: dict, timeout: int) -> dict:
+    request_id = str(uuid.uuid4())
+    reply: queue.Queue[dict] = queue.Queue()
+    with lock:
+        pending[request_id] = reply
+    try:
+        print(json.dumps({"type": f"{kind}_request", "id": request_id, **data}, ensure_ascii=False), flush=True)
+        response = reply.get(timeout=timeout)
+        return response.get("payload", {"ok": False, "error": response.get("error", "Desktop tool returned no result.")})
+    except queue.Empty:
+        return {"ok": False, "error": "Timed out waiting for the desktop tool."}
+    finally:
+        with lock:
+            pending.pop(request_id, None)
+
+
+def request_mcp(action: dict) -> dict:
+    return request_tool("mcp", {"action": action}, timeout=320)
+
+
 def main() -> int:
     import main as agent
+
+    module_name = sys.argv.pop(1).removesuffix(".py")
+    mode = sys.argv[1] if len(sys.argv) > 1 else ""
+    host_model = mode == "--mcp-only"
+    if mode in {"--mcp", "--mcp-only"}:
+        from mcp_runtime import configure_broker
+        sys.argv.pop(1)
+        configure_broker(request_mcp, enabled=True)
+    if not host_model and sys.argv[1:2] == ["--artifact-preview"]:
+        from artifact_preview import configure_preview_start
+        sys.argv.pop(1)
+        configure_preview_start(lambda: request_tool("artifact_preview", {}, timeout=600))
 
     class BrokerClient(agent.BaseModelClient):
         def __init__(self, **selection):
@@ -91,10 +123,10 @@ def main() -> int:
             clone.progress_callback = self.progress_callback
             return clone
 
-    agent.create_model_client = lambda **selection: BrokerClient(**selection)
+    if not host_model:
+        agent.create_model_client = lambda **selection: BrokerClient(**selection)
     sys.stdin = BridgeInput()
     threading.Thread(target=receive, daemon=True).start()
-    module_name = sys.argv.pop(1).removesuffix(".py")
     if module_name not in {"main", "main_v2", "live_test_loop"}:
         raise ValueError("Unsupported agent backend")
     module = agent if module_name == "main" else importlib.import_module(module_name)

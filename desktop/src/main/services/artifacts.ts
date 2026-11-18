@@ -22,6 +22,7 @@ import { runArtifactBlueprintTurn } from './artifactBlueprintAgent';
 import { sqliteCapability } from './artifactDependencies';
 import { createArtifactRunBridge } from './artifactRunRuntime';
 import type { ArtifactRuntimeBridge } from './artifactRuntimeBridge';
+import type { McpHost } from './mcp';
 
 interface Running { state: ArtifactRuntime; child?: ChildProcess; sandbox?: ArtifactSandbox; processProxy?: ArtifactProcessProxy; modelBroker?: ArtifactModelBroker; runtimeBridge?: ArtifactRuntimeBridge; start?: Promise<ArtifactRuntime>; cancelled: boolean }
 export class ArtifactsService {
@@ -40,7 +41,7 @@ export class ArtifactsService {
   private changingAccess = new Set<string>();
   private changingRuntime = new Set<string>();
   private dependencyRepairs = new Map<string, ArtifactSandbox>();
-  constructor(readonly library: ArtifactLibraryService, private readonly settings: RuntimeSettingsService, private readonly emit: (event: ArtifactEvent) => void, private readonly activeWorkspace: () => string = () => '') {
+  constructor(readonly library: ArtifactLibraryService, private readonly settings: RuntimeSettingsService, private readonly emit: (event: ArtifactEvent) => void, private readonly activeWorkspace: () => string = () => '', private readonly mcp?: McpHost) {
     this.git = new ArtifactGitService(library);
     this.prebuiltUpdates = new ArtifactPrebuiltUpdates(library, library.prebuiltUpdateHome());
     this.capabilities = new ArtifactCapabilitiesService(settings.artifactSetupDirectory(), this.preview, (progress) => this.emit({ type: 'setup', progress }), undefined, undefined, undefined, settings);
@@ -270,8 +271,17 @@ export class ArtifactsService {
     const creation = (async () => {
       const artifact = await this.library.find(id);
       const workspace = new WorkspaceService((paths) => { if (paths.includes('.artifact/apis.json')) this.emit({ type: 'apis', id }); }); await workspace.open(artifact.root);
-      const execution = new ArtifactAgentExecution(() => this.sandbox(id), (message) => this.emit({ type: 'agent', id, event: { type: 'stderr', message } }), (context) => this.capabilities.hostContext(context));
-      const agent = new AgentService(workspace, (event) => this.emit({ type: 'agent', id, event }), this.settings, execution);
+      const execution = new ArtifactAgentExecution(
+        () => this.sandbox(id),
+        message => this.emit({ type: 'agent', id, event: { type: 'stderr', message } }),
+        context => this.capabilities.hostContext(context),
+        async () => {
+          const preview = await this.start(id);
+          if (preview.status !== 'running' || !preview.url) throw new Error('Artifact preview has no published URL.');
+          return preview.url;
+        },
+      );
+      const agent = new AgentService(workspace, (event) => this.emit({ type: 'agent', id, event }), this.settings, execution, this.mcp, `artifact:${id}`);
       this.agents.set(id, { workspace, agent }); return agent;
     })();
     this.agentCreations.set(id, creation);
@@ -289,9 +299,17 @@ export class ArtifactsService {
   async submit(id: string, text: string) {
     if (this.updatingPrebuilts.has(id)) throw new Error('This prebuilt is being updated. Retry when the update finishes.');
     const artifact = await this.library.find(id);
-    const app = await this.library.app(id); const apis = await this.library.apis(id);
+    const [app, apis, playwrightEnabled] = await Promise.all([
+      this.library.app(id), this.library.apis(id),
+      this.mcp?.isEnabled({ root: artifact.root, profile: `artifact:${id}` }, 'playwright').catch(() => false),
+    ]);
+    const preview = this.runtimes.get(id)?.state;
+    const browserPreview = playwrightEnabled ? (
+      ' Playwright MCP is enabled for this artifact. Use Start Preview during development or verification to get the published host URL, then open that URL with the Playwright MCP browser tools.'
+      + (preview?.status === 'running' && preview.url ? ` The current preview URL is ${preview.url}.` : '')
+    ) : '';
     const grants = [...(artifact.access?.directories || []).map(({ id, label, access, allowProcessProxy, processProxyAllowlist }) => ({ path: `/reads/${id}`, label, access, allowProcessProxy: Boolean(allowProcessProxy), processProxyAllowlist })), ...(artifact.access?.allowWorkspaceRead ? [{ path: '/reads/workspace', label: 'Workbench repository, when open at session start', access: 'read', allowProcessProxy: Boolean(artifact.access.allowWorkspaceProcessProxy), processProxyAllowlist: artifact.access.workspaceProcessProxyAllowlist }] : [])];
-    const instruction = `You are working in an independent skillz artifact repository: /repo. Build or update the requested artifact here. Read AGENTS.md, artifact.json, .artifact/app.json, and .artifact/apis.json. Preserve the Express/Vite dynamic-port runtime and run npm run build. App capabilities: ${JSON.stringify(app)}. API commands: ${JSON.stringify(apis.apis.map(api => ({ id: api.id, collection: api.collection, method: api.method, kind: api.commandKind || (api.method === 'GET' ? 'discovery' : 'mutation') })))}. Use configured /api/<id>, /ws/<id>, src/skillz.ts, and generated command routes where appropriate. Shared source context is read-only at /context. Additional folders are listed in SKILLZ_READ_ROOTS and mounted at /reads/<id>; use list_files and read_file there. Default file access is limited to /repo. Granted directories: ${JSON.stringify(grants)}. A grant marked write may be changed only when the user's request requires it; all other grants are read only. A grant with allowProcessProxy may launch only package scripts named in processProxyAllowlist through the desktop host; when no explicit list exists, conventional dev, start, serve, and preview scripts are the defaults. Prefer dev for source development and describe preview as a built-app preview. Process Proxy is separate from read/write permission and must be shown as unavailable when not granted. Read AGENTS.md for the /files API. Never edit the source repository or the parent library.\n\nUser request:\n${text}`;
+    const instruction = `You are working in an independent skillz artifact repository: /repo. Follow the user’s requested scope. For source changes, read AGENTS.md, artifact.json, .artifact/app.json, and .artifact/apis.json, preserve the Express/Vite dynamic-port runtime, and run npm run build after editing. For a browser or MCP execution task, perform the requested operation and report its observed result; source edits are only needed when requested.${browserPreview} App capabilities: ${JSON.stringify(app)}. API commands: ${JSON.stringify(apis.apis.map(api => ({ id: api.id, collection: api.collection, method: api.method, kind: api.commandKind || (api.method === 'GET' ? 'discovery' : 'mutation') })))}. Use configured /api/<id>, /ws/<id>, src/skillz.ts, and generated command routes where appropriate. Shared source context is read-only at /context. Additional folders are listed in SKILLZ_READ_ROOTS and mounted at /reads/<id>; use list_files and read_file there. Default file access is limited to /repo. Granted directories: ${JSON.stringify(grants)}. A grant marked write may be changed only when the user's request requires it; all other grants are read only. A grant with allowProcessProxy may launch only package scripts named in processProxyAllowlist through the desktop host; when no explicit list exists, conventional dev, start, serve, and preview scripts are the defaults. Prefer dev for source development and describe preview as a built-app preview. Process Proxy is separate from read/write permission and must be shown as unavailable when not granted. Read AGENTS.md for the /files API. Never edit the source repository or the parent library.\n\nUser request:\n${text}`;
     return (await this.agent(id)).submit(instruction);
   }
   async processScripts(id: string): Promise<Record<string, string[]>> {

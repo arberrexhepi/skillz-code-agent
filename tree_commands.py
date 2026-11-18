@@ -95,6 +95,7 @@ from issue_facts import (
 
 
 COMMAND_VERBS = frozenset({
+    "artifact-preview",
     "approve-npm",
     "batch",
     "cat",
@@ -114,6 +115,7 @@ COMMAND_VERBS = frozenset({
     "list-run-issues",
     "list_run_issues",
     "ls",
+    "mcp",
     "mutate",
     "npm",
     "patch",
@@ -275,7 +277,9 @@ class TreeCommandParser:
         rest = parts[1] if len(parts) > 1 else ""
 
         dispatch = {
+            "artifact-preview": self._cmd_artifact_preview,
             "ls": self._cmd_ls,
+            "mcp": self._cmd_mcp,
             "cat": self._cmd_cat,
             "read-line-range": self._cmd_read_line_range,
             "read_line_range": self._cmd_read_line_range,
@@ -349,6 +353,24 @@ class TreeCommandParser:
         read = action["type"] in DISCOVERY_ACTION_TYPES
         return CommandResult(ok=True, output=f"[dispatch: {verb}]", command_type="read" if read else "write",
                              needs_tool=True, tool_action=action)
+
+    def _cmd_artifact_preview(self, rest: str) -> CommandResult:
+        if rest.strip() not in {"", "start"}:
+            return CommandResult(False, "Usage: artifact-preview start", "error")
+        return CommandResult(True, "[dispatch: Start Preview]", "tool", needs_tool=True,
+                             tool_action={"type": "artifact_preview"})
+
+    def _cmd_mcp(self, rest: str) -> CommandResult:
+        from mcp_runtime import OPERATIONS
+
+        try:
+            action = json.loads(rest)
+            if not isinstance(action, dict) or not isinstance(action.get("operation"), str) or action["operation"] not in OPERATIONS:
+                raise ValueError("Specify a valid MCP operation.")
+        except ValueError as exc:
+            return CommandResult(False, f"MCP requires a JSON action object. {exc}", "error")
+        return CommandResult(True, "[dispatch: MCP]", "tool" if action["operation"] == "call" else "read",
+                             needs_tool=True, tool_action={**action, "type": "mcp"})
 
     def _cmd_ls(self, rest: str) -> CommandResult:
         parts = rest.split()

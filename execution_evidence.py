@@ -10,6 +10,7 @@ import shlex
 from dataclasses import dataclass
 
 from discovery.dispatch import DISCOVERY_ACTION_TYPES
+from shell_processes import npm_script
 from tree_commands import CommandResult
 
 
@@ -18,6 +19,24 @@ REPOSITORY_READ_COMMANDS = {
 }
 SOURCE_READ_COMMANDS = {"cat", "read-line-range", "read_file", "read_symbol", "read_context", "find_regex"}
 EMPTY_SEARCH_OUTPUTS = {"", "(empty)", "(no matches)", "(no symbol matches)", "(no symbols found)"}
+
+
+def external_execution_identity(action: dict) -> str | None:
+    """Identify an actual tool operation, independent of provider text or catalog lookups."""
+    kind = action.get("type")
+    if kind == "artifact_preview":
+        return "artifact_preview:start"
+    if kind == "mcp" and action.get("operation") in ("call", "read-resource", "get-prompt"):
+        fields = ("operation", "server", "name", "uri")
+        return "mcp:" + json.dumps([*(action.get(field) for field in fields), action.get("arguments") or {}], sort_keys=True)
+    if kind == "run_shell" and action.get("operation") not in ("status", "stop"):
+        command = action.get("command", "")
+        if isinstance(command, str):
+            command = command.removeprefix("--background ")
+        script = npm_script(command)
+        if script is not None:
+            return "npm:" + json.dumps(script[0])
+    return None
 
 
 @dataclass(frozen=True)

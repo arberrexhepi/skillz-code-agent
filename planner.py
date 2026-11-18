@@ -12,6 +12,7 @@ import textwrap
 import time
 from dataclasses import dataclass, field, replace as _dataclass_replace
 from context_compaction import serialize_prompt
+from execution_evidence import external_execution_identity
 from issue_facts import IssueFactLedger
 from pathlib import Path
 from planner_control import (
@@ -23,7 +24,7 @@ from planner_control import (
     planner_intake_format_instructions,
     use_tagged_planner_control,
 )
-from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Protocol, Tuple
 from runtime_catalog import runtime_model_lines, runtime_provider_lines
 
 
@@ -392,6 +393,8 @@ class PlannerSession:
     last_completed_results: List[GoalExecutionResult] = field(default_factory=list)
     last_execution_summary: str = ""
     last_next_steps: List[str] = field(default_factory=list)
+    last_auto_next_steps: List[str] = field(default_factory=list)
+    follow_up_context: Optional[Dict[str, Any]] = None
     awaiting_plan_revision: bool = False
     plan_revision_feedback: List[str] = field(default_factory=list)
     pending_discovery: Optional[DiscoveryRequest] = None
@@ -822,6 +825,8 @@ class PlannerAgent:
         self.session.last_completed_results = []
         self.session.last_execution_summary = ""
         self.session.last_next_steps = []
+        self.session.last_auto_next_steps = []
+        self.session.follow_up_context = None
         self.session.awaiting_plan_revision = False
         self.session.plan_revision_feedback = []
         self.session.pending_discovery = None
@@ -916,6 +921,22 @@ class PlannerAgent:
             return self._handle_intake_turn()
 
         if self.session.last_completed_plan is not None:
+            # Preserve the artifact submission's workspace instructions when it wraps the user text.
+            marker = "\n\nUser request:\n"
+            prefix, separator, request = text.rpartition(marker) if text.startswith(
+                "You are working in an independent skillz artifact repository: /repo."
+            ) else ("", "", text)
+            if re.fullmatch(
+                r"(?:proceed|continue|go ahead) with (?:the )?(?:suggested )?next steps[.!]?",
+                request.strip(),
+                re.IGNORECASE,
+            ):
+                if not self.session.last_next_steps:
+                    return "The completed plan has no suggested next steps."
+                request = "Plan the following suggested actions from the completed work:\n" + "\n".join(
+                    f"{index}. {step}" for index, step in enumerate(self.session.last_next_steps, start=1)
+                )
+                text = prefix + separator + request
             self._start_follow_up_request(text)
             return self._handle_intake_turn()
 
@@ -1008,6 +1029,8 @@ class PlannerAgent:
         self.session.executing_goal_count = 0
         self.session.last_execution_summary = ""
         self.session.last_next_steps = []
+        self.session.last_auto_next_steps = []
+        self.session.follow_up_context = None
         self.session.last_completed_plan = None
         self.session.last_completed_results = []
         self.session.completed_results = []
@@ -1083,6 +1106,8 @@ class PlannerAgent:
         self.session.executing_goal_count = 0
         self.session.last_execution_summary = ""
         self.session.last_next_steps = []
+        self.session.last_auto_next_steps = []
+        self.session.follow_up_context = None
         self.session.last_completed_plan = None
         self.session.last_completed_results = []
         self.session.completed_results = []
@@ -1092,6 +1117,7 @@ class PlannerAgent:
         return f"Closed issue {issue_id_closed}. It will stay out of active context until reopened."
 
     def _start_follow_up_request(self, user_request: str) -> None:
+        self.session.follow_up_context = self._follow_up_context_payload()
         self.session.latest_request = user_request.strip()
         self.session.intake_messages = [{"role": "user", "content": user_request.strip()}]
         self.session.pending_plan = None
@@ -1101,6 +1127,7 @@ class PlannerAgent:
         self.session.last_completed_results = []
         self.session.last_execution_summary = ""
         self.session.last_next_steps = []
+        self.session.last_auto_next_steps = []
         self.session.awaiting_plan_revision = False
         self.session.plan_revision_feedback = []
         self.session.pending_discovery = None
@@ -1167,6 +1194,7 @@ class PlannerAgent:
         preserve_context: bool,
         discovery_budget: Optional[DiscoveryMode] = None,
         resume_discovery: bool = False,
+        goal_scope: str = "",
     ) -> Dict[str, Any]:
         target_worker = worker or self.worker
         progress_domain = "discovery" if discovery_budget is not None else "plan"
@@ -1187,7 +1215,10 @@ class PlannerAgent:
 
         history_start = len(getattr(target_worker, "history", []))
         started = time.time()
+        set_goal_scope = getattr(target_worker, "set_goal_scope", None)
         try:
+            if callable(set_goal_scope):
+                set_goal_scope(goal_scope)
             run_result = target_worker.run_task(task)
             elapsed = time.time() - started
             history_slice = list(getattr(target_worker, "history", [])[history_start:])
@@ -1205,6 +1236,8 @@ class PlannerAgent:
                 },
             }
         finally:
+            if callable(set_goal_scope):
+                set_goal_scope("")
             try:
                 target_worker.clear_steering()
             finally:
@@ -1254,13 +1287,7 @@ class PlannerAgent:
         }
 
     @staticmethod
-    def _history_has_successful_workspace_mutation(history_slice: List[Dict[str, Any]] | List[Any]) -> bool:
-        mutation_actions = {
-            "write_file", "patch_file", "replace_lines", "replace_range", "replace_snippet", "replace_regex", "insert_before",
-            "insert_after", "delete_range", "delete_snippet", "append_block", "prepend_block",
-            "move_block", "replace_symbol", "insert_symbol_member", "rename_symbol", "create_file",
-            "delete_file", "rename_file", "copy_file", "fill_template", "batch_mutate", "npm_command",
-        }
+    def _successful_worker_actions(history_slice: List[Dict[str, Any]] | List[Any]) -> Iterable[Dict[str, Any]]:
         candidates: List[tuple[Any, Any]] = []
         for item in history_slice:
             action = getattr(item, "action", None)
@@ -1283,11 +1310,22 @@ class PlannerAgent:
             else:
                 result_ok = bool(getattr(result, "ok", False))
             if result_ok:
-                if "_changed_paths" in action:
-                    if action["_changed_paths"]:
-                        return True
-                elif str(action.get("type", "") or "") in mutation_actions:
+                yield action
+
+    @staticmethod
+    def _history_has_successful_workspace_mutation(history_slice: List[Dict[str, Any]] | List[Any]) -> bool:
+        mutation_actions = {
+            "write_file", "patch_file", "replace_lines", "replace_range", "replace_snippet", "replace_regex", "insert_before",
+            "insert_after", "delete_range", "delete_snippet", "append_block", "prepend_block",
+            "move_block", "replace_symbol", "insert_symbol_member", "rename_symbol", "create_file",
+            "delete_file", "rename_file", "copy_file", "fill_template", "batch_mutate", "npm_command",
+        }
+        for action in PlannerAgent._successful_worker_actions(history_slice):
+            if "_changed_paths" in action:
+                if action["_changed_paths"]:
                     return True
+            elif str(action.get("type", "") or "") in mutation_actions:
+                return True
         return False
 
     def _subscription_write_goal_is_unverified_noop(
@@ -1299,7 +1337,7 @@ class PlannerAgent:
         scope = str(goal.estimated_scope or "mixed").strip().lower()
         return (
             str(getattr(self.config, "provider", "") or "").strip().lower() == "codex-subscription"
-            and scope not in {"read", "validation", "analysis", "discovery"}
+            and scope not in {"read", "validation", "analysis", "discovery", "execute"}
             and bool(worker_result["ok"])
             and not bool(worker_result["validation_ran"])
             and not self._history_has_successful_workspace_mutation(history_slice)
@@ -1370,6 +1408,7 @@ class PlannerAgent:
                 steering=steering,
                 goal_fact_keys=goal.relevant_fact_keys,
                 preserve_context=goal.preserve_context,
+                goal_scope=goal.estimated_scope,
             )
             history_slice = list(execution["history_slice"])
             elapsed = float(execution["elapsed"])
@@ -1401,6 +1440,7 @@ class PlannerAgent:
                     steering=steering + "\n" + recovery_instruction,
                     goal_fact_keys=goal.relevant_fact_keys,
                     preserve_context=True,
+                    goal_scope=goal.estimated_scope,
                 )
                 history_slice.extend(list(recovery["history_slice"]))
                 elapsed += float(recovery["elapsed"])
@@ -1425,6 +1465,16 @@ class PlannerAgent:
                         ),
                     }
                 )
+            if goal.estimated_scope == "execute" and worker_result["ok"]:
+                execution_observed = any(external_execution_identity(action)
+                                         for action in self._successful_worker_actions(history_slice))
+                if not execution_observed:
+                    message = "Execution goal returned without a successful task-specific MCP operation, artifact preview, or package script."
+                    worker_result.update(ok=False, task_satisfied=False, validation_passed=False,
+                                         validation_summary=message, final_message=message)
+                elif not worker_result["validation_ran"]:
+                    worker_result.update(validation_ran=True, validation_passed=True,
+                                         validation_summary="Observed successful external execution.")
             return GoalExecutionResult(
                 goal_id=goal.goal_id,
                 title=goal.title,
@@ -2203,37 +2253,12 @@ class PlannerAgent:
             response = "\n\n".join([response, self.execute_discovery(mode)])
         return response
 
-    def _extract_next_steps_from_summary(self, summary: str) -> List[str]:
-        lines = str(summary or "").splitlines()
-        in_next_steps = False
-        steps: List[str] = []
-        for line in lines:
-            stripped = line.strip()
-            if not stripped:
-                continue
-            if stripped.lower().startswith("next steps"):
-                in_next_steps = True
-                continue
-            if in_next_steps and re.match(r"^[A-Z][A-Za-z ]+$", stripped) and not re.match(r"^[-*\d]", stripped):
-                break
-            if in_next_steps:
-                cleaned = re.sub(r"^(?:[-*]|\d+[.)])\s*", "", stripped).strip()
-                if cleaned and cleaned.lower() != "none." and cleaned.lower() != "none":
-                    steps.append(cleaned)
-        return self._filter_completed_next_steps(
-            self.session.last_completed_plan or PlannerPlan(original_request="", summary="", goals=[]),
-            self.session.last_completed_results,
-            steps,
-        )
-
     def _continuous_completed_scope_texts(self) -> List[str]:
         texts: List[str] = []
         for item in self.continuous_state.completed_issues:
             if not isinstance(item, dict):
                 continue
-            # The execution summary includes its own Next Steps section. Treating
-            # that text as completed scope suppresses every newly proposed
-            # follow-up before it can be created.
+            # Execution reports can mention open findings and suggested actions.
             for key in ["request_summary", "plan_summary", "summary"]:
                 value = str(item.get(key, "") or "").strip()
                 if value:
@@ -2245,10 +2270,7 @@ class PlannerAgent:
         creator = getattr(self.worker, "create_issue", None)
         if not callable(creator):
             return created
-        completed_scope = self._continuous_completed_scope_texts()
-        for step in self._extract_next_steps_from_summary(self.session.last_execution_summary):
-            if self._next_step_is_probably_completed(step, completed_scope):
-                continue
+        for step in self.session.last_auto_next_steps:
             issue = creator(
                 request_summary=step,
                 plan_summary=step,
@@ -2312,6 +2334,8 @@ class PlannerAgent:
                 self.session.last_completed_results = []
                 self.session.last_execution_summary = ""
                 self.session.last_next_steps = []
+                self.session.last_auto_next_steps = []
+                self.session.follow_up_context = None
                 self.session.defer_issue_close_for_review = True
 
                 self.continuous_state.status = "planning"
@@ -2491,6 +2515,12 @@ class PlannerAgent:
                 self.continuous_state.created_followup_issues.extend(followups)
                 if followups:
                     output.append(f"Cycle {cycle}: created follow-up issues: {', '.join(followup_ids)}.")
+                if (
+                    run_prompt and cycle < self.continuous_config.max_cycles
+                    and self.session.last_next_steps and not self.session.last_auto_next_steps
+                ):
+                    self.continuous_state.stop_reason = "followup_requires_approval"
+                    break
         finally:
             self.session.defer_issue_close_for_review = False
             self.continuous_state.status = "stopped"
@@ -2624,7 +2654,7 @@ class PlannerAgent:
         if self._use_tagged_planner_control():
             try:
                 payload = parse_final_summary_response(raw)
-                if payload.get("summary") or payload.get("next_steps"):
+                if payload.get("summary") or payload.get("next_steps") or payload.get("optional_next_steps"):
                     return payload
             except Exception:
                 pass
@@ -2677,6 +2707,7 @@ class PlannerAgent:
             - Each goal should be substantial, not a tiny task list.
             - Mark a goal `parallelizable=true` only if it is safely independent, read-only or validation-only, and does not need preserved worker context.
             - Use `estimated_scope=write` for goals expected to mutate files or git state.
+            - Use `estimated_scope=execute` to start an artifact preview or operate a browser, service, or workflow through an MCP tool or a package script when the deliverable does not require repository changes. Name the operation and the observable success condition.
             - preserve_context=true only when the next goal genuinely benefits from worker continuity.
             - delegation_notes should contain useful commentary for the worker, not generic filler.
             - Strong delegation_notes usually include concrete targets, constraints, and validation direction.
@@ -2964,7 +2995,12 @@ class PlannerAgent:
             sections.append("Delegation notes:\n- " + "\n- ".join(goal.delegation_notes))
         if goal.success_signals:
             sections.append("Success signals:\n- " + "\n- ".join(goal.success_signals))
-        sections.append("Validation expectation:\n- Prefer one real validation step before finish: diff review, targeted build/typecheck/test, or another concrete integrity check if available.")
+        if goal.estimated_scope == "execute":
+            sections.append("Execution scope: perform the task-specific operation using an MCP tool, artifact preview, or package script as appropriate. "
+                            "Use the returned evidence to check the success signals and report the outcome. "
+                            "Catalog lookups alone do not complete the goal. Repository edits are unnecessary unless expressly requested.")
+        else:
+            sections.append("Validation expectation:\n- Prefer one real validation step before finish: diff review, targeted build/typecheck/test, or another concrete integrity check if available.")
         if self.session.last_discovery is not None:
             discovery_findings = _discovery_findings_lines(self.session.last_discovery)
             sections.append("Discovery findings:\n- " + "\n- ".join(discovery_findings or [self.session.last_discovery.final_message]))
@@ -3244,52 +3280,59 @@ class PlannerAgent:
             ]
             return "\n".join(lines)
 
-        completed_titles = [f"- {r.title}: {r.final_message}" for r in results if r.final_message]
-        completed_block = "\n".join(completed_titles) if completed_titles else "(none)"
+        auto = self.continuous_state.enabled
+        prior_completed_actions = self._continuous_completed_scope_texts() if auto else []
         prompt = json.dumps(
             {
                 "original_request": plan.original_request,
                 "plan_summary": plan.summary,
+                "not_in_scope": plan.not_in_scope,
                 "goals": [self._goal_payload(goal) for goal in plan.goals],
                 "results": [self._result_payload(result) for result in results],
-                "continuous_run_prompt": self.continuous_state.run_prompt,
-                "continuous_run_completed_issues": list(self.continuous_state.completed_issues),
+                "continuous_run_prompt": self.continuous_state.run_prompt if auto else "",
+                "continuous_run_completed_issues": prior_completed_actions,
             },
             indent=2,
         )
-        run_completed = self._continuous_completed_context()
-        run_completed_block = (
-            "\n\nAUTO RUN ALREADY COMPLETED ISSUES (do NOT suggest these as next steps):\n"
-            + run_completed
-            if run_completed
-            else ""
-        )
         raw = self._planner_complete(
-                        final_summary_instructions(use_tags=self._use_tagged_planner_control())
-                        + "\n\nALREADY COMPLETED (do NOT suggest any of this as next steps):"
-            + "\n"
-            + completed_block
-            + run_completed_block
+            final_summary_instructions(use_tags=self._use_tagged_planner_control())
             + "\n\n"
             + textwrap.dedent(
                 """
-                Requirements:
-                - next_steps must be NEW work not covered by any completed goal above
-                - when continuous_run_prompt is present, next_steps should be remaining slices of that prompt, not repeats of continuous_run_completed_issues
-                - a step is NOT new if any completed goal already implemented, integrated, or added what the step describes
-                - next_steps must be strictly remaining work, optional follow-up, or explicit validation that is not already completed
-                - avoid generic suggestions like add tests unless tied to the result
-                - if the requested work is already complete and no concrete follow-up remains, return an empty next_steps list
-                - prefer 0 to 4 next steps, not forced suggestions
+                Write Next Steps for the person receiving the report, in manual and continuous runs.
+                Separate work actually performed from problems discovered or mentioned in the results.
+                A completed review can report unresolved findings. Turn those findings into concrete
+                actions even when the original request was fully satisfied. Group related findings
+                and specify the target and observable result of each action.
+                For example, an audit that finds a popover overflows can suggest fixing its width
+                and checking that it fits the reported mobile viewport.
+                Use next_steps for unfinished work already authorized by the original request (or the
+                active continuous_run_prompt). Use optional_next_steps for adjacent recommendations
+                that need separate approval, including fixes found by a read-only audit.
+                Prioritize the most consequential actions. Exclude work already performed or listed in
+                continuous_run_completed_issues. Leave both lists empty only if no concrete action remains.
                 """
             ).strip(),
             prompt,
         )
         payload = self._load_final_summary_payload(raw)
         summary = str(payload.get("summary") or "Plan execution finished.").strip()
-        next_steps = [str(item) for item in payload.get("next_steps") or [] if str(item).strip()]
-        next_steps = self._filter_completed_next_steps(plan, results, next_steps)
-        self.session.last_next_steps = list(next_steps)
+        completed_actions = {
+            self._next_step_key(text)
+            for text in [
+                plan.original_request, plan.summary,
+                *(text for goal in plan.goals for text in (goal.title, goal.goal)),
+                *(result.delegated_task for result in results),
+                *prior_completed_actions,
+            ]
+        }
+        optional_steps = self._unique_next_steps(payload.get("optional_next_steps"), completed_actions)
+        auto_steps = self._unique_next_steps(
+            payload.get("next_steps"), completed_actions | {self._next_step_key(step) for step in optional_steps}
+        )
+        next_steps = auto_steps + optional_steps
+        self.session.last_next_steps = next_steps
+        self.session.last_auto_next_steps = auto_steps
         lines = [
             "Execution Summary",
             f"- {summary}",
@@ -3297,82 +3340,24 @@ class PlannerAgent:
         if next_steps:
             lines.extend(["", "Next Steps"])
             lines.extend(f"{index}. {item}" for index, item in enumerate(next_steps, start=1))
+            lines.extend(["", "Say “Proceed with next steps” to plan these actions."])
         else:
             lines.extend(["", "Next Steps", "- None."])
         return "\n".join(lines)
 
-    def _meaningful_tokens(self, text: str) -> List[str]:
-        stop_words = {
-            "the", "and", "for", "with", "that", "this", "from", "into", "after", "before",
-            "then", "than", "when", "where", "while", "will", "would", "could", "should",
-            "about", "have", "has", "had", "already", "user", "users", "app", "flow",
-            "work", "goal", "result", "complete", "completed", "update", "updated", "implement",
-            "implemented", "verify", "validation", "specific", "next", "steps", "step",
-        }
-        return [
-            token for token in re.findall(r"[a-z0-9_]+", text.lower())
-            if len(token) >= 3 and token not in stop_words
-        ]
+    @staticmethod
+    def _next_step_key(text: str) -> str:
+        return " ".join(text.casefold().split()).rstrip(".!")
 
-    def _completed_scope_texts(self, plan: PlannerPlan, results: List[GoalExecutionResult]) -> List[str]:
-        texts: List[str] = [plan.original_request, plan.summary, plan.clarification_summary]
-        for goal in plan.goals:
-            texts.extend([goal.title, goal.goal, goal.reason])
-            texts.extend(goal.delegation_notes)
-            texts.extend(goal.success_signals)
-        for result in results:
-            texts.extend([result.title, result.final_message, result.delegated_task, result.commentary_for_next_goal])
-        return [text.strip() for text in texts if text and text.strip()]
-
-    def _next_step_is_probably_completed(self, next_step: str, completed_texts: List[str]) -> bool:
-        next_step_normalized = " ".join(self._meaningful_tokens(next_step))
-        next_tokens = set(self._meaningful_tokens(next_step))
-        if not next_tokens:
-            return False
-
-        # Per-text check: any single completed text covers most of the step
-        for completed in completed_texts:
-            completed_tokens = set(self._meaningful_tokens(completed))
-            if not completed_tokens:
-                continue
-            completed_normalized = " ".join(self._meaningful_tokens(completed))
-            if next_step_normalized and next_step_normalized in completed_normalized:
-                return True
-            overlap = len(next_tokens & completed_tokens)
-            if overlap == 0:
-                continue
-            coverage = overlap / max(1, len(next_tokens))
-            if coverage >= 0.6:
-                return True
-
-        # Aggregate pool check: the entire body of completed work collectively
-        # covers the step's vocabulary, meaning the step introduces no new concepts
-        all_completed_tokens: set = set()
-        for completed in completed_texts:
-            all_completed_tokens.update(self._meaningful_tokens(completed))
-        if all_completed_tokens and next_tokens:
-            aggregate_coverage = len(next_tokens & all_completed_tokens) / max(1, len(next_tokens))
-            if aggregate_coverage >= 0.65:
-                return True
-        return False
-
-    def _filter_completed_next_steps(
-        self,
-        plan: PlannerPlan,
-        results: List[GoalExecutionResult],
-        next_steps: List[str],
-    ) -> List[str]:
-        completed_texts = self._completed_scope_texts(plan, results)
+    def _unique_next_steps(self, steps: Any, completed_actions: set[str]) -> List[str]:
+        if not isinstance(steps, list):
+            return []
+        seen = completed_actions | {"", "none"}
         filtered: List[str] = []
-        seen: Dict[str, None] = {}
-        for step in next_steps:
-            normalized = step.strip()
-            if not normalized or normalized in seen:
-                continue
-            seen[normalized] = None
-            if self._next_step_is_probably_completed(normalized, completed_texts):
-                continue
-            filtered.append(normalized)
+        for step in steps:
+            if isinstance(step, str) and (key := self._next_step_key(step)) not in seen:
+                seen.add(key)
+                filtered.append(step.strip())
         return filtered
 
     def _goal_payload(self, goal: PlannerGoal) -> Dict[str, Any]:
@@ -3636,11 +3621,12 @@ class PlannerAgent:
 
     def _follow_up_context_payload(self) -> Optional[Dict[str, Any]]:
         if self.session.last_completed_plan is None:
-            return None
+            return self.session.follow_up_context
         return {
             "prior_plan": self._plan_payload(self.session.last_completed_plan),
             "prior_results": [self._result_payload(result) for result in self.session.last_completed_results[-5:]],
             "prior_execution_summary": self.session.last_execution_summary,
+            "prior_next_steps": list(self.session.last_next_steps),
             "prior_discovery": self._discovery_result_payload(self.session.last_discovery),
         }
 

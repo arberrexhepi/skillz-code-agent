@@ -10,7 +10,7 @@ export interface AgentExecution {
   stop(): Promise<void>;
   prepareRuntime?(provider: string, model: string): Promise<() => void>;
 }
-export interface AgentLaunch { agentRoot: string; scriptName: string; python: { executable: string; args: string[] }; env: NodeJS.ProcessEnv; options: AgentStartOptions }
+export interface AgentLaunch { agentRoot: string; scriptName: string; python: { executable: string; args: string[] }; env: NodeJS.ProcessEnv; options: AgentStartOptions; mcp?: boolean }
 export class ArtifactAgentExecution implements AgentExecution {
   private sandbox?: ArtifactSandbox;
   private child?: ChildProcessWithoutNullStreams;
@@ -19,7 +19,9 @@ export class ArtifactAgentExecution implements AgentExecution {
   private baseContext?: AgentLaunch;
   private generation = 0;
   private selection?: { provider: string; model: string };
-  constructor(private readonly createSandbox: () => Promise<ArtifactSandbox>, private readonly log: (text: string) => void, private readonly prepareHost?: (context: AgentLaunch) => Promise<AgentLaunch>) {}
+  constructor(private readonly createSandbox: () => Promise<ArtifactSandbox>, private readonly log: (text: string) => void,
+    private readonly prepareHost?: (context: AgentLaunch) => Promise<AgentLaunch>,
+    private readonly startPreview?: () => Promise<string>) {}
   async launch(context: AgentLaunch): Promise<ChildProcessWithoutNullStreams> {
     const generation = this.generation;
     this.baseContext = context;
@@ -30,7 +32,10 @@ export class ArtifactAgentExecution implements AgentExecution {
     const sandbox = await this.createSandbox(); this.sandbox = sandbox;
     const prepared = await sandbox.prepare(this.log, context.agentRoot);
     if (generation !== this.generation) { await sandbox.stop(); throw new Error('Agent start cancelled.'); }
-    const child = sandbox.spawn(prepared.docker, prepared.args, ['python3', '-u', '/opt/skillz/artifact_agent_entry.py', context.scriptName, '--provider', context.options.provider, '--model', context.options.model, '--root', '/repo', '--tools', '/opt/skillz/agent_tools.py', '--extension-bridge'], ['-i']);
+    const child = sandbox.spawn(prepared.docker, prepared.args, ['python3', '-u', '/opt/skillz/artifact_agent_entry.py', context.scriptName,
+      ...(context.mcp ? ['--mcp'] : []), ...(this.startPreview ? ['--artifact-preview'] : []),
+      '--provider', context.options.provider, '--model', context.options.model,
+      '--root', '/repo', '--tools', '/opt/skillz/agent_tools.py', '--extension-bridge'], ['-i']);
     this.child = child;
     child.once('exit', () => { if (this.child === child) void this.stop().catch(() => {}); });
     return child;
@@ -70,10 +75,26 @@ export class ArtifactAgentExecution implements AgentExecution {
     };
   }
   message(payload: Record<string, unknown>): boolean {
-    if (payload.type !== 'artifact_model_request') return false;
+    const preview = payload.type === 'artifact_preview_request';
+    if (!preview && payload.type !== 'artifact_model_request') return false;
     const context = this.context, child = this.child;
-    if (!context || !child || typeof payload.id !== 'string') return true;
-    const reply = (value: Record<string, unknown>) => { if (this.child === child && !child.stdin.destroyed) child.stdin.write(JSON.stringify({ ...value, type: 'artifact_model_response', id: payload.id }) + '\n'); };
+    if (!context || !child || typeof payload.id !== 'string' || payload.id.length > 80) return true;
+    const reply = (value: Record<string, unknown>) => {
+      if (this.child === child && !child.stdin.destroyed) {
+        child.stdin.write(JSON.stringify({ ...value, type: preview ? 'artifact_preview_response' : 'artifact_model_response', id: payload.id }) + '\n');
+      }
+    };
+    if (preview) {
+      if (!this.startPreview || Object.keys(payload).some(key => key !== 'type' && key !== 'id')) {
+        reply({ payload: { ok: false, error: 'Start Preview accepts no arguments and is scoped to this artifact.' } });
+      } else {
+        void Promise.resolve().then(this.startPreview).then(
+          url => reply({ payload: { ok: true, status: 'running', url } }),
+          error => reply({ payload: { ok: false, error: error instanceof Error ? error.message : String(error) } }),
+        );
+      }
+      return true;
+    }
     if (payload.provider !== this.selection?.provider || payload.model !== this.selection?.model) { reply({ error: 'Model request does not match the selected runtime.' }); return true; }
     if (this.models.size >= 8) { reply({ error: 'Too many simultaneous model requests.' }); return true; }
     const helper = spawnModelHelper(context.python.executable, [...context.python.args, path.join(context.agentRoot, 'artifact_model_host.py')], { cwd: context.agentRoot, env: context.env, windowsHide: true });

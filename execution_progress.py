@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 import re
 from typing import Sequence
 
-from execution_evidence import RepositoryObservation, repository_observation
+from execution_evidence import RepositoryObservation, external_execution_identity, repository_observation
 from tree_commands import CommandResult
 from issue_proposals import diagnostic_fingerprint
 
@@ -43,6 +43,7 @@ class ExecutionProgress:
     targets: list[str] = field(default_factory=list)
     diagnostic_repair: DiagnosticRepair | None = None
     diagnostic_fingerprints: set[str] = field(default_factory=set)
+    external_executions: set[str] = field(default_factory=set)
 
     @property
     def recovering(self) -> bool:
@@ -69,8 +70,13 @@ class ExecutionProgress:
         )
         return True
 
-    def observe_turn(self, commands: Sequence[str], results: Sequence[CommandResult], *, edit_attempted: bool = False) -> None:
-        if edit_attempted:
+    def observe_turn(self, commands: Sequence[str], results: Sequence[CommandResult], *,
+                     edit_attempted: bool = False, allow_external_progress: bool = True) -> None:
+        executions = {identity for result in results if result.ok
+                      and (identity := external_execution_identity(result.tool_action or {})) is not None}
+        novel_execution = allow_external_progress and bool(executions - self.external_executions)
+        self.external_executions.update(executions)
+        if edit_attempted or novel_execution:
             self.read_only_turns = self.repository_reads = self.read_chars = self.context_replacements = self.focused_reads_used = 0
             self.source_lines.clear()
             self.targets.clear()
@@ -119,6 +125,7 @@ class ExecutionProgress:
             "read_chars": self.read_chars,
             "source_lines_returned": {path: len(lines) for path, lines in self.source_lines.items()},
             "context_replacements": self.context_replacements,
+            "external_executions": len(self.external_executions),
             "focused_reads_remaining": max(0, RECOVERY_READ_ALLOWANCE - self.focused_reads_used),
             "recovery": self.recovering,
             "recent_targets": list(self.targets),
@@ -145,14 +152,15 @@ class ExecutionProgress:
             )
         return (
             f"{status}: {self.read_only_turns} completed execution turns, {self.repository_reads} repository reads "
-            f"and {self.context_replacements} context replacements since the last edit attempt. "
+            f"and {self.context_replacements} context replacements since the last edit attempt or new external execution. "
             "Reading new or evicted source does not reset this allowance. Use the current bounded edit surface to make the "
             "requested change; you do not need the entire file in context. If context is missing, name the exact target "
             "and missing identifier/anchor, then request a small read-symbol or read-context window. "
             "Do not promise an edit after one more broad scan or reload every declaration before editing. "
             + (f"Only {max(0, RECOVERY_READ_ALLOWANCE - self.focused_reads_used)} focused reads remain, each at most "
                f"{RECOVERY_READ_LINES} source lines and {RECOVERY_READ_CHARS} characters. " if self.recovering else "")
-            + "For a read-only task, deliver the findings. If a safe change is unavailable, finish with a concrete blocker; never edit merely to reset a counter."
+            + "For an execution goal, run the next task-specific MCP operation or package script and report its result. "
+              "For a read-only task, deliver the findings. If the required action is unavailable, report the concrete blocker."
         )
 
     def stop_reason(self) -> str:
@@ -161,7 +169,7 @@ class ExecutionProgress:
             return (f"diagnostic repair stalled at {repair.path}:{repair.line}: the bounded inspection/repair window expired "
                     f"without an edit attempt or completed answer ({self.read_only_turns} execution turns, {self.repository_reads} repository reads).")
         return (
-            f"execution delivery stalled: {self.read_only_turns} execution turns without an edit attempt or completed answer; "
+            f"execution delivery stalled: {self.read_only_turns} execution turns without an edit attempt, new external execution, or completed answer; "
             f"{self.repository_reads} repository reads and {self.context_replacements} context replacements. "
             "The bounded recovery allowance was exhausted."
         )

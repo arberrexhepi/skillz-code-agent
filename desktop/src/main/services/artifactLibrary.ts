@@ -32,7 +32,9 @@ async function writeText(file: string, value: string): Promise<void> {
 export class ArtifactLibraryService {
   private queue: Promise<unknown> = Promise.resolve();
   private legacyPrebuiltIds = new Map<string, string | undefined>();
-  constructor(private readonly settingsFile: string, private readonly template: string, private readonly contextHome: string, private readonly prebuiltHome = path.join(path.dirname(template), 'prebuilt-artifacts')) {}
+  constructor(private readonly settingsFile: string, private readonly template: string, private readonly contextHome: string,
+    private readonly prebuiltHome = path.join(path.dirname(template), 'prebuilt-artifacts'),
+    private readonly enablePlaywrightMcp?: (id: string, root: string) => Promise<void>) {}
   private serial<T>(operation: () => Promise<T>): Promise<T> { const pending = this.queue.then(operation); this.queue = pending.catch(() => {}); return pending; }
   async library(): Promise<ArtifactLibrary> {
     let settings: { root?: string };
@@ -124,7 +126,7 @@ export class ArtifactLibraryService {
     if (!(await this.prebuilts()).some(item => item.id === artifactId.parse(id))) throw new Error('Unknown prebuilt artifact.');
     return path.join(this.prebuiltHome, id);
   }
-  async installPrebuilt(id: string, access: ArtifactAccess, runtime?: import('../../shared/artifacts').CreateArtifact['runtime']): Promise<ArtifactRecord> {
+  async installPrebuilt(id: string, access: ArtifactAccess, runtime?: CreateArtifact['runtime'], playwrightMcp?: boolean): Promise<ArtifactRecord> {
     const preset = (await this.prebuilts()).find(item => item.id === artifactId.parse(id));
     if (!preset) throw new Error('Unknown prebuilt artifact.');
     const source = path.join(this.prebuiltHome, id);
@@ -133,11 +135,12 @@ export class ArtifactLibraryService {
     const checked = artifactAccessSchema.parse(access);
     if (preset.requiresWriteAccess && !checked.directories.some(directory => directory.access === 'write')) throw new Error('Share at least one repository with Allow changes enabled.');
     if (preset.requiresProcessProxy && !checked.directories.some(directory => directory.allowProcessProxy)) throw new Error('Share at least one repository with Allow Process Proxy enabled.');
-    return this.createFrom({ title: preset.title, prompt: preset.description, sourceRoot: '', shareFacts: false, shareMemory: false, runtime, access: checked }, source, 'Install prebuilt artifact', preset.id);
+    return this.createFrom({ title: preset.title, prompt: preset.description, sourceRoot: '', shareFacts: false, shareMemory: false, runtime, access: checked, playwrightMcp }, source, 'Install prebuilt artifact', preset.id);
   }
   private createFrom(raw: CreateArtifact, source: string, initialCommit: string, prebuiltId?: string): Promise<ArtifactRecord> {
     return this.serial(async () => {
-      const options = createArtifactSchema.parse(raw);
+      const { playwrightMcp, ...options } = createArtifactSchema.parse(raw);
+      if (playwrightMcp && !this.enablePlaywrightMcp) throw new Error('The artifact installer has no MCP host.');
       const library = await this.library();
       if (!library.root) throw new Error('Configure an artifact folder first.');
       if ((options.shareFacts || options.shareMemory) && !options.sourceRoot) throw new Error('Open a source workspace before sharing context.');
@@ -179,6 +182,7 @@ export class ArtifactLibraryService {
       await git(root, 'add', '--', '.');
       await git(root, ...author, 'commit', '-m', initialCommit);
       if (sourceBaseline) await writeSourceSnapshot(prebuiltBaselineFile(path.dirname(this.settingsFile), root), { version: 1, root, prebuiltId, files: sourceBaseline });
+      if (playwrightMcp) await this.enablePlaywrightMcp?.(id, root);
       // Existing child repository is registered as a gitlink, not added as ordinary files.
       await git(library.root, '-c', 'protocol.file.allow=always', 'submodule', 'add', `./${id}`, id);
       await git(library.root, 'submodule', 'absorbgitdirs', '--', id);

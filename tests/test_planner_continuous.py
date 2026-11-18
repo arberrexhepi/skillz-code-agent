@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from planner import DiscoveryRequest, DiscoveryResult, GoalExecutionResult, PlannerAgent, PlannerPlan
 from planner import PlannerGoal
@@ -210,6 +211,62 @@ class ContinuousAutoApprovalTests(unittest.TestCase):
         self.assertEqual(completed_counts, [1, 2])
         self.assertEqual(planner.session.last_next_steps, [])
         self.assertEqual(planner.export_state()["last_next_steps"], [])
+
+    def test_read_only_findings_become_actionable_followups_in_manual_and_auto_runs(self):
+        audit = "Audit the artifact UI at 1440x900 and 390x844. Keep the repository read-only."
+        popover = "Fix the 83px right-edge overflow on the mobile Runtime & Sandbox Status popover at 390x844."
+        favicon = "Serve /favicon.ico and verify it returns HTTP 200."
+        findings = (
+            f"Completed both viewport checks with zero repository edits. Open findings: {popover} {favicon}"
+        )
+        for auto in (False, True):
+            with self.subTest(auto=auto), tempfile.TemporaryDirectory() as tmpdir:
+                root = Path(tmpdir)
+                audit_plan = present_plan("Audit the artifact UI", audit, ["Use Playwright MCP."])
+                audit_plan["action"]["goals"][0]["estimated_scope"] = "execute"
+                fixes = present_plan("Fix the reported UI issues", f"{popover} {favicon}", ["Use the audit findings."])
+                model = FakeModel([
+                    audit_plan,
+                    {"summary": findings, "next_steps": [audit], "optional_next_steps": [popover, favicon, popover.lower()]},
+                    fixes,
+                ])
+                config = SimpleNamespace(
+                    root=root, provider="local", model="fixture", thinking_mode="medium",
+                    verbosity="medium", max_parallel_workers=1,
+                )
+                worker = FakeWorker(root)
+                planner = ImmediateExecutionPlannerForTest(model, config, lambda: worker, json.loads)
+                goal_result = GoalExecutionResult(
+                    goal_id="goal-1", title="Audit the artifact UI", delegated_task=audit,
+                    final_message=findings, status="completed", task_satisfied=True,
+                )
+                with (
+                    patch.object(planner, "_execute_goal_with_worker", return_value=goal_result) as execute,
+                    patch.object(worker, "create_issue", wraps=worker.create_issue) as create_issue,
+                ):
+                    if auto:
+                        summary = planner.start_continuous(max_cycles=2, prompt=audit)
+                        self.assertEqual(planner.continuous_state.stop_reason, "followup_requires_approval")
+                        self.assertFalse(any(call.kwargs.get("source") == "next_step" for call in create_issue.call_args_list))
+                    else:
+                        planner.start_request(audit)
+                        summary = planner.continue_conversation("approve")
+
+                    self.assertEqual(planner.export_state()["last_next_steps"], [popover, favicon])
+                    self.assertIn(f"Next Steps\n1. {popover}\n2. {favicon}", summary)
+                    self.assertIn(findings, json.loads(model.prompts[1])["results"][0]["final_message"])
+
+                    reply = "Proceed with the suggested next steps."
+                    if not auto:
+                        reply = "You are working in an independent skillz artifact repository: /repo.\n\nUser request:\n" + reply
+                    planner.continue_conversation(reply)
+                    execute.assert_called_once()
+                    self.assertIsNotNone(planner.session.pending_plan)
+                    prompt = json.loads(model.prompts[2])
+                    self.assertIn(popover, prompt["request"])
+                    self.assertIn(favicon, prompt["request"])
+                    self.assertEqual(prompt["follow_up_context"]["prior_next_steps"], [popover, favicon])
+                    self.assertEqual(prompt["follow_up_context"]["prior_results"][0]["final_message"], findings)
 
     def test_manual_discovery_handoff_continues_to_plan(self):
         with tempfile.TemporaryDirectory() as tmpdir:

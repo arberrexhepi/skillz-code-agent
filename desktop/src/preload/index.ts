@@ -3,6 +3,13 @@ import { contextBridge, ipcRenderer } from 'electron';
 import type { AgentEvent, TerminalEvent, WorkbenchApi } from '../shared/contracts';
 
 const api: WorkbenchApi = {
+  mcp: {
+    profile: (id) => ipcRenderer.invoke('mcp:profile', id),
+    save: (name, settings, id) => ipcRenderer.invoke('mcp:save', name, settings, id),
+    manage: (action, name, id) => ipcRenderer.invoke('mcp:manage', action, name, id),
+    inspect: (name, kind, id, query, offset) => ipcRenderer.invoke('mcp:inspect', name, kind, id, query, offset),
+    setup: () => ipcRenderer.invoke('mcp:setup'),
+  },
   artifacts: {
     capabilities: (selection, artifactId) => ipcRenderer.invoke('artifacts:capabilities', selection, artifactId),
     installCapabilities: (selection, artifactId) => ipcRenderer.invoke('artifacts:install-capabilities', selection, artifactId),
@@ -14,7 +21,7 @@ const api: WorkbenchApi = {
     cleanDocker: () => ipcRenderer.invoke('artifacts:clean-docker'),
     library: () => ipcRenderer.invoke('artifacts:library'),
     prebuilts: () => ipcRenderer.invoke('artifacts:prebuilts'),
-    installPrebuilt: (id, access, runtime) => ipcRenderer.invoke('artifacts:install-prebuilt', id, access, runtime),
+    installPrebuilt: (id, access, runtime, playwrightMcp) => ipcRenderer.invoke('artifacts:install-prebuilt', id, access, runtime, playwrightMcp),
     chooseFolder: () => ipcRenderer.invoke('artifacts:choose-folder'),
     prebuiltUpdateStatus: (id) => ipcRenderer.invoke('artifacts:prebuilt-update-status', id),
     reviewPrebuiltUpdate: (id) => ipcRenderer.invoke('artifacts:review-prebuilt-update', id),

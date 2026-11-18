@@ -61,9 +61,9 @@ export type ReadDirectory = z.infer<typeof readDirectorySchema>;
 export type ReadDirectoryChoice = ReadDirectory & { packageScripts: string[] };
 export interface PrebuiltArtifact { id: string; title: string; description: string; previousTitles?: string[]; requiresWriteAccess: boolean; requiresProcessProxy?: boolean; usesAgentRuntime?: boolean; }
 export type ArtifactAccess = z.infer<typeof artifactAccessSchema>;
-export const createArtifactSchema = z.object({ title: z.string().trim().min(1).max(120), prompt: z.string().trim().min(1).max(20000), sourceRoot: z.string().max(4096), shareFacts: z.boolean(), shareMemory: z.boolean(), runtime: artifactAgentRuntimeSchema.optional(), access: artifactAccessSchema.optional(), app: artifactAppSchema.optional() });
+export const createArtifactSchema = z.object({ title: z.string().trim().min(1).max(120), prompt: z.string().trim().min(1).max(20000), sourceRoot: z.string().max(4096), shareFacts: z.boolean(), shareMemory: z.boolean(), runtime: artifactAgentRuntimeSchema.optional(), access: artifactAccessSchema.optional(), app: artifactAppSchema.optional(), playwrightMcp: z.boolean().optional() });
 export type CreateArtifact = z.infer<typeof createArtifactSchema>;
-export interface ArtifactRecord extends CreateArtifact { id: string; root: string; createdAt: string; prebuiltId?: string; contextMode: 'links' | 'junction' | 'snapshot' | 'unavailable' | 'none'; contextWarning?: string }
+export interface ArtifactRecord extends Omit<CreateArtifact, 'playwrightMcp'> { id: string; root: string; createdAt: string; prebuiltId?: string; contextMode: 'links' | 'junction' | 'snapshot' | 'unavailable' | 'none'; contextWarning?: string }
 export interface ArtifactLibrary { root: string; artifacts: ArtifactRecord[] }
 export interface ArtifactRuntime { id: string; status: 'stopped' | 'installing' | 'starting' | 'running' | 'error'; url?: string; error?: string; logs: string }
 export const artifactSetupSelectionSchema = z.object({ provider: z.enum(['openai', 'codex-subscription', 'gemini', 'anthropic', 'meta', 'local', 'ollama', 'ollama-local', 'ollama-runpod']), model: z.string().min(1).max(200) });
@@ -119,7 +119,7 @@ export interface ArtifactsApi {
   chooseFolder(): Promise<ArtifactLibrary | null>;
   create(options: CreateArtifact): Promise<ArtifactRecord>;
   prebuilts(): Promise<PrebuiltArtifact[]>;
-  installPrebuilt(id: string, access: ArtifactAccess, runtime?: z.infer<typeof artifactAgentRuntimeSchema>): Promise<ArtifactRecord>;
+  installPrebuilt(id: string, access: ArtifactAccess, runtime?: z.infer<typeof artifactAgentRuntimeSchema>, playwrightMcp?: boolean): Promise<ArtifactRecord>;
   prebuiltUpdateStatus(id: string): Promise<PrebuiltUpdateStatus>;
   reviewPrebuiltUpdate(id: string): Promise<PrebuiltUpdateReview>;
   applyPrebuiltUpdate(id: string, request: PrebuiltUpdateRequest): Promise<PrebuiltUpdateResult>;

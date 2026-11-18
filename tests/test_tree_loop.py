@@ -734,7 +734,7 @@ class TestTreeLoop(unittest.TestCase):
 
     def test_run_shell_refuses_long_running_dev_command(self):
         model = FakeModel([
-            "shell npm run dev",
+            "shell vite",
             "finish done",
         ])
         loop = TreeLoop(
