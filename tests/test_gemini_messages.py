@@ -72,6 +72,7 @@ class GeminiMessageTests(unittest.TestCase):
         self.assertEqual([item.role for item in request["contents"]], ["user", "model", "user"])
         self.assertEqual(request["contents"][1].parts[0].text, "second")
         self.assertEqual(request["config"].kwargs["system_instruction"], "system rules")
+        self.assertNotIn("max_output_tokens", request["config"].kwargs)
         self.assertEqual(request["config"].kwargs["automatic_function_calling"], {"disable": True})
         self.assertEqual(request["config"].kwargs["tool_config"], {"function_calling_config": {"mode": "NONE"}})
         usage = client.get_last_metrics()["usage"]
@@ -80,6 +81,33 @@ class GeminiMessageTests(unittest.TestCase):
         self.assertEqual(usage["reasoning_tokens"], 9)
         self.assertEqual(usage["cached_tokens"], 210)
 
+    def test_modern_model_tags_use_the_same_effort_controls(self):
+        client = self._client()
+        with patch("main.genai_types", FakeGeminiTypes):
+            for tag in ("gemini-3.8-flash", "gemini-4-hydrogen", "models/gemini-5-example", "custom-thinking-alias"):
+                client.model = tag
+                for effort in ("low", "medium", "high", "xhigh", "auto"):
+                    with self.subTest(tag=tag, effort=effort):
+                        client.thinking_mode = effort
+                        config = client._generate_config("system", include_summaries=True).kwargs
+                        expected = {"include_thoughts": True}
+                        if effort != "auto":
+                            expected["thinking_level"] = effort
+                        self.assertEqual(config["thinking_config"].kwargs, expected)
+                        self.assertNotIn("max_output_tokens", config)
+
+    def test_trailing_stream_chunk_cannot_overwrite_protocol_failure(self):
+        client = self._client()
+        part = SimpleNamespace(text="finish premature", thought=False)
+        chunks = [SimpleNamespace(candidates=[SimpleNamespace(
+            finish_reason=reason, content=SimpleNamespace(parts=[part] if reason == "MALFORMED_RESPONSE" else [])
+        )], prompt_feedback=None) for reason in ("MALFORMED_RESPONSE", "STOP")]
+        client.client.models.generate_content_stream = lambda **kwargs: iter(chunks)
+        with patch("main.genai_types", FakeGeminiTypes):
+            text = client._stream_gemini_messages("system", [], lambda _: None, None)
+        self.assertEqual(text, "finish premature")
+        self.assertEqual(client.get_last_metrics()["response"]["candidates"][0]["finish_reason"], "MALFORMED_RESPONSE")
+
     @unittest.skipIf(agent.genai is None, "google-genai is not installed")
     def test_sdk_makes_one_request_without_afc_warning_for_both_completion_paths(self):
         # Exercise the installed SDK's generate_content method, replacing only
@@ -87,7 +115,12 @@ class GeminiMessageTests(unittest.TestCase):
         from google.genai.models import Models
         client = self._client()
         client.client = agent.genai.Client(api_key="fixture-key")
-        response = SimpleNamespace(text="done", usage_metadata=None)
+        response = agent.genai_types.GenerateContentResponse(candidates=[
+            agent.genai_types.Candidate(
+                content=agent.genai_types.Content(parts=[agent.genai_types.Part(text="done")]),
+                finish_reason="STOP",
+            ),
+        ])
         try:
             for messages in (False, True):
                 with self.subTest(messages=messages), patch.object(Models, "_generate_content", return_value=response) as generate, self.assertNoLogs("google_genai.models", level="WARNING"):

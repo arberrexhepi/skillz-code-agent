@@ -5,6 +5,7 @@ import importlib
 import os
 import threading
 from typing import Any, Dict, Iterable, List, Optional
+from reasoning_effort import available_reasoning_efforts
 
 
 BASE_RUNTIME_PROVIDER_CATALOG: Dict[str, Dict[str, Any]] = {
@@ -17,7 +18,7 @@ BASE_RUNTIME_PROVIDER_CATALOG: Dict[str, Dict[str, Any]] = {
             "gpt-6.1-terra",
             "gpt-6.1-sol",
             "gpt-6.1-astra",
-            "gpt-6.2-terra"
+            "gpt-6.2-terra",
             "gpt-6.2-sol",
             "gpt-6.2-astra",
         ],
@@ -32,10 +33,10 @@ BASE_RUNTIME_PROVIDER_CATALOG: Dict[str, Dict[str, Any]] = {
             "gpt-5.6-luna",
             "gpt-5.6-terra",
             "gpt-5.6-sol",
-            "gpt-6.1-terra"
+            "gpt-6.1-terra",
             "gpt-6.1-sol",
             "gpt-6.1-astra",
-            "gpt-6.2-terra"
+            "gpt-6.2-terra",
             "gpt-6.2-sol",
             "gpt-6.2-astra",
         ],
@@ -270,12 +271,20 @@ def _refresh_anthropic_models() -> List[str]:
     )
 
 
+def gemini_http_options(**options: Any) -> Dict[str, Any]:
+    # SDK 3 defaults to v1. Keep the existing endpoint for preview models
+    # and let operators opt into another version through the SDK setting.
+    if not os.getenv("GOOGLE_GENAI_API_VERSION"):
+        options["api_version"] = "v1beta"
+    return options
+
+
 def _refresh_gemini_models() -> List[str]:
     api_key = str(os.environ.get("GEMINI_API_KEY", "")).strip()
     if not api_key:
         return []
     genai = importlib.import_module("google.genai")
-    client = genai.Client(api_key=api_key, http_options={"timeout": 5000})
+    client = genai.Client(api_key=api_key, http_options=gemini_http_options(timeout=5000))
     pager = client.models.list(config={"page_size": 100})
     models: List[str] = []
     for item in pager:
@@ -435,6 +444,8 @@ def runtime_options_payload(
     providers: List[Dict[str, Any]] = []
     for key, info in RUNTIME_PROVIDER_CATALOG.items():
         suggested_models = [str(item) for item in info.get("models", []) if str(item).strip()]
+        models = _dedupe_preserve_order([*suggested_models, str(info.get("default_model") or ""),
+                                       normalized_current_model if key == normalized_current_provider else ""])
         providers.append(
             {
                 "key": key,
@@ -443,6 +454,7 @@ def runtime_options_payload(
                 "env_var": info.get("env_var"),
                 "default_model": info.get("default_model"),
                 "suggested_models": suggested_models,
+                "reasoning_efforts": {model: available_reasoning_efforts(key, model) for model in models},
                 "notes": info.get("notes", ""),
                 "active": key == normalized_current_provider,
                 "active_model": normalized_current_model if key == normalized_current_provider else "",

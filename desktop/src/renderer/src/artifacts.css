@@ -471,6 +471,9 @@
 .artifact-repository-empty { color: #788694; }
 .artifact-repository-empty > span { color: #67a687; font-size: 36px; }
 .artifact-repository-empty h2 { color: #d2dbe2; font-size: 19px; font-weight: 560; }
+.artifact-issues { flex: 1; min-height: 0; overflow: auto; }
+.artifact-issues > .panel-heading { position: sticky; top: 0; z-index: 1; background: #0d1115; }
+.artifact-issues .issues-panel { box-sizing: border-box; max-width: 760px; margin-inline: auto; padding: 8px 16px 20px; }
 
 @media (max-width: 1250px) {
   .artifacts-layout { grid-template-columns: 210px minmax(0,1fr); }

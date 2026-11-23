@@ -1,6 +1,6 @@
 import type { ArtifactsApi } from './artifacts';
 import type { McpApi } from './mcp';
-import type { WorkspaceIssuesSnapshot } from './workspaceIssues';
+import type { WorkspaceIssueAction, WorkspaceIssuesSnapshot } from './workspaceIssues';
 import type { RepoFactsSnapshot } from './repoFacts';
 
 export interface WorkspaceInfo {
@@ -73,6 +73,7 @@ export interface AgentStartOptions {
 }
 
 import type { AgentBackoff, AgentBridgeState, AgentProgressMessage, CodexSubscriptionStatus, JsonMap, RuntimeOptionsPayload } from './agentTypes';
+import type { ReasoningEffort, ReasoningModel, ReasoningPhase, RepoReasoningPreferences } from './reasoningPreferences';
 export type { AgentBridgeState } from './agentTypes';
 
 export interface AgentResponse {
@@ -115,7 +116,7 @@ export interface WorkbenchApi {
     read(path: string): Promise<FileDocument>;
     repoFacts(workspaceRoot: string): Promise<RepoFactsSnapshot>;
     issues(workspaceRoot: string): Promise<WorkspaceIssuesSnapshot>;
-    issueAction(workspaceRoot: string, action: 'create_issue' | 'close_issue' | 'reopen_issue', extras: JsonMap): Promise<WorkspaceIssuesSnapshot>;
+    issueAction(workspaceRoot: string, action: WorkspaceIssueAction, extras: JsonMap): Promise<WorkspaceIssuesSnapshot>;
     write(path: string, content: string): Promise<FileDocument>;
     onChange(listener: (paths: string[]) => void): () => void;
   };
@@ -150,6 +151,8 @@ export interface WorkbenchApi {
     reconfigureRuntime(provider: string, model: string): Promise<AgentResponse>;
     configureBackoff(enabled: boolean, tokenLimitK: number): Promise<AgentResponse>;
     runtimeOptions(provider?: string, model?: string): Promise<RuntimeOptionsPayload>;
+    reasoningPreferences(selection: ReasoningModel, artifactId?: string): Promise<RepoReasoningPreferences>;
+    saveReasoningPreference(selection: ReasoningModel, phase: ReasoningPhase, effort: ReasoningEffort | null, root: string, artifactId?: string): Promise<RepoReasoningPreferences>;
     codexSubscriptionStatus(): Promise<CodexSubscriptionStatus>;
     codexSubscriptionLogin(): Promise<CodexSubscriptionStatus>;
     chooseCodexCli(): Promise<string | null>;

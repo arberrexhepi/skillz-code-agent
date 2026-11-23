@@ -14,7 +14,7 @@ import type { RuntimeSettingsService } from './runtimeSettings';
 const providerKeys: Record<string, string> = { openai: 'OPENAI_API_KEY', gemini: 'GEMINI_API_KEY', anthropic: 'ANTHROPIC_API_KEY', meta: 'META_AI_API_KEY' };
 const providerLabels: Record<string, string> = { openai: 'OpenAI', gemini: 'Google Gemini', anthropic: 'Anthropic', meta: 'Meta AI' };
 const packages: Record<string, string> = { gemini: 'google-genai', openai: 'openai', anthropic: 'anthropic', meta: 'openai', local: 'openai', ollama: 'openai', 'ollama-local': 'openai', 'ollama-runpod': 'openai' };
-interface ProviderProbe { sdkReady: boolean; keyReady: boolean; keyName?: string; label: string; detail?: string; }
+interface ProviderProbe { sdkReady: boolean; sdkUpdateAvailable?: boolean; keyReady: boolean; keyName?: string; label: string; detail?: string; }
 export interface ArtifactDependencySetup {
   status(): Promise<ArtifactCapability[]>;
   install(log: (text: string) => void): Promise<void>;
@@ -116,7 +116,7 @@ export class ArtifactCapabilitiesService {
       const items: ArtifactCapability[] = [{ id: 'python', label: 'Python', ready: true, detail: [python.executable, ...python.args].join(' ') }];
       try {
         const probe = await this.probe(python, await this.environment(selection.provider), selection);
-        items.push({ id: 'provider', label: `${probe.label} support`, ready: probe.sdkReady, detail: probe.detail || (packages[selection.provider] ? (probe.sdkReady ? 'Provider SDK installed.' : `Install ${packages[selection.provider]} in a workbench-managed Python environment.`) : 'Uses the local Codex CLI; sign in under Agent runtime below.'), installable: !probe.sdkReady && Boolean(packages[selection.provider]) });
+        items.push({ id: 'provider', label: `${probe.label} support`, ready: probe.sdkReady, detail: probe.detail || (packages[selection.provider] ? (probe.sdkReady ? 'Provider SDK installed.' : `Install ${packages[selection.provider]} in a workbench-managed Python environment.`) : 'Uses the local Codex CLI; sign in under Agent runtime below.'), installable: Boolean(packages[selection.provider] && (!probe.sdkReady || probe.sdkUpdateAvailable)) });
         if (selection.provider === 'codex-subscription') items.push({ id: 'credentials', label: 'ChatGPT sign-in', ready: probe.keyReady, detail: probe.keyReady ? 'Signed in to Codex with ChatGPT.' : 'Use the Codex sign-in controls under Agent runtime.' });
         if (probe.keyName) items.push({ id: 'credentials', label: 'Provider key', ready: probe.keyReady, optional: true, detail: probe.keyReady ? 'Configured. The key has not been validated with the provider.' : `Add ${probe.keyName} in Vault to connect this provider.` });
       } catch (error) { items.push({ id: 'provider', label: 'Provider setup', ready: false, detail: String(error) }); }
@@ -155,7 +155,8 @@ export class ArtifactCapabilitiesService {
         const base = await this.tools.resolvePythonCommand(this.source(), process.platform, pythonEnvironment());
         await this.tools.runLogged(base.executable, [...base.args, '-m', 'venv', path.join(this.home, 'python')], this.source(), this.log);
       }
-      await this.tools.runLogged(this.managedPython(), ['-m', 'pip', 'install', '--disable-pip-version-check', pkg], this.source(), this.log);
+      const upgrade = selection.provider === 'gemini' ? ['--upgrade'] : [];
+      await this.tools.runLogged(this.managedPython(), ['-m', 'pip', 'install', '--disable-pip-version-check', ...upgrade, pkg], this.source(), this.log);
     }
     if (needed.has('runtime')) { this.update({ step: 'Preparing artifact runtime' }); await this.tools.ensureSandboxImage(this.log, this.source()); }
     if (needed.has('sqlite') && dependencies) { this.update({ step: 'Repairing SQLite dependencies' }); await dependencies.install(this.log); }

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from email.utils import parsedate_to_datetime
 import importlib
 import hashlib
@@ -21,12 +21,13 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple, cast
-from issue_facts import FACT_TYPE_ARCHITECTURE, FACT_TYPE_GOAL, IssueFactLedger, IssueFactRecord
+from issue_facts import CompletedGoalCheckpoint, FACT_TYPE_ARCHITECTURE, FACT_TYPE_GOAL, IssueFactLedger, IssueFactRecord
 from memory_manager import MemoryManager, MemoryQuery
 from project_diagnostics import run_backend_diagnostics
 from diagnostics import changed_files_check as run_changed_files_check
 from diagnostics import project_problems as run_project_problems
 from runtime_catalog import (
+    gemini_http_options,
     refresh_runtime_provider_catalog_once,
     runtime_model_lines,
     runtime_options_payload,
@@ -37,12 +38,18 @@ from runtime_catalog import (
 from skill_loader import MarkdownSkill, load_markdown_skills_from_dir
 from codex_subscription import run_codex_subscription_completion
 from bridge_presentation import bridge_exchange
+from model_output_progress import ModelOutputObserver, ModelOutputProgress
+from structured_command_response import COMMAND_BLOCK_INSTRUCTION, COMMAND_BLOCK_SCHEMA, StructuredCommandResponse
+from reasoning_effort import REASONING_EFFORTS, active_reasoning_effort, gemini_thinking_api, resolve_reasoning_effort
+from verification_repair import MAX_INVESTIGATION_TURNS, MAX_REPAIR_TURNS, repair_action_error
+from verification_run import VerificationRun, is_verification_setup, needs_verification_check
 from discovery_budget import DiscoveryBudget
 from mcp_runtime import invoke_mcp, mcp_guidance, model_mcp_result
-from artifact_preview import preview_guidance, run_artifact_preview
+from artifact_preview import has_preview_broker, preview_guidance, run_artifact_preview
 from shell_processes import PACKAGE_SHELL_GUIDANCE, install_shell_process_cleanup, run_managed_shell
 from proposal_runtime import ProposalRuntimeMixin
 from issue_proposals import PROPOSAL_GUIDANCE
+from provider_response import GENERATION_LIMIT_REASONS, CommandResponseLimit, CommandWaveBoundary, ProviderResponseRecovery
 
 # Simple helpers used by memory integration. These are intentionally small
 # and defensive: if you replace them with more sophisticated implementations
@@ -161,7 +168,7 @@ MAX_FILE_READ_BYTES = 100_000
 MAX_FILE_WRITE_BYTES = 500_000
 MAX_SHELL_OUTPUT_CHARS = 20_000
 DEFAULT_MAX_STEPS = 200
-MAX_ACTION_BATCH_SIZE = 4
+MAX_NON_EDIT_ACTIONS_PER_TURN = 4
 TEXT_MUTATION_ACTION_TYPES = {
     "write_file",
     "patch_file",
@@ -945,6 +952,14 @@ def _is_transient_model_error(exc: Exception) -> bool:
     )
 
 
+def _model_retry_limit(exc: Exception) -> int:
+    if _model_error_status(exc) == 429 and re.search(r"\b(?:spending|spend) cap\b", str(exc), re.IGNORECASE):
+        # The provider can temporarily throttle requests near a cap. One retry preserves
+        # recovery from a brief throttle without repeatedly spending the same large prompt.
+        return 2
+    return _MODEL_MAX_ATTEMPTS
+
+
 def _selected_model_headers(headers: Any) -> Dict[str, str]:
     if headers is None:
         return {}
@@ -1054,6 +1069,15 @@ def _normalize_chat_messages(messages: Sequence[Dict[str, str]]) -> List[Dict[st
 
 class BaseModelClient:
     backoff: BackoffStrategy
+    command_response_framing = True
+
+    @property
+    def thinking_mode(self) -> str:
+        return active_reasoning_effort(getattr(self, "_thinking_mode", "auto"))
+
+    @thinking_mode.setter
+    def thinking_mode(self, effort: str) -> None:
+        self._thinking_mode = effort
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
@@ -1063,6 +1087,13 @@ class BaseModelClient:
 
     def complete_messages(self, system: str, messages: Sequence[Dict[str, str]]) -> str:
         return self._complete_messages_with_backoff(system, messages)
+
+    def complete_messages_with_progress(
+        self, system: str, messages: Sequence[Dict[str, str]], on_summary: Callable[[str], None],
+        *, on_output: Optional[ModelOutputObserver] = None,
+    ) -> str:
+        """Report public summaries and cumulative response character counts."""
+        return self._complete_messages_with_backoff(system, messages, on_summary=on_summary, on_output=on_output)
 
     def set_prompt_cache_key(self, key: str) -> None:
         self._base_prompt_cache_key = str(key or "").strip()
@@ -1203,13 +1234,14 @@ class BaseModelClient:
                 return result
             except Exception as exc:
                 self._record_retry_exception(retry_metadata, exc)
-                if _is_transient_model_error(exc) and attempt < _MODEL_MAX_ATTEMPTS - 1:
+                attempt_limit = _model_retry_limit(exc)
+                if _is_transient_model_error(exc) and attempt < attempt_limit - 1:
                     wait = _transient_retry_delay(exc, attempt)
                     retry_metadata["retry_delays_s"].append(round(wait, 3))
                     status = _model_error_status(exc)
                     label = f"HTTP {status}" if status is not None else type(exc).__name__
                     eprint(
-                        f"Transient model failure ({label}, attempt {attempt + 1}/{_MODEL_MAX_ATTEMPTS}). "
+                        f"Transient model failure ({label}, attempt {attempt + 1}/{attempt_limit}). "
                         f"Waiting {wait:.0f}s before retry..."
                     )
                     time.sleep(wait)
@@ -1225,13 +1257,18 @@ class BaseModelClient:
         # unreachable but satisfies type checker
         raise RuntimeError("Backoff retries exhausted")
 
-    def _complete_messages_with_backoff(self, system: str, messages: Sequence[Dict[str, str]]) -> str:
+    def _complete_messages_with_backoff(
+        self, system: str, messages: Sequence[Dict[str, str]], *,
+        on_summary: Optional[Callable[[str], None]] = None,
+        on_output: Optional[ModelOutputObserver] = None,
+    ) -> str:
         """Wrap message-based provider calls with the same rate-limit backoff."""
         backoff = getattr(self, "backoff", None)
         if backoff is None:
             self.backoff = BackoffStrategy()
             backoff = self.backoff
         retry_metadata = self._begin_retry_sequence()
+        self._set_last_metrics({})
         current_messages = list(messages)
         for attempt in range(_MODEL_MAX_ATTEMPTS):
             if backoff.enabled and backoff.should_wait():
@@ -1240,7 +1277,10 @@ class BaseModelClient:
                     eprint(f"Backoff: token window limit reached ({backoff.token_limit_k}k). Waiting {wait:.0f}s...")
                     time.sleep(wait)
             try:
-                result = self._do_complete_messages(system, current_messages)
+                if on_summary is None:
+                    result = self._do_complete_messages(system, current_messages)
+                else:
+                    result = self._do_complete_messages_with_progress(system, current_messages, on_summary, on_output=on_output)
                 metrics = self.get_last_metrics()
                 usage = metrics.get("usage", {}) if isinstance(metrics, dict) else {}
                 input_tokens = (
@@ -1252,15 +1292,27 @@ class BaseModelClient:
                     backoff.record_tokens(input_tokens)
                 self._finish_retry_success(retry_metadata)
                 return result
+            except (CommandResponseLimit, CommandWaveBoundary) as exc:
+                metrics = self.get_last_metrics()
+                response = metrics.setdefault("response", {})
+                if isinstance(exc, CommandWaveBoundary):
+                    response["wave_boundary"] = True
+                else:
+                    response.update(exc.metadata)
+                self._set_last_metrics(metrics)
+                return exc.text if isinstance(exc, CommandWaveBoundary) else ""
             except Exception as exc:
                 self._record_retry_exception(retry_metadata, exc)
-                if _is_transient_model_error(exc) and attempt < _MODEL_MAX_ATTEMPTS - 1:
+                attempt_limit = _model_retry_limit(exc)
+                if _is_transient_model_error(exc) and attempt < attempt_limit - 1:
+                    if on_summary is not None:
+                        on_summary("")  # Clear the interrupted attempt's summary.
                     wait = _transient_retry_delay(exc, attempt)
                     retry_metadata["retry_delays_s"].append(round(wait, 3))
                     status = _model_error_status(exc)
                     label = f"HTTP {status}" if status is not None else type(exc).__name__
                     eprint(
-                        f"Transient model failure ({label}, attempt {attempt + 1}/{_MODEL_MAX_ATTEMPTS}). "
+                        f"Transient model failure ({label}, attempt {attempt + 1}/{attempt_limit}). "
                         f"Waiting {wait:.0f}s before retry..."
                     )
                     time.sleep(wait)
@@ -1269,7 +1321,11 @@ class BaseModelClient:
                             backoff._window_start = time.time()
                             backoff._window_tokens = 0
                     if status == 500 and attempt == _MODEL_MAX_ATTEMPTS - 2:
-                        current_messages = self._prepare_final_retry_messages(current_messages, retry_metadata)
+                        if on_output is not None and on_output.preserve_request_context:
+                            # This request contains the interrupted reply needed by the recovery turn.
+                            self._rotate_prompt_cache_key()
+                        else:
+                            current_messages = self._prepare_final_retry_messages(current_messages, retry_metadata)
                     continue
                 self._finish_retry_failure(retry_metadata, exc)
                 raise
@@ -1281,6 +1337,12 @@ class BaseModelClient:
     def _do_complete_messages(self, system: str, messages: Sequence[Dict[str, str]]) -> str:
         prompt = "\n\n".join(str(item.get("content", "")) for item in messages if item.get("role") != "assistant")
         return self._do_complete(system, prompt)
+
+    def _do_complete_messages_with_progress(
+        self, system: str, messages: Sequence[Dict[str, str]], on_summary: Callable[[str], None],
+        *, on_output: Optional[ModelOutputObserver] = None,
+    ) -> str:
+        return self._do_complete_messages(system, messages)
 
     def clone(self) -> "BaseModelClient":
         raise NotImplementedError
@@ -1443,9 +1505,7 @@ class OpenAIModelClient(BaseModelClient):
             ],
         }
 
-        # OpenAI Responses API reasoning effort.
-        if self.thinking_mode and self.thinking_mode != "auto":
-            kwargs["reasoning"] = {"effort": self.thinking_mode}
+        self._apply_reasoning_effort(kwargs)
 
         # Verbosity is supported on newer GPT-5.x models; harmless to omit if not desired.
         if self.verbosity and getattr(self, "supports_verbosity", True):
@@ -1461,11 +1521,14 @@ class OpenAIModelClient(BaseModelClient):
                 "usage": usage_dict,
                 "prompt_cache_key": self.prompt_cache_key,
                 "response_headers": response_headers,
+                "response": {"limit_reason": getattr(getattr(response, "incomplete_details", None), "reason", "")},
                 "rate_limit_headers": {
                     key: value for key, value in response_headers.items() if key.startswith("x-ratelimit-")
                 },
             }
         )
+        if getattr(response, "status", None) == "incomplete":
+            return ""
         text = getattr(response, "output_text", None)
         if text:
             return text
@@ -1479,6 +1542,23 @@ class OpenAIModelClient(BaseModelClient):
         return "\n".join(chunks).strip()
 
     def _do_complete_messages(self, system: str, messages: Sequence[Dict[str, str]]) -> str:
+        return self._complete_openai_messages(system, messages)
+
+    def _do_complete_messages_with_progress(
+        self, system: str, messages: Sequence[Dict[str, str]], on_summary: Callable[[str], None],
+        *, on_output: Optional[ModelOutputObserver] = None,
+    ) -> str:
+        if self.provider_name != "openai":
+            return self._do_complete_messages(system, messages)
+        return self._complete_openai_messages(
+            system, messages, on_summary=on_summary if self.thinking_mode != "none" else None, on_output=on_output,
+        )
+
+    def _complete_openai_messages(
+        self, system: str, messages: Sequence[Dict[str, str]], *,
+        on_summary: Optional[Callable[[str], None]] = None,
+        on_output: Optional[ModelOutputObserver] = None,
+    ) -> str:
         kwargs: Dict[str, Any] = {
             "model": self.model,
             "input": [
@@ -1487,14 +1567,29 @@ class OpenAIModelClient(BaseModelClient):
             ],
         }
 
-        if self.thinking_mode and self.thinking_mode != "auto":
-            kwargs["reasoning"] = {"effort": self.thinking_mode}
+        self._apply_reasoning_effort(kwargs)
         if self.verbosity and getattr(self, "supports_verbosity", True):
             kwargs["text"] = {"verbosity": self.verbosity}
         self._apply_prompt_cache_kwargs(kwargs)
 
-        response, response_headers = self._create_response(kwargs)
+        streamed_text = ""
+        if on_summary is None:
+            response, response_headers = self._create_response(kwargs)
+        else:
+            reasoning = {**kwargs.get("reasoning", {}), "summary": "auto"}
+            try:
+                response, response_headers, streamed_text = self._stream_response({**kwargs, "reasoning": reasoning}, on_summary, on_output)
+            except Exception as exc:
+                # Some models and accounts reject the summary option at request time.
+                error = str(exc).lower()
+                summary_rejected = any(
+                    marker in error for marker in ("reasoning.summary", "reasoning summary", "reasoning summaries")
+                )
+                if _model_error_status(exc) not in {400, 403} or not summary_rejected:
+                    raise
+                response, response_headers = self._create_response(kwargs)
         usage_dict = _usage_to_dict(getattr(response, "usage", None))
+        limit_reason = getattr(getattr(response, "incomplete_details", None), "reason", "") or ""
         self._set_last_metrics(
             {
                 "provider": getattr(self, "provider_name", "openai"),
@@ -1502,11 +1597,17 @@ class OpenAIModelClient(BaseModelClient):
                 "usage": usage_dict,
                 "prompt_cache_key": self.prompt_cache_key,
                 "response_headers": response_headers,
+                "response": {"limit_reason": limit_reason},
                 "rate_limit_headers": {
                     key: value for key, value in response_headers.items() if key.startswith("x-ratelimit-")
                 },
             }
         )
+        if getattr(response, "status", None) == "incomplete":
+            if not (on_output and on_output.preview_strategy and limit_reason.upper() in GENERATION_LIMIT_REASONS):
+                return ""
+            if streamed_text:
+                return streamed_text  # The command loop replays this as context for recovery.
         text = getattr(response, "output_text", None)
         if text:
             return text
@@ -1517,6 +1618,42 @@ class OpenAIModelClient(BaseModelClient):
                 if getattr(content, "type", None) == "output_text":
                     chunks.append(getattr(content, "text", ""))
         return "\n".join(chunks).strip()
+
+    def _stream_response(
+        self, kwargs: Dict[str, Any], on_summary: Callable[[str], None], on_output: Optional[ModelOutputObserver],
+    ) -> Tuple[Any, Dict[str, str], str]:
+        stream = self.client.responses.create(**kwargs, stream=True)
+        output = ModelOutputProgress(on_output)
+        fragments: List[str] = []
+        with stream:
+            headers = _selected_model_headers(stream.response.headers)
+            last_summary_part = None
+            streamed_parts = set()
+            for event in stream:
+                if event.type in {"response.reasoning_summary_text.delta", "response.reasoning_summary_text.done"}:
+                    part = (event.item_id, event.summary_index)
+                    if event.type.endswith(".delta"):
+                        text = event.delta
+                        streamed_parts.add(part)
+                    else:
+                        text = event.text if part not in streamed_parts else ""
+                    if not text:
+                        continue
+                    if last_summary_part is not None and part != last_summary_part:
+                        on_summary("\n\n")
+                    on_summary(text)
+                    last_summary_part = part
+                elif event.type == "response.output_text.delta" and event.delta:
+                    fragments.append(event.delta)
+                    output.add(event.delta)
+                elif event.type in {"response.completed", "response.incomplete"}:
+                    if event.type == "response.completed":
+                        output.finish()
+                    return event.response, headers, "".join(fragments)
+                elif event.type in {"response.failed", "error"}:
+                    error = getattr(getattr(event, "response", event), "error", None) or event
+                    raise RuntimeError(getattr(error, "message", None) or "OpenAI response stream failed.")
+        raise RuntimeError("OpenAI response stream ended before a final response.")
 
     def _create_response(self, kwargs: Dict[str, Any]) -> Tuple[Any, Dict[str, str]]:
         responses = self.client.responses
@@ -1537,6 +1674,11 @@ class OpenAIModelClient(BaseModelClient):
             kwargs["prompt_cache_key"] = cache_key
         if self.model.lower().startswith("gpt-5.5"):
             kwargs["prompt_cache_retention"] = "24h"
+
+    def _apply_reasoning_effort(self, kwargs: Dict[str, Any]) -> None:
+        settings = resolve_reasoning_effort(self.provider_name, self.model, self.thinking_mode)
+        if settings["value"] is not None:
+            kwargs["reasoning"] = {"effort": settings["value"]}
 
 
 class MetaModelClient(OpenAIModelClient):
@@ -1618,13 +1760,23 @@ class CodexSubscriptionModelClient(BaseModelClient):
     def _do_complete_messages(self, system: str, messages: Sequence[Dict[str, str]]) -> str:
         return self._invoke(system, _normalize_chat_messages(messages))
 
-    def _invoke(self, system: str, messages: Sequence[Dict[str, str]]) -> str:
+    def _do_complete_messages_with_progress(
+        self, system: str, messages: Sequence[Dict[str, str]], on_summary: Callable[[str], None],
+        *, on_output: Optional[ModelOutputObserver] = None,
+    ) -> str:
+        return self._invoke(system, _normalize_chat_messages(messages), on_summary=on_summary)
+
+    def _invoke(
+        self, system: str, messages: Sequence[Dict[str, str]], *,
+        on_summary: Optional[Callable[[str], None]] = None,
+    ) -> str:
         text, metrics = run_codex_subscription_completion(
             model=self.model,
             thinking_mode=self.thinking_mode,
             system=system,
             messages=messages,
             progress_callback=self.progress_callback,
+            on_summary=on_summary,
         )
         self._set_last_metrics(metrics)
         return text
@@ -1808,6 +1960,8 @@ class OllamaModelClient(BaseModelClient):
 
 
 class GeminiModelClient(BaseModelClient):
+    provider_name = "gemini"
+
     def __init__(
         self,
         model: str,
@@ -1818,7 +1972,7 @@ class GeminiModelClient(BaseModelClient):
         api_key = os.getenv("GEMINI_API_KEY")
         if not api_key:
             raise RuntimeError("GEMINI_API_KEY is not set.")
-        self.client = genai.Client(api_key=api_key)
+        self.client = genai.Client(api_key=api_key, http_options=gemini_http_options())
         self.model = model
         self.thinking_mode = thinking_mode
         self.backoff = BackoffStrategy()
@@ -1831,51 +1985,10 @@ class GeminiModelClient(BaseModelClient):
         c.backoff = BackoffStrategy(enabled=self.backoff.enabled, token_limit_k=self.backoff.token_limit_k)
         return c
 
-    def _build_thinking_config(self) -> Optional[Any]:
-        """
-        Gemini 3 models: thinking_level
-        Gemini 2.5 models: thinking_budget
-        """
-        m = self.model.lower()
-
-        # Help static type checkers understand that genai_types is not None
-        assert genai_types is not None
-
-        if "gemini-3" in m:
-            if self.thinking_mode in {"auto", "", None}:  # type: ignore
-                return None
-            mapping = {
-                "minimal": "minimal",
-                "low": "low",
-                "medium": "medium",
-                "high": "high",
-            }
-            level = mapping.get(self.thinking_mode)
-            if not level:
-                return None
-            thinking_config_ctor = cast(Any, genai_types.ThinkingConfig)
-            return thinking_config_ctor(thinking_level=level)
-
-        # Gemini 2.5 style thinking_budget
-        if "gemini-2.5" in m:
-            mapping = {
-                "none": 0,
-                "minimal": 256,
-                "low": 1024,
-                "medium": 4096,
-                "high": 8192,
-                "auto": -1,
-            }
-            budget = mapping.get(self.thinking_mode, -1)
-            thinking_config_ctor = cast(Any, genai_types.ThinkingConfig)
-            return thinking_config_ctor(thinking_budget=budget)
-
-        return None
-
     def complete(self, system: str, prompt: str) -> str:
         return self._complete_with_backoff(system, prompt)
 
-    def _generate_config(self, system: str) -> Any:
+    def _generate_config(self, system: str, *, include_summaries: bool = False, command_schema: bool = False) -> Any:
         config_kwargs: Dict[str, Any] = {
             "system_instruction": system,
             "temperature": 0.1,
@@ -1885,11 +1998,22 @@ class GeminiModelClient(BaseModelClient):
             # This client uses text command/JSON protocols with no native tools.
             "tool_config": {"function_calling_config": {"mode": "NONE"}},
         }
-        thinking_config = self._build_thinking_config()
-        if thinking_config is not None:
-            config_kwargs["thinking_config"] = thinking_config
-
+        if command_schema:
+            config_kwargs.update(
+                system_instruction=system + COMMAND_BLOCK_INSTRUCTION,
+                response_mime_type="application/json",
+                response_json_schema=COMMAND_BLOCK_SCHEMA,
+            )
+        settings = resolve_reasoning_effort("gemini", self.model, self.thinking_mode)
+        thinking_kwargs: Dict[str, Any] = {}
+        if settings["parameter"] is not None:
+            thinking_kwargs[settings["parameter"]] = settings["value"]
+        if include_summaries:
+            thinking_kwargs["include_thoughts"] = True
         assert genai_types is not None
+        if thinking_kwargs:
+            config_kwargs["thinking_config"] = genai_types.ThinkingConfig(**thinking_kwargs)
+
         return genai_types.GenerateContentConfig(**config_kwargs)
 
     def _gemini_content(self, *, role: str, text: str) -> Any:
@@ -1907,8 +2031,8 @@ class GeminiModelClient(BaseModelClient):
             role = item["role"]
             if role == "system":
                 continue
-            content = str(item.get("content", "") or "").strip()
-            if not content:
+            content = str(item.get("content", "") or "")
+            if not content.strip():
                 continue
             provider_messages.append(self._gemini_content(role=role, text=content))
         return provider_messages
@@ -1943,15 +2067,16 @@ class GeminiModelClient(BaseModelClient):
         usage_dict["cached_tokens"] = cached_tokens
         return usage_dict
 
-    def _record_gemini_metrics(self, response: Any) -> None:
+    def _record_gemini_metrics(self, response: Any, *, usage_meta: Any = None, response_details: Optional[Dict[str, Any]] = None) -> None:
         from provider_response import gemini_response_metadata
-        usage_meta = getattr(response, "usage_metadata", None) or getattr(response, "usageMetadata", None)
+        if usage_meta is None:
+            usage_meta = getattr(response, "usage_metadata", None) or getattr(response, "usageMetadata", None)
         self._set_last_metrics(
             {
                 "provider": "gemini",
                 "model": self.model,
                 "usage": self._gemini_usage_dict(usage_meta),
-                "response": gemini_response_metadata(response),
+                "response": {**gemini_response_metadata(response), **(response_details or {})},
             }
         )
 
@@ -1998,6 +2123,87 @@ class GeminiModelClient(BaseModelClient):
         )
         self._record_gemini_metrics(response)
         return self._gemini_response_text(response)
+
+    def _do_complete_messages_with_progress(
+        self, system: str, messages: Sequence[Dict[str, str]], on_summary: Callable[[str], None],
+        *, on_output: Optional[ModelOutputObserver] = None,
+    ) -> str:
+        command_schema = bool(on_output and on_output.require_command_frame and self.model.lower().rsplit("/", 1)[-1].startswith("gemini-4-"))
+        include_summaries = self.thinking_mode != "none"
+        if not command_schema and (not include_summaries or gemini_thinking_api(self.model) is None):
+            return self._do_complete_messages(system, messages)
+        try:
+            return self._stream_gemini_messages(system, messages, on_summary, on_output,
+                                                command_schema=command_schema, include_summaries=include_summaries)
+        except Exception as exc:
+            error = str(exc).lower()
+            if not include_summaries or _model_error_status(exc) != 400 or not any(
+                marker in error for marker in ("include_thoughts", "includethoughts", "thought summaries")
+            ):
+                raise
+            on_summary("")
+            if command_schema:
+                return self._stream_gemini_messages(system, messages, on_summary, on_output,
+                                                    command_schema=True, include_summaries=False)
+            return self._do_complete_messages(system, messages)
+
+    def _stream_gemini_messages(
+        self, system: str, messages: Sequence[Dict[str, str]], on_summary: Callable[[str], None],
+        on_output: Optional[ModelOutputObserver], *, command_schema: bool = False, include_summaries: bool = True,
+    ) -> str:
+        contents = self._gemini_messages(messages) or [self._gemini_content(role="user", text="Continue.")]
+        fragments: List[str] = []
+        output = ModelOutputProgress(on_output)
+        decoder = StructuredCommandResponse() if command_schema else None
+        response_details = {"command_encoding": "json_schema"} if command_schema else {}
+        from provider_response import gemini_response_metadata
+
+        response = usage_meta = rejected = None
+        stream = self.client.models.generate_content_stream(
+            model=self.model, contents=contents,
+            config=self._generate_config(system, include_summaries=include_summaries, command_schema=command_schema),
+        )
+        try:
+            for chunk in stream:
+                usage_meta = getattr(chunk, "usage_metadata", None) or usage_meta
+                candidates = chunk.candidates or []
+                if response is None or candidates or chunk.prompt_feedback is not None:
+                    response = chunk
+                if candidates:
+                    metadata = gemini_response_metadata(chunk)
+                    if ProviderResponseRecovery.protocol_failure_reason(metadata) or ProviderResponseRecovery.budget_failure_reason(metadata):
+                        rejected = chunk
+                for candidate in candidates:
+                    for part in getattr(candidate.content, "parts", None) or []:
+                        if part.text:
+                            if part.thought:
+                                if include_summaries:
+                                    on_summary(part.text)
+                            else:
+                                delta = decoder.add(part.text) if decoder is not None else part.text
+                                if decoder is None:
+                                    fragments.append(delta)
+                                if rejected is None and delta:
+                                    output.add(delta)
+            text = decoder.partial_text() if decoder is not None else "".join(fragments)
+            if rejected is None and decoder is not None and decoder.received_text:
+                try:
+                    complete = decoder.finish()
+                except ValueError:
+                    response_details["command_envelope_invalid"] = True
+                else:
+                    if remaining := complete[len(text):]:
+                        output.add(remaining)
+                    text = complete
+            if rejected is None and not response_details.get("command_envelope_invalid"):
+                output.finish()
+        finally:
+            close = getattr(stream, "close", None)
+            if callable(close):
+                close()
+            self._record_gemini_metrics(rejected if rejected is not None else response, usage_meta=usage_meta,
+                                        response_details=response_details)
+        return text if rejected is not None else text.strip()
 
 
 @dataclass
@@ -2234,6 +2440,8 @@ class WorkerRunResult:
     validation_passed: bool
     touched_paths: List[str] = field(default_factory=list)
     validation: WorkerValidationResult = field(default_factory=WorkerValidationResult)
+    verification: Dict[str, Any] | None = None
+    suspended: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -2244,6 +2452,8 @@ class WorkerRunResult:
             "validation_passed": self.validation_passed,
             "touched_paths": list(self.touched_paths),
             "validation": self.validation.to_dict(),
+            **({"verification": self.verification} if self.verification is not None else {}),
+            **({"suspended": True} if self.suspended else {}),
         }
 
 
@@ -2495,6 +2705,14 @@ class WorkingFolderAgent(ProposalRuntimeMixin):
             self._clear_facts()
         self._current_task = ""
 
+    def configure_verification(self, requirements: list[str] | None, *, review_deferred: bool = False) -> None:
+        self._verification = VerificationRun(
+            requirements, review_deferred=review_deferred, managed_browser=has_preview_broker(),
+        ) if requirements is not None else None
+
+    def configure_verification_repair(self, paths: frozenset[str] | None) -> None:
+        self._verification_repair_paths = paths
+
     def get_last_run_metrics(self) -> Dict[str, Any]:
         return dict(self._run_metrics) if isinstance(self._run_metrics, dict) else {}
 
@@ -2660,6 +2878,7 @@ class WorkingFolderAgent(ProposalRuntimeMixin):
         return issue.summary()
 
     def activate_issue(self, issue_id: str) -> Dict[str, Any]:
+        self._load_repo_facts_into_map()
         issue = self.issue_ledger.activate_issue(str(issue_id or "").strip())
         self._persist_repo_facts()
         self._clear_facts()
@@ -3005,6 +3224,9 @@ class WorkingFolderAgent(ProposalRuntimeMixin):
         return result
 
     def _steering_block(self) -> str:
+        verification = getattr(self, "_verification", None)
+        if verification is not None:
+            return "\n\n".join(filter(None, (self.steering_prompt, verification.guidance(tree_commands=False))))
         if not self.steering_prompt.strip():
             return "None"
         return self.steering_prompt
@@ -3217,6 +3439,7 @@ class WorkingFolderAgent(ProposalRuntimeMixin):
     def _start_new_run(self) -> None:
         self._run_sequence += 1
         self._active_run_id = self._run_sequence
+        self.diagnostic_provenance = self._initial_diagnostic_provenance()
 
     def _fact_records_by_run_scope(self) -> Tuple[List[FactRecord], List[FactRecord]]:
         return self.issue_ledger.records_by_run_scope(self._active_run_id)
@@ -3316,14 +3539,39 @@ class WorkingFolderAgent(ProposalRuntimeMixin):
     def _serialize_repo_facts_markdown(self, records: Optional[List[FactRecord]] = None) -> str:
         return self.issue_ledger.to_markdown()
 
-    def _load_repo_facts_records(self) -> List[FactRecord]:
+    def save_pending_approval(self, issue_id: str, draft: Optional[Dict[str, Any]], *, expected_revision: str = "") -> None:
+        self._load_repo_facts_into_map(strict=True)
+        self.issue_ledger.save_pending_approval(self._repo_facts_path(), issue_id, draft, expected_revision=expected_revision)
+
+    def approve_pending_plan(self, issue_id: str, snapshot: Dict[str, Any], *, expected_revision: str) -> Dict[str, Any]:
+        self._load_repo_facts_into_map(strict=True)
+        issue = self.issue_ledger.approve_pending_plan(
+            self._repo_facts_path(), issue_id, snapshot, expected_revision=expected_revision,
+        )
+        self._clear_facts()
+        return issue.summary()
+
+    def record_completed_goal(
+        self, *, issue_id: str, plan_summary: str, goal: Dict[str, Any], result: Dict[str, Any],
+        original_index: int, total_goal_count: int,
+    ) -> Dict[str, Any]:
+        self._load_repo_facts_into_map(strict=True)
+        checkpoint = CompletedGoalCheckpoint.from_execution(
+            plan_summary=plan_summary, goal=goal, result=result,
+            original_index=original_index, total_goal_count=total_goal_count,
+        )
+        persisted = self.issue_ledger.record_completed_goal(issue_id=issue_id, checkpoint=checkpoint)
+        self.issue_ledger.save(self._repo_facts_path())
+        return persisted.to_dict()
+
+    def _load_repo_facts_records(self, *, strict: bool = False) -> List[FactRecord]:
         path = self._repo_facts_path()
-        self.issue_ledger = IssueFactLedger.load(path)
+        self.issue_ledger = IssueFactLedger.load(path, strict=strict)
         self._repo_facts_loaded_count = self.issue_ledger.total_fact_count()
         return self.issue_ledger.active_context_records()
 
-    def _load_repo_facts_into_map(self) -> None:
-        records = self._load_repo_facts_records()
+    def _load_repo_facts_into_map(self, *, strict: bool = False) -> None:
+        records = self._load_repo_facts_records(strict=strict)
         self.fact_map = {record.key: record for record in records}
 
     def repo_facts_status_lines(self) -> List[str]:
@@ -3350,10 +3598,7 @@ class WorkingFolderAgent(ProposalRuntimeMixin):
 
     def _persist_repo_facts(self) -> None:
         try:
-            self._repo_facts_path().write_text(
-                self._serialize_repo_facts_markdown(),
-                encoding="utf-8",
-            )
+            self.issue_ledger.save(self._repo_facts_path())
             self._repo_facts_loaded_count = self.issue_ledger.total_fact_count()
         except Exception:
             return
@@ -3999,6 +4244,19 @@ class WorkingFolderAgent(ProposalRuntimeMixin):
     def _build_run_result(self, final_message: str, ok: bool) -> WorkerRunResult:
         steps = self._current_run_steps()
         touched_paths = self._collect_touched_paths_for_steps(steps)
+        verification = getattr(self, "_verification", None)
+        if verification is not None:
+            notes = verification.record_handoff(final_message) if ok else ""
+            report = verification.report(verification.stop_reason or ("" if ok else final_message), notes)
+            if self._run_metrics:
+                self._run_metrics["verification"] = verification.snapshot(final=True)
+            return WorkerRunResult(
+                ok=verification.passed, final_message=report, task_satisfied=verification.passed,
+                validation_ran=any(check.attempts for check in verification.checks.values()),
+                validation_passed=verification.passed, touched_paths=touched_paths,
+                validation=WorkerValidationResult(kind="verification", passed=verification.passed, summary=report.splitlines()[0]),
+                verification=verification.snapshot(final=True),
+            )
         validation = self._validation_result_for_run(steps)
         validation = WorkerValidationResult(kind=validation.kind, passed=validation.passed, summary=validation.summary + self._proposal_deferral_summary())
         has_mutations = any(
@@ -4392,6 +4650,8 @@ class WorkingFolderAgent(ProposalRuntimeMixin):
 
     def _set_active_error(self, action: Dict[str, Any], result: ActionResult) -> None:
         payload = result.payload if isinstance(result.payload, dict) else {}
+        if payload.get("code") == "VERIFICATION_REPAIR_ACTION_SKIPPED":
+            return
         path = str(action.get("path", "") or payload.get("path", "") or "")
         error_type = self._extract_error_type(payload)
         message = ""
@@ -5754,7 +6014,7 @@ class WorkingFolderAgent(ProposalRuntimeMixin):
         diagnostics = [dict(item) for item in run.diagnostics]
         stdout = run.stdout
         stderr = run.stderr
-        returncode = int(run.returncode)
+        returncode = int(run.scoped_returncode)
 
         if returncode == 0:
             if mutation_step is not None:
@@ -5847,11 +6107,13 @@ class WorkingFolderAgent(ProposalRuntimeMixin):
             "diagnostic_engine": run.engine,
             "diagnostic_scope": run.scope,
             "diagnostics": diagnostics,
-            "returncode": int(run.returncode),
+            "returncode": int(run.scoped_returncode),
             "command": list(run.command),
-            "stdout": shorten(run.stdout, 2000),
-            "stderr": shorten(run.stderr, 2000),
         }
+        if run.other_file_error_count:
+            payload.update(compiler_returncode=run.returncode, other_file_error_count=run.other_file_error_count)
+        else:
+            payload.update(stdout=shorten(run.stdout, 2000), stderr=shorten(run.stderr, 2000))
 
         if diagnostics:
             payload["diagnostics"] = self._apply_proposal_deferrals(diagnostics)
@@ -5871,12 +6133,7 @@ class WorkingFolderAgent(ProposalRuntimeMixin):
             )
             return ActionResult(ok=False, name="diagnose", payload=payload)
 
-        if run.returncode != 0:
-            if not str(run.stdout or "").strip() and not str(run.stderr or "").strip():
-                payload["summary"] = (
-                    f"Backend {run.engine} diagnostics found no issues in {run.path}."
-                )
-                return ActionResult(ok=True, name="diagnose", payload=payload)
+        if run.scoped_returncode != 0:
             payload.update(
                 {
                     "code": "DIAGNOSTIC_COMMAND_FAILED",
@@ -5886,6 +6143,8 @@ class WorkingFolderAgent(ProposalRuntimeMixin):
             return ActionResult(ok=False, name="diagnose", payload=payload)
 
         payload["summary"] = f"Backend {run.engine} diagnostics found no issues in {run.path}."
+        if run.other_file_error_count:
+            payload["summary"] += " The compiler reported errors in other files."
         return ActionResult(ok=True, name="diagnose", payload=payload)
 
     def _handle_changed_files_check_action(self, action: Dict[str, Any]) -> ActionResult:
@@ -6336,9 +6595,26 @@ class WorkingFolderAgent(ProposalRuntimeMixin):
                 self._parallel_discovery_prefetch_payload(task)
         final_message = "Stopped: max steps reached."
         run_ok = False
+        verification = getattr(self, "_verification", None)
+        verification_turn_open = False
         try:
             turn_limit = budget.remaining_turns if budget else self.config.max_steps
+            scoped_paths = getattr(self, "_verification_repair_paths", None)
+            if scoped_paths is not None:
+                turn_limit = min(turn_limit, MAX_REPAIR_TURNS if scoped_paths else MAX_INVESTIGATION_TURNS)
+            if verification is not None:
+                verification.turn_limit = min(turn_limit, verification.turn_limit)
+                turn_limit = verification.turn_limit
             for _turn in range(1, turn_limit + 1):
+                if verification is not None:
+                    if verification_turn_open:
+                        verification.finish_turn()
+                        verification_turn_open = False
+                    if verification.stop_reason:
+                        final_message = verification.stop_reason
+                        break
+                    verification.begin_turn()
+                    verification_turn_open = True
                 if budget:
                     budget.turns_used += 1
                 step_num = len(self.history) + 1
@@ -6358,23 +6634,34 @@ class WorkingFolderAgent(ProposalRuntimeMixin):
                     print("\n--- MODEL RAW OUTPUT ---\n")
                     print(raw)
 
+                protocol_error = ""
                 try:
+                    metrics_getter = getattr(self.model, "get_last_metrics", None)
+                    metrics = metrics_getter() if callable(metrics_getter) else {}
+                    metadata = (metrics or {}).get("response", {})
+                    protocol_error = ProviderResponseRecovery.protocol_failure_reason(metadata) or ProviderResponseRecovery.budget_failure_reason(metadata)
+                    if protocol_error:
+                        raise ValueError(f"Provider rejected the response with {protocol_error}. No actions were executed. Retry the unfinished action.")
                     obj = extract_first_json_object(raw)
                 except Exception as exc:
+                    error_type = "provider_protocol_failure" if protocol_error else "parse_error"
+                    error_message = str(exc) if protocol_error else f"Could not parse JSON: {exc}"
+                    if protocol_error and _turn == turn_limit:
+                        final_message = f"Stopped: {error_message} The model turn budget was exhausted."
                     self._set_output_format_recovery(
-                        error_type="parse_error",
-                        message=f"Could not parse JSON: {exc}",
+                        error_type=error_type,
+                        message=error_message,
                         raw=raw,
                     )
                     result = ActionResult(
                         ok=False,
-                        name="parse_error",
-                        payload={"error": f"Could not parse JSON: {exc}", "raw": shorten(raw, 4000)},
+                        name=error_type,
+                        payload={"error": error_message, "raw": shorten(raw, 4000)},
                     )
                     error_step = AgentStep(
                         step=len(self.history) + 1,
-                        thought="Model returned invalid JSON.",
-                        action={"type": "output_format_error", "error_type": "parse_error"},
+                        thought="Provider rejected model output." if protocol_error else "Model returned invalid JSON.",
+                        action={"type": "output_format_error", "error_type": error_type},
                         result=result,
                         elapsed_s=time.time() - started,
                         run_id=self._active_run_id,
@@ -6419,6 +6706,8 @@ class WorkingFolderAgent(ProposalRuntimeMixin):
 
                     self._current_thought = thought
                     result = self._execute_action(action)
+                    if verification is not None and result.ok and action.get("type") in {"read_file", "read_symbol"}:
+                        verification.observe_source(str(action.get("path") or ""))
                     if result.ok:
                         self._clear_output_format_recovery()
                     error_cleared = self._maybe_clear_active_error(action, result)
@@ -6454,14 +6743,22 @@ class WorkingFolderAgent(ProposalRuntimeMixin):
                         final_message = budget.pending_extension["findings"]
                         return self._build_run_result(final_message, False)
                     self._run_automatic_diagnostics_after_step(step)
-                    self._run_fact_subagent(task, step)
+                    if verification is None and scoped_paths is None:
+                        self._run_fact_subagent(task, step)
                     if action.get("type") == "drop_context" and result.ok:
                         self._reset_model_conversation(task)
 
                     if action["type"] == "finish" and result.ok:
                         final_message = str(result.payload.get("message", "Done."))
                         run_ok = True
+                        if verification is not None:
+                            break
                         return self._build_run_result(final_message, run_ok)
+
+                    if verification is not None:
+                        if not result.ok:
+                            break
+                        continue
 
                     entered_completion_check = self._maybe_enter_completion_check(task)
                     if not result.ok:
@@ -6480,10 +6777,21 @@ class WorkingFolderAgent(ProposalRuntimeMixin):
                         run_ok = True
                         return self._build_run_result(final_message, run_ok)
 
+                if verification is not None and run_ok:
+                    break
+            if verification_turn_open:
+                verification.finish_turn()
             return self._build_run_result(final_message, run_ok)
+        except Exception as exc:
+            if verification is None:
+                raise
+            if verification_turn_open:
+                verification.finish_turn()
+            final_message = f"Worker execution failed: {exc}"
+            return self._build_run_result(final_message, False)
         finally:
             self._last_run_result = self._build_run_result(final_message, run_ok)
-            self._flush_observability(final_message)
+            self._flush_observability(self._last_run_result.final_message)
 
     def _print_step(self, step: AgentStep) -> None:
         if self.on_step_callback is not None:
@@ -6872,7 +7180,7 @@ class WorkingFolderAgent(ProposalRuntimeMixin):
                 23. Prefer the smallest reliable mutation primitive that matches the change: replace_range or replace_snippet before write_file, and structural/file-system mutations when the target is a symbol or file move rather than raw text.
                 24. If several related edits are clearly needed, prefer begin_edit_batch, complete the related mutation actions, then call end_edit_batch so the host can verify all touched files in one read batch. While edit batch mode is active, same-file consolidation limits are deferred until batch exit.
                 25. The host records mutation attempt facts automatically under keys like patch_attempt::..., write_attempt::..., or edit_attempt::<type>::.... Those auto facts include the originating thought summary and any automatic post-mutation diagnostics status. Reuse them only when that prior attempt matches the current reasoning branch; do not let an unrelated old attempt suppress a materially different edit.
-                26. If you use `actions`, keep it to at most 4 ordered actions, stop at the first failure, and only place `finish` as the last item.
+                26. Use `actions` for related edits and their checks. The host dispatches actions in order and stops at the first failure. Include at most 4 actions other than file edits, and place `finish` last.
 
                 If a task is ambiguous, inspect the repository first.
                 """).strip()
@@ -7274,19 +7582,11 @@ class WorkingFolderAgent(ProposalRuntimeMixin):
                         "object": obj,
                     },
                 )
-            if len(actions) > MAX_ACTION_BATCH_SIZE:
-                return None, self._error_action_result(
-                    "schema_error",
-                    {
-                        "error": f"actions may contain at most {MAX_ACTION_BATCH_SIZE} items.",
-                        "count": len(actions),
-                    },
-                )
-
             if len(actions) != 1 and any(isinstance(item, dict) and item.get("type") == "request_discovery_extension" for item in actions):
                 return None, self._error_action_result("schema_error", {"error": "A discovery extension request must be the only action in its turn."})
             normalized_actions: List[Dict[str, Any]] = []
             finish_seen = False
+            non_edit_count = 0
             for index, item in enumerate(actions, start=1):
                 if not isinstance(item, dict):
                     return None, self._error_action_result(
@@ -7305,6 +7605,8 @@ class WorkingFolderAgent(ProposalRuntimeMixin):
                             "object": item,
                         },
                     )
+                if action_type not in MUTATION_ACTION_TYPES and action_type != "batch_mutate":
+                    non_edit_count += 1
                 if action_type == "finish":
                     if finish_seen or index != len(actions):
                         return None, self._error_action_result(
@@ -7316,6 +7618,14 @@ class WorkingFolderAgent(ProposalRuntimeMixin):
                         )
                     finish_seen = True
                 normalized_actions.append(dict(item))
+            if non_edit_count > MAX_NON_EDIT_ACTIONS_PER_TURN:
+                return None, self._error_action_result(
+                    "schema_error",
+                    {
+                        "error": f"actions may contain at most {MAX_NON_EDIT_ACTIONS_PER_TURN} items other than file edits.",
+                        "count": non_edit_count,
+                    },
+                )
             return normalized_actions, None
 
         if not isinstance(action, dict) or "type" not in action:
@@ -8646,7 +8956,7 @@ class WorkingFolderAgent(ProposalRuntimeMixin):
                 {"code": "SHELL_DISABLED", "message": "Shell access is disabled by SHELL_ACCESS=false."},
             )
         managed = run_managed_shell(self.root, action, {**os.environ, "PYTHONIOENCODING": "utf-8"},
-                                    allow_changes=self.discovery_budget is None)
+                                    allow_changes=self.discovery_budget is None and getattr(self, "_verification", None) is None)
         if managed is not None:
             self._invalidate_fast_caches()
             return ActionResult(ok="error" not in managed, name=action_type,
@@ -9129,11 +9439,42 @@ class WorkingFolderAgent(ProposalRuntimeMixin):
 
         return None
 
-    def _execute_action(self, action: Dict[str, Any]) -> ActionResult:
+    def _execute_action(self, action: Dict[str, Any], *, verification_check: bool = False) -> ActionResult:
         t = action.get("type")
         action_type = str(t or "")
+        verification = getattr(self, "_verification", None)
+        provenance = getattr(self, "diagnostic_provenance", None)
 
         try:
+            repair_paths = getattr(self, "_verification_repair_paths", None)
+            if repair_paths is not None:
+                if not repair_paths and action_type == "finish":
+                    return ActionResult(ok=True, name="finish", payload={"message": str(action.get("message") or "")})
+                if error := repair_action_error(action, root=self.root, paths=repair_paths):
+                    return self._error_action_result(action_type, {"error": error, "code": "VERIFICATION_REPAIR_ACTION_SKIPPED"})
+            if action_type == "verify":
+                if verification is None:
+                    raise ValueError("verify is available in verification goals.")
+                nested = action.get("action")
+                if isinstance(nested, dict) and is_verification_setup(nested):
+                    return self._execute_action(nested, verification_check=True)
+                if not isinstance(nested, dict) or not needs_verification_check(nested):
+                    raise ValueError("Provide a check, diagnostics, shell, MCP, or preview action.")
+                ids = verification.begin_checks(action.get("checks"), action=nested)
+                outcome = self._execute_action(nested, verification_check=True)
+                kind = str(nested.get("type"))
+                output = outcome.payload
+                state = verification.record(ids, kind=kind, ok=outcome.ok, output=output,
+                                            unavailable=bool(output.get("managed_process") or output.get("unavailable")), action=nested)
+                return ActionResult(ok=True, name="verify", payload={"verification": state})
+            if verification is not None and not verification_check:
+                if action_type == "finish":
+                    return ActionResult(ok=True, name="finish", payload={"message": str(action.get("message") or "")})
+                if needs_verification_check(action):
+                    raise ValueError("Bind this tool to required checks with the verify action.")
+                if (action_type != "mcp" and not is_verification_setup(action)
+                        and (error := repair_action_error(action, root=self.root, paths=frozenset()))):
+                    return self._error_action_result(action_type, {"error": error})
             if self.discovery_budget is not None and self.discovery_budget.pending_extension:
                 return self._error_action_result(action_type, {"error": "Discovery is awaiting the user's extension decision."})
             if action_type == "request_discovery_extension":
@@ -9176,7 +9517,10 @@ class WorkingFolderAgent(ProposalRuntimeMixin):
                 payload = run_artifact_preview(action)
                 return ActionResult(ok=payload["ok"], name=action_type, payload=payload)
             if action_type == "mcp":
-                payload = model_mcp_result(invoke_mcp(self.root, action))
+                with provenance.track(action) if provenance is not None else nullcontext():
+                    payload = invoke_mcp(self.root, action)
+                if not verification_check:
+                    payload = model_mcp_result(payload)
                 return ActionResult(ok=payload["ok"], name="mcp", payload=payload)
             handlers: Dict[str, Callable[[Dict[str, Any]], ActionResult]] = {
                 "list_files": self._handle_list_files_action,
@@ -9253,7 +9597,11 @@ class WorkingFolderAgent(ProposalRuntimeMixin):
             handler = handlers.get(str(t))
             if handler is None:
                 return ActionResult(ok=False, name="unknown_action", payload={"error": f"Unknown action type: {t}"})
-            return handler(action)
+            with provenance.track(action) if provenance is not None else nullcontext():
+                outcome = handler(action)
+            if provenance is not None and isinstance(outcome.payload.get("diagnostics"), list):
+                provenance.observe(outcome.payload["diagnostics"])
+            return outcome
 
         except subprocess.TimeoutExpired:
             return ActionResult(ok=False, name=t or "unknown", payload={"error": "Shell command timed out."})
@@ -9601,8 +9949,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--thinking-mode",
         default="medium",
-        choices=["auto", "none", "minimal", "low", "medium", "high", "xhigh"],
-        help="OpenAI/Meta: reasoning effort. Gemini: mapped to thinking_level or thinking_budget.",
+        choices=REASONING_EFFORTS,
+        help="Reasoning effort translated for the provider. Auto uses the model default.",
     )
 
     parser.add_argument(
@@ -9665,8 +10013,9 @@ def _handle_bridge_planner_action(
         decision = "accept" if action_name == "accept_issue_proposal" else "ignore"
         proposal = planner.worker.decide_issue_proposal(proposal_id, decision)
         return f"Suggestion {proposal_id} {proposal['status']}." + (f" Created {proposal['accepted_issue_id']} without changing the active task." if decision == "accept" else "")
-    if action_name in {"approve_plan", "reject_plan", "continue_issue", "revise_plan"} and ("expected_plan" in request or action_name == "revise_plan"):
-        current = planner.session.pending_plan or (planner.session.paused_plan if planner.session.execution_paused else None)
+    if action_name in {"approve_plan", "reject_plan", "continue_issue", "revise_plan", "resume_execution"} and ("expected_plan" in request or action_name == "revise_plan"):
+        paused_plan = planner.session.paused_plan if planner.session.execution_paused else None
+        current = paused_plan if action_name == "resume_execution" else planner.session.pending_plan or paused_plan
         if current is None or planner.session.executing or request.get("expected_plan") != planner._plan_payload(current):
             raise ValueError("The plan changed. Review the current plan before deciding.")
     if action_name == "revise_plan":
@@ -10140,6 +10489,13 @@ def _run_extension_bridge(args: argparse.Namespace) -> int:
         })
 
     planner.on_plan_callback = _plan_callback
+    planner.on_model_progress = lambda payload: _emit_bridge_message({
+        "type": "progress",
+        "domain": "planner",
+        **payload,
+        **({} if payload["action_type"] in {"model_reasoning_summary", "model_output_progress"}
+           else {"state": safe_bridge_state()}),
+    })
 
     def add_exchange(role: str, content: str) -> None:
         text = str(content or "").strip()

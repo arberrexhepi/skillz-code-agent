@@ -6,6 +6,7 @@ import shlex
 from pathlib import Path
 os.environ["SKILLZ_CODEX_MODEL_ONLY"] = "1"
 from main import create_model_client
+from model_output_progress import ModelOutputObserver
 
 
 def setup_error(error):
@@ -46,8 +47,14 @@ def capabilities(request):
     available = {'openai': agent.OpenAI is not None, 'anthropic': agent.Anthropic is not None,
                  'google-genai': agent.genai is not None and agent.genai_types is not None}
     key = info.get('env_var')
-    return {'package': package, 'sdkReady': available.get(package, True), 'keyName': key,
-            'keyReady': not key or bool(os.getenv(key)), 'label': info['label']}
+    result = {'package': package, 'sdkReady': available.get(package, True), 'keyName': key,
+              'keyReady': not key or bool(os.getenv(key)), 'label': info['label']}
+    if provider == 'gemini' and result['sdkReady'] and not hasattr(getattr(agent.genai_types, "FinishReason", None), "MALFORMED_RESPONSE"):
+        if sys.version_info >= (3, 11):
+            result.update(sdkUpdateAvailable=True, detail="Update the Gemini SDK to recognize MALFORMED_RESPONSE.")
+        else:
+            result["detail"] = "Python 3.11 or newer is required for the Gemini SDK upgrade."
+    return result
 
 
 def main(check=False, inspect=False):
@@ -62,10 +69,28 @@ def main(check=False, inspect=False):
         print(json.dumps({"ready": True}), flush=True)
         return
     client.set_prompt_cache_key(request.get("prompt_cache_key", ""))
-    progress = getattr(client, "set_progress_callback", None)
-    if callable(progress):
-        progress(lambda event: print(json.dumps({"progress": event}), flush=True))
-    text = client.complete_messages(request["system"], request["messages"])
+    if request.get("reasoning_summary") is True:
+        def emit_summary(delta):
+            print(json.dumps({"progress": {"type": "reasoning_summary", "delta": delta}}), flush=True)
+
+        def emit_output_progress(count, draft):
+            print(json.dumps({"progress": {
+                "type": "output_progress", "output_chars": count, "draft_strategy": draft,
+            }}), flush=True)
+
+        text = client.complete_messages_with_progress(
+            request["system"], request["messages"], emit_summary,
+            on_output=ModelOutputObserver(
+                emit_output_progress, preview_strategy=request.get("preview_strategy") is True,
+                preserve_request_context=request.get("preserve_request_context") is True,
+                require_command_frame=request.get("require_command_frame") is True,
+            ),
+        )
+    else:
+        progress = getattr(client, "set_progress_callback", None)
+        if callable(progress):
+            progress(lambda event: print(json.dumps({"progress": event}), flush=True))
+        text = client.complete_messages(request["system"], request["messages"])
     print(json.dumps({"text": text, "metrics": client.get_last_metrics()}, ensure_ascii=False), flush=True)
 
 
@@ -73,4 +98,9 @@ if __name__ == "__main__":
     try:
         main(check="--check" in sys.argv[1:], inspect="--capabilities" in sys.argv[1:])
     except Exception as error:
-        print(json.dumps({"error": setup_error(error)}), flush=True)
+        from main import _model_error_status
+        from tree_loop import _model_error_metadata
+
+        details = _model_error_metadata(error)
+        details["status_code"] = _model_error_status(error) or details["status_code"]
+        print(json.dumps({"error": setup_error(error), "error_details": details}), flush=True)

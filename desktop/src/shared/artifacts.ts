@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import type { AgentEvent, AgentResponse, AgentStartOptions, GitCommit, GitDiscardResult, GitFileDiff, GitStatus } from './contracts';
 import type { JsonMap, RuntimeOptionsPayload } from './agentTypes';
+import type { WorkspaceIssueAction, WorkspaceIssuesSnapshot } from './workspaceIssues';
 import { artifactAppMcpSchema, type ArtifactAppMcpRequest } from './artifactAppMcp';
 
 export const artifactId = z.string().regex(/^[a-z0-9][a-z0-9-]{0,63}$/);
@@ -104,7 +105,7 @@ export const prebuiltUpdateRequestSchema = z.object({
 });
 export type PrebuiltUpdateRequest = z.infer<typeof prebuiltUpdateRequestSchema>;
 export interface PrebuiltUpdateResult { updatedFiles: number; backup: string }
-export type ArtifactEvent = { type: 'setup'; progress: ArtifactSetupProgress } | { type: 'runtime'; runtime: ArtifactRuntime } | { type: 'runtime-setup'; id: string } | { type: 'runtime-selection'; record: ArtifactRecord } | { type: 'prebuilt-updated'; id: string } | { type: 'apis'; id: string } | { type: 'agent'; id: string; event: AgentEvent };
+export type ArtifactEvent = { type: 'setup'; progress: ArtifactSetupProgress } | { type: 'runtime'; runtime: ArtifactRuntime } | { type: 'runtime-setup'; id: string } | { type: 'runtime-selection'; record: ArtifactRecord } | { type: 'prebuilt-updated'; id: string } | { type: 'apis'; id: string } | { type: 'issues'; id: string } | { type: 'agent'; id: string; event: AgentEvent };
 export const previewInputSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('click'), x: z.number().min(0).max(3000), y: z.number().min(0).max(3000) }),
   z.object({ type: z.literal('wheel'), dx: z.number().min(-3000).max(3000), dy: z.number().min(-3000).max(3000) }),
@@ -150,6 +151,8 @@ export interface ArtifactsApi {
   reload(id: string): Promise<void>;
   closePreview(id: string): Promise<void>;
   reveal(id: string): Promise<void>;
+  issues(id: string): Promise<WorkspaceIssuesSnapshot>;
+  issueAction(id: string, action: WorkspaceIssueAction, extras: JsonMap): Promise<WorkspaceIssuesSnapshot>;
   gitStatus(id: string): Promise<GitStatus>;
   gitInitialize(id: string): Promise<GitStatus>;
   gitHistory(id: string, limit?: number): Promise<GitCommit[]>;

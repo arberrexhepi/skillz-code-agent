@@ -252,6 +252,7 @@ interface PlannerState extends JsonMap {
   } | null;
   paused_completed_results?: Array<{ title?: string; final_message?: string; status?: string; goal_id?: string }>;
   paused_failed_goal_id?: string;
+  paused_suspended_goal_id?: string;
   paused_failed_goal_title?: string;
   paused_failed_goal_index?: number;
   paused_failure_reason?: string;
@@ -259,7 +260,7 @@ interface PlannerState extends JsonMap {
   paused_failure_status_code?: number | null;
   paused_failure_request_id?: string;
   resume_checkpoint?: {
-    mode?: 'retry_failed_goal' | 'resume_remaining' | 'durable_continuation' | 'issue_continuation';
+    mode?: 'retry_failed_goal' | 'resume_suspended_goal' | 'resume_remaining' | 'durable_continuation' | 'issue_continuation';
     total_goal_count?: number;
     completed_goal_count?: number;
     completed_goal_ids?: string[];
@@ -3563,7 +3564,7 @@ class AgentPanel implements vscode.Disposable {
           const prefix = isDone ? '\u2713 ' : ((isCurrent || isResumeNext) ? '\u25b6 ' : '');
           const resumeStatus = isDone && (paused || continuationPlan)
             ? 'Completed · skipped on resume'
-            : (isResumeNext ? (planner.paused_failed_goal_id ? 'Retry starts here' : 'Resume starts here') : ((paused || continuationPlan) && !isDone ? 'Queued after resume point' : ''));
+            : (isResumeNext ? (planner.paused_suspended_goal_id ? 'Suspended' : planner.paused_failed_goal_id ? 'Retry starts here' : 'Resume starts here') : ((paused || continuationPlan) && !isDone ? 'Queued after resume point' : ''));
           const statusSuffix = resumeStatus || (result ? (result.status || '') : '');
           header.innerHTML = prefix + '<strong>' + (g.title || g.goal_id || 'Goal') + '</strong> ' + scopeBadge(g.estimated_scope) + (statusSuffix ? '<span class="muted"> \u2014 ' + statusSuffix + '</span>' : '');
           item.appendChild(header);
@@ -3607,7 +3608,7 @@ class AgentPanel implements vscode.Disposable {
         const status = planner.paused_failure_status_code ? 'HTTP ' + planner.paused_failure_status_code + ' · ' : '';
         phase.appendChild(el('span', 'phase-body', (failedGoal ? failedGoal + ': ' : '') + status + reason + (requestId ? ' (request ' + requestId + ')' : '')));
         card.appendChild(phase);
-        const recoveryActions = actions.filter(a => a.type === 'retry_failed_goal' || a.type === 'reject_plan');
+        const recoveryActions = actions.filter(a => ['resume_execution', 'retry_failed_goal', 'reject_plan'].includes(a.type));
         const row = actionRow(recoveryActions);
         if (row) { card.appendChild(row); }
       }

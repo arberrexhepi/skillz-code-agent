@@ -91,6 +91,13 @@ class CodexSubscriptionTests(unittest.TestCase):
             return subprocess.CompletedProcess(args, 0, stdout=json.dumps(event), stderr="")
 
         with patch("codex_subscription.subprocess.run", side_effect=fake_run):
+            run_codex_subscription_completion(
+                model="gpt-5.6-terra",
+                thinking_mode="auto",
+                system="Return JSON only.",
+                messages=[{"role": "user", "content": "Finish."}],
+            )
+            self.assertFalse(any(arg.startswith("model_reasoning_effort=") for arg in captured["args"]))
             text, metrics = run_codex_subscription_completion(
                 model="gpt-5.6-terra",
                 thinking_mode="medium",
@@ -100,6 +107,7 @@ class CodexSubscriptionTests(unittest.TestCase):
 
         self.assertEqual(text, '{"action":"finish"}')
         self.assertIn("--ephemeral", captured["args"])
+        self.assertIn('model_reasoning_effort="medium"', captured["args"])
         for override in ("features.shell_tool=false", "features.unified_exec=false", "tools.view_image=false", "features.code_mode_host=false", "features.apps=false", "features.plugins=false", "features.multi_agent=false", "features.skip_host_skill_discovery=true", 'web_search="disabled"', "project_doc_max_bytes=0"):
             self.assertIn(override, captured["args"])
         self.assertEqual(captured["args"][captured["args"].index("--sandbox") + 1], "read-only")
@@ -177,6 +185,25 @@ class CodexSubscriptionTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         self.assertEqual([event["type"] for event in events], ["turn.started", "turn.completed"])
         self.assertTrue(all("skillz_elapsed_s" in event for event in events))
+
+    @patch("codex_subscription.quick_chatgpt_auth_status", return_value={"authenticated": True})
+    @patch("codex_subscription.resolve_codex_executable", return_value="/fake/codex")
+    def test_subscription_streams_completed_reasoning_items_before_final_message(self, _resolve, _auth):
+        summaries = []
+
+        def stream(args, *, progress_callback, **kwargs):
+            assert 'model_reasoning_summary="auto"' in args
+            assert "show_raw_agent_reasoning=false" in args
+            progress_callback({"type": "item.completed", "item": {"type": "agent_message", "text": "finish done"}})
+            progress_callback({"type": "item.completed", "item": {"type": "reasoning", "text": "Checking Blender tools."}})
+            assert summaries == ["Checking Blender tools.\n\n"]
+            Path(args[args.index("--output-last-message") + 1]).write_text("finish done", encoding="utf-8")
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+        with patch("codex_subscription._run_codex_exec_streaming", side_effect=stream):
+            client = main.CodexSubscriptionModelClient("gpt-5.6-terra")
+            result = client.complete_messages_with_progress("system", [{"role": "user", "content": "Inspect."}], summaries.append)
+        self.assertEqual(result, "finish done")
 
 
 if __name__ == "__main__":

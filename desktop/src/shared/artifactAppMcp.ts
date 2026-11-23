@@ -59,8 +59,26 @@ export const artifactAppMcpRequestSchema = z.object({
 });
 export type ArtifactAppMcpRequest = z.infer<typeof artifactAppMcpRequestSchema>;
 
+const previewRoute = z.string().max(4096).regex(/^\/(?![\/\\])[^\\\r\n]*$/);
+const browserSelector = z.string().trim().min(1).max(500);
+const browserLabel = z.string().trim().min(1).max(140);
+const browserCheckStep = z.discriminatedUnion('type', [
+  z.strictObject({ type: z.literal('assert-visible'), selector: browserSelector, label: browserLabel }),
+  z.strictObject({ type: z.literal('click'), selector: browserSelector, label: browserLabel }),
+  z.strictObject({ type: z.literal('goto'), route: previewRoute, label: browserLabel }),
+]);
+export type ArtifactBrowserCheckStep = z.infer<typeof browserCheckStep>;
+
 export const artifactPreviewActionSchema = z.discriminatedUnion('operation', [
   z.strictObject({ operation: z.literal('restart') }),
+  z.strictObject({ operation: z.literal('route-check'), route: previewRoute }),
+  z.strictObject({
+    operation: z.literal('browser-check'),
+    input: z.strictObject({
+      route: previewRoute,
+      steps: z.array(browserCheckStep).min(1).max(8).refine(steps => steps.some(step => step.type === 'assert-visible')),
+    }),
+  }),
   z.strictObject({ operation: z.literal('mcp'), input: artifactAppMcpRequestSchema.omit({ approveMutations: true }).strict() }),
   z.strictObject({ operation: z.literal('chat'), input: z.strictObject({ message: z.string().trim().min(1).max(4000) }) }),
 ]);

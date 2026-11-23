@@ -1,5 +1,8 @@
 /** The persisted issue_facts.py ledger, rendered without starting or modifying the agent. */
 export const REPO_FACTS_PATH = 'repo_facts.md';
+export function matchRepoFactsJsonBlock(source: string): RegExpExecArray | null {
+  return /```json[ \t]*\r?\n([\s\S]*?)\r?\n[ \t]*```[ \t]*(?=\r?$)/m.exec(source) || /```json\s*([\s\S]*?)\s*```/.exec(source);
+}
 export type RepoFactKind = 'architecture' | 'goal';
 export interface RepoFact {
   key: string;
@@ -63,7 +66,7 @@ const map = (value: unknown): value is Record<string, unknown> => Boolean(value 
 export function parseRepoFacts(markdown: string): RepoFactsLedger {
   const trimmed = markdown.replace(/^\uFEFF/, '').trim();
   if (!trimmed) return { schemaVersion: null, legacy: false, activeIssueId: '', issues: [], migration: {}, warnings: [] };
-  const block = /```json\s*([\s\S]*?)\s*```/.exec(trimmed);
+  const block = matchRepoFactsJsonBlock(trimmed);
   let payload: unknown;
   try { payload = JSON.parse(block ? block[1] : trimmed); }
   catch { throw new Error('The saved file does not contain valid JSON. Open the source to inspect it, then refresh.'); }

@@ -1450,10 +1450,10 @@ class TestExecuteTool(unittest.TestCase):
         self.assertIn("finish must be the final executable command", result.turns[0].results[0].output)
         self.assertIn("skipped after prior command failure", result.turns[0].results[1].output)
 
-    def test_batch_turn_enforces_mutation_limit(self):
+    def test_batch_turn_dispatches_all_file_edits_in_order(self):
+        paths = [f"sample-{index}.txt" for index in range(35)]
         model = FakeModel([
-            "batch start\nwrite /repo/a.txt a\nwrite /repo/b.txt b\nwrite /repo/c.txt c\nwrite /repo/d.txt d\nwrite /repo/e.txt e\nbatch end",
-            "finish done",
+            "\n".join(["batch start", *(f"write /repo/{path} {path}" for path in paths), "batch end", "finish done"]),
         ])
         loop = TreeLoop(
             model=model,
@@ -1462,12 +1462,12 @@ class TestExecuteTool(unittest.TestCase):
             verbose=False,
         )
 
-        result = loop.run("Exercise bounded batch writes")
+        result = loop.run("Write the fixture files")
 
         self.assertTrue(result.finished)
-        self.assertIn("mutation batch limit exceeded", result.turns[0].results[5].output)
-        self.assertIn("skipped after prior command failure", result.turns[0].results[6].output)
-        self.assertFalse(Path(self.tmpdir, "e.txt").exists())
+        self.assertEqual(len(result.turns), 1)
+        self.assertTrue(all(result.ok for result in result.turns[0].results))
+        self.assertEqual([Path(self.tmpdir, path).read_text().strip() for path in paths], paths)
 
     def test_write_refreshes_recent_full_file_context(self):
         loop = self._make_loop()

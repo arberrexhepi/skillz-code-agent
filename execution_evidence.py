@@ -24,6 +24,8 @@ EMPTY_SEARCH_OUTPUTS = {"", "(empty)", "(no matches)", "(no symbol matches)", "(
 def external_execution_identity(action: dict) -> str | None:
     """Identify an actual tool operation, independent of provider text or catalog lookups."""
     kind = action.get("type")
+    if kind == "run_route_check" and action.get("_route_checked"):
+        return "route:" + json.dumps([action.get("target"), action.get("base_url")])
     if kind == "artifact_preview":
         operation = action.get("operation", "start")
         payload = action.get("input") or {}

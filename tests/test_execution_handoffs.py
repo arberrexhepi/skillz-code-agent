@@ -371,6 +371,41 @@ class EmptyProviderRecoveryTests(unittest.TestCase):
                 self.assertIn("failed with MALFORMED_RESPONSE", result.finish_message)
                 self.assertIn(detail, result.finish_message)
 
+    def test_malformed_provider_action_cannot_be_replaced_with_finish(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            model = RecordingMessageModel(["write note.txt attempted", "finish Done", "finish Still done"])
+            model.get_last_metrics = lambda: {"response": {"candidates": [
+                {"finish_reason": "MALFORMED_RESPONSE" if len(model.calls) == 1 else "STOP"}
+            ]}}
+            result = TreeLoop(model=model, workspace_root=root, max_turns=3, verbose=False).run("Write a note")
+            self.assertFalse((root / "note.txt").exists())
+        self.assertFalse(result.finished)
+        self.assertEqual(len(model.calls), 3)
+        self.assertIn("provider-rejected action is still pending", result.finish_message)
+
+    def test_gemini_retries_malformed_stream_without_changing_transport(self):
+        class Model(RecordingMessageModel):
+            provider_name = "gemini"
+            modes = []
+
+            def complete_messages(self, system, messages):
+                self.modes.append("text")
+                return super().complete_messages(system, messages)
+
+            def complete_messages_with_progress(self, system, messages, on_summary, *, on_output):
+                self.modes.append("stream")
+                return super().complete_messages(system, messages)
+
+            def get_last_metrics(self):
+                return {"response": {"candidates": [{"finish_reason": "MALFORMED_RESPONSE" if len(self.calls) == 1 else "STOP"}]}}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            model = Model(["", "ls /repo", "finish Inspected"])
+            loop = TreeLoop(model=model, workspace_root=Path(tmp), max_turns=2, verbose=False, model_event_observer=lambda _: None)
+            self.assertTrue(loop.run("Inspect").finished)
+        self.assertEqual(model.modes, ["stream", "stream", "stream"])
+
     def test_persistent_protocol_failure_stays_bounded_with_source_preserved(self):
         with tempfile.TemporaryDirectory() as tmp:
             model = RecordingMessageModel(["", "", ""])
@@ -384,7 +419,7 @@ class EmptyProviderRecoveryTests(unittest.TestCase):
             self.assertIn("MALFORMED_FUNCTION_CALL after 2 targeted retries", result.finish_message)
             self.assertEqual(loop._conversation_task, "Current goal")
 
-    def test_two_empty_responses_stop_as_provider_failure_with_exact_usage_and_reason(self):
+    def test_two_capped_responses_suspend_with_exact_usage_and_reason(self):
         with tempfile.TemporaryDirectory() as tmp:
             model = RecordingMessageModel(["", ""])
             model.get_last_metrics = lambda: {"response": {"candidates": [{"finish_reason": "MAX_TOKENS"}]},
@@ -396,12 +431,14 @@ class EmptyProviderRecoveryTests(unittest.TestCase):
             self.assertEqual(len(model.calls), 2)
             self.assertEqual(worker.history, [])
             self.assertEqual(worker._execution_delivery.read_only_turns, 0)
-            self.assertIn("provider returned empty text twice", result.final_message)
+            self.assertTrue(result.suspended)
+            self.assertIn("command response budget exceeded", result.final_message)
             self.assertIn("MAX_TOKENS", result.final_message)
             trace = (Path(tmp) / "trace.md").read_text()
-            self.assertIn("Empty provider response", trace)
+            self.assertIn("Command response budget recovery", trace)
             self.assertNotIn("## Model output format repair", trace)
-            self.assertEqual(worker._observability_metrics["empty_provider_responses"], 2)
+            self.assertEqual(worker._observability_metrics["response_budget_failures"], 2)
+            self.assertEqual(worker._observability_metrics["empty_provider_responses"], 0)
             usage = worker.usage_accounting_state()
             self.assertEqual(usage["current_run"]["model_calls"], 2)
             self.assertEqual(usage["current_run"]["input_tokens"], 40)

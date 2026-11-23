@@ -8,6 +8,9 @@ import { ArtifactLibraryService } from './artifactLibrary';
 import { ArtifactPreviewService } from './artifactPreview';
 import { AgentService } from './agent';
 import { WorkspaceService } from './workspace';
+import { readWorkspaceIssues, updateWorkspaceIssues } from './workspaceIssues';
+import { ISSUE_PROPOSALS_PATH, type WorkspaceIssueAction } from '../../shared/workspaceIssues';
+import { REPO_FACTS_PATH } from '../../shared/repoFacts';
 import type { RuntimeSettingsService } from './runtimeSettings';
 import { terminate } from './artifactProcess';
 import { ArtifactSandbox, stopArtifactContainers } from './artifactSandbox';
@@ -60,6 +63,15 @@ export class ArtifactsService {
   async dockerCleanupPlan() { return planArtifactDockerCleanup(await this.artifactRoots()); }
   async cleanDocker() { return cleanArtifactDockerResources(await this.artifactRoots()); }
   create(options: CreateArtifact): Promise<ArtifactRecord> { return this.library.create(options); }
+  async issues(id: string) {
+    return readWorkspaceIssues((await this.library.find(id)).root);
+  }
+  async issueAction(id: string, action: WorkspaceIssueAction, extras: Record<string, unknown>) {
+    const { root } = await this.library.find(id);
+    const snapshot = await updateWorkspaceIssues(root, action, extras);
+    this.emit({ type: 'issues', id });
+    return snapshot;
+  }
   private async dependencySetup(id?: string) {
     if (!id) return undefined;
     const artifact = await this.library.find(id);
@@ -253,6 +265,13 @@ export class ArtifactsService {
   }
   private async runPreviewAction(id: string, input: unknown): Promise<Record<string, unknown>> {
     const action = artifactPreviewActionSchema.parse(input);
+    if (action.operation === 'route-check' || action.operation === 'browser-check') {
+      const preview = await this.start(id);
+      if (preview.status !== 'running' || !preview.url) return { ok: false, unavailable: true, error: 'Artifact preview has no published URL.' };
+      return action.operation === 'browser-check'
+        ? this.preview.checkRoute(preview.url, action.input.route, action.input.steps)
+        : this.preview.checkRoute(preview.url, action.route);
+    }
     if (action.operation === 'restart') {
       if (this.changingApp.has(id) || this.updatingPrebuilts.has(id)) throw new Error('Wait for the artifact update before restarting its preview.');
       await this.stop(id);
@@ -323,7 +342,11 @@ export class ArtifactsService {
     const inFlight = this.agentCreations.get(id); if (inFlight) return inFlight;
     const creation = (async () => {
       const artifact = await this.library.find(id);
-      const workspace = new WorkspaceService((paths) => { if (paths.includes('.artifact/apis.json')) this.emit({ type: 'apis', id }); }); await workspace.open(artifact.root);
+      const workspace = new WorkspaceService((paths) => {
+        if (paths.includes('.artifact/apis.json')) this.emit({ type: 'apis', id });
+        if (paths.includes(REPO_FACTS_PATH) || paths.includes(ISSUE_PROPOSALS_PATH)) this.emit({ type: 'issues', id });
+      });
+      await workspace.open(artifact.root);
       const execution = new ArtifactAgentExecution(
         () => this.sandbox(id),
         message => this.emit({ type: 'agent', id, event: { type: 'stderr', message } }),
@@ -359,7 +382,7 @@ export class ArtifactsService {
     ]);
     const preview = this.runtimes.get(id)?.state;
     const browserPreview = playwrightEnabled ? (
-      ' Playwright MCP is enabled for this artifact. Use Start Preview during development or verification to get the published host URL, then open that URL with the Playwright MCP browser tools.'
+      ' Playwright MCP is enabled for this artifact. Use Start Preview and its published host URL for interactive Playwright MCP checks. TreeLoop run-route-check uses the managed preview directly for route diagnostics.'
       + (preview?.status === 'running' && preview.url ? ` The current preview URL is ${preview.url}.` : '')
     ) : '';
     const appMcp = app.mcp.enabled

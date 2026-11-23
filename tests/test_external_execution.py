@@ -137,6 +137,21 @@ def test_artifact_preview_is_scoped_and_available_to_stable_execution(tmp_path):
         start.assert_called_once_with()
 
 
+def test_artifact_route_check_uses_published_preview_without_workspace_playwright(tmp_path):
+    model = RecordingMessageModel([])
+    loop = TreeLoop(model=model, workspace_root=tmp_path, verbose=False)
+    action = {"type": "run_route_check", "target": "http://127.0.0.1:41981/studio?mode=test"}
+    published = "http://127.0.0.1:52413/studio?mode=test"
+    with patch("artifact_preview._request", return_value={
+        "ok": True, "url": published, "finalUrl": published, "title": "Motion Studio", "route": "/studio?mode=test",
+        "pageErrors": [{"message": "Render failed"}],
+    }) as route, patch("tree_loop.subprocess.run", side_effect=AssertionError("No workspace browser")):
+        result = loop._exec_run_route_check(action)
+    route.assert_called_once_with({"operation": "route-check", "route": "/studio?mode=test"})
+    assert f"url={published}" in result and "issues=1" in result
+    assert loop._tool_message_indicates_failure("run_route_check", result)
+
+
 def test_artifact_preview_verification_is_external_execution(tmp_path, monkeypatch):
     catalog = {"operation": "list", "server": "game-tools"}
     read = {"operation": "call", "server": "game-tools", "name": "read_board"}

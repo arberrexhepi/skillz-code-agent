@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,10 +9,14 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import main
+from bridge_presentation import presentation_parts
+from execution_progress import READ_ONLY_RECOVERY_TURNS, RECOVERY_TURN_ALLOWANCE
 from main import BackoffStrategy, BaseModelClient
 from issue_facts import CompletedGoalCheckpoint, IssueFactLedger
 from live_test_loop import TreeLoopPlannerWorker
+from model_output_progress import ModelOutputObserver
 from planner import GoalExecutionResult, PlannerAgent, PlannerGoal, PlannerPlan
+from tests.test_live_test_loop import FakeModelClient
 
 
 class HttpError(RuntimeError):
@@ -144,6 +149,18 @@ class ModelRetryTests(unittest.TestCase):
         self.assertEqual([call.args[0] for call in sleep.call_args_list], [17.0])
 
     @patch.object(main.time, "sleep")
+    def test_spending_cap_respects_one_retry_and_keeps_status(self, sleep) -> None:
+        errors = [HttpError(429, "Temporarily rate-limited to prevent exceeding the monthly spending cap.",
+                            headers={"retry-after": "17"}) for _ in range(3)]
+        client = FlakyModelClient(errors)
+        with self.assertRaises(HttpError) as failure:
+            client.complete_messages("system", [{"role": "user", "content": "prompt"}])
+        self.assertEqual(client.calls, 2)
+        sleep.assert_called_once_with(17.0)
+        self.assertEqual(failure.exception.retry_attempts, 2)
+        self.assertEqual(client.get_last_error_metrics()["status_code"], 429)
+
+    @patch.object(main.time, "sleep")
     def test_recovered_retry_preserves_error_status_code_message_and_request(self, _sleep) -> None:
         client = FlakyModelClient(
             [
@@ -201,6 +218,17 @@ class ModelRetryTests(unittest.TestCase):
         self.assertEqual(client.prompts[-1], "fresh compacted context")
         self.assertEqual([call.args[0] for call in sleep.call_args_list], [1.0, 2.0, 60.0])
         self.assertTrue(client.get_last_metrics()["retry"]["fresh_context_retry"])
+
+    @patch.object(main.time, "sleep")
+    def test_capped_recovery_keeps_the_interrupted_reply_through_provider_backoff(self, _sleep) -> None:
+        client = FlakyModelClient([])
+        client.set_final_retry_message_compactor(lambda _: [{"role": "user", "content": "compacted"}])
+        messages = [{"role": "assistant", "content": "interrupted reply"}, {"role": "user", "content": "retry"}]
+        observer = ModelOutputObserver(lambda *_: None, preserve_request_context=True)
+        failures = [HttpError(500, "internal server error") for _ in range(3)]
+        with patch.object(client, "_do_complete_messages_with_progress", side_effect=[*failures, "ok"]) as complete:
+            self.assertEqual(client.complete_messages_with_progress("system", messages, lambda _: None, on_output=observer), "ok")
+        self.assertEqual([call.args[1] for call in complete.call_args_list], [messages] * 4)
 
     @patch.object(main.time, "sleep")
     @patch.object(main.random, "uniform", return_value=0.0)
@@ -604,6 +632,57 @@ class PlannerRecoveryTests(unittest.TestCase):
         self.assertEqual(message, "resumed")
         self.assertEqual(planner.calls, 1)
         self.assertEqual(exchanges, [("assistant", "resumed")])
+
+    def test_bridge_resume_continues_budget_paused_goal_with_its_live_validation_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            note = root / "note.txt"
+            note.write_text("original\n")
+            read_limit = READ_ONLY_RECOVERY_TURNS + RECOVERY_TURN_ALLOWANCE
+            worker_model = FakeModelClient(["finish First goal complete", 'patch note.txt "original" -> "updated"']
+                                           + ["stat /repo/note.txt"] * read_limit
+                                           + ["finish abstain", "cat /repo/note.txt\nfinish Validated the existing edit"])
+            config = SimpleNamespace(root=str(root), provider="gemini", model="test", thinking_mode="auto",
+                                     verbosity="medium", max_parallel_workers=1)
+            with patch.dict(os.environ, {"SKILLZ_OBSERVABILITY_PATH": str(root / "trace.md")}):
+                worker = TreeLoopPlannerWorker(model=worker_model, root=root, max_turns=read_limit + 3, verbose=False)
+                planner_model = FakeModelClient([json.dumps({"summary": "The note was updated and verified."})])
+                planner = PlannerAgent(planner_model, config, lambda: worker, json.loads)
+                planner.session.pending_plan = PlannerPlan("Update the note", "Update the note", goals=[
+                    PlannerGoal("goal-1", "Prepare", "Confirm preparation", "Before editing", estimated_scope="read"),
+                    PlannerGoal("goal-2", "Update", "Update and verify the note", "Deliver the edit", depends_on=["goal-1"], estimated_scope="write"),
+                ])
+                started = []
+                planner.on_goal_callback = lambda event, index, goal_id, _title: started.append(goal_id) if event == "goal_start" else None
+                with patch.object(planner, "_plan_next_goal_guidance", return_value=""), patch.object(
+                    planner, "_handle_intake_turn", side_effect=AssertionError("Resume must not replan")
+                ):
+                    paused_message = planner.execute_pending_plan()
+                    self.assertTrue(planner.session.execution_paused)
+                    state = planner.export_state()
+                    self.assertEqual(state["paused_suspended_goal_id"], "goal-2")
+                    self.assertEqual(state["paused_failed_goal_id"], "")
+                    self.assertEqual(state["last_completed_results"][-1]["status"], "suspended")
+                    self.assertEqual(state["resume_checkpoint"]["mode"], "resume_suspended_goal")
+                    self.assertEqual(state["suggested_next_actions"][0]["type"], "resume_execution")
+                    self.assertIn("suspended", [part.get("status") for part in presentation_parts(planner, "assistant", paused_message)])
+                    self.assertTrue(worker.can_resume_delivery())
+                    self.assertIsNotNone(worker._pending_verification)
+                    paused_turn = worker.history[-1].turn_number
+                    message = main._handle_bridge_planner_action(
+                        planner=planner, transcript=[],
+                        request={"action": "resume_execution", "expected_plan": state["paused_plan"]},
+                        add_exchange=lambda _role, _text: None,
+                    )
+            self.assertIn("Resuming checkpointed plan", message)
+            self.assertEqual(started, ["goal-1", "goal-2", "goal-2"])
+            self.assertFalse(planner.session.execution_paused)
+            self.assertTrue(planner.session.last_completed_results[-1].validation_passed)
+            self.assertEqual(worker.history[-1].turn_number, paused_turn + 1)
+            self.assertEqual(note.read_text(), "updated\n")
+            self.assertEqual(len(planner_model.calls), 1)
+            self.assertIn('patch note.txt "original" -> "updated"', worker_model.calls[-1]["prompt"])
+            self.assertIn("operator resumed this goal", worker_model.calls[-1]["prompt"])
 
 
 if __name__ == "__main__":

@@ -30,33 +30,47 @@ import json
 import tempfile
 import hashlib
 from issue_proposals import IssueProposalStore, PROPOSAL_GUIDANCE
+from diagnostic_provenance import DiagnosticProvenance
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Protocol, Sequence, Tuple, TypedDict
 
 from context_tree_bridge import ContextTreeBridge
-from artifact_preview import preview_guidance, run_artifact_preview
+from artifact_preview import check_artifact_route, preview_guidance, run_artifact_preview
 from discovery.dispatch import DISCOVERY_ACTION_TYPES, execute_discovery_action
 from mcp_runtime import invoke_mcp, mcp_guidance, model_mcp_result
 from mutation_text import PARSE_ERROR_PREFIX, is_text_mutation
 from mutation_runtime import EXPLICIT_MUTATION_TYPES, execute_mutation, compact_mutation_result
 from project_diagnostics import run_backend_diagnostics
 from model_result_delivery import ReadWorkingSet, prepare_model_result, render_packet
+from model_output_progress import ModelOutputObserver, ModelOutputProgress
 from goal_handoff import HANDOFF_READ_CHARS, summarize_handoff
 from repository_changes import RepositorySnapshot
 from shell_processes import PACKAGE_SHELL_GUIDANCE, npm_script, run_managed_shell
-from provider_response import PROTOCOL_FAILURES, ProviderResponseError, ProviderResponseRecovery
-from command_blocks import group_command_blocks
+from provider_response import (
+    GENERATION_LIMIT_REASONS, PROTOCOL_FAILURES, RESPONSE_BUDGET_FAILURES,
+    CommandResponseLimit, CommandWaveBoundary,
+    ProviderResponseError, ProviderResponseRecovery,
+)
+from command_blocks import BEGIN_COMMANDS, COMMAND_FRAME_RULE, END_COMMANDS, CommandResponseScan, group_command_blocks, normalize_command_header
 from tree_commands import (
     Annotation,
     COMMAND_VERBS,
     CommandResult,
+    has_strategy_placeholders,
     is_annotation,
     is_strategy,
     parse_multi_command,
     parse_annotation,
     parse_strategy,
 )
+
+
+_BATCH_DIAGNOSTIC_INSPECTIONS = frozenset({
+    "cat", "read-line-range", "read-context", "read-symbol", "find-regex", "grep", "repo-map", "symbols", "find-symbol",
+    "list-issues", "list-run-issues", "show-issue", "show-run-issue", "diagnose",
+})
+_BATCH_DIAGNOSTICS_LIMIT = 8
 
 
 def _model_error_metadata(exc: Exception) -> Dict[str, Any]:
@@ -210,7 +224,6 @@ def _looks_like_command(line: str) -> bool:
     return first in COMMAND_VERBS
 
 
-_MARKDOWN_COMMAND_PREFIX_RE = re.compile(r"^(?:[-*+]\s+|\d{1,3}[.)]\s+|\[[ xX]\]\s+)")
 _INLINE_ANNOTATION_RE = re.compile(r">>\w+:\s*")
 
 
@@ -236,15 +249,7 @@ def _strip_leading_control_preamble(raw: str) -> str:
 
 def _normalize_command_candidate(line: str) -> str:
     """Recover executable command lines wrapped in common Markdown prose syntax."""
-    candidate = str(line or "").lstrip()
-    if candidate.startswith("> "):
-        candidate = candidate[2:].lstrip()
-    candidate = _MARKDOWN_COMMAND_PREFIX_RE.sub("", candidate, count=1).lstrip()
-    if len(candidate.rstrip()) >= 2 and candidate.startswith("`") and candidate.rstrip().endswith("`"):
-        candidate = candidate.rstrip()[1:-1].lstrip()
-    command_label = re.match(r"^(?:command|action)\s*:\s*(.+)$", candidate, re.IGNORECASE | re.DOTALL)
-    if command_label:
-        candidate = command_label.group(1).lstrip()
+    candidate = normalize_command_header(line)
     return candidate if is_text_mutation(candidate) or is_strategy(candidate) else candidate.rstrip()
 
 
@@ -258,7 +263,14 @@ def _has_executable_command(command_block: str) -> bool:
     )
 
 
-def _build_output_repair_instruction() -> str:
+def _build_output_repair_instruction(format_error: str = "") -> str:
+    if format_error:
+        return (
+            f"FORMAT REPAIR REQUIRED: {format_error}\n"
+            "No commands from that response were executed. Rewrite the rejected command or strategy with its original intent. "
+            "Include all intended steps, with every strategy dependency defined. Do not skip the malformed step or replace it with `finish`. "
+            "Return only the corrected Playground OS commands and optional >>th: and >>pl: annotations."
+        )
     return "\n".join(
         [
             "FORMAT REPAIR REQUIRED: your previous response contained no executable Playground OS command.",
@@ -284,6 +296,9 @@ _SYSTEM_PROMPT_TEMPLATE = """\
 You are a precise coding agent operating inside a playground OS.
 NON-NEGOTIABLE EXECUTION CONTRACT: every response must contain at least one executable Playground OS command.
 `>>th:` and `>>pl:` annotations do not count as executable commands. Never return prose-only planning.
+Emit one wave per response: one brief `>>th:`, one `>>pl:`, then the commands you can justify from results already received.
+End the response after that batch. Plan any work that depends on its results in the next turn after the host executes it.
+{command_frame_hint}
 Your workspace is mounted as a virtual filesystem with 5 mounts:
   /repo    — source files (lazy-loaded)
   /facts   — durable facts you record (persist across turns)
@@ -356,9 +371,9 @@ RULES:
    pipelines. This is the fastest way to gather broad context.
 6. Annotate your output with >> lines. They cost nothing and make your
    reasoning visible. Always start with >>th: to explain your approach.
-7. When your task is complete, use: finish <summary message>
-8. You may issue multiple commands per turn (one per line) or a strategy block. Prefer at most 8 focused reads. A hard safety
-   limit rejects any turn containing more than 32 executable commands before any command in that batch runs.
+7. When your task is complete, use `finish <summary message>` as the final command. Its summary can contain punctuation, including commas.
+8. You may issue related file edits in one turn. The host dispatches commands in order and stops at the first failure.
+   Prefer at most 8 focused reads. Turns with more than 32 commands other than file edits are rejected before dispatch.
 9. Do NOT wrap commands in code fences or JSON. Just emit them directly.
 10. IMPORTANT: When writing files with heredoc, the ENTIRE file content goes
     between <<< and >>>. Do NOT try to use shell-style variable substitution
@@ -381,6 +396,7 @@ RULES:
 15. Strategy placeholders like `{{s1}}` are raw upstream text plus a few safe text transforms. You may use `.stdout`, `.trim()`, `.replace("old", "new")`, `.split('\n').filter(line => ...).join('\n')`, numeric indexing like `.split('\n')[0]`, and regex capture extraction like `.match(/pattern/)[1]`, but do not invent arbitrary code execution inside placeholders.
 16. Use `batch start` before a cluster of related file fixes and `batch end` after the cluster is landed and verified. Batch related edits together, then run one finite verification step such as `diagnose /repo/src/file.tsx`, `run-check typecheck`, or `run-check build`.
 16a. After editing a `.ts`, `.tsx`, `.js`, `.jsx`, or `.py` file, prefer `diagnose <path>` when you need backend file-targeted diagnostics that do not rely on an editor.
+16b. If diagnostics fail at `batch end`, the batch is closed. A queued `diagnose` for the same file can reuse that result. Use the findings and any queued inspection results to plan the repair, then rerun validation after editing.
 17. When working from a large trace or many diagnostics, maintain composure. It is normal for new downstream errors to appear after one fix lands. Do not panic, do not restart from scratch, and do not treat each new error as proof the last fix was wrong. Read the next grounded error, fix the next issue, and keep moving.
 
 FORMAT (every turn):
@@ -563,7 +579,7 @@ def _build_context_summary_message(task: str, history: Sequence[Turn], os_state:
 # Command extraction from LLM output
 # ---------------------------------------------------------------------------
 
-def extract_commands(raw: str) -> str:
+def extract_commands(raw: str, *, require_frame: bool = False) -> str:
     """Extract annotations and actual commands from an LLM response.
 
     Models often mix explanation with commands, sometimes wrapping the
@@ -574,7 +590,11 @@ def extract_commands(raw: str) -> str:
 
     Free-form prose is ignored rather than being sent to the command parser.
     """
-    lines = group_command_blocks(_strip_leading_control_preamble(raw).splitlines())
+    text = raw if require_frame else _strip_leading_control_preamble(raw)
+    lines = group_command_blocks(
+        [line.removesuffix("\r") for line in text.split("\n")],
+        response_scan=CommandResponseScan(require_frame=require_frame),
+    )
     if lines and lines[0].startswith(PARSE_ERROR_PREFIX):
         return lines[0]
     extracted: List[str] = []
@@ -582,9 +602,6 @@ def extract_commands(raw: str) -> str:
 
     for line in lines:
         stripped = line.strip()
-
-        if stripped.startswith("```"):
-            continue
 
         if not stripped:
             continue
@@ -638,10 +655,24 @@ class RecentRead:
     output: str
 
 
-MAX_MUTATION_COMMANDS_PER_TURN = 4
-MAX_EXECUTABLE_COMMANDS_PER_TURN = 32
+MAX_NON_EDIT_COMMANDS_PER_TURN = 32
 MAX_CONSECUTIVE_COMMANDLESS_TURNS = 2
 MAX_MODEL_OUTPUT_REPAIR_ATTEMPTS = 1
+
+
+def _is_file_edit_command(command: str) -> bool:
+    if is_text_mutation(command):
+        return True
+    parts = command.split(None, 1)
+    if len(parts) != 2 or parts[0].lower() != "mutate":
+        return False
+    try:
+        action = json.loads(parts[1])
+    except ValueError:
+        return False
+    return isinstance(action, dict) and str(action.get("type") or "") in (
+        EXPLICIT_MUTATION_TYPES | {"write_file", "replace_lines", "patch_file"}
+    )
 
 
 def _executable_commands(command_block: str) -> List[str]:
@@ -652,6 +683,43 @@ def _executable_commands(command_block: str) -> List[str]:
             return []
         return [command for label, step in plan.steps.items() if label != "error" for command in step.commands]
     return [command for command in parse_multi_command(command_block) if not is_annotation(command)]
+
+
+def _has_non_finish_command(command_block: str) -> bool:
+    return any(command.split(None, 1)[0].lower() != "finish" for command in _executable_commands(command_block))
+
+
+def _has_complete_recovery_wave(command_block: str) -> bool:
+    commands = parse_multi_command(command_block)
+    headers = [parse_annotation(command) for command in commands[:2]]
+    return [header.tag for header in headers if header and header.content] == ["th", "pl"] and bool(
+        _executable_commands(command_block)
+    )
+
+
+def _delivery_attempt_instruction(reason: str) -> str:
+    return (
+        f"FINAL DELIVERY ATTEMPT: {reason}\n"
+        "Use only the retained evidence and the original goal. If you can make a concrete, in-scope file change, "
+        "briefly state the edit strategy in `>>pl:`, then emit a grounded file edit such as `patch`, `replace-lines`, "
+        "`replace-regex` with an exact match count, `write`, or an `edit-batch` of related mutations. "
+        "Strategy steps (`s1:`, `s1 -> s2:`) may contain file edits only. "
+        "Use exact anchors for existing code and do not reconstruct an existing file from partial source. "
+        "Ignore earlier suggestions to gather more evidence. No reads, checks, shell commands, or MCP calls are allowed on this turn. "
+        "If this goal does not call for a file change, or an edit cannot be grounded safely, emit `finish abstain` "
+        "as the only command. Abstaining leaves the goal incomplete. Any edits will use the normal mutation and validation path."
+    )
+
+
+def _delivery_attempt_preflight(commands: Sequence[str]) -> Optional[CommandResult]:
+    if len(commands) == 1 and re.fullmatch(r"finish\s+abstain", commands[0], re.IGNORECASE):
+        return CommandResult(ok=True, output="The model abstained from the final edit attempt.", command_type="delivery_abstained")
+    if commands and all(_is_file_edit_command(command) for command in commands):
+        return None
+    return CommandResult(
+        ok=False, command_type="error",
+        output="Final delivery attempt rejected. Expected only file edits, or `finish abstain`.",
+    )
 
 
 class TreeLoop:
@@ -675,6 +743,7 @@ class TreeLoop:
         read_context_observer: Optional[Callable[[Sequence[Tuple[str, CommandResult]]], None]] = None,
         turn_observer: Optional[Callable[[Turn], None]] = None,
         model_event_observer: Optional[Callable[[Dict[str, Any]], None]] = None,
+        backend_check_observer: Optional[Callable[[str, bool, str, List[Dict[str, Any]]], None]] = None,
         allow_shell: Optional[bool] = None,
     ) -> None:
         self.model = model
@@ -690,6 +759,7 @@ class TreeLoop:
         self._read_working_set = ReadWorkingSet()
         self._repository_snapshot: Optional[RepositorySnapshot] = None
         self.model_event_observer = model_event_observer
+        self.backend_check_observer = backend_check_observer
         self.allow_shell = _env_flag_enabled("SHELL_ACCESS", True) if allow_shell is None else bool(allow_shell)
         self.workspace_root = workspace_root.resolve()
         self._external_status_provider = get_status or (lambda: {})
@@ -722,8 +792,11 @@ class TreeLoop:
         self._conversation_task = ""
         self._conversation_history_start = 0
         self._handoff_summary = ""
+        self.diagnostic_provenance = DiagnosticProvenance(self.workspace_root)
         self.bridge.tree.diagnostic_disposition = lambda diagnostics: IssueProposalStore(self.workspace_root).apply_deferrals(
-            diagnostics, scope='task:' + hashlib.sha256(getattr(self, '_proposal_task', self._conversation_task).encode()).hexdigest())
+            diagnostics, scope='task:' + hashlib.sha256(getattr(self, '_proposal_task', self._conversation_task).encode()).hexdigest(),
+            may_defer=self.diagnostic_provenance.may_defer,
+        )
         self._conversation_compaction_count = 0
         self._conversation_char_budget = int(os.getenv("TREELOOP_MESSAGE_CONTEXT_CHARS", "120000") or "120000")
         self._total_reads = 0
@@ -731,10 +804,16 @@ class TreeLoop:
         self._deferred_diagnostic_paths: set[str] = set()
         self._same_turn_halt_reason = ""
         self._external_stop_reason = ""
+        self._delivery_attempt_reason = ""
+        self.delivery_suspended = False
         self._inspected_run_issue_ids: set[str] = set()
         compactor_setter = getattr(self.model, "set_final_retry_message_compactor", None)
         if callable(compactor_setter):
             compactor_setter(self._compact_messages_for_final_retry)
+
+    @property
+    def require_command_frame(self) -> bool:
+        return getattr(self.model, "command_response_framing", False) is True
 
     def setup(self, *, max_files: int = 5000) -> Dict[str, Any]:
         """Index workspace and initial sync."""
@@ -747,9 +826,11 @@ class TreeLoop:
     # Main loop
     # ------------------------------------------------------------------
 
-    def run(self, task: str) -> LoopResult:
+    def run(self, task: str, *, resume: bool = False, diagnostic_provenance: Optional[DiagnosticProvenance] = None) -> LoopResult:
         """Run the agent loop until finish or max turns."""
         self._proposal_task = str(task or "").strip()
+        if not resume:
+            self.diagnostic_provenance = diagnostic_provenance or DiagnosticProvenance(self.workspace_root)
         if self._conversation_task and self._proposal_task != self._conversation_task:
             self.begin_goal_handoff()
         if not self.bridge._indexed:
@@ -762,9 +843,18 @@ class TreeLoop:
         interrupted = False
         commandless_turns = 0
         self._external_stop_reason = ""
+        self._delivery_attempt_reason = ""
+        self.delivery_suspended = False
         self._refresh_log_issue_signals()
 
-        for turn_num in range(1, self.max_turns + 1):
+        turn_offset = self.history[-1].turn_number if resume and self.history else 0
+        turn_limit = turn_offset + self.max_turns
+        # Reserve one final delivery turn even when the read allowance expires on the last regular turn.
+        for turn_num in range(turn_offset + 1, turn_limit + 2):
+            delivery_attempt_reason = self._delivery_attempt_reason
+            self._delivery_attempt_reason = ""
+            if turn_num > turn_limit and not delivery_attempt_reason:
+                break
             before_turn = getattr(self, "before_turn", None)
             if before_turn is not None:
                 before_turn()
@@ -777,9 +867,11 @@ class TreeLoop:
             if prompt_steering and self.history:
                 call_messages.append({"role": "user", "content": _build_current_steering_message(prompt_steering)})
             messages = _merge_adjacent_messages(call_messages)
+            # Keep the one-turn contract in the system prompt so provider retries can compact the conversation safely.
+            turn_system = system + "\n\n" + _delivery_attempt_instruction(delivery_attempt_reason) if delivery_attempt_reason else system
 
             if self.verbose:
-                _log(f"── Turn {turn_num}/{self.max_turns} ──")
+                _log(f"── Turn {turn_num}/{turn_limit} ──")
 
             # Call LLM
             t0 = time.time()
@@ -787,18 +879,26 @@ class TreeLoop:
             repair_attempts = 0
             provider_recovery = ProviderResponseRecovery()
             command_block = ""
-            if self.model_event_observer is not None:
-                try:
-                    self.model_event_observer({"event": "model_call_start", "turn": turn_num})
-                except Exception:
-                    pass
+            self._emit_live_progress("model_call_start", turn_num, delivery_attempt=bool(delivery_attempt_reason))
             try:
                 raw_output, active_model_call_started, messages = self._complete_with_provider_recovery(
-                    system, messages, turn_num, active_model_call_started, provider_recovery,
+                    turn_system, messages, turn_num, active_model_call_started, provider_recovery,
+                    delivery_attempt=bool(delivery_attempt_reason),
                 )
-                command_block = extract_commands(raw_output)
+                command_block = extract_commands(raw_output, require_frame=self.require_command_frame)
+                format_error = self._command_format_error(command_block)
+                if not delivery_attempt_reason and provider_recovery.discarded_action and not _has_non_finish_command(command_block):
+                    format_error = format_error or "A provider-rejected action is still pending. Reissue the action before finishing."
+                rejected_format_error = format_error
+                if self.require_command_frame and format_error and not _has_non_finish_command(extract_commands(raw_output)):
+                    # A framing-only error around a completion can be repaired as a completion.
+                    rejected_format_error = ""
+                if provider_recovery.budget_retries and not _has_executable_command(command_block):
+                    format_error = format_error or "The focused response retry returned no executable command."
                 while (
-                    not _has_executable_command(command_block)
+                    not delivery_attempt_reason
+                    and not provider_recovery.budget_retries
+                    and (format_error or not _has_executable_command(command_block))
                     and repair_attempts < MAX_MODEL_OUTPUT_REPAIR_ATTEMPTS
                 ):
                     repair_attempts += 1
@@ -825,7 +925,9 @@ class TreeLoop:
                             )
                         except Exception:
                             pass
-                    repair_instruction = _build_output_repair_instruction()
+                    repair_instruction = _build_output_repair_instruction(format_error)
+                    if self.require_command_frame:
+                        repair_instruction += "\n" + COMMAND_FRAME_RULE
                     repair_output_excerpt = raw_output
                     if len(repair_output_excerpt) > 8000:
                         repair_output_excerpt = repair_output_excerpt[:8000] + "\n… (invalid output truncated)"
@@ -840,8 +942,13 @@ class TreeLoop:
                     raw_output, active_model_call_started, messages = self._complete_with_provider_recovery(
                         system, repair_messages, turn_num, active_model_call_started, provider_recovery,
                     )
-                    command_block = extract_commands(raw_output)
+                    command_block = extract_commands(raw_output, require_frame=self.require_command_frame)
+                    format_error = self._command_format_error(command_block)
+                    if (rejected_format_error or provider_recovery.discarded_action) and not format_error and not _has_non_finish_command(command_block):
+                        format_error = rejected_format_error or "A provider-rejected action is still pending. Reissue the action before finishing."
             except ProviderResponseError as exc:
+                if exc.budget_exhausted:
+                    self.delivery_suspended = True
                 finish_message = f"stopped: {exc}"
                 break
             except KeyboardInterrupt:
@@ -875,6 +982,8 @@ class TreeLoop:
                 self._checkpoint_steering = ""
             if self._recovery_steering:
                 self._recovery_steering = ""
+            parsed_commands = _executable_commands(command_block) if command_block else []
+            delivery_preflight = _delivery_attempt_preflight(parsed_commands) if delivery_attempt_reason else None
             llm_elapsed = time.time() - active_model_call_started
             if self.model_event_observer is not None:
                 try:
@@ -884,7 +993,7 @@ class TreeLoop:
                             "turn": turn_num,
                             "elapsed_s": round(llm_elapsed, 3),
                             "output_chars": len(raw_output),
-                            "output_valid": _has_executable_command(command_block),
+                            "output_valid": not format_error and (delivery_preflight.ok if delivery_preflight is not None else _has_executable_command(command_block)),
                             "repair_attempt": repair_attempts,
                         }
                     )
@@ -915,20 +1024,25 @@ class TreeLoop:
             turn_annotations: List[Annotation] = []
             batch_executed = False
 
-            if command_block:
-                parsed_commands = _executable_commands(command_block)
+            if format_error:
+                commands_issued = ["command_batch_rejected"]
+                results = [CommandResult(False, f"{format_error} No commands from this response were executed.", "error")]
+            elif delivery_preflight is not None:
+                commands_issued = ["delivery_attempt"]
+                results = [delivery_preflight]
+            elif command_block:
                 executable_command_count = len(parsed_commands)
                 has_extension = any(command.split(None, 1)[0].lower() == "request-discovery-extension" for command in parsed_commands)
                 if has_extension and executable_command_count != 1:
                     commands_issued = ["command_batch_rejected"]
                     results = [CommandResult(ok=False, command_type="error", output="A discovery extension request must be the only executable command in its turn. No commands were executed.")]
-                elif executable_command_count > MAX_EXECUTABLE_COMMANDS_PER_TURN:
+                elif (non_edit_count := sum(not _is_file_edit_command(command) for command in parsed_commands)) > MAX_NON_EDIT_COMMANDS_PER_TURN:
                     commands_issued = ["command_batch_rejected"]
                     results = [CommandResult(
                         ok=False,
                         output=(
-                            f"command batch limit exceeded: received {executable_command_count} executable commands; "
-                            f"at most {MAX_EXECUTABLE_COMMANDS_PER_TURN} are allowed in one turn. "
+                            f"command batch limit exceeded: received {non_edit_count} commands other than file edits; "
+                            f"at most {MAX_NON_EDIT_COMMANDS_PER_TURN} are allowed in one turn. "
                             "No commands from this batch were executed. Emit one focused command or a small bounded group."
                         ),
                         command_type="error",
@@ -939,7 +1053,7 @@ class TreeLoop:
                         "or a small bounded group of directly relevant reads."
                     )
                 else:
-                    commands_issued, results, turn_annotations = self._execute_command_batch(command_block)
+                    commands_issued, results, turn_annotations = self._execute_command_batch(command_block, turn=turn_num)
                     batch_executed = True
             else:
                 if self.verbose:
@@ -1019,7 +1133,7 @@ class TreeLoop:
                 {"role": "assistant", "content": raw_output},
                 {"role": "user", "content": _build_turn_result_message(turn)},
             ])
-            if self.turn_observer is not None:
+            if self.turn_observer is not None and delivery_preflight is None:
                 self.turn_observer(turn)
 
             if self._external_stop_reason:
@@ -1027,6 +1141,31 @@ class TreeLoop:
                 if self.verbose:
                     _log(f"  ■ STOPPED: {finish_message}")
                 break
+
+            if delivery_attempt_reason:
+                if any((result.tool_action or {}).get("_changed_paths") for result in results):
+                    if turn_num >= turn_limit:
+                        self.delivery_suspended = True
+                        finish_message = "Final delivery edits were applied. The turn limit was reached before the goal could finish."
+                        break
+                    continue
+                self.delivery_suspended = True
+                finish_message = f"stopped: {delivery_attempt_reason}"
+                detail = next((result.output for result in results if not result.ok), "")
+                if detail:
+                    finish_message += f" Final delivery attempt: {_truncate_for_cli(detail, 500)}"
+                elif delivery_preflight is None:
+                    finish_message += " The final delivery attempt made no file changes."
+                break
+
+            if format_error:
+                if provider_recovery.budget_retries:
+                    self.delivery_suspended = True
+                finish_message = f"stopped: malformed command response after {repair_attempts} format retry. {format_error}"
+                break
+
+            if self._delivery_attempt_reason:
+                continue
 
             if commandless_turns >= MAX_CONSECUTIVE_COMMANDLESS_TURNS:
                 finish_message = (
@@ -1059,8 +1198,8 @@ class TreeLoop:
             if (
                 self.checkpoint_interval > 0
                 and self.checkpoint_callback is not None
-                and turn_num % self.checkpoint_interval == 0
-                and turn_num < self.max_turns
+                and (turn_num - turn_offset) % self.checkpoint_interval == 0
+                and turn_num < turn_limit
             ):
                 # Inject a >>ju: request into steering for the next turn
                 self._checkpoint_steering = (
@@ -1099,6 +1238,15 @@ class TreeLoop:
     def request_stop(self, reason: str) -> None:
         """Stop after the current turn without treating the run as completed."""
         self._external_stop_reason = str(reason or "").strip() or "external stop requested"
+
+    def request_delivery_attempt(self, reason: str) -> None:
+        """Ask for a final edit strategy using the context retained in this run."""
+        self._delivery_attempt_reason = reason
+
+    def request_delivery_pause(self, reason: str) -> None:
+        """Suspend delivery while keeping the current goal context available for Resume."""
+        self.delivery_suspended = True
+        self.request_stop(reason)
 
     def reset_conversation(self) -> None:
         self._conversation_messages.clear()
@@ -1200,7 +1348,47 @@ class TreeLoop:
         }]
         return list(self._conversation_messages)
 
-    def _complete_model(self, system: str, messages: Sequence[ChatMessage]) -> str:
+    def _emit_live_progress(self, event: str, turn: int, **payload: Any) -> None:
+        if self.model_event_observer is not None:
+            try:
+                self.model_event_observer({"event": event, "turn": turn, **payload})
+            except Exception:
+                pass
+
+    def _complete_model(
+        self, system: str, messages: Sequence[ChatMessage], *, turn: int, preserve_request_context: bool = False,
+    ) -> str:
+        complete_with_progress = getattr(self.model, "complete_messages_with_progress", None)
+        if callable(complete_with_progress):
+            streamed = False
+
+            def on_summary(delta: str) -> None:
+                nonlocal streamed
+                if not delta:
+                    streamed = False
+                self._emit_live_progress("model_reasoning_summary", turn, thought=delta)
+
+            def on_output(count: int, draft: list[str]) -> None:
+                nonlocal streamed
+                streamed = True
+                self._emit_live_progress("model_output_progress", turn, output_chars=count, draft_strategy=draft)
+
+            observer = ModelOutputObserver(on_output, preview_strategy=True, preserve_request_context=preserve_request_context,
+                                           require_command_frame=self.require_command_frame)
+            output = complete_with_progress(
+                system, list(messages), on_summary, on_output=observer,
+            )
+            text = str(output or "")
+            if text and not streamed:
+                # Some backends deliver the response as a complete message.
+                preview = ModelOutputProgress(observer)
+                try:
+                    preview.add(text)
+                    preview.finish()
+                except (CommandResponseLimit, CommandWaveBoundary):
+                    # The caller checks the provider finish reason before slicing the reply.
+                    pass
+            return text
         complete_messages = getattr(self.model, "complete_messages", None)
         if callable(complete_messages):
             return str(complete_messages(system, list(messages)) or "")
@@ -1210,45 +1398,94 @@ class TreeLoop:
 
     def _complete_with_provider_recovery(
         self, system: str, messages: Sequence[ChatMessage], turn: int,
-        started: float, recovery: ProviderResponseRecovery,
+        started: float, recovery: ProviderResponseRecovery, *, delivery_attempt: bool = False,
     ) -> Tuple[str, float, Sequence[ChatMessage]]:
         """Retry provider delivery in place without evicting source or spending execution turns."""
         retry_system = system
         base_messages = list(messages)
         last_protocol_reason = ""
         while True:
-            output = self._complete_model(retry_system, messages)
+            limit_metadata: dict[str, Any] = {}
+            try:
+                output = self._complete_model(
+                    retry_system, messages, turn=turn, preserve_request_context=recovery.generation_limit_retry,
+                )
+            except CommandWaveBoundary as exc:
+                output = exc.text
+                limit_metadata = {"wave_boundary": True}
+            except CommandResponseLimit as exc:
+                output = ""
+                limit_metadata = exc.metadata
             metrics_getter = getattr(self.model, "get_last_metrics", None)
             try:
                 metrics = metrics_getter() if callable(metrics_getter) else {}
             except Exception:
                 metrics = {}
-            metadata = (metrics or {}).get("response", {})
+            metadata = {**((metrics or {}).get("response") or {}), **limit_metadata}
             reason = recovery.failure_reason(output, metadata)
             if not reason:
+                # Check complete replies too, including CLI and non-streaming recovery.
+                guard = ModelOutputProgress(ModelOutputObserver(lambda *_: None, preview_strategy=True,
+                                                               require_command_frame=self.require_command_frame))
+                try:
+                    guard.add(output)
+                    guard.finish()
+                except CommandWaveBoundary as exc:
+                    output = exc.text
+                    metadata["wave_boundary"] = True
+                except CommandResponseLimit as exc:
+                    metadata.update(exc.metadata)
+                    reason = str(exc)
+            if not reason and metadata.get("wave_boundary"):
+                wave = extract_commands(output)
+                actions = _executable_commands(wave)
+                terminal_commands = {"finish", "request-discovery-extension"}
+                if not actions or any(command.split(None, 1)[0].lower() in terminal_commands for command in actions):
+                    reason = "COMMAND_ANNOTATION_LIMIT"
+            if not reason and recovery.generation_limit_retry and not _has_complete_recovery_wave(
+                extract_commands(output, require_frame=self.require_command_frame),
+            ):
+                reason = "INCOMPLETE_RECOVERY_WAVE"
+            if not reason:
+                self._emit_live_progress(
+                    "model_response_received", turn,
+                    **({"summary": "Command wave ready to execute"} if metadata.get("wave_boundary") else {}),
+                )
                 return output, started, messages
             protocol_failure = reason in PROTOCOL_FAILURES
+            budget_failure = reason in RESPONSE_BUDGET_FAILURES
+            envelope_failure = reason == "INVALID_COMMAND_ENVELOPE"
             if protocol_failure:
                 last_protocol_reason = reason
+            if protocol_failure or budget_failure or envelope_failure:
+                discarded = extract_commands(output)
+                recovery.discarded_action |= bool(metadata.get("discarded_action")) or _has_non_finish_command(discarded) or bool(self._command_format_error(discarded))
             retry = recovery.claim_retry(reason)
             if self.model_event_observer is not None:
                 try:
                     self.model_event_observer({
                         "event": "model_call_finish", "turn": turn,
-                        "elapsed_s": round(time.time() - started, 3), "output_chars": len(output),
-                        "output_valid": False, "empty_response": not output.strip(), "provider_response": metadata,
+                        "elapsed_s": round(time.time() - started, 3), "output_chars": metadata.get("output_chars", len(output)),
+                        "output_valid": False, "empty_response": not output.strip() and not (budget_failure or envelope_failure),
+                        "provider_response": metadata, "response_budget_failure": budget_failure,
                         "provider_protocol_failure": protocol_failure, "recovery_reason": reason,
                         "rejected_output_excerpt": output[:4000] if protocol_failure else "",
                         "provider_retry_pending": retry, "provider_recovery_attempts": recovery.retries,
                         "provider_recovery_exhausted": not retry, "preserved_source_context": True,
-                        "empty_response_retry_pending": retry and not protocol_failure,
-                        "empty_response_recovery_exhausted": not retry and not protocol_failure,
+                        "empty_response_retry_pending": retry and reason == "EMPTY_RESPONSE",
+                        "empty_response_recovery_exhausted": not retry and reason == "EMPTY_RESPONSE",
                     })
                 except Exception:
                     pass
             if not retry:
                 detail = f" Provider response {json.dumps(metadata, ensure_ascii=False)}" if metadata else ""
-                if protocol_failure:
+                if reason == "INCOMPLETE_RECOVERY_WAVE":
+                    message = "The generation cap retry did not produce a complete thought, plan, and command wave. Current goal and source preserved."
+                elif budget_failure:
+                    message = f"command response budget exceeded ({reason}). Current goal and source preserved."
+                elif recovery.generation_limit_retry:
+                    message = f"The generation limit recovery response failed ({reason}). Current goal and source preserved."
+                elif protocol_failure:
                     message = (
                         f"provider command delivery failed with {reason} after {recovery.protocol_retries} targeted retries. "
                         "Current goal and source preserved."
@@ -1258,15 +1495,29 @@ class TreeLoop:
                         f"provider command delivery failed with {last_protocol_reason} and the last retry returned no usable text. "
                         "Current goal and source preserved."
                     )
+                elif envelope_failure:
+                    message = "The provider returned an invalid structured command block after recovery. Current goal and source preserved."
                 else:
                     message = "provider returned empty text twice after one retry preserving context."
-                raise ProviderResponseError(message + detail)
-            instruction = recovery.instruction(reason)
+                raise ProviderResponseError(message + detail, budget_exhausted=budget_failure or bool(recovery.budget_retries))
+            partial = output if reason in GENERATION_LIMIT_REASONS and output.strip() else ""
+            instruction = recovery.instruction(reason, has_partial_text=bool(partial))
+            if self.require_command_frame:
+                instruction += " " + COMMAND_FRAME_RULE
+            if recovery.discarded_action and not delivery_attempt:
+                instruction += " Reissue the unfinished action as a text command. A completion message cannot replace it."
+            if delivery_attempt:
+                instruction += " The final delivery contract still applies: emit only file edits, or use `finish abstain`."
             # Retry the same delivered context. Refreshing the request must not
             # compact the active goal's source merely because the provider erred.
-            messages = [*base_messages, {"role": "user", "content": instruction}]
+            messages = list(base_messages)
+            if partial:
+                messages.append({"role": "assistant", "content": partial})
+            messages.append({"role": "user", "content": instruction})
             messages = _merge_adjacent_messages(messages)
-            retry_system = system + "\n\nPROVIDER RECOVERY OVERRIDE FOR THIS REQUEST:\n" + instruction if protocol_failure else system
+            retry_system = system
+            if protocol_failure or budget_failure or envelope_failure:
+                retry_system += "\n\nPROVIDER RECOVERY OVERRIDE FOR THIS REQUEST:\n" + instruction
             started = time.time()
             if self.model_event_observer is not None:
                 try:
@@ -1404,26 +1655,27 @@ class TreeLoop:
             )
         )
 
-    def _is_bounded_mutation_result(self, result: CommandResult) -> bool:
-        action = result.tool_action or {}
-        action_type = str(action.get("type", "") or "")
-        return action_type in EXPLICIT_MUTATION_TYPES | {
-            "write_file",
-            "replace_lines",
-            "patch_file",
-            "git_add",
-            "git_restore",
-            "git_commit",
-        }
-
     # ------------------------------------------------------------------
     # Prompt construction
     # ------------------------------------------------------------------
 
     def _system_prompt(self) -> str:
         grammar = self.bridge.render_command_grammar()
+        frame_hint = ""
+        if self.require_command_frame:
+            frame_hint = (
+                f"\n{COMMAND_FRAME_RULE} Put any >>th: and >>pl: annotations inside the frame. "
+                "Keep provider reasoning summaries in their own channel. When ready to act, start the frame directly. "
+                "Use `>>th:` for a short public statement of intent. Commands are literal Playground OS text. "
+                "Omit native function calls, Markdown fences, and preambles. Output one complete frame, then stop.\n"
+                f"{BEGIN_COMMANDS}\n"
+                ">>th: I need the current source.\n"
+                ">>pl: Read the relevant lines.\n"
+                "read-line-range /repo/src/example.ts 20-40\n"
+                f"{END_COMMANDS}\n"
+            )
         shell_note = "\nSHELL ACCESS POLICY: SHELL_ACCESS=false. Do not emit `shell <command>` or any action that dispatches to `run_shell`. Prefer structured file, git, and diagnostics commands.\n" if not self.allow_shell else ""
-        return "\n".join(filter(None, [(_SYSTEM_PROMPT_TEMPLATE + shell_note).format(command_grammar=grammar),
+        return "\n".join(filter(None, [(_SYSTEM_PROMPT_TEMPLATE + shell_note).format(command_grammar=grammar, command_frame_hint=frame_hint),
                                        PROPOSAL_GUIDANCE, mcp_guidance(self.workspace_root, tree=True), preview_guidance(tree=True),
                                        "For the shell command: " + PACKAGE_SHELL_GUIDANCE if self.allow_shell else ""]))
 
@@ -1575,42 +1827,75 @@ class TreeLoop:
     # Built-in tool execution (writes to disk)
     # ------------------------------------------------------------------
 
-    def _execute_command_batch(self, raw: str) -> Tuple[List[str], List[CommandResult], List[Annotation]]:
+    def _command_format_error(self, raw: str) -> str:
+        if raw.startswith(PARSE_ERROR_PREFIX):
+            return raw.removeprefix(PARSE_ERROR_PREFIX)
+        strategy = parse_strategy(raw) if is_strategy(raw) else None
+        if strategy is not None and (error := strategy.steps.get("error")) is not None:
+            return error.results[0].output
+        for command in _executable_commands(raw):
+            verb = command.split(None, 1)[0].lower()
+            # These parsers only translate arguments. Other commands may inspect or change the workspace while parsing.
+            if not (_is_file_edit_command(command) or verb in {"mutate", "discover", "mcp"}):
+                continue
+            if strategy is not None and has_strategy_placeholders(command):
+                continue
+            result = self.bridge.parser.parse_and_execute(command)
+            if not result.ok:
+                return f"Malformed `{verb}` command: {result.output}"
+        return ""
+
+    def _execute_command_batch(self, raw: str, *, turn: int = 0) -> Tuple[List[str], List[CommandResult], List[Annotation]]:
         """Complete commands in execution order, including tools and observers."""
         commands: List[str] = []
         results: List[CommandResult] = []
         remaining = len(_executable_commands(raw))
-        bounded_mutations = 0
         blocked_reason = ""
+        blocked_prefix = "skipped after prior command failure"
+        batch_diagnostic_failure = False
+        batch_diagnostic_paths: set[str] = set()
         self._same_turn_halt_reason = ""
 
         def execute(command: str, label: str) -> CommandResult:
-            nonlocal remaining, bounded_mutations, blocked_reason
+            nonlocal remaining, blocked_reason, blocked_prefix, batch_diagnostic_failure
             annotation = parse_annotation(command)
             if annotation is not None:
                 result = CommandResult(ok=True, output=annotation.compact(), command_type="annotation")
             else:
                 remaining -= 1
-                if blocked_reason:
-                    result = CommandResult(ok=False, output=f"skipped after prior command failure: {blocked_reason}", command_type="skipped")
+                parts = command.split(None, 2)
+                verb = parts[0].lower().replace("_", "-") if parts else ""
+                if blocked_reason and not (batch_diagnostic_failure and verb in _BATCH_DIAGNOSTIC_INSPECTIONS):
+                    result = CommandResult(ok=False, output=f"{blocked_prefix}: {blocked_reason}", command_type="skipped")
                 else:
-                    result = self.bridge.execute_single(command)
+                    local_read = len(parts) >= 2 and verb in {"cat", "read-line-range"}
+                    if local_read:
+                        self._emit_live_progress("tool_start", turn, summary=f"Reading {parts[1][:180]}")
+                    try:
+                        result = self.bridge.execute_single(command)
+                    finally:
+                        if local_read:
+                            self._emit_live_progress("tool_finish", turn)
                     if result.command_type == "finish" and remaining > 0:
                         result.ok = False
                         result.output = "finish must be the final executable command in a turn"
                     if result.ok and result.command_type == "read":
                         self._total_reads += 1
                     if result.ok and result.needs_tool:
-                        if self._is_bounded_mutation_result(result):
-                            bounded_mutations += 1
-                            if bounded_mutations > MAX_MUTATION_COMMANDS_PER_TURN:
-                                result.ok = False
-                                result.output = f"mutation batch limit exceeded: at most {MAX_MUTATION_COMMANDS_PER_TURN} mutating commands are allowed in one turn"
-                        if result.ok:
-                            if result.command_type != "read" and (result.tool_action or {}).get("type") not in {"run_shell", "mcp", "artifact_preview"}:
+                        action = result.tool_action or {}
+                        action_type = action.get("type")
+                        path = str(action.get("path") or "").removeprefix("./")
+                        if (batch_diagnostic_failure and action_type == "diagnose" and path in batch_diagnostic_paths
+                                and action["limit"] <= _BATCH_DIAGNOSTICS_LIMIT):
+                            result.ok = False
+                            result.needs_tool = False
+                            result.command_type = "reused"
+                            result.output = f"Reused the failed batch-end diagnostics above for {path}."
+                        else:
+                            if result.command_type != "read" and action_type not in {"run_shell", "mcp", "artifact_preview"}:
                                 self._total_writes += 1
-                            executed = self._execute_tool(result)
-                            if (result.tool_action or {}).get("type") == "run_shell" and (result.tool_action or {}).get("_changed_paths"):
+                            executed = self._dispatch_tool_with_progress(result, turn)
+                            if action_type == "run_shell" and action.get("_changed_paths"):
                                 self._total_writes += 1
                             if executed:
                                 result.output = executed
@@ -1630,8 +1915,21 @@ class TreeLoop:
             if annotation is None and not blocked_reason:
                 if not result.ok:
                     blocked_reason = result.output or "command failed"
+                    if ((result.tool_action or {}).get("type") == "end_edit_batch"
+                            and self._batch_diagnostics_failed(result.output) and not self._same_turn_halt_reason):
+                        batch_diagnostic_failure = True
+                        batch_diagnostic_paths.update((result.tool_action or {}).get("_batch_diagnostic_paths", ()))
+                        blocked_prefix = "held after edit-batch diagnostics"
+                        blocked_reason = "repair the reported diagnostics, then rerun validation"
+                    elif result.command_type == "skipped":
+                        blocked_prefix = "skipped by runtime"
                 elif self._same_turn_halt_reason:
                     blocked_reason = self._same_turn_halt_reason
+                    blocked_prefix = "skipped by runtime"
+            elif batch_diagnostic_failure and self._same_turn_halt_reason:
+                batch_diagnostic_failure = False
+                blocked_reason = self._same_turn_halt_reason
+                blocked_prefix = "skipped by runtime"
             if self.verbose:
                 if annotation is not None:
                     _log(f"  {annotation.compact()}")
@@ -1650,6 +1948,38 @@ class TreeLoop:
             annotations = self.bridge.last_annotations
         return commands, results, annotations
 
+    def _dispatch_tool_with_progress(
+        self, result: CommandResult, turn: int, *, dispatch: Optional[Callable[[CommandResult], str]] = None,
+    ) -> str:
+        action = result.tool_action or {}
+        action_type = str(action.get("type") or "")
+        execute = dispatch or self._execute_tool
+        if not action_type or action_type in {"finish", "verify"}:
+            return execute(result)
+
+        label = f"Running {action_type.replace('_', ' ')}"
+        if action_type == "mcp":
+            server = " ".join(str(action.get("server") or "").split())[:80]
+            name = " ".join(str(action.get("name") or "").split())[:80]
+            if action.get("operation") == "call" and name:
+                label = f"Calling {name} on {server} MCP" if server else f"Calling MCP tool {name}"
+            else:
+                label = f"Querying {server} MCP" if server else "Querying MCP"
+
+        self._emit_live_progress("tool_start", turn, summary=label)
+        try:
+            provenance = self.diagnostic_provenance
+            with provenance.track(action, shell_tracks_changes=True):
+                output = execute(result)
+            if action_type in {"run_check", "run_shell", "run_route_check"} and output:
+                provenance.observe(self.bridge.tree._parse_log_issues(str(output), source_path=label))
+            elif action_type == "diagnose" and "diagnostics:\n" in str(output):
+                latest = self._signal_state.get("latest_diagnostics") or {}
+                provenance.observe(latest.get("diagnostics", []))
+            return output
+        finally:
+            self._emit_live_progress("tool_finish", turn)
+
     def _execute_tool(self, r: CommandResult) -> str:
         """Execute a tool action. Returns a status string.
 
@@ -1661,6 +1991,7 @@ class TreeLoop:
             # These fields are host evidence, never model-supplied assertions.
             r.tool_action.pop("_changed_paths", None)
             r.tool_action.pop("_change_accounting", None)
+            r.tool_action.pop("_batch_diagnostic_paths", None)
         if self.tool_dispatcher:
             try:
                 dispatched = self.tool_dispatcher(r)
@@ -1696,7 +2027,12 @@ class TreeLoop:
             store = IssueProposalStore(self.workspace_root)
             scope = 'task:' + hashlib.sha256(self._conversation_task.encode()).hexdigest()
             try:
-                proposal = store.propose(action, diagnostics=self.bridge.tree.list_log_issues(), scope=scope, parent_issue_id='', goal=self._conversation_task)
+                diagnostics = self.bridge.tree.list_log_issues()
+                self.diagnostic_provenance.observe(diagnostics)
+                proposal = store.propose(
+                    action, diagnostics=diagnostics, scope=scope, parent_issue_id='', goal=self._conversation_task,
+                    may_defer=self.diagnostic_provenance.may_defer,
+                )
                 self._refresh_log_issue_signals()
                 return f"Recorded {proposal['proposal_id']}; linked diagnostics no longer gate this task."
             except Exception as exc:
@@ -1721,7 +2057,7 @@ class TreeLoop:
         elif action_type == "begin_edit_batch":
             message = self._exec_begin_edit_batch()
         elif action_type == "end_edit_batch":
-            message = self._exec_end_edit_batch()
+            message = self._exec_end_edit_batch(action)
         elif action_type == "finish":
             message = ""  # finish is handled by the loop
         elif action_type == "set_fact":
@@ -1746,19 +2082,24 @@ class TreeLoop:
             exit_code = re.search(r"^exit_code=(-?\d+)\s*$", lowered, re.MULTILINE)
             return lowered.startswith(f"{action_type}:") or bool(match and int(match.group(1)) > 0) or bool(exit_code and int(exit_code.group(1)) != 0)
         if action_type == "end_edit_batch":
-            return bool(re.search(r"\bissues=[1-9]\d*", lowered)) or "backend_diagnostics_warning" in lowered
+            return lowered.startswith("end_edit_batch:") or TreeLoop._batch_diagnostics_failed(lowered)
         return lowered.startswith(f"{action_type}:")
+
+    @staticmethod
+    def _batch_diagnostics_failed(message: str) -> bool:
+        return bool(re.search(r"\bissues=[1-9]\d*", message)) or "backend_diagnostics_warning" in message
 
     def _exec_begin_edit_batch(self) -> str:
         self._signal_state["edit_batch_mode"] = True
         return "edit batch started; group related fixes, then verify before ending the batch"
 
-    def _exec_end_edit_batch(self) -> str:
+    def _exec_end_edit_batch(self, action: Dict[str, Any]) -> str:
         self._signal_state["edit_batch_mode"] = False
         paths = sorted(self._deferred_diagnostic_paths)
         self._deferred_diagnostic_paths.clear()
-        diagnostics = [self._run_backend_diagnostics_for_path(path, trigger_action="batch end") for path in paths]
-        return "\n".join(["edit batch ended; deferred diagnostics completed", *filter(None, diagnostics)])
+        diagnostics = {path: self._run_backend_diagnostics_for_path(path, trigger_action="batch end") for path in paths}
+        action["_batch_diagnostic_paths"] = [path for path, message in diagnostics.items() if message.startswith("backend_diagnostics ")]
+        return "\n".join(["edit batch ended; deferred diagnostics completed", *filter(None, diagnostics.values())])
 
     def _exec_write_file(self, action: Dict[str, Any]) -> str:
         rel_path = action.get("path", "")
@@ -1888,6 +2229,8 @@ class TreeLoop:
         for path in paths:
             if (self.workspace_root / path).is_file():
                 message = self._append_backend_diagnostics(message, path, trigger_action=action_type)
+            elif self.backend_check_observer is not None and not (self.workspace_root / path).exists():
+                self.backend_check_observer(path, True, "File removed from the workspace.", [])
         return message
 
     def _append_backend_diagnostics(self, message: str, rel_path: str, *, trigger_action: str) -> str:
@@ -1901,13 +2244,15 @@ class TreeLoop:
 
     def _run_backend_diagnostics_for_path(self, rel_path: str, *, trigger_action: str) -> str:
         try:
-            run = run_backend_diagnostics(self.workspace_root, path=rel_path, limit=8, timeout=30)
+            run = run_backend_diagnostics(self.workspace_root, path=rel_path, limit=_BATCH_DIAGNOSTICS_LIMIT, timeout=30)
         except ValueError:
             return ""
 
         diagnostics = [dict(item) for item in run.diagnostics]
+        issues: List[Dict[str, Any]] = []
+        lines: List[str] = []
         if diagnostics:
-            self.bridge.tree.ingest_diagnostic_content(
+            issues = self.bridge.tree.ingest_diagnostic_content(
                 json.dumps(diagnostics, indent=2),
                 source_path=f"[diagnose:{run.path}]",
             )
@@ -1923,20 +2268,20 @@ class TreeLoop:
                 lines.append(
                     f"- {item.get('path', run.path)}:{item.get('line', '')}:{item.get('column', '')} {item.get('code', '')} {item.get('message', '')}".rstrip()
                 )
-            return "\n".join(lines)
-
-        self._signal_state["latest_diagnostics"] = None
-        if run.returncode == 0:
-            return ""
-
-        lines = [f"backend_diagnostics_warning engine={run.engine} path={run.path} exit_code={run.returncode}"]
-        stdout = _strip_ansi(run.stdout).strip()
-        stderr = _strip_ansi(run.stderr).strip()
-        if stdout:
-            lines.append(f"stdout:\n{stdout}")
-        if stderr:
-            lines.append(f"stderr:\n{stderr}")
-        return "\n".join(lines)
+        else:
+            self._signal_state["latest_diagnostics"] = None
+            if run.scoped_returncode != 0:
+                lines.append(f"backend_diagnostics_warning engine={run.engine} path={run.path} exit_code={run.returncode}")
+                stdout = _strip_ansi(run.stdout).strip()
+                stderr = _strip_ansi(run.stderr).strip()
+                if stdout:
+                    lines.append(f"stdout:\n{stdout}")
+                if stderr:
+                    lines.append(f"stderr:\n{stderr}")
+        message = "\n".join(lines)
+        if self.backend_check_observer is not None:
+            self.backend_check_observer(run.path, not lines, message, issues)
+        return message
 
     def _rewrite_repo_shell_paths(self, command: str) -> str:
         if self.workspace_root == Path("/repo"):
@@ -1984,8 +2329,12 @@ class TreeLoop:
         ):
             self._read_working_set.invalidate_dependencies()
 
-    def _exec_run_shell(self, action: Dict[str, Any], *, allow_process_changes: bool = True) -> str:
+    def _exec_run_shell(
+        self, action: Dict[str, Any], *, allow_process_changes: bool = True, verification_check: bool = False,
+    ) -> str:
         action.pop("_managed_process", None)
+        if action.get("check_name"):
+            allow_process_changes = False
         if not self.allow_shell:
             command = str(action.get("command", "") or "").strip().lower()
             if command.startswith(_PACKAGE_MANAGER_INSTALL_HINT_PREFIXES):
@@ -2049,6 +2398,8 @@ class TreeLoop:
 
         stdout = _strip_ansi(result.stdout).strip()
         stderr = _strip_ansi(result.stderr).strip()
+        if verification_check:
+            action["_verification_output"] = {"returncode": result.returncode, "stdout": stdout, "stderr": stderr}
         parts: List[str] = [f"exit_code={result.returncode}"]
         if action["_changed_paths"]:
             parts.append("observed_file_changes=" + json.dumps(action["_changed_paths"], ensure_ascii=False))
@@ -2285,29 +2636,42 @@ class TreeLoop:
             f"engine={run.engine}",
             f"path={run.path}",
             "issues=0",
+            f"exit_code={run.scoped_returncode}",
         ]
-        stdout = _strip_ansi(run.stdout).strip()
-        stderr = _strip_ansi(run.stderr).strip()
-        if run.returncode != 0 and not stdout and not stderr:
-            parts.append("exit_code=0")
-            return "\n".join(parts)
-        parts.append(f"exit_code={run.returncode}")
-        if run.returncode != 0:
+        if run.other_file_error_count:
+            parts.extend([
+                f"scope={run.scope}",
+                f"compiler_exit_code={run.returncode}",
+                f"other_file_errors={run.other_file_error_count}",
+                "The requested file has no diagnostics. The compiler reported errors in other files.",
+            ])
+        if run.scoped_returncode != 0:
+            stdout = _strip_ansi(run.stdout).strip()
+            stderr = _strip_ansi(run.stderr).strip()
             if stdout:
                 parts.append(f"stdout:\n{stdout}")
             if stderr:
                 parts.append(f"stderr:\n{stderr}")
+            if not stdout and not stderr:
+                parts.append("Diagnostic command failed without output.")
             return "diagnose: " + "\n".join(parts)
         return "\n".join(parts)
 
     def _exec_run_route_check(self, action: Dict[str, Any]) -> str:
         action.pop("_validation_unavailable", None)
+        action.pop("_route_checked", None)
         target = str(action.get("target", "") or "").strip()
         if not target:
             return "run_route_check: missing target route or URL"
 
         base_url = str(action.get("base_url", "") or "").strip()
         url = self._resolve_route_check_url(target, base_url)
+        preview = check_artifact_route(target, base_url)
+        if preview is not None:
+            if not preview.get("ok"):
+                action["_validation_unavailable"] = bool(preview.get("unavailable"))
+                return f"run_route_check: {preview.get('error') or 'The artifact preview check failed.'}"
+            return self._record_route_check(action, preview, target, url)
         script = """
 const fs = require('fs');
 const { chromium } = require('playwright');
@@ -2423,7 +2787,12 @@ main().catch((error) => {
             payload = json.loads(result.stdout or "{}")
         except json.JSONDecodeError as exc:
             return f"run_route_check: invalid JSON output: {exc}"
+        return self._record_route_check(action, payload, target, url)
 
+    def _record_route_check(self, action: dict, payload: dict, target: str, url: str) -> str:
+        if not isinstance(payload, dict) or not payload.get("finalUrl"):
+            return "run_route_check: the browser returned no route observation"
+        action["_route_checked"] = True
         issues = self.bridge.tree.ingest_browser_diagnostics(payload, source_path=f"[run-route-check:{target}]")
         parts = [
             f"url={payload.get('url', url)}",

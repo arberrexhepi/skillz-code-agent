@@ -149,6 +149,7 @@ COMMAND_VERBS = frozenset({
     "skill",
     "stat",
     "symbols",
+    "verify",
     "write",
 }) | EXTENSION_VERBS
 
@@ -161,7 +162,7 @@ COMMAND_VERBS = frozenset({
 class CommandResult:
     ok: bool
     output: str
-    command_type: str  # "read" | "write" | "mutation" | "skill" | "error" | "finish" | "annotation"
+    command_type: str  # Includes tool, check, and held or reused results.
     needs_tool: bool = False  # True if this must dispatch to ToolbeltRunner
     tool_action: Optional[Dict[str, Any]] = None  # Translated action dict for ToolbeltRunner
     model_output: Optional[str] = None  # Exact delivered text; output retains the complete tool result.
@@ -331,6 +332,7 @@ class TreeCommandParser:
             "approve-npm": self._cmd_approve_npm,
             "reject-npm": self._cmd_reject_npm,
             "finish": self._cmd_finish,
+            "verify": self._cmd_verify,
             "skill": self._cmd_skill,
         }
         dispatch.update({verb: (lambda rest, verb=verb: self._cmd_extension(verb, rest)) for verb in EXTENSION_VERBS})
@@ -359,16 +361,16 @@ class TreeCommandParser:
         operation = parts[0] if parts else "start"
         argument = parts[1] if len(parts) > 1 else ""
         action = {"type": "artifact_preview", "operation": operation}
-        if operation in {"mcp", "chat"}:
+        if operation in {"mcp", "chat", "browser-check"}:
             try:
                 payload = json.loads(argument)
             except ValueError:
                 payload = None
             if not isinstance(payload, dict):
-                return CommandResult(False, "Preview mcp and chat actions require a JSON object.", "error")
+                return CommandResult(False, f"Preview {operation} requires a JSON object.", "error")
             action["input"] = payload
         elif operation not in {"start", "restart"} or argument:
-            return CommandResult(False, "Usage: artifact-preview start|restart|mcp <JSON>|chat <JSON>", "error")
+            return CommandResult(False, "Usage: artifact-preview start|restart|mcp <JSON>|chat <JSON>|browser-check <JSON>", "error")
         return CommandResult(True, f"[dispatch: Preview {operation}]", "tool", needs_tool=True, tool_action=action)
 
     def _cmd_mcp(self, rest: str) -> CommandResult:
@@ -877,12 +879,19 @@ class TreeCommandParser:
         )
 
     def _cmd_shell(self, rest: str) -> CommandResult:
+        action: Dict[str, Any] = {"type": "run_shell", "command": rest}
+        if rest.startswith("--check="):
+            check, *parts = rest.split(None, 1)
+            name = check.removeprefix("--check=")
+            if not parts or not re.fullmatch(r"[a-z][a-z0-9-]{0,63}", name):
+                return CommandResult(False, "Usage: shell --check=<name> <finite test command>", "error")
+            action.update(command=parts[0], check_name=name)
         return CommandResult(
             ok=True,
             output=f"[dispatch: shell]",
             command_type="write",
             needs_tool=True,
-            tool_action={"type": "run_shell", "command": rest},
+            tool_action=action,
         )
 
     def _cmd_npm(self, rest: str) -> CommandResult:
@@ -1338,6 +1347,13 @@ class TreeCommandParser:
             output="[dispatch: request_discovery_extension]",
             tool_action={**payload, "type": "request_discovery_extension"})
 
+    def _cmd_verify(self, rest: str) -> CommandResult:
+        parts = rest.split(None, 1)
+        if len(parts) != 2:
+            return CommandResult(False, "Usage: verify check-1,check-2 <tool command>", "error")
+        return CommandResult(True, "[dispatch: verification]", "read", needs_tool=True,
+                             tool_action={"type": "verify", "checks": parts[0].split(","), "command": parts[1]})
+
     def _cmd_finish(self, rest: str) -> CommandResult:
         message = rest.strip() or "Done."
         return CommandResult(
@@ -1562,6 +1578,7 @@ def execute_multi(
 #   - "sN:" labels a strategy step. Dotted sublabels such as "s1.a:" are also valid.
 #     Commands after the colon are the group.
 #   - Comma-separated commands within a step run in parallel.
+#   - A finish command consumes the rest of the step as its summary.
 #   - "-> sN, sM" at the end of a step declares dependents that receive output.
 #   - A step won't execute until all steps that point to it have finished.
 #   - The accumulated output of upstream steps is available to downstream
@@ -1582,6 +1599,7 @@ def execute_multi(
 # output.
 
 _STRATEGY_LABEL_RE = STRATEGY_LABEL_PATTERN
+_EMPTY_STRATEGY_STEP_RE = re.compile(rf"(?:[\w.,\s]+->\s*)?{_STRATEGY_LABEL_RE}\s*:\s*\Z", re.I)
 _STRATEGY_LINE_RE = re.compile(
     rf"^(?:(?P<deps>[\w.\s,]+)->\s*)?(?P<label>{_STRATEGY_LABEL_RE})\s*:\s*(?P<body>.+?)(?:\s*->\s*(?P<targets>[\w.\s,]+))?\Z",
     re.IGNORECASE | re.DOTALL,
@@ -1599,7 +1617,7 @@ def _split_strategy_commands(body: str) -> List[str]:
     brace_depth = 0
     bracket_depth = 0
 
-    for char in body:
+    for index, char in enumerate(body):
         current.append(char)
 
         if quote:
@@ -1635,9 +1653,13 @@ def _split_strategy_commands(body: str) -> List[str]:
             bracket_depth = max(0, bracket_depth - 1)
             continue
         if char == "," and not (quote or paren_depth or brace_depth or bracket_depth):
+            if re.fullmatch(r"\s*verify\s+check-\d+(?:,check-\d+)*,", "".join(current), flags=re.I):
+                continue
             current.pop()
             command = "".join(current).lstrip()
             if command:
+                if command.split(None, 1)[0].lower() == "finish":
+                    return [*commands, command + body[index:]]
                 commands.append(command)
             current = []
 
@@ -1675,6 +1697,45 @@ class StrategyPlan:
         return "Strategy plan:\n" + "\n".join(lines)
 
 
+def parse_strategy_step(line: str) -> Optional[StrategyStep]:
+    """Read one strategy step after its surrounding block has been identified."""
+    # Mutation operands and multiline payloads may contain literal arrows.
+    header = re.match(
+        rf"^(?:(?P<deps>[\w.\s,]+)->\s*)?(?P<label>{_STRATEGY_LABEL_RE})\s*:[ \t]*(?P<body>.+)\Z",
+        line, re.IGNORECASE | re.DOTALL,
+    )
+    if header is None:
+        return None
+
+    body = header.group("body").lstrip()
+    literal_body = is_text_mutation(body) or "\n" in body
+    targets = []
+    if literal_body:
+        commands = [body]
+    else:
+        match = _STRATEGY_LINE_RE.match(line)
+        if match is None:
+            return None
+        commands = _split_strategy_commands(match.group("body").lstrip())
+        if target_text := match.group("targets"):
+            if commands and commands[-1].split(None, 1)[0].lower() == "finish":
+                commands = _split_strategy_commands(body)
+            else:
+                targets = target_text.split(",")
+    dependencies = (header.group("deps") or "").split(",")
+    return StrategyStep(
+        label=header.group("label").strip().lower(),
+        commands=commands,
+        depends_on=[label.strip().lower() for label in dependencies if label.strip()],
+        targets=[label.strip().lower() for label in targets if label.strip()],
+    )
+
+
+def _invalid_strategy(message: str) -> StrategyPlan:
+    error = CommandResult(False, message, "error")
+    return StrategyPlan(steps={"error": StrategyStep(label="error", commands=[], results=[error])}, execution_order=[["error"]])
+
+
 def parse_strategy(raw: str) -> Optional[StrategyPlan]:
     """Parse a strategy block into a StrategyPlan.
 
@@ -1686,12 +1747,7 @@ def parse_strategy(raw: str) -> Optional[StrategyPlan]:
     raw_lines = raw.splitlines()
     logical_lines = collapse_heredocs(raw_lines)
     if logical_lines and logical_lines[0].startswith(PARSE_ERROR_PREFIX):
-        return StrategyPlan(
-            steps={"error": StrategyStep(label="error", commands=[], results=[CommandResult(
-                ok=False, output=logical_lines[0].removeprefix(PARSE_ERROR_PREFIX), command_type="error",
-            )])},
-            execution_order=[["error"]],
-        )
+        return _invalid_strategy(logical_lines[0].removeprefix(PARSE_ERROR_PREFIX))
     lines = [l.lstrip() for l in logical_lines if l.strip() and not l.strip().startswith("#")]
     if not lines:
         return None
@@ -1699,74 +1755,54 @@ def parse_strategy(raw: str) -> Optional[StrategyPlan]:
     steps: Dict[str, StrategyStep] = {}
     # Track forward-declared targets for wiring deps
     forward_targets: Dict[str, List[str]] = {}  # source_label -> [target_labels]
+    loose_commands = []
 
     for line in lines:
-        # Text payloads are opaque. Use left-side dependencies on mutation
-        # steps so a literal trailing ` -> s2` cannot be consumed as an edge.
-        header = re.match(
-            rf"^(?:(?P<deps>[\w.\s,]+)->\s*)?(?P<label>{_STRATEGY_LABEL_RE})\s*:[ \t]*(?P<body>.+)\Z",
-            line, re.IGNORECASE | re.DOTALL,
-        )
-        literal_body = header is not None and (is_text_mutation(header.group("body")) or "\n" in header.group("body"))
-        m = header if literal_body else _STRATEGY_LINE_RE.match(line)
-        if m is None:
+        step = parse_strategy_step(line)
+        if step is None:
+            if _EMPTY_STRATEGY_STEP_RE.fullmatch(line):
+                return _invalid_strategy(f"Invalid strategy: missing command after `{line.rstrip()}`.")
+            if line.split(None, 1)[0].lower() in COMMAND_VERBS:
+                loose_commands.append(line.split(None, 1)[0])
             continue
-
-        label = m.group("label").strip().lower()
-        body = m.group("body").lstrip()
-        deps_str = (m.group("deps") or "").strip()
-        targets_str = "" if literal_body else (m.group("targets") or "").strip()
-
-        # Parse top-level comma-separated commands, but keep commas that are
-        # part of inline code payloads, strings, or structured literals.
-        # Embedded newlines from collapsed heredocs stay single-command.
-        if "\n" in body:
-            commands = [body]
-        else:
-            commands = _split_strategy_commands(body)
-
-        # Parse explicit deps (left side: "s1, s2 -> sN: ...")
-        deps = [d.strip().lower() for d in deps_str.split(",") if d.strip()] if deps_str else []
-
-        # Parse targets (right side: "... -> s4, s5")
-        targets = [t.strip().lower() for t in targets_str.split(",") if t.strip()] if targets_str else []
+        label = step.label
 
         if label in steps:
-            return StrategyPlan(
-                steps={
-                    "error": StrategyStep(
-                        label="error",
-                        commands=[],
-                        results=[
-                            CommandResult(
-                                ok=False,
-                                output=(
-                                    f"Invalid strategy: duplicate label `{label}`. "
-                                    "Emit exactly one executable strategy block with unique labels like `s1:`, `s2:`, or `s1.a:`."
-                                ),
-                                command_type="error",
-                            )
-                        ],
-                    )
-                },
-                execution_order=[["error"]],
-            )
+            return _invalid_strategy(f"Invalid strategy: duplicate label `{label}`. Use unique labels like `s1:`, `s2:`, or `s1.a:`.")
 
-        steps[label] = StrategyStep(label=label, commands=commands, depends_on=deps, targets=targets)
-        if targets:
-            forward_targets[label] = targets
+        for command in step.commands:
+            verb = command.split(None, 1)[0].lower()
+            if verb not in COMMAND_VERBS:
+                return _invalid_strategy(f"Invalid strategy: unknown command `{verb}` in step `{label}`.")
+        if not step.commands:
+            return _invalid_strategy(f"Invalid strategy: missing command in step `{label}`.")
+
+        steps[label] = step
+        if step.targets:
+            forward_targets[label] = step.targets
 
     if not steps:
         return None
+    if loose_commands:
+        return _invalid_strategy(f"Invalid strategy: `{loose_commands[0]}` has no step label. Label every command or use a plain command list.")
 
     # Wire forward targets into deps: if s1 -> s3, then s3.depends_on includes s1
     for source, targets in forward_targets.items():
         for target in targets:
-            if target in steps and source not in steps[target].depends_on:
+            if target not in steps:
+                return _invalid_strategy(f"Invalid strategy: step `{source}` targets undefined step `{target}`.")
+            if source not in steps[target].depends_on:
                 steps[target].depends_on.append(source)
+    for label, step in steps.items():
+        for dependency in step.depends_on:
+            if dependency not in steps:
+                return _invalid_strategy(f"Invalid strategy: step `{label}` depends on undefined step `{dependency}`.")
 
     # Topological sort into execution tiers
-    execution_order = _topological_tiers(steps)
+    try:
+        execution_order = _topological_tiers(steps)
+    except ValueError as exc:
+        return _invalid_strategy(str(exc))
 
     return StrategyPlan(steps=steps, execution_order=execution_order)
 
@@ -1787,9 +1823,7 @@ def _topological_tiers(steps: Dict[str, StrategyStep]) -> List[List[str]]:
         # Find all steps with no unresolved deps
         tier = [label for label in remaining if in_degree.get(label, 0) == 0]
         if not tier:
-            # Cycle detected — just dump remaining
-            tiers.append(sorted(remaining))
-            break
+            raise ValueError(f"Invalid strategy: circular dependencies among {', '.join(sorted(remaining))}.")
         tier.sort()  # deterministic ordering
         tiers.append(tier)
         for label in tier:
@@ -1802,7 +1836,7 @@ def _topological_tiers(steps: Dict[str, StrategyStep]) -> List[List[str]]:
     return tiers
 
 
-_PLACEHOLDER_RE = re.compile(r"\{(s\w+(?:\.[^{}]*)?)\}", re.IGNORECASE)
+_PLACEHOLDER_RE = re.compile(r"\{(s[0-9]+(?:\.[^{}]*)?)\}", re.IGNORECASE)
 _QUOTED_ARG_RE = r'(?:"(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\')'
 
 
@@ -2027,11 +2061,15 @@ def _resolve_strategy_placeholders(command: str, steps: Dict[str, StrategyStep])
     return _PLACEHOLDER_RE.sub(_replace, command)
 
 
+def has_strategy_placeholders(command: str) -> bool:
+    return _PLACEHOLDER_RE.search(command) is not None
+
+
 def is_strategy(raw: str) -> bool:
     """Quick check if the input looks like a strategy block."""
     for block in group_command_blocks(raw.splitlines()):
         line = block.split("\n", 1)[0].strip()
-        if line and not line.startswith("#") and _STRATEGY_LINE_RE.match(line):
+        if line and not line.startswith("#") and (_STRATEGY_LINE_RE.match(line) or _EMPTY_STRATEGY_STEP_RE.fullmatch(line)):
             return True
     return False
 

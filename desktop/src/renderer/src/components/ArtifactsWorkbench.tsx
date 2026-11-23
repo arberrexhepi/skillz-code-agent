@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { defaultArtifactApp, type ArtifactAppConfig, type ArtifactLibrary, type ArtifactRecord, type ArtifactRuntime, type PrebuiltArtifact } from '../../../shared/artifacts';
+import { defaultArtifactApp, type ArtifactAppConfig, type ArtifactLibrary, type ArtifactRecord, type ArtifactRuntime, type ArtifactSetupSelection, type PrebuiltArtifact } from '../../../shared/artifacts';
 import type { GitStatus, WorkbenchApi } from '../../../shared/contracts';
 import { AgentWorkspaceProvider } from '../agent/AgentWorkspaceContext';
 import { useAgentWorkspace, type RuntimeSelection } from '../agent/agentWorkspace';
 import { RuntimeSelectionFields } from './agent/RuntimeDrawer';
 import { AgentPanel } from './AgentPanel';
+import { AgentIssues, type AgentIssuesApi } from './AgentIssues';
 import { McpPanel } from './McpPanel';
 import { ArtifactAgentActivity } from './ArtifactAgentActivity';
 import { ArtifactAccessFields, ArtifactAccessPanel, emptyAccess } from './ArtifactAccess';
@@ -18,7 +19,19 @@ import { ArtifactDockerStorage } from './ArtifactDockerStorage';
 import { ArtifactPreview } from './ArtifactPreview';
 import { ArtifactRepository } from './ArtifactRepository';
 import { ArtifactVault } from './ArtifactVault';
-import { FileNavigationContext } from './PathText';
+import { FileNavigationContext, type FileNavigation } from './PathText';
+
+const artifactSections = {
+  preview: 'Preview',
+  repository: 'Repository',
+  issues: 'Issues',
+  connections: 'API Blueprints',
+  app: 'App capabilities',
+  access: 'File access',
+  mcp: 'MCP',
+  setup: 'Setup',
+  logs: 'Server logs',
+};
 
 export function ArtifactsWorkbench({ visible, sourceRoot, onClose }: { visible: boolean; sourceRoot: string; onClose: () => void }): React.JSX.Element {
   const sourceAgent = useAgentWorkspace();
@@ -134,26 +147,45 @@ function ArtifactSession({ record, sourceRoot, active, runtime, initialRuntime, 
     return { ...window.workbench.agent, runtimeOptions: (provider, model) => artifacts.agentRuntimeOptions(id, provider, model), start: (options) => artifacts.agentStart(id, options), submit: (text) => artifacts.agentSubmit(id, text), plannerAction: (action, extras) => artifacts.agentPlannerAction(id, action, extras), workerAction: (action) => artifacts.agentWorkerAction(id, action), reconfigureRuntime: (provider, model) => artifacts.agentReconfigure(id, provider, model), configureBackoff: (enabled, limit) => artifacts.agentBackoff(id, enabled, limit), stop: () => artifacts.agentStop(id), onEvent: (listener) => artifacts.onEvent((event) => { if (event.type === 'agent' && event.id === id) listener(event.event); }) };
   }, [record.id]);
   // A separate provider preserves the source agent and every other artifact conversation.
-  return <div className="artifact-session" hidden={!active}><AgentWorkspaceProvider api={api} initialRuntime={initialRuntime} savedRuntime={record.runtime}><FileNavigationContext.Provider value={null}><ArtifactSessionBody record={record} sourceRoot={sourceRoot} active={active} runtime={runtime} setupRequest={setupRequest} request={request} onRequested={onRequested} /><ArtifactAgentActivity /></FileNavigationContext.Provider></AgentWorkspaceProvider></div>;
+  return <div className="artifact-session" hidden={!active}><AgentWorkspaceProvider api={api} initialRuntime={initialRuntime} savedRuntime={record.runtime} artifactId={record.id}><FileNavigationContext.Provider value={null}><ArtifactSessionBody record={record} sourceRoot={sourceRoot} active={active} runtime={runtime} setupRequest={setupRequest} request={request} onRequested={onRequested} /><ArtifactAgentActivity /></FileNavigationContext.Provider></AgentWorkspaceProvider></div>;
 }
 function ArtifactSessionBody({ record, sourceRoot, active, runtime, setupRequest, request, onRequested }: { record: ArtifactRecord; sourceRoot: string; active: boolean; runtime?: ArtifactRuntime; setupRequest: number; request: boolean; onRequested: () => void }) {
   const agent = useAgentWorkspace();
-  const [section, setSection] = useState<'preview' | 'repository' | 'connections' | 'app' | 'access' | 'mcp' | 'setup' | 'logs'>('preview');
+  const [section, setSection] = useState<keyof typeof artifactSections>('preview');
   const [error, setError] = useState(''); const [busy, setBusy] = useState(false);
   const [setupNeeded, setSetupNeeded] = useState(false);
   const [, setSetupBusy] = useState(false);
   useEffect(() => { if (setupRequest) setSection('setup'); }, [setupRequest]);
   const [repositoryStatus, setRepositoryStatus] = useState<GitStatus | null>(null);
+  const [repositoryPath, setRepositoryPath] = useState<string>();
   const [apiRevision, setApiRevision] = useState(0);
   const [sourceRevision, setSourceRevision] = useState(0);
+  const [issueRevision, setIssueRevision] = useState(0);
+  const issueApi = useMemo<AgentIssuesApi>(() => ({
+    issues: () => window.workbench.artifacts.issues(record.id),
+    issueAction: (_root, action, extras) => window.workbench.artifacts.issueAction(record.id, action, extras),
+  }), [record.id]);
+  const openIssuePath = useCallback((path: string) => {
+    setRepositoryPath(path);
+    setSection('repository');
+  }, []);
+  const issueNavigation = useMemo<FileNavigation>(() => ({
+    root: record.root, open: ({ path }) => openIssuePath(path),
+  }), [record.root, openIssuePath]);
+  const refreshIssues = (): void => setIssueRevision(current => current + 1);
+  useEffect(() => {
+    if (active) setIssueRevision(current => current + 1);
+  }, [active]);
   useEffect(() => window.workbench.artifacts.onEvent(event => {
     if (event.type === 'prebuilt-updated' && event.id === record.id) setSourceRevision(current => current + 1);
+    if (event.type === 'issues' && event.id === record.id) setIssueRevision(current => current + 1);
   }), [record.id]);
+  const selection = { provider: agent.runtime.provider, model: agent.runtime.model } as ArtifactSetupSelection;
   const setupReady = useCallback((ready: boolean) => setSetupNeeded(!ready), []);
   useEffect(() => {
     if (!active) return;
     let stale = false;
-    void window.workbench.artifacts.capabilities({ provider: agent.runtime.provider, model: agent.runtime.model } as import('../../../shared/artifacts').ArtifactSetupSelection, record.id)
+    void window.workbench.artifacts.capabilities({ provider: agent.runtime.provider, model: agent.runtime.model } as ArtifactSetupSelection, record.id)
       .then(value => { if (!stale) setSetupNeeded(!value.ready); })
       .catch(() => { if (!stale) setSetupNeeded(true); });
     return () => { stale = true; };
@@ -161,6 +193,49 @@ function ArtifactSessionBody({ record, sourceRoot, active, runtime, setupRequest
   const sent = useRef(false);
   useEffect(() => { if (request && !sent.current) { sent.current = true; void Promise.resolve().then(() => agent.submit(record.prompt)).then((ok) => { if (!ok) setError('The artifact was created, but the agent could not accept the request. Check Runtime and choose Send original request.'); onRequested(); }); } }, [request, agent, record.prompt, onRequested]);
   async function run(action: () => Promise<unknown>) { setBusy(true); setError(''); try { await action(); } catch (error) { setError(clean(error)); } finally { setBusy(false); } }
-  return <><div className="artifact-canvas"><div className="artifact-toolbar"><strong>{record.title}</strong><span className={`artifact-runtime ${runtime?.status || ''}`}>{runtime?.status || 'stopped'}</span><button disabled={busy || runtime?.status === 'installing' || runtime?.status === 'starting'} onClick={() => void run(() => window.workbench.artifacts.start(record.id))}>{runtime?.status === 'running' ? 'Running' : 'Start preview'}</button>{runtime && runtime.status !== 'stopped' && <button onClick={() => void run(() => window.workbench.artifacts.stop(record.id))}>Stop</button>}<button onClick={() => void run(() => window.workbench.artifacts.reveal(record.id))}>Open folder</button></div><div className="artifact-section-tabs">{(['preview', 'repository', 'connections', 'app', 'access', 'mcp', 'setup', 'logs'] as const).map((item) => <button className={section === item ? 'active' : ''} key={item} onClick={() => setSection(item)}>{item === 'preview' ? 'Preview' : item === 'repository' ? <>Repository{repositoryStatus?.files.length ? <span className="count-badge">{repositoryStatus.files.length}</span> : null}</> : item === 'connections' ? 'API Blueprints' : item === 'app' ? 'App capabilities' : item === 'access' ? 'File access' : item === 'mcp' ? 'MCP' : item === 'setup' ? 'Setup' : 'Server logs'}</button>)}<button disabled={Boolean(agent.state.pendingAction)} onClick={() => void run(() => agent.submit(record.prompt))}>Send original request</button></div><ArtifactPrebuiltUpdate record={record} active={active} />{setupNeeded && section !== 'setup' && <div className="artifact-setup-notice" role="status">Some artifact capabilities need setup or repair.<button onClick={() => setSection('setup')}>Repair capabilities</button></div>}{error && <div className="artifacts-error" role="alert">{error}</div>}{record.contextMode !== 'none' && <div className="artifact-context">Shared context: {record.shareFacts ? 'repo facts' : ''}{record.shareFacts && record.shareMemory ? ' + ' : ''}{record.shareMemory ? 'memory observability' : ''} · {record.contextMode === 'snapshot' ? 'read-only snapshot, refreshed automatically' : record.contextMode === 'links' ? 'linked files' : record.contextWarning}</div>}<ArtifactPreview title={record.title} active={active && section === 'preview'} runtime={runtime} />{section === 'repository' && <ArtifactRepository key={sourceRevision} id={record.id} root={record.root} onStatus={setRepositoryStatus} />}{section === 'connections' && <ArtifactConnections id={record.id} running={runtime?.status === 'running'} revision={apiRevision} />}{section === 'app' && <ArtifactAppCapabilities id={record.id} previewUrl={runtime?.status === 'running' ? runtime.url : undefined} />}{section === 'access' && <ArtifactAccessPanel id={record.id} sourceRoot={sourceRoot} />}{section === 'mcp' && <McpPanel artifactId={record.id} />}{section === 'setup' && <ArtifactRuntimeSetup record={record} running={runtime?.status === 'running'} onReadyChange={setupReady} onBusyChange={setSetupBusy} />}{section === 'logs' && <pre className="artifact-logs">{runtime?.logs || 'Start preview to install dependencies and launch the server.'}{runtime?.error && `\n${runtime.error}`}</pre>}</div><div className="artifact-agent"><div className="artifact-standard-agent" hidden={section === 'connections'}><AgentPanel label="ARTIFACT AGENT" /></div><ArtifactBlueprintAgent id={record.id} selection={{ provider: agent.runtime.provider, model: agent.runtime.model } as import('../../../shared/artifacts').ArtifactSetupSelection} active={section === 'connections'} onChanged={() => setApiRevision((current) => current + 1)} /></div></>;
+  return <>
+    <div className="artifact-canvas">
+      <div className="artifact-toolbar">
+        <strong>{record.title}</strong>
+        <span className={`artifact-runtime ${runtime?.status || ''}`}>{runtime?.status || 'stopped'}</span>
+        <button disabled={busy || runtime?.status === 'installing' || runtime?.status === 'starting'} onClick={() => void run(() => window.workbench.artifacts.start(record.id))}>{runtime?.status === 'running' ? 'Running' : 'Start preview'}</button>
+        {runtime && runtime.status !== 'stopped' && <button onClick={() => void run(() => window.workbench.artifacts.stop(record.id))}>Stop</button>}
+        <button onClick={() => void run(() => window.workbench.artifacts.reveal(record.id))}>Open folder</button>
+      </div>
+      <nav className="artifact-section-tabs" aria-label="Artifact sections">
+        {(Object.keys(artifactSections) as Array<keyof typeof artifactSections>).map(item =>
+          <button type="button" className={section === item ? 'active' : ''} aria-pressed={section === item} key={item} onClick={() => {
+            if (item === 'repository') setRepositoryPath(undefined);
+            setSection(item);
+          }}>
+            {artifactSections[item]}{item === 'repository' && repositoryStatus?.files.length ? <span className="count-badge">{repositoryStatus.files.length}</span> : null}
+          </button>
+        )}
+        <button disabled={Boolean(agent.state.pendingAction)} onClick={() => void run(() => agent.submit(record.prompt))}>Send original request</button>
+      </nav>
+      <ArtifactPrebuiltUpdate record={record} active={active} />
+      {setupNeeded && section !== 'setup' && <div className="artifact-setup-notice" role="status">Some artifact capabilities need setup or repair.<button onClick={() => setSection('setup')}>Repair capabilities</button></div>}
+      {error && <div className="artifacts-error" role="alert">{error}</div>}
+      {record.contextMode !== 'none' && <div className="artifact-context">Shared context: {record.shareFacts ? 'repo facts' : ''}{record.shareFacts && record.shareMemory ? ' + ' : ''}{record.shareMemory ? 'memory observability' : ''} · {record.contextMode === 'snapshot' ? 'read-only snapshot, refreshed automatically' : record.contextMode === 'links' ? 'linked files' : record.contextWarning}</div>}
+      <ArtifactPreview title={record.title} active={active && section === 'preview'} runtime={runtime} />
+      {section === 'repository' && <ArtifactRepository key={sourceRevision} id={record.id} root={record.root} onStatus={setRepositoryStatus} requestedPath={repositoryPath} />}
+      {section === 'issues' && <div className="artifact-issues">
+        <div className="panel-heading"><span>ISSUES</span><button type="button" className="icon-button push-right" aria-label="Refresh artifact issues" onClick={refreshIssues}>↻</button></div>
+        <FileNavigationContext.Provider value={issueNavigation}>
+          <AgentIssues key={record.root} api={issueApi} workspaceRoot={record.root} revision={issueRevision + sourceRevision} onOpenPath={openIssuePath} />
+        </FileNavigationContext.Provider>
+      </div>}
+      {section === 'connections' && <ArtifactConnections id={record.id} running={runtime?.status === 'running'} revision={apiRevision} />}
+      {section === 'app' && <ArtifactAppCapabilities id={record.id} previewUrl={runtime?.status === 'running' ? runtime.url : undefined} />}
+      {section === 'access' && <ArtifactAccessPanel id={record.id} sourceRoot={sourceRoot} />}
+      {section === 'mcp' && <McpPanel artifactId={record.id} />}
+      {section === 'setup' && <ArtifactRuntimeSetup record={record} running={runtime?.status === 'running'} onReadyChange={setupReady} onBusyChange={setSetupBusy} />}
+      {section === 'logs' && <pre className="artifact-logs">{runtime?.logs || 'Start preview to install dependencies and launch the server.'}{runtime?.error && `\n${runtime.error}`}</pre>}
+    </div>
+    <div className="artifact-agent">
+      <div className="artifact-standard-agent" hidden={section === 'connections'}><AgentPanel label="ARTIFACT AGENT" /></div>
+      <ArtifactBlueprintAgent id={record.id} selection={selection} active={section === 'connections'} onChanged={() => setApiRevision(current => current + 1)} />
+    </div>
+  </>;
 }
 function clean(error: unknown): string { return String(error).replace(/^Error invoking remote method '[^']+': Error: /, ''); }

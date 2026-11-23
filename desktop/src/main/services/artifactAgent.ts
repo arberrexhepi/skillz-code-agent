@@ -102,23 +102,40 @@ export class ArtifactAgentExecution implements AgentExecution {
     if (payload.provider !== this.selection?.provider || payload.model !== this.selection?.model) { reply({ error: 'Model request does not match the selected runtime.' }); return true; }
     if (this.models.size >= 8) { reply({ error: 'Too many simultaneous model requests.' }); return true; }
     const helper = spawnModelHelper(context.python.executable, [...context.python.args, path.join(context.agentRoot, 'artifact_model_host.py')], { cwd: context.agentRoot, env: context.env, windowsHide: true });
-    this.models.add(helper); let output = '', errors = ''; let final: Record<string, unknown> | undefined;
-    const timeout = setTimeout(() => { void terminate(helper); reply({ error: 'Model request timed out.' }); }, 1200000);
+    this.models.add(helper);
+    let output = '', errors = '', settled = false;
+    const finish = (value: Record<string, unknown>): void => {
+      if (settled) return;
+      settled = true;
+      reply(value);
+    };
+    let timeout = setTimeout(() => { void terminate(helper); finish({ error: 'Model request timed out.' }); }, 1200000);
     helper.stdout.setEncoding('utf8'); helper.stderr.setEncoding('utf8');
     helper.stdout.on('data', (text: string) => {
+      if (settled) return;
       output += text;
-      if (output.length > 16 * 1024 * 1024) { void terminate(helper); return; }
+      if (output.length > 16 * 1024 * 1024) { void terminate(helper); finish({ error: 'Model helper response exceeded 16 MB.' }); return; }
       let newline: number;
       while ((newline = output.indexOf('\n')) >= 0) {
         const line = output.slice(0, newline); output = output.slice(newline + 1);
-        try { const value = JSON.parse(line) as Record<string, unknown>; if ('progress' in value) reply(value); else final = value; }
+        try {
+          const value = JSON.parse(line) as Record<string, unknown>;
+          if ('progress' in value) reply(value);
+          else if (typeof value.text === 'string' || typeof value.error === 'string') {
+            // The complete reply is a protocol record. Helper and subprocess cleanup can finish separately.
+            finish(value);
+            clearTimeout(timeout);
+            timeout = setTimeout(() => { void terminate(helper); }, 5000);
+            return;
+          } else errors = 'Model helper returned an invalid response.';
+        }
         catch { errors = 'Model helper returned invalid JSON.'; }
       }
     });
     helper.stderr.on('data', (text: string) => { errors = (errors + text).slice(-3000); this.log(text); });
-    helper.on('error', (error) => reply({ error: error.message }));
-    helper.on('close', () => { clearTimeout(timeout); this.models.delete(helper); reply(final || { error: errors || 'Model helper returned an invalid response.' }); });
-    helper.stdin.on('error', (error) => reply({ error: error.message }));
+    helper.on('error', (error) => finish({ error: error.message }));
+    helper.on('close', () => { clearTimeout(timeout); this.models.delete(helper); finish({ error: errors || 'Model helper returned an invalid response.' }); });
+    helper.stdin.on('error', (error) => finish({ error: error.message }));
     helper.stdin.end(JSON.stringify(payload));
     return true;
   }

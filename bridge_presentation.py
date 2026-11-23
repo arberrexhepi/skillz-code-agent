@@ -84,7 +84,7 @@ def presentation_parts(planner: Any, role: str, text: str) -> list[dict]:
             original_result = deepcopy(result)
             original_result.commentary_for_next_goal = ""
             rendered = planner._render_goal_result(index, total, original_result)
-        blocks.append((rendered, _report("plan", "complete" if result.status == "completed" else "failed", "Goal plan", rendered, goals=[_snapshot(result)], plan=_snapshot(plan))))
+        blocks.append((rendered, _report("plan", "complete" if result.status == "completed" else result.status, "Goal plan", rendered, goals=[_snapshot(result)], plan=_snapshot(plan))))
 
     # Keep every unrecognized span, including conversational text after reports.
     parts: list[dict] = []

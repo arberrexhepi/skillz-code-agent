@@ -37,7 +37,7 @@ Agent chat uses 14px body/composer text, 13px code, and 11px supporting labels a
 
 Discovery choices, plan approvals/results, and issue lifecycle actions appear in collapsed workflow report cards, in conversation order. Expand a card for selections, outcomes, and original workflow text. New bridge messages carry explicit presentation boundaries so conversational replies appended to reports remain in the chat. The original bridge transcript is unchanged; older bridge messages use conservative format recognition.
 
-Operator-facing turn thoughts appear above the composer while work runs (collapsible when space is tight). Full thoughts remain readable, and Activity retains tool-level history. The beta loop forwards explicit `>>th` annotations; provider-internal reasoning is not displayed.
+The activity card above the composer shows live planner calls and TreeLoop worker turns while keeping the latest agent thought visible. It shows which tool is being dispatched, how much response text has arrived, and how long a model stream has been quiet, including the wait for its first update. OpenAI API, Gemini, and Codex subscription summaries appear in a scrollable dropdown when available. The separate **Draft strategy** dropdown shows recognized tags, step labels, and command names as the response arrives. TreeLoop carries prior results between goals locally. Activity retains planner and tool events.
 
 ## Artifacts
 

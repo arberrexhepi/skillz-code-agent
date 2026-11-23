@@ -179,6 +179,46 @@ class ContinuousAutoApprovalTests(unittest.TestCase):
         self.assertEqual(guidance, "")
         self.assertEqual(model.prompts, [])
 
+    def test_treeloop_carries_results_into_next_goal_without_model_guidance(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            model = FakeModel([{"summary": "Both goals completed.", "next_steps": []}])
+            config = SimpleNamespace(
+                root=str(root), provider="gemini", model="gemini-4-neon",
+                thinking_mode="low", verbosity="medium", max_parallel_workers=1,
+            )
+            worker = FakeWorker(root)
+            worker.uses_local_goal_handoff = True
+            tasks = []
+
+            class RecordingPlanner(ImmediateExecutionPlannerForTest):
+                def _execute_goal_with_worker(self, worker, plan, goal, index):
+                    tasks.append(self._build_goal_task(plan, goal, index))
+                    result = super()._execute_goal_with_worker(worker, plan, goal, index)
+                    result.touched_paths = ["anim_pipeline/rig.py"]
+                    return result
+
+            planner = RecordingPlanner(model, config, lambda: worker, json.loads)
+            planner.session.pending_plan = PlannerPlan(
+                original_request="Complete both", summary="Complete both",
+                goals=[
+                    PlannerGoal("goal-1", "First", "Complete first.", "Needed."),
+                    PlannerGoal("goal-2", "Second", "Complete second.", "Needed."),
+                ],
+            )
+            events = []
+            planner.on_plan_callback = lambda event, payload: events.append((event, payload))
+
+            planner.execute_pending_plan()
+
+            self.assertEqual(len(model.prompts), 1)
+            self.assertEqual(len(tasks), 2)
+            self.assertIn("goal-1: goal done", tasks[1])
+            self.assertIn("Touched paths: anim_pipeline/rig.py", tasks[1])
+            self.assertIn("Validation passed · validated", tasks[1])
+            self.assertIn("Context policy: Reuse previous worker context", tasks[1])
+            self.assertIn(("goal_handoff", {"summary": "Carrying prior goal results into Second."}), events)
+
     def test_goal_finish_callback_sees_incremental_completed_results(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

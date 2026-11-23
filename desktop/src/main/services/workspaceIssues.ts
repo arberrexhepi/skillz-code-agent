@@ -2,17 +2,18 @@ import { promises as fs } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { readRepoFacts } from './repoFacts';
-import { ISSUE_PROPOSALS_PATH, issuesFromLedger, parseIssueProposals, type WorkspaceIssuesSnapshot } from '../../shared/workspaceIssues';
+import { matchRepoFactsJsonBlock } from '../../shared/repoFacts';
+import { ISSUE_PROPOSALS_PATH, issuesFromLedger, parseIssueProposals, type WorkspaceIssueAction, type WorkspaceIssuesSnapshot } from '../../shared/workspaceIssues';
 
-export type WorkspaceIssueAction = 'create_issue' | 'close_issue' | 'reopen_issue';
 type JsonObject = Record<string, unknown>;
 const factsName = 'repo_facts.md';
 const maxBytes = 5 * 1024 * 1024;
+const updates = new Map<string, Promise<WorkspaceIssuesSnapshot>>();
 const timestamp = (): string => new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
 const object = (value: unknown): value is JsonObject => Boolean(value && typeof value === 'object' && !Array.isArray(value));
 
 function parseDocument(source: string): { before: string; after: string; ledger: JsonObject & { issues: JsonObject[] } } {
-  const block = /```json\s*([\s\S]*?)\s*```/.exec(source);
+  const block = matchRepoFactsJsonBlock(source);
   const json = block?.[1] ?? source.trim();
   let value: unknown;
   try { value = JSON.parse(json); }
@@ -63,6 +64,8 @@ export async function mutateWorkspaceIssue(root: string, action: WorkspaceIssueA
     const id = String(extras.issue_id || '').trim();
     const issue = ledger.issues.find(item => item.issue_id === id);
     if (!issue) throw new Error(`Issue ${id || '(missing ID)'} no longer exists.`);
+    delete issue.pending_approval;
+    delete issue.approved_plan;
     if (action === 'close_issue') {
       issue.status = 'closed';
       if (!String(issue.closed_at || '').trim()) issue.closed_at = timestamp();
@@ -104,4 +107,17 @@ export async function readWorkspaceIssues(root: string): Promise<WorkspaceIssues
     proposals: proposals.status === 'fulfilled' ? proposals.value : [],
     proposalError: proposals.status === 'rejected' ? String(proposals.reason).replace(/^Error: /, '') : undefined,
   };
+}
+
+export async function updateWorkspaceIssues(root: string, action: WorkspaceIssueAction, extras: JsonObject, assertCurrent?: () => void): Promise<WorkspaceIssuesSnapshot> {
+  const previous = updates.get(root);
+  const pending = (async () => {
+    await previous?.catch(() => {});
+    await mutateWorkspaceIssue(root, action, extras, assertCurrent);
+    assertCurrent?.();
+    return readWorkspaceIssues(root);
+  })();
+  updates.set(root, pending);
+  try { return await pending; }
+  finally { if (updates.get(root) === pending) updates.delete(root); }
 }

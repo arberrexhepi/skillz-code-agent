@@ -3,6 +3,7 @@ import { promises as fs } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import type { ArtifactsService } from './services/artifacts';
 import { prebuiltUpdateRequestSchema, artifactAgentRuntimeSchema, artifactSetupSelectionSchema, artifactBlueprintChatMessageSchema, artifactVaultProviderSchema, artifactId, artifactApisSchema, artifactAccessSchema, artifactAppSchema, createArtifactSchema, previewInputSchema } from '../shared/artifacts';
+import { WORKSPACE_ISSUE_ACTIONS } from '../shared/workspaceIssues';
 import { clipboard, dialog, ipcMain, Menu, shell, type BrowserWindow, type IpcMainEvent, type IpcMainInvokeEvent, type MenuItemConstructorOptions } from 'electron';
 import { isUntracked } from '../shared/gitStatus';
 import { z } from 'zod';
@@ -13,6 +14,8 @@ import type { WorkspaceService } from './services/workspace';
 import type { McpHost, McpScope } from './services/mcp';
 import type { McpServerSettings } from '../shared/mcp';
 import { artifactAppMcpRequestSchema } from '../shared/artifactAppMcp';
+import { reasoningEffortSchema, reasoningModelSchema, reasoningPhaseSchema } from '../shared/reasoningPreferences';
+import { readReasoningPreferences, saveReasoningPreference } from './services/reasoningPreferences';
 
 interface Services {
   artifacts: ArtifactsService;
@@ -45,7 +48,7 @@ export function registerIpc(window: BrowserWindow, services: Services): void {
     'workspace:current', 'workspace:recent', 'workspace:choose', 'workspace:open', 'workspace:close', 'workspace:list', 'workspace:show-entry-menu', 'workspace:create-file', 'workspace:read', 'workspace:write', 'workspace:repo-facts', 'workspace:issues', 'workspace:issue-action',
     'git:status', 'git:initialize', 'git:history', 'git:file-diff', 'git:stage', 'git:stage-all', 'git:unstage', 'git:discard', 'git:commit', 'git:push',
     'terminal:create', 'terminal:copy', 'agent:start', 'agent:submit', 'agent:planner-action', 'agent:worker-action',
-    'agent:reconfigure-runtime', 'agent:configure-backoff', 'agent:runtime-options',
+    'agent:reconfigure-runtime', 'agent:configure-backoff', 'agent:runtime-options', 'agent:reasoning-preferences', 'agent:save-reasoning-preference',
     'agent:codex-subscription-status', 'agent:codex-subscription-login', 'agent:stop',
     'agent:choose-codex-cli', 'agent:set-codex-cli-path',
     'mcp:profile', 'mcp:save', 'mcp:manage', 'mcp:inspect', 'mcp:setup',
@@ -65,7 +68,7 @@ export function registerIpc(window: BrowserWindow, services: Services): void {
     });
   };
 
-  const artifactChannels = ['capabilities', 'install-capabilities', 'setup-progress', 'vault', 'save-provider-key', 'setup-download', 'docker-cleanup-plan', 'clean-docker', 'library', 'prebuilts', 'install-prebuilt', 'prebuilt-update-status', 'review-prebuilt-update', 'apply-prebuilt-update', 'choose-folder', 'choose-read-directory', 'access', 'process-scripts', 'save-access', 'save-runtime', 'create', 'apis', 'save-apis', 'blueprint-agent', 'run-api-collection', 'app', 'save-app', 'app-mcp-request', 'start', 'stop', 'install-browser', 'preview', 'input', 'reload', 'close-preview', 'reveal', 'git-status', 'git-initialize', 'git-history', 'git-file-diff', 'git-stage', 'git-stage-all', 'git-unstage', 'git-discard', 'git-commit', 'git-push', 'agent-start', 'agent-submit', 'agent-runtime', 'agent-planner', 'agent-worker', 'agent-reconfigure', 'agent-backoff', 'agent-stop'];
+  const artifactChannels = ['capabilities', 'install-capabilities', 'setup-progress', 'vault', 'save-provider-key', 'setup-download', 'docker-cleanup-plan', 'clean-docker', 'library', 'prebuilts', 'install-prebuilt', 'prebuilt-update-status', 'review-prebuilt-update', 'apply-prebuilt-update', 'choose-folder', 'choose-read-directory', 'access', 'process-scripts', 'save-access', 'save-runtime', 'create', 'apis', 'save-apis', 'blueprint-agent', 'run-api-collection', 'app', 'save-app', 'app-mcp-request', 'start', 'stop', 'install-browser', 'preview', 'input', 'reload', 'close-preview', 'reveal', 'issues', 'issue-action', 'git-status', 'git-initialize', 'git-history', 'git-file-diff', 'git-stage', 'git-stage-all', 'git-unstage', 'git-discard', 'git-commit', 'git-push', 'agent-start', 'agent-submit', 'agent-runtime', 'agent-planner', 'agent-worker', 'agent-reconfigure', 'agent-backoff', 'agent-stop'];
   const mcpScope = async (value: unknown): Promise<McpScope> => {
     const id = artifactId.optional().parse(value);
     return id ? { root: (await services.artifacts.library.find(id)).root, profile: `artifact:${id}` }
@@ -156,6 +159,12 @@ export function registerIpc(window: BrowserWindow, services: Services): void {
   handle('artifacts:reload', (_event, id: unknown) => services.artifacts.preview.reload(artifactId.parse(id)));
   handle('artifacts:close-preview', (_event, id: unknown) => services.artifacts.preview.close(artifactId.parse(id)));
   handle('artifacts:reveal', async (_event, id: unknown) => { const artifact = await services.artifacts.library.find(artifactId.parse(id)); const error = await shell.openPath(artifact.root); if (error) throw new Error(error); });
+  const issueAction = z.enum(WORKSPACE_ISSUE_ACTIONS);
+  const issueExtras = z.record(z.string(), z.unknown());
+  handle('artifacts:issues', (_event, id: unknown) => services.artifacts.issues(artifactId.parse(id)));
+  handle('artifacts:issue-action', (_event, id: unknown, action: unknown, extras: unknown = {}) => services.artifacts.issueAction(
+    artifactId.parse(id), issueAction.parse(action), issueExtras.parse(extras),
+  ));
   handle('artifacts:git-status', (_event, id: unknown) => services.artifacts.git.status(artifactId.parse(id)));
   handle('artifacts:git-initialize', (_event, id: unknown) => services.artifacts.git.initialize(artifactId.parse(id)));
   handle('artifacts:git-history', (_event, id: unknown, limit: unknown = 75) => services.artifacts.git.history(artifactId.parse(id), z.number().int().min(1).max(200).parse(limit)));
@@ -266,8 +275,8 @@ export function registerIpc(window: BrowserWindow, services: Services): void {
   handle('workspace:issues', (_event, root: unknown) => services.workspace.issues(z.string().min(1).max(4096).parse(root)));
   handle('workspace:issue-action', (_event, root: unknown, action: unknown, extras: unknown = {}) => services.workspace.issueAction(
     z.string().min(1).max(4096).parse(root),
-    z.enum(['create_issue', 'close_issue', 'reopen_issue']).parse(action),
-    z.record(z.string(), z.unknown()).parse(extras),
+    issueAction.parse(action),
+    issueExtras.parse(extras),
   ));
   handle('workspace:repo-facts', (_event, root: unknown) => services.workspace.repoFacts(z.string().min(1).max(4096).parse(root)));
   handle('workspace:write', (_event, path: unknown, content: unknown) => (
@@ -353,6 +362,15 @@ export function registerIpc(window: BrowserWindow, services: Services): void {
     z.string().max(80).parse(provider),
     z.string().max(200).parse(model),
   ));
+  handle('agent:reasoning-preferences', async (_event, selection: unknown, id: unknown) => {
+    const { root } = await mcpScope(id);
+    return readReasoningPreferences(root, reasoningModelSchema.parse(selection));
+  });
+  handle('agent:save-reasoning-preference', async (_event, selection: unknown, phase: unknown, effort: unknown, expectedRoot: unknown, id: unknown) => {
+    const { root } = await mcpScope(id);
+    if (!sameWorkspacePath(root, relativePath.parse(expectedRoot))) throw new Error('The repository changed while editing reasoning settings.');
+    return saveReasoningPreference(root, reasoningModelSchema.parse(selection), reasoningPhaseSchema.parse(phase), reasoningEffortSchema.nullable().parse(effort));
+  });
   handle('agent:codex-subscription-status', () => services.agent.codexSubscriptionStatus());
   handle('agent:codex-subscription-login', () => services.agent.codexSubscriptionLogin());
   handle('agent:choose-codex-cli', async () => {

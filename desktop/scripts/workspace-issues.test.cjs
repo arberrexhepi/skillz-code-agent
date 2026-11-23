@@ -75,6 +75,22 @@ test('native issue mutations create, close, and reopen durable issues without an
   await mutateWorkspaceIssue(root,'reopen_issue',{issue_id:'issue-042'});snapshot=await readWorkspaceIssues(root);assert.equal(snapshot.issues.find(issue=>issue.id==='issue-042').status,'open');assert.equal(snapshot.activeIssueId,'issue-042');assert.equal(snapshot.issues.find(issue=>issue.id==='issue-042').reopenCount,1);
   const empty=fixture(t);await mutateWorkspaceIssue(empty,'create_issue',{summary:'First issue'});const first=await readWorkspaceIssues(empty);assert.equal(first.status,'ready');assert.equal(first.issues[0].id,'issue-001');assert.equal(first.activeIssueId,'');
 });
+test('offline issue changes preserve other drafts with fenced code and discard a closed issue draft', async t => {
+  const root = fixture(t);
+  const source = path.join(root, 'repo_facts.md');
+  const data = JSON.parse(/```json\s*([\s\S]*?)\s*```/.exec(repoFactsMarkdown)[1]);
+  const issue = data.issues.find(item => item.issue_id === 'issue-042');
+  const other = data.issues.find(item => item.issue_id === 'issue-039');
+  const draft = { plan: { original_request: 'Use this fixture\n```json\n{}\n```' } };
+  issue.pending_approval = other.pending_approval = draft;
+  fs.writeFileSync(source, '# Repo Facts\n\n```json\n' + JSON.stringify(data, null, 2) + '\n```\n');
+  assert.equal((await readWorkspaceIssues(root)).status, 'ready');
+  await mutateWorkspaceIssue(root, 'close_issue', { issue_id: issue.issue_id });
+  await mutateWorkspaceIssue(root, 'reopen_issue', { issue_id: issue.issue_id });
+  const saved = JSON.parse(fs.readFileSync(source, 'utf8').split('\n').slice(3, -2).join('\n'));
+  assert.equal(saved.issues.find(item => item.issue_id === issue.issue_id).pending_approval, undefined);
+  assert.deepEqual(saved.issues.find(item => item.issue_id === other.issue_id).pending_approval, draft);
+});
 test('issue cards keep lifecycle actions outside disclosure; facts display no issue workflow/history',()=>{
   const issue=issuesSnapshot('alpha').issues[0];
   const html=renderToStaticMarkup(React.createElement(ManagedIssueCard,{issue,active:true,expanded:false,busy:false,pending:false,onToggle(){},onAction(){}}));
@@ -101,4 +117,43 @@ test('issues IPC checks the sender and root; service rejects a read completed af
   const originalRead=fs.promises.readFile;let began,release;const entered=new Promise(r=>began=r);
   t.mock.method(fs.promises,'readFile',async(...args)=>{began();await new Promise(r=>release=r);return originalRead(...args);});
   const pending=assert.rejects(service.issues(root),/Workspace changed/);await entered;current=root+'-next';release();await pending;
+});
+
+test('artifact issues IPC resolves the artifact id and shares the same serialized ledger updates', async t => {
+  const handlers = new Map();
+  const ipcPath = require.resolve('../src/main/ipc.ts');
+  delete require.cache[ipcPath];
+  const original = Module._load;
+  t.mock.method(Module, '_load', function (request, ...rest) {
+    if (request === 'electron') return { ipcMain: { removeHandler(){}, removeAllListeners(){}, on(){}, handle: (name, listener) => handlers.set(name, listener) } };
+    return original.call(this, request, ...rest);
+  });
+  const { registerIpc, ArtifactsService, WorkspaceService } = load(() => ({
+    ...require('../src/main/ipc.ts'), ...require('../src/main/services/artifacts.ts'), ...require('../src/main/services/workspace.ts'),
+  }));
+  const artifactRoot = fixture(t);
+  const sourceRoot = fixture(t);
+  fs.writeFileSync(path.join(artifactRoot, 'repo_facts.md'), repoFactsMarkdown);
+  const artifacts = Object.create(ArtifactsService.prototype);
+  const events = [];
+  artifacts.emit = event => events.push(event);
+  artifacts.library = { find: async id => {
+    if (id !== 'alpha') throw new Error('Artifact is not in the configured library.');
+    return { root: artifactRoot };
+  } };
+  const workspace = new WorkspaceService(() => {});
+  workspace.requireRoot = () => sourceRoot;
+  registerIpc({ webContents: { id: 42 } }, { workspace, artifacts });
+  const read = handlers.get('artifacts:issues');
+  const change = handlers.get('artifacts:issue-action');
+  const sender = { sender: { id: 42 } };
+  assert.throws(() => read({ sender: { id: 99 } }, 'alpha'), /Untrusted/);
+  assert.throws(() => read(sender, artifactRoot));
+  await assert.rejects(read(sender, 'other'), /not in the configured library/);
+  assert.equal((await read(sender, 'alpha')).workspaceRoot, artifactRoot);
+  await Promise.all(['One issue', 'Another issue'].map(summary => change(sender, 'alpha', 'create_issue', { summary })));
+  const result = await read(sender, 'alpha');
+  assert.deepEqual(result.issues.slice(-2).map(issue => issue.request), ['One issue', 'Another issue']);
+  assert.equal((await workspace.issues(sourceRoot)).issues.length, 0);
+  assert.deepEqual(events, [{ type: 'issues', id: 'alpha' }, { type: 'issues', id: 'alpha' }]);
 });

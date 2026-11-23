@@ -99,21 +99,49 @@ def main() -> int:
             return self.complete_messages(system, [{"role": "user", "content": prompt}])
 
         def complete_messages(self, system, messages):
+            return self._complete_via_host(system, messages)
+
+        def complete_messages_with_progress(self, system, messages, on_summary, *, on_output=None):
+            return self._complete_via_host(system, messages, on_summary=on_summary, on_output=on_output)
+
+        def _complete_via_host(self, system, messages, *, on_summary=None, on_output=None):
             request_id = str(uuid.uuid4())
             response_queue: queue.Queue[dict] = queue.Queue()
             with lock:
                 pending[request_id] = response_queue
             try:
-                payload = {"type": "artifact_model_request", "id": request_id, **self.selection, "system": system, "messages": list(messages), "prompt_cache_key": getattr(self, "prompt_cache_key", "")}
+                payload = {"type": "artifact_model_request", "id": request_id, **self.selection,
+                           "thinking_mode": self.thinking_mode, "system": system, "messages": list(messages),
+                           "prompt_cache_key": getattr(self, "prompt_cache_key", "")}
+                if on_summary is not None:
+                    payload["reasoning_summary"] = True
+                if on_output is not None and on_output.preview_strategy:
+                    payload["preview_strategy"] = True
+                if on_output is not None and on_output.require_command_frame:
+                    payload["require_command_frame"] = True
+                if on_output is not None and on_output.preserve_request_context:
+                    payload["preserve_request_context"] = True
                 print(json.dumps(payload, ensure_ascii=False), flush=True)
                 while True:
                     response = response_queue.get(timeout=1200)
                     if "progress" not in response:
                         break
-                    if self.progress_callback:
-                        self.progress_callback(response["progress"])
+                    progress = response["progress"]
+                    if progress.get("type") == "reasoning_summary":
+                        if on_summary is not None:
+                            on_summary(progress["delta"])
+                    elif progress.get("type") == "output_progress":
+                        if on_output is not None:
+                            on_output.report(progress["output_chars"], progress.get("draft_strategy", []))
+                    elif self.progress_callback:
+                        self.progress_callback(progress)
                 if response.get("error"):
-                    raise RuntimeError(response["error"])
+                    error = RuntimeError(response["error"])
+                    for name, value in (response.get("error_details") or {}).items():
+                        if name in {"status_code", "request_id", "retry_attempts", "retry_request_ids", "retry_delays_s",
+                                    "rate_limit_headers", "retry_after", "fresh_context_retry"}:
+                            setattr(error, name, value)
+                    raise error
                 self._set_last_metrics(response.get("metrics", {}))
                 return str(response.get("text", ""))
             finally:

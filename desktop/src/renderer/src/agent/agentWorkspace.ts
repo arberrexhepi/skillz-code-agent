@@ -10,6 +10,7 @@ export interface RuntimeSelection extends AgentStartOptions {
 export interface AgentWorkspaceValue {
   state: AgentUiState;
   runtime: RuntimeSelection;
+  artifactId?: string;
   backoff?: AgentBackoff;
   setRuntime: (runtime: Partial<RuntimeSelection>) => void;
   start: () => Promise<boolean>;

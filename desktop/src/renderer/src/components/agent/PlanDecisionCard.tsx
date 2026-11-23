@@ -67,20 +67,19 @@ export function PlanDecisionCard(): React.JSX.Element {
         // A late response must not dismiss a subsequently reopened review.
         if (reviewVersion.current === actionReviewVersion) { close(); setFeedback(''); }
       }
-      else setError('The request failed. Your feedback is saved here; check the agent notice and retry.');
+      else setError(action === 'revise_plan' ? 'The request failed. Your feedback is saved here. Check the agent notice and retry.' : 'The request failed. Check the agent notice and retry.');
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : 'The request failed. Your feedback is saved here.');
+      setError(cause instanceof Error ? cause.message : 'The request failed. Check the agent notice and retry.');
     } finally {
       submitting.current = false;
       setSending(false);
     }
   };
-  const approveAction = planner.execution_paused ? 'continue_issue' : 'approve_plan';
-  const approveLabel = planner.execution_paused ? `Resume${planner.resume_checkpoint?.next_goal_index ? ` at goal ${planner.resume_checkpoint.next_goal_index}` : ''}` : 'Approve plan';
+  const resumeLabel = `Resume${planner.resume_checkpoint?.next_goal_index ? ` at goal ${planner.resume_checkpoint.next_goal_index}` : ''}`;
   const actions = (target: PlannerPlan): React.JSX.Element => <div className="decision-buttons plan-review-actions">
     <button type="button" className="plan-reject" disabled={busy || changed} onClick={() => void act('reject_plan', target)}>Reject</button>
     <button type="button" disabled={busy || changed} onClick={() => setEditing(true)}>Suggest plan changes</button>
-    <button type="button" className="primary-button" disabled={busy || changed} onClick={() => void act(approveAction, target)}>{approveLabel}</button>
+    {!planner.execution_paused && <button type="button" className="primary-button" disabled={busy || changed} onClick={() => void act('approve_plan', target)}>Approve plan</button>}
   </div>;
 
   return <>
@@ -88,7 +87,11 @@ export function PlanDecisionCard(): React.JSX.Element {
       <header><span>DECISION</span><strong>{title}</strong><small>{plan.goals?.length || 0} goals</small></header>
       {plan.summary && <p className="plan-preview-summary"><PathText>{plan.summary}</PathText></p>}
       <PlanPauseReason planner={planner} />
-      <div className="decision-buttons"><button type="button" className="primary-button" onClick={() => openReview()}>Review full plan ↗</button><button type="button" disabled={busy} onClick={() => openReview(true)}>Suggest plan changes</button></div>
+      <div className="decision-buttons">
+        {planner.execution_paused && <button type="button" className="primary-button" disabled={busy || Boolean(plan.dependency_errors?.length)} onClick={() => void act('resume_execution', plan)}>{resumeLabel}</button>}
+        <button type="button" className={planner.execution_paused ? undefined : 'primary-button'} onClick={() => openReview()}>Review full plan ↗</button>
+        {!planner.execution_paused && <button type="button" disabled={busy} onClick={() => openReview(true)}>Suggest plan changes</button>}
+      </div>
       {!review && error && <p role="alert" className="plan-error"><PathText>{error}</PathText></p>}
     </section>}
     <dialog onClickCapture={(event) => { if ((event.target as Element).closest('.path-chip[data-file-reference]')) close(); }} ref={dialog} className="plan-review-dialog" aria-labelledby={labelId}
@@ -98,7 +101,7 @@ export function PlanDecisionCard(): React.JSX.Element {
       }}>
       {review && <div className="plan-review-layout">
         <header>
-          <div><h2 id={labelId} ref={heading} tabIndex={-1}>Plan review</h2><div className="plan-review-subtitle"><span>{review.goals?.length || 0} goals</span>Review before execution</div></div>
+          <div><h2 id={labelId} ref={heading} tabIndex={-1}>Plan review</h2><div className="plan-review-subtitle"><span>{review.goals?.length || 0} goals</span>{planner.execution_paused ? 'Execution paused' : 'Review before execution'}</div></div>
           <button type="button" onClick={close} aria-label="Close plan review"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true"><path d="m4 4 8 8M12 4l-8 8" /></svg></button>
         </header>
         <div className="plan-review-body" tabIndex={0} role="region" aria-label="Full plan details"><PlanDetails plan={review} /></div>

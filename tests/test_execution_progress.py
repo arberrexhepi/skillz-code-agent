@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 import unittest
@@ -39,14 +40,32 @@ class ExecutionProgressTests(unittest.TestCase):
         progress.focused_reads_used = 0
         self.assertFalse(progress.allow_focused_read('grep /repo "hit"', repository_observation('grep /repo "hit"', search), search))
 
-    def test_edits_reset_the_delivery_phase_but_passing_checks_do_not(self):
+    def test_fresh_check_grants_bounded_report_turn_without_refilling_reads(self):
         progress = ExecutionProgress(read_only_turns=READ_ONLY_RECOVERY_TURNS)
-        check = CommandResult(True, "exit_code=0", "mutation", tool_action={"type": "run_check", "kind": "build"})
+        progress.focused_reads_used = 2
+        check = CommandResult(True, "exit_code=0\nissues=0", "mutation", tool_action={"type": "run_check", "kind": "build"})
         progress.observe_turn(["run-check build"], [check])
         self.assertEqual(progress.read_only_turns, READ_ONLY_RECOVERY_TURNS + 1)
+        self.assertEqual(progress.verification_report_turns, 1)
+        self.assertEqual(progress.focused_reads_used, 2)
+        self.assertIn("VERIFICATION PROGRESS", progress.guidance())
+        progress.observe_turn(["run-check build"], [check])
+        self.assertEqual(progress.verification_report_turns, 1)
         progress.observe_turn(["patch App.tsx"], [CommandResult(False, "anchor mismatch", "mutation")], edit_attempted=True)
         self.assertEqual(progress.read_only_turns, 0)
         self.assertFalse(progress.recovering)
+
+    def test_mixed_goal_can_report_smoke_pass_at_the_old_stall_boundary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            expected = READ_ONLY_RECOVERY_TURNS + RECOVERY_TURN_ALLOWANCE
+            model = FakeModelClient(["stat /repo"] * (expected - 1) + ["shell printf SMOKE_OK", "finish Smoke check passed"])
+            with patch.dict(os.environ, {"SKILLZ_OBSERVABILITY_PATH": str(root / "trace.md"), "SHELL_ACCESS": "true"}):
+                worker = TreeLoopPlannerWorker(model=model, root=root, max_turns=expected + 1, verbose=False)
+                worker.set_goal_scope("mixed")
+                result = worker.run_task("Verify the backend integration")
+            self.assertTrue(result.ok, result.final_message)
+            self.assertIn("shell smoke test passed (SMOKE_OK)", model.calls[-1]["prompt"])
 
     def test_live_worker_bounds_the_motion_studio_read_eviction_cycle(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -59,22 +78,67 @@ class ExecutionProgressTests(unittest.TestCase):
                 + f"read-line-range /repo/src/App.tsx {start}-{end}"
                 for start, end in (ranges * 8)
             ]
-            model = FakeModelClient(responses)
+            expected = READ_ONLY_RECOVERY_TURNS + RECOVERY_TURN_ALLOWANCE
+            model = FakeModelClient(responses[:expected] + ["finish abstain"])
             with patch.dict(os.environ, {"SKILLZ_OBSERVABILITY_PATH": str(root / "trace.md")}):
                 worker = TreeLoopPlannerWorker(model=model, root=root, max_turns=48, checkpoint_interval=0, verbose=False)
                 worker.loop._conversation_char_budget = 70000  # Force the same working-set churn.
                 result = worker.run_task("Repair the Creative Dock in the bounded target")
-            expected = READ_ONLY_RECOVERY_TURNS + RECOVERY_TURN_ALLOWANCE
-            self.assertEqual(len(model.calls), expected)
+            self.assertEqual(len(model.calls), expected + 1)
             self.assertFalse(result.ok)
             self.assertFalse(worker._has_mutation)
-            self.assertIn("execution delivery stalled", result.final_message)
-            self.assertIn(f"{expected} execution turns", result.final_message)
+            self.assertEqual(result.final_message, f"stopped: {worker._execution_delivery.stop_reason()}")
             self.assertGreater(worker._execution_delivery.context_replacements, 0)
             self.assertIn("EXECUTION DELIVERY CHECKPOINT", model.calls[4]["prompt"])
             self.assertIn("EXECUTION DELIVERY RECOVERY", model.calls[8]["prompt"])
             self.assertIn("Host-retained context manifest", model.calls[8]["prompt"])
+            self.assertIn("FINAL DELIVERY ATTEMPT", model.calls[expected]["system"])
+            self.assertIn("Host-retained context manifest", model.calls[expected]["prompt"])
+            self.assertIn("finish abstain", model.calls[expected]["system"])
             self.assertIn('"execution_delivery"', (root / "trace.md").read_text())
+
+    def test_final_delivery_can_apply_a_grounded_batch_and_resume_validation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            note = root / "note.txt"
+            note.write_text("original\nsecond\n")
+            expected = READ_ONLY_RECOVERY_TURNS + RECOVERY_TURN_ALLOWANCE
+            operations = [
+                {"type": "replace_snippet", "path": "note.txt", "old_text": "original", "new_text": "updated"},
+                {"type": "replace_snippet", "path": "note.txt", "old_text": "second", "new_text": "verified"},
+            ]
+            strategy = ">>pl: Update both lines using their exact text.\ns1: edit-batch " + json.dumps({"operations": operations})
+            model = FakeModelClient(["cat /repo/note.txt"] + ["stat /repo/note.txt"] * (expected - 1) + [
+                strategy, "cat /repo/note.txt\nfinish Updated both lines",
+            ])
+            with patch.dict(os.environ, {"SKILLZ_OBSERVABILITY_PATH": str(root / "trace.md")}):
+                worker = TreeLoopPlannerWorker(model=model, root=root, max_turns=expected + 2, verbose=False)
+                worker.set_goal_scope("write")
+                progress = []
+                worker.on_step_callback = progress.append
+                result = worker.run_task("Update both lines in note.txt")
+            self.assertTrue(result.ok, result.final_message)
+            self.assertTrue(result.validation.passed)
+            self.assertEqual(note.read_text(), "updated\nverified\n")
+            self.assertIn("1 | original\n 2 | second", model.calls[expected]["prompt"])
+            self.assertEqual(worker.history[expected].plan, "Update both lines using their exact text.")
+            self.assertTrue(any(event.get("phase") == "Preparing final edit strategy" for event in progress))
+
+    def test_final_delivery_cannot_dispatch_reads_or_claim_completion(self):
+        expected = READ_ONLY_RECOVERY_TURNS + RECOVERY_TURN_ALLOWANCE
+        for response in ("s1: write note.txt updated\ns1 -> s2: cat /repo/note.txt", "finish done"):
+            with self.subTest(response=response), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                note = root / "note.txt"
+                note.write_text("original\n")
+                model = FakeModelClient(["stat /repo/note.txt"] * expected + [response])
+                with patch.dict(os.environ, {"SKILLZ_OBSERVABILITY_PATH": str(root / "trace.md")}):
+                    worker = TreeLoopPlannerWorker(model=model, root=root, max_turns=expected, verbose=False)
+                    result = worker.run_task("Update the note")
+                self.assertEqual(len(model.calls), expected + 1)
+                self.assertFalse(result.ok)
+                self.assertIn("Final delivery attempt rejected", result.final_message)
+                self.assertEqual(note.read_text(), "original\n")
 
     def test_read_only_answer_and_a_grounded_edit_remain_possible_in_recovery(self):
         for final in ("finish Inspection findings are ready", "replace-lines note.txt:1-1 updated\nfinish Updated"):

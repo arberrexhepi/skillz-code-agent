@@ -13,6 +13,7 @@ from typing import Sequence
 from execution_evidence import RepositoryObservation, external_execution_identity, repository_observation
 from tree_commands import CommandResult
 from issue_proposals import diagnostic_fingerprint
+from validation_evidence import verification_pass
 
 READ_ONLY_WARNING_TURNS = 4
 READ_ONLY_RECOVERY_TURNS = 8
@@ -20,6 +21,7 @@ RECOVERY_TURN_ALLOWANCE = 3
 RECOVERY_READ_ALLOWANCE = 2
 RECOVERY_READ_LINES = 120
 RECOVERY_READ_CHARS = 6000
+MAX_VERIFICATION_REPORT_TURNS = 3
 
 
 @dataclass
@@ -44,6 +46,9 @@ class ExecutionProgress:
     diagnostic_repair: DiagnosticRepair | None = None
     diagnostic_fingerprints: set[str] = field(default_factory=set)
     external_executions: set[str] = field(default_factory=set)
+    verification_passes: dict[str, str] = field(default_factory=dict)
+    verification_report_turns: int = 0
+    fresh_verification_pass: bool = False
 
     @property
     def recovering(self) -> bool:
@@ -54,7 +59,7 @@ class ExecutionProgress:
         deadline = READ_ONLY_RECOVERY_TURNS + RECOVERY_TURN_ALLOWANCE
         if self.diagnostic_repair is not None:
             deadline = max(deadline, self.diagnostic_repair.deadline)
-        return self.read_only_turns >= deadline
+        return self.read_only_turns >= deadline + self.verification_report_turns
 
     def focus_diagnostic(self, issue: dict) -> bool:
         """A new concrete check failure earns one bounded repair window, not more reconnaissance."""
@@ -76,14 +81,28 @@ class ExecutionProgress:
                       and (identity := external_execution_identity(result.tool_action or {})) is not None}
         novel_execution = allow_external_progress and bool(executions - self.external_executions)
         self.external_executions.update(executions)
+        self.fresh_verification_pass = False
+        if edit_attempted:
+            self.verification_passes.clear()
         if edit_attempted or novel_execution:
             self.read_only_turns = self.repository_reads = self.read_chars = self.context_replacements = self.focused_reads_used = 0
             self.source_lines.clear()
             self.targets.clear()
             self.diagnostic_repair = None
             self.diagnostic_fingerprints.clear()
+            self.verification_report_turns = 0
+        else:
+            self.read_only_turns += 1
+        if edit_attempted:
+            return  # Results from this turn may include checks run before the source changed.
+        for result in results:
+            if (passed := verification_pass(result)) is not None and passed[0] not in self.verification_passes:
+                self.verification_passes[passed[0]] = passed[1]
+                self.fresh_verification_pass = True
+        if self.fresh_verification_pass and self.recovering and self.verification_report_turns < MAX_VERIFICATION_REPORT_TURNS:
+            self.verification_report_turns += 1
+        if novel_execution:
             return
-        self.read_only_turns += 1
         for command, result in zip(commands, results):
             observation = repository_observation(command, result)
             if observation is None:
@@ -126,6 +145,8 @@ class ExecutionProgress:
             "source_lines_returned": {path: len(lines) for path, lines in self.source_lines.items()},
             "context_replacements": self.context_replacements,
             "external_executions": len(self.external_executions),
+            "verification_passes": list(self.verification_passes.values())[-6:],
+            "verification_report_turns": self.verification_report_turns,
             "focused_reads_remaining": max(0, RECOVERY_READ_ALLOWANCE - self.focused_reads_used),
             "recovery": self.recovering,
             "recent_targets": list(self.targets),
@@ -140,13 +161,21 @@ class ExecutionProgress:
         if self.read_only_turns < READ_ONLY_WARNING_TURNS:
             return ""
         status = "EXECUTION DELIVERY RECOVERY" if self.recovering else "EXECUTION DELIVERY CHECKPOINT"
+        if self.fresh_verification_pass and self.recovering:
+            evidence = "; ".join(list(self.verification_passes.values())[-6:])
+            return (
+                f"VERIFICATION PROGRESS: {evidence}. Use these recorded results to finish if the goal is satisfied. "
+                "Otherwise address the specific remaining requirement or report its blocker. "
+                "The additional reporting allowance does not renew repository reads. Do not rerun passed checks to extend it."
+            )
         repair = self.diagnostic_repair
         if repair is not None and self.read_only_turns < repair.deadline:
             return (
                 f"DIAGNOSTIC REPAIR: the failed check identified {repair.path}:{repair.line}. "
                 f"{repair.deadline - self.read_only_turns} repair turns and {max(0, RECOVERY_READ_ALLOWANCE - repair.reads_used)} "
                 f"focused reads remain (at most {RECOVERY_READ_LINES} lines / {RECOVERY_READ_CHARS} characters each). "
-                "Use the retained diagnostic source to make the targeted fix; if exact context is missing, read the small suggested window or declaration. "
+                "Use the retained diagnostic source to repair the failure. Batch related edits with `edit-batch` or `batch start` and `batch end`. "
+                "If exact context is missing, read the small suggested window or use `find-regex` with a tight match limit and context. "
                 "A whole-file reread is unnecessary. Rerunning the same failed check does not renew this repair window. "
                 "After the fix, rerun the failed check. If repair is unavailable, report the specific blocker."
             )
