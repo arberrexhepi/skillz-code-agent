@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "chatbot": { "enabled": false },
+  "chatbot": { "enabled": false, "includeShell": true, "shellLayout": "floating" },
   "database": {
     "enabled": false,
     "dialect": "sqlite",

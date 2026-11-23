@@ -38,6 +38,45 @@ workspace. Repository profiles are tied to the repository path. Artifacts
 have their own profiles and connect through the desktop host. Their server
 configuration and OAuth tokens stay on the host.
 
+## Artifact app runtime
+
+Under **App capabilities**, enable **Artifact MCP**, add the app's MCP
+connections, save, and start or restart the preview. Each app runs its own
+MCP backend and uses the servers configured in `.artifact/app.json`.
+Workbench’s separate **MCP** tab configures the development agent.
+
+Choose **Executable** for a program available inside the artifact, such
+as a Node dependency installed by its `package.json` or a script in the
+artifact repository. **Streamable HTTP** accepts an HTTPS service or HTTP
+loopback inside the container. Use a named environment variable for
+bearer credentials. Workbench passes only the configured names from the
+host environment to the preview.
+
+Use **Run MCP tools and read resources** in App capabilities or the app’s
+`artifactMcp()` function in `src/mcp.ts`. MCP clients can connect to
+`<preview-url>/_skillz/mcp` and use the `mcp_request` tool or the
+`artifact-mcp://` resources. For a resource template, percent-encode the
+upstream resource URI as one path segment.
+
+To use a server from the installed **Skillz chatbot**, enable chatbot access
+for that server and restart the preview. Tools without a read-only MCP
+annotation require explicit approval. The artifact’s chatbot keeps the
+usual `approveMutations` option.
+
+### Create an artifact-local server
+
+Select **Create MCP server**, enter a server ID, and save capabilities. This
+installs `mcp/<server-id>/server.py` with a read-only note tool and an
+approval-gated write tool. Edit the file to provide app-specific tools. The
+preview supplies Python and the MCP SDK. Saving again preserves your edits.
+For an app-owned HTTP data route, the tool process can use
+`SKILLZ_ARTIFACT_TOOL_ORIGIN` to reach the app inside the container.
+
+The artifact agent loads [artifact-mcp-authoring](../skills/artifact-mcp-authoring.md)
+and can test the manual runner and chatbot through `artifact-preview mcp` and
+`artifact-preview chat`. Both verification actions keep mutation approval
+off. Use the manual runner's approval control to exercise a write explicitly.
+
 ## CLI
 
 Install the optional Python dependency into the Skillz interpreter.

@@ -1,2 +1,2 @@
-# Optional host dependency for Skillz MCP connections.
+# Optional dependency for the Workbench MCP host and the artifact app MCP backend.
 mcp==1.27.1

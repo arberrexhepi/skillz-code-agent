@@ -23,6 +23,7 @@ import { sqliteCapability } from './artifactDependencies';
 import { createArtifactRunBridge } from './artifactRunRuntime';
 import type { ArtifactRuntimeBridge } from './artifactRuntimeBridge';
 import type { McpHost } from './mcp';
+import { artifactMcpSourcePath, artifactPreviewActionSchema, type ArtifactAppMcpRequest } from '../../shared/artifactAppMcp';
 
 interface Running { state: ArtifactRuntime; child?: ChildProcess; sandbox?: ArtifactSandbox; processProxy?: ArtifactProcessProxy; modelBroker?: ArtifactModelBroker; runtimeBridge?: ArtifactRuntimeBridge; start?: Promise<ArtifactRuntime>; cancelled: boolean }
 export class ArtifactsService {
@@ -98,6 +99,7 @@ export class ArtifactsService {
   }
   async start(id: string): Promise<ArtifactRuntime> {
     if (this.updatingPrebuilts.has(id)) throw new Error('This prebuilt is being updated. Retry when the update finishes.');
+    if (this.changingApp.has(id)) throw new Error('App capabilities are being saved. Retry when they finish.');
     if (this.changingRuntime.has(id)) throw new Error('Artifact runtime settings are being saved. Retry when saving finishes.');
     if (this.dependencyRepairs.has(id)) throw new Error('Artifact dependencies are being repaired. Retry when repair finishes.');
     if (this.changingAccess.has(id)) throw new Error('File permissions are changing. Retry when saving finishes.');
@@ -132,13 +134,18 @@ export class ArtifactsService {
     const log = (text: string) => this.update(runtime, { logs: (runtime.state.logs + text).slice(-30000) });
     check();
     this.update(runtime, { status: 'installing' });
-    const prepared = await sandbox.prepare(log);
+    const prepared = await sandbox.prepare(log, undefined, app.mcp.enabled);
     check();
     const port = await new Promise<number>((resolve, reject) => { const server = createServer(); server.once('error', reject); server.listen(0, '127.0.0.1', () => { const port = (server.address() as { port: number }).port; server.close(() => resolve(port)); }); });
     const variables = new Set((await this.library.apis(id)).apis.flatMap(api => Object.values(api.headerEnv).map(setting => typeof setting === 'string' ? setting : setting.env)));
     if (app.database.enabled && app.database.dialect !== 'sqlite') variables.add(app.database.connectionEnv);
+    if (app.mcp.enabled) for (const mcp of app.mcp.servers) {
+      if (!mcp.enabled) continue;
+      if (mcp.transport === 'stdio') mcp.env.forEach(variable => variables.add(variable));
+      else if (mcp.bearerEnv) variables.add(mcp.bearerEnv);
+    }
     const secretEnv = [...variables].filter((name) => process.env[name] !== undefined).flatMap((name) => ['--env', name]);
-    const runtimeEnv: string[] = [];
+    const runtimeEnv = app.mcp.enabled ? ['--env', 'SKILLZ_ARTIFACT_MCP=1'] : [];
     if (artifact.access?.allowAgentRuntime) {
       if (!artifact.runtime) throw new Error('Choose a provider and model before enabling the recorded beta runtime.');
       const bridge = createArtifactRunBridge({
@@ -207,9 +214,55 @@ export class ArtifactsService {
   }
   async saveApp(id: string, config: import('../../shared/artifacts').ArtifactAppConfig) {
     if (this.updatingPrebuilts.has(id) || this.changingApp.has(id)) throw new Error('Wait for the current artifact update to finish.');
+    if (this.runtimes.get(id)?.start) throw new Error('Wait for the preview to finish starting before saving app capabilities.');
     this.changingApp.add(id);
     try { return await this.library.saveApp(id, config); }
     finally { this.changingApp.delete(id); }
+  }
+  async requestAppMcp(id: string, request: ArtifactAppMcpRequest): Promise<Record<string, unknown>> {
+    return this.postPreviewJson(id, '/_skillz/mcp/request', request);
+  }
+  private async postPreviewJson(id: string, endpoint: '/_skillz/mcp/request' | '/_skillz/agent/chat',
+    data: object): Promise<Record<string, unknown>> {
+    const runtime = this.runtimes.get(id)?.state;
+    if (runtime?.status !== 'running' || !runtime.url) throw new Error('Start this artifact preview before verifying its app.');
+    const body = JSON.stringify(data);
+    if (Buffer.byteLength(body) > 65_536) throw new Error('Preview request exceeds 64 KB.');
+    const response = await fetch(new URL(endpoint, runtime.url), {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body,
+      signal: AbortSignal.timeout(270_000), redirect: 'error',
+    });
+    const reader = response.body?.getReader();
+    if (!reader) throw new Error('Artifact preview returned an empty response.');
+    const chunks: Uint8Array[] = [];
+    let size = 0;
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        size += value.length;
+        if (size > 1_100_000) throw new Error('Artifact preview response exceeds 1 MB.');
+        chunks.push(value);
+      }
+    } finally { await reader.cancel(); }
+    let result: unknown;
+    try { result = JSON.parse(Buffer.concat(chunks).toString('utf8')); }
+    catch { throw new Error(`Artifact preview returned a non-JSON response from ${endpoint} (HTTP ${response.status}).`); }
+    if (!result || typeof result !== 'object' || Array.isArray(result)) throw new Error('Artifact preview returned an invalid response.');
+    return result as Record<string, unknown>;
+  }
+  private async runPreviewAction(id: string, input: unknown): Promise<Record<string, unknown>> {
+    const action = artifactPreviewActionSchema.parse(input);
+    if (action.operation === 'restart') {
+      if (this.changingApp.has(id) || this.updatingPrebuilts.has(id)) throw new Error('Wait for the artifact update before restarting its preview.');
+      await this.stop(id);
+      const preview = await this.start(id);
+      return { ok: preview.status === 'running', status: preview.status, url: preview.url };
+    }
+    if (action.operation === 'mcp') return this.requestAppMcp(id, { ...action.input, approveMutations: false });
+    const result = await this.postPreviewJson(id, '/_skillz/agent/chat', { ...action.input, approveMutations: false });
+    const { message, error, elicitation, mcpCalls } = result;
+    return { ok: typeof message === 'string' && !error, message, error, elicitation, mcpCalls };
   }
   async applyPrebuiltUpdate(id: string, request: import('../../shared/artifacts').PrebuiltUpdateRequest) {
     if (this.updatingPrebuilts.has(id) || this.changingApp.has(id) || this.changingRuntime.has(id) || this.changingAccess.has(id) || this.dependencyRepairs.has(id) || this.runtimes.get(id)?.start || this.agentStarts.has(id)) throw new Error('Wait for the current artifact operation to finish before updating this prebuilt.');
@@ -280,6 +333,7 @@ export class ArtifactsService {
           if (preview.status !== 'running' || !preview.url) throw new Error('Artifact preview has no published URL.');
           return preview.url;
         },
+        action => this.runPreviewAction(id, action),
       );
       const agent = new AgentService(workspace, (event) => this.emit({ type: 'agent', id, event }), this.settings, execution, this.mcp, `artifact:${id}`);
       this.agents.set(id, { workspace, agent }); return agent;
@@ -308,8 +362,20 @@ export class ArtifactsService {
       ' Playwright MCP is enabled for this artifact. Use Start Preview during development or verification to get the published host URL, then open that URL with the Playwright MCP browser tools.'
       + (preview?.status === 'running' && preview.url ? ` The current preview URL is ${preview.url}.` : '')
     ) : '';
+    const appMcp = app.mcp.enabled
+      ? ' Artifact MCP runs inside this artifact’s app server and has its own connections. Tools and resources can be run manually in App capabilities, via src/mcp.ts or POST /_skillz/mcp/request, or from a client connected to /_skillz/mcp. To let the installed Skillz chatbot use a server, enable its chatbot access in App capabilities and use src/skillz.ts to call the chatbot. Calls without a read-only tool annotation require explicit mutation approval. Restart the preview after changing MCP configuration.'
+      : '';
+    const appCapabilities = { ...app, mcp: {
+      enabled: app.mcp.enabled,
+      servers: app.mcp.servers.map(({ id, enabled, transport, chatbot, source }) => ({
+        id, enabled, transport, chatbot, ...(source === 'artifact' ? { source: artifactMcpSourcePath(id) } : {}),
+      })),
+    } };
+    const chatbotGuidance = ' For any goal to set up, style, repair, or verify the in-app Skillz chatbot, load the bundled artifact-chatbot skill directly before exploring the repo. Use skill artifact-chatbot in Beta TreeLoop or {"type":"skill","name":"artifact-chatbot"} in Stable.'
+      + (app.chatbot.enabled && app.chatbot.includeShell ? ` The selected ${app.chatbot.shellLayout} shell is in src/skillz-chat.` : '');
+    const mcpAuthoring = ' For goals to create or edit custom app MCP tools, load skill artifact-mcp-authoring in Beta TreeLoop or {"type":"skill","name":"artifact-mcp-authoring"} in Stable. Created servers live at mcp/<server-id>/server.py. Use the artifact Preview actions to verify the same manual runner and chatbot routes.';
     const grants = [...(artifact.access?.directories || []).map(({ id, label, access, allowProcessProxy, processProxyAllowlist }) => ({ path: `/reads/${id}`, label, access, allowProcessProxy: Boolean(allowProcessProxy), processProxyAllowlist })), ...(artifact.access?.allowWorkspaceRead ? [{ path: '/reads/workspace', label: 'Workbench repository, when open at session start', access: 'read', allowProcessProxy: Boolean(artifact.access.allowWorkspaceProcessProxy), processProxyAllowlist: artifact.access.workspaceProcessProxyAllowlist }] : [])];
-    const instruction = `You are working in an independent skillz artifact repository: /repo. Follow the user’s requested scope. For source changes, read AGENTS.md, artifact.json, .artifact/app.json, and .artifact/apis.json, preserve the Express/Vite dynamic-port runtime, and run npm run build after editing. For a browser or MCP execution task, perform the requested operation and report its observed result; source edits are only needed when requested.${browserPreview} App capabilities: ${JSON.stringify(app)}. API commands: ${JSON.stringify(apis.apis.map(api => ({ id: api.id, collection: api.collection, method: api.method, kind: api.commandKind || (api.method === 'GET' ? 'discovery' : 'mutation') })))}. Use configured /api/<id>, /ws/<id>, src/skillz.ts, and generated command routes where appropriate. Shared source context is read-only at /context. Additional folders are listed in SKILLZ_READ_ROOTS and mounted at /reads/<id>; use list_files and read_file there. Default file access is limited to /repo. Granted directories: ${JSON.stringify(grants)}. A grant marked write may be changed only when the user's request requires it; all other grants are read only. A grant with allowProcessProxy may launch only package scripts named in processProxyAllowlist through the desktop host; when no explicit list exists, conventional dev, start, serve, and preview scripts are the defaults. Prefer dev for source development and describe preview as a built-app preview. Process Proxy is separate from read/write permission and must be shown as unavailable when not granted. Read AGENTS.md for the /files API. Never edit the source repository or the parent library.\n\nUser request:\n${text}`;
+    const instruction = `You are working in an independent skillz artifact repository: /repo. Follow the user’s requested scope. For source changes, read AGENTS.md, artifact.json, .artifact/app.json, and .artifact/apis.json, preserve the Express/Vite dynamic-port runtime, and run npm run build after editing. For a browser or MCP execution task, perform the requested operation and report its observed result; source edits are only needed when requested.${browserPreview}${appMcp}${chatbotGuidance}${mcpAuthoring} App capabilities: ${JSON.stringify(appCapabilities)}. API commands: ${JSON.stringify(apis.apis.map(api => ({ id: api.id, collection: api.collection, method: api.method, kind: api.commandKind || (api.method === 'GET' ? 'discovery' : 'mutation') })))}. Use configured /api/<id>, /ws/<id>, src/skillz.ts, and generated command routes where appropriate. Shared source context is read-only at /context. Additional folders are listed in SKILLZ_READ_ROOTS and mounted at /reads/<id>; use list_files and read_file there. Default file access is limited to /repo. Granted directories: ${JSON.stringify(grants)}. A grant marked write may be changed only when the user's request requires it; all other grants are read only. A grant with allowProcessProxy may launch only package scripts named in processProxyAllowlist through the desktop host; when no explicit list exists, conventional dev, start, serve, and preview scripts are the defaults. Prefer dev for source development and describe preview as a built-app preview. Process Proxy is separate from read/write permission and must be shown as unavailable when not granted. Read AGENTS.md for the /files API. Never edit the source repository or the parent library.\n\nUser request:\n${text}`;
     return (await this.agent(id)).submit(instruction);
   }
   async processScripts(id: string): Promise<Record<string, string[]>> {

@@ -286,6 +286,22 @@ class TreeLoopPlannerWorkerTests(unittest.TestCase):
             self.assertTrue(any("mode: aggregate" in output for output in first_turn_outputs))
             self.assertTrue(any("project_problems" in output for output in first_turn_outputs))
 
+    def test_artifact_chatbot_skill_reaches_the_next_worker_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model = FakeModelClient(["skill artifact-chatbot", "finish Ready to mount the shell."])
+            worker = TreeLoopPlannerWorker(
+                model=model,
+                root=Path(tmpdir),
+                max_turns=2,
+                checkpoint_interval=0,
+                thinking_mode="low",
+                verbose=False,
+            )
+            result = worker.run_task("Load the Skillz chatbot setup guidance.")
+            self.assertTrue(result.ok)
+            self.assertIn("POST /_skillz/agent/chat", model.calls[1]["prompt"])
+            self.assertIn("skillzChat.registerTargets", model.calls[1]["prompt"])
+
     def test_playground_os_can_discover_and_invoke_bibbity_boop_skill(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

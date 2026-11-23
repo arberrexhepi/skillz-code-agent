@@ -4,6 +4,7 @@ import path from 'node:path';
 import { attachGateway } from './gateway';
 import { attachArtifactAgent } from './agent';
 import { closeDatabase } from './database';
+import { attachArtifactMcp } from './mcp';
 
 const root = process.cwd();
 const app = express();
@@ -11,6 +12,7 @@ const server = createServer(app);
 app.use(express.json({ limit: '1mb' }));
 const closeGateway = attachGateway(app, server, root);
 const closeAgent = attachArtifactAgent(app);
+const closeMcp = await attachArtifactMcp(app, root);
 let closeVite: (() => Promise<void>) | undefined;
 if (process.argv.includes('--production')) {
   app.use(express.static(path.join(root, 'dist')));
@@ -25,6 +27,6 @@ server.listen(Number(process.env.SKILLZ_ARTIFACT_PORT || 0), process.env.SKILLZ_
   const { port } = server.address() as { port: number };
   console.log('SKILLZ_ARTIFACT_READY ' + JSON.stringify({ url: `http://127.0.0.1:${port}` }));
 });
-async function stop() { closeAgent(); closeGateway(); await closeDatabase(); await closeVite?.(); server.closeAllConnections(); server.close(() => process.exit(0)); }
+async function stop() { closeAgent(); closeMcp(); closeGateway(); await closeDatabase(); await closeVite?.(); server.closeAllConnections(); server.close(() => process.exit(0)); }
 process.on('SIGTERM', () => void stop());
 process.on('SIGINT', () => void stop());

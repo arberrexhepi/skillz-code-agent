@@ -60,7 +60,7 @@ from skill_loader import load_markdown_skills_from_dir  # noqa: E402
 from tree_commands import CommandResult  # noqa: E402
 from bridge_presentation import bridge_exchange  # noqa: E402
 from tree_loop import TreeLoop, Turn  # noqa: E402
-from artifact_preview import start_artifact_preview  # noqa: E402
+from artifact_preview import run_artifact_preview  # noqa: E402
 from discovery.dispatch import DISCOVERY_ACTION_TYPES, execute_discovery_action  # noqa: E402
 from mcp_runtime import invoke_mcp, model_mcp_result  # noqa: E402
 from discovery_budget import DiscoveryBudget as TreeLoopDiscoveryBudget  # noqa: E402
@@ -2682,7 +2682,7 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
         if self.discovery_budget is not None and result.needs_tool:
             if action_type == "artifact_preview":
                 result.ok = False
-                return "Starting an artifact preview is available during goal execution."
+                return "Artifact preview actions are available during goal execution."
             if action_type == "mcp" and action.get("operation") == "call":
                 result.ok = False
                 return "MCP tool execution is available during goal execution. Use discovery to inspect inputs."
@@ -2754,7 +2754,7 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
             return ""
 
         if action_type == "artifact_preview":
-            payload = start_artifact_preview()
+            payload = run_artifact_preview(action)
             result.ok = payload["ok"]
             return json.dumps(payload, ensure_ascii=False)
         if action_type == "mcp":

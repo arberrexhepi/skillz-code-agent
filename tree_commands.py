@@ -355,10 +355,21 @@ class TreeCommandParser:
                              needs_tool=True, tool_action=action)
 
     def _cmd_artifact_preview(self, rest: str) -> CommandResult:
-        if rest.strip() not in {"", "start"}:
-            return CommandResult(False, "Usage: artifact-preview start", "error")
-        return CommandResult(True, "[dispatch: Start Preview]", "tool", needs_tool=True,
-                             tool_action={"type": "artifact_preview"})
+        parts = rest.split(None, 1)
+        operation = parts[0] if parts else "start"
+        argument = parts[1] if len(parts) > 1 else ""
+        action = {"type": "artifact_preview", "operation": operation}
+        if operation in {"mcp", "chat"}:
+            try:
+                payload = json.loads(argument)
+            except ValueError:
+                payload = None
+            if not isinstance(payload, dict):
+                return CommandResult(False, "Preview mcp and chat actions require a JSON object.", "error")
+            action["input"] = payload
+        elif operation not in {"start", "restart"} or argument:
+            return CommandResult(False, "Usage: artifact-preview start|restart|mcp <JSON>|chat <JSON>", "error")
+        return CommandResult(True, f"[dispatch: Preview {operation}]", "tool", needs_tool=True, tool_action=action)
 
     def _cmd_mcp(self, rest: str) -> CommandResult:
         from mcp_runtime import OPERATIONS

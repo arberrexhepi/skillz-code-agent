@@ -29,7 +29,10 @@ export type ArtifactApiConfig = z.infer<typeof artifactApiSchema>;
 export type ArtifactApis = z.infer<typeof artifactApisSchema>;
 export const artifactAppSchema = z.object({
   version: z.literal(1),
-  chatbot: z.object({ enabled: z.boolean().default(false) }).default({ enabled: false }),
+  chatbot: z.object({
+    enabled: z.boolean().default(false), includeShell: z.boolean().default(true),
+    shellLayout: z.enum(['floating', 'sidebar', 'workspace']).default('floating'),
+  }).default({ enabled: false, includeShell: true, shellLayout: 'floating' }),
   database: z.object({ enabled: z.boolean().default(false), dialect: z.enum(['sqlite', 'postgres', 'mysql', 'mariadb', 'mssql']).default('sqlite'), connectionEnv: z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/).default('DATABASE_URL'), storage: z.string().min(1).max(500).default('.artifact-data/data.sqlite') }).default({ enabled: false, dialect: 'sqlite', connectionEnv: 'DATABASE_URL', storage: '.artifact-data/data.sqlite' }),
 });
 export type ArtifactAppConfig = z.infer<typeof artifactAppSchema>;

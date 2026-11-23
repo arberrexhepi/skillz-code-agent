@@ -78,7 +78,7 @@ require('node:readline').createInterface({ input: process.stdin }).on('line', li
   fs.writeFileSync(path.join(fixture, 'artifact_model_host.py'), 'import json, sys\njson.load(sys.stdin)\nprint(\'{"ready":true}\')\n');
   fs.writeFileSync(path.join(fixture, 'main.py'), `
 import json, os, pathlib, sys
-from artifact_preview import start_artifact_preview
+from artifact_preview import run_artifact_preview, start_artifact_preview
 from mcp_runtime import invoke_mcp
 class BaseModelClient: pass
 def main():
@@ -90,6 +90,8 @@ def main():
         result = {}
         if action.get('operation') == 'start_preview':
             result = start_artifact_preview()
+        elif action.get('operation') == 'verify_app':
+            result = run_artifact_preview(action['action'])
         elif action.get('operation') == 'report_prompt':
             result = prompt
         elif action:
@@ -181,6 +183,9 @@ createServer((_, response) => {
       assert.equal(id, optedIn.id);
       return { status: 'running', url: 'http://127.0.0.1:49153' };
     });
+    t.mock.method(workbench, 'runPreviewAction', async (id, action) => ({
+      ok: true, id, action,
+    }));
   }
   const selection = { provider: 'gemini', model: 'fixture' };
   const launch = { operation: 'start_preview' };
@@ -198,6 +203,12 @@ createServer((_, response) => {
   assert.equal(preview.ok, true, JSON.stringify(preview));
   assert.match(preview.url, /^http:\/\/127\.0\.0\.1:\d+$/);
   assert.equal(preview.url, (await ask(previewAgent, launch)).url);
+  const appAction = { operation: 'mcp', input: { operation: 'call', server: 'game-tools', name: 'read_board' } };
+  const verifyApp = { operation: 'verify_app', action: appAction };
+  assert.equal((await ask(standalone, verifyApp)).ok, false);
+  if (!docker) {
+    assert.deepEqual(await ask(previewAgent, verifyApp), { ok: true, id: optedIn.id, action: appAction });
+  }
   if (docker) {
     assert.equal(preview.url, (await workbench.start(optedIn.id)).url);
     assert.match(await (await fetch(preview.url)).text(), /Served by Docker/);

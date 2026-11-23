@@ -35,7 +35,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Protocol, Sequence, Tuple, TypedDict
 
 from context_tree_bridge import ContextTreeBridge
-from artifact_preview import preview_guidance, start_artifact_preview
+from artifact_preview import preview_guidance, run_artifact_preview
 from discovery.dispatch import DISCOVERY_ACTION_TYPES, execute_discovery_action
 from mcp_runtime import invoke_mcp, mcp_guidance, model_mcp_result
 from mutation_text import PARSE_ERROR_PREFIX, is_text_mutation
@@ -1215,6 +1215,7 @@ class TreeLoop:
         """Retry provider delivery in place without evicting source or spending execution turns."""
         retry_system = system
         base_messages = list(messages)
+        last_protocol_reason = ""
         while True:
             output = self._complete_model(retry_system, messages)
             metrics_getter = getattr(self.model, "get_last_metrics", None)
@@ -1227,6 +1228,8 @@ class TreeLoop:
             if not reason:
                 return output, started, messages
             protocol_failure = reason in PROTOCOL_FAILURES
+            if protocol_failure:
+                last_protocol_reason = reason
             retry = recovery.claim_retry(reason)
             if self.model_event_observer is not None:
                 try:
@@ -1244,11 +1247,19 @@ class TreeLoop:
                 except Exception:
                     pass
             if not retry:
-                detail = f"; provider response: {json.dumps(metadata, ensure_ascii=False)}" if metadata else ""
-                message = (
-                    f"provider command delivery failed with {reason} after {recovery.protocol_retries} targeted retries; current goal and source preserved"
-                    if protocol_failure else "provider returned empty text twice; one retry preserving context was exhausted"
-                )
+                detail = f" Provider response {json.dumps(metadata, ensure_ascii=False)}" if metadata else ""
+                if protocol_failure:
+                    message = (
+                        f"provider command delivery failed with {reason} after {recovery.protocol_retries} targeted retries. "
+                        "Current goal and source preserved."
+                    )
+                elif last_protocol_reason:
+                    message = (
+                        f"provider command delivery failed with {last_protocol_reason} and the last retry returned no usable text. "
+                        "Current goal and source preserved."
+                    )
+                else:
+                    message = "provider returned empty text twice after one retry preserving context."
                 raise ProviderResponseError(message + detail)
             instruction = recovery.instruction(reason)
             # Retry the same delivered context. Refreshing the request must not
@@ -1670,7 +1681,7 @@ class TreeLoop:
         action_type = action.get("type", "")
 
         if action_type == "artifact_preview":
-            payload = start_artifact_preview()
+            payload = run_artifact_preview(action)
             r.ok = payload["ok"]
             return json.dumps(payload, ensure_ascii=False)
         if action_type == "mcp":

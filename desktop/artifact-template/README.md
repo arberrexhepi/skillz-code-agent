@@ -10,8 +10,24 @@ Run this artifact through the desktop **Artifacts** panel. The preview and agent
 - Configure grants in **File access** in the desktop. Saving stops the preview and agent; restart them to apply new mounts. Repository files cannot grant themselves access. Native host paths are never required in artifact code.
 - Configure request collections in `.artifact/apis.json` or **API Blueprints**. Use `/api/<id>` for HTTP and `/ws/<id>` for WebSocket. Examples, extracted variables, and tests support collection runs. Every HTTP request also becomes a typed Skillz command; read methods default to discovery and write methods to mutation. Use `host.docker.internal` for services running on the host.
 - Configure the optional Python chatbot and Sequelize database under **App capabilities**. Browser code calls `askSkillz()` from `src/skillz.ts`. SQLite stays under `.artifact-data/`; other DBMS choices use the configured connection URL environment variable.
+- **Include chatbot UI shell** installs `SkillzChat` in `src/skillz-chat`. The starter uses the configured layout. In a custom app, mount it as a floating pill, sidebar, or workspace sized to its parent. Style the shell with its `--skillz-chat-*` CSS variables.
 - `headerEnv` maps upstream header names to environment variables, e.g. `{"Authorization":{"env":"SCHEMA_API_TOKEN","prefix":"Bearer "}}`. A plain variable-name string remains supported. Set values before starting the desktop; restart the preview after changes. Keep credentials out of frontend configuration.
 - Read shared source context via `/context/repo-facts` and `/context/memory`. The desktop refreshes selected snapshots automatically; they are separate from this artifact's own agent memory.
 - Commit changes inside this child repository, then update the parent's submodule pointer. Configure remotes before publishing; nothing is pushed automatically.
 
 Docker enforces host filesystem grants even for direct backend filesystem calls and child processes. Model calls use the desktop's local provider configuration through a model-only bridge. Running this project's scripts directly on the host bypasses that container boundary; use the workbench to run with its permissions.
+
+Sidebar and workspace show broadcasts and input requests in the transcript.
+The floating pill forwards events to custom UI when you register targets. Use
+the registration's return value as component cleanup. If a target is absent,
+its events appear in the floating chat.
+
+```ts
+import { skillzChat } from './skillz-chat';
+
+const unregister = skillzChat.registerTargets({
+  message: entry => showMessage(entry.content),
+  elicitation: (entry, respond) => showQuestion(entry.question, entry.choices, respond),
+});
+// Call unregister() when the custom UI unmounts.
+```

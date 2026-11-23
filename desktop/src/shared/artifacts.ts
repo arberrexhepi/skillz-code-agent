@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import type { AgentEvent, AgentResponse, AgentStartOptions, GitCommit, GitDiscardResult, GitFileDiff, GitStatus } from './contracts';
 import type { JsonMap, RuntimeOptionsPayload } from './agentTypes';
+import { artifactAppMcpSchema, type ArtifactAppMcpRequest } from './artifactAppMcp';
 
 export const artifactId = z.string().regex(/^[a-z0-9][a-z0-9-]{0,63}$/);
 const shape = z.record(z.string(), z.unknown());
@@ -38,9 +39,15 @@ export const artifactBlueprintChatMessageSchema = z.object({ role: z.enum(['user
 export type ArtifactBlueprintChatMessage = z.infer<typeof artifactBlueprintChatMessageSchema>;
 export interface ArtifactBlueprintAgentResult { message: string; config: ArtifactApis; changes: string[]; }
 export const artifactDatabaseDialectSchema = z.enum(['sqlite', 'postgres', 'mysql', 'mariadb', 'mssql']);
+export const artifactChatLayouts = ['floating', 'sidebar', 'workspace'] as const;
 export const artifactAppSchema = z.object({
   version: z.literal(1),
-  chatbot: z.object({ enabled: z.boolean().default(false) }).default({ enabled: false }),
+  chatbot: z.object({
+    enabled: z.boolean().default(false),
+    includeShell: z.boolean().default(true),
+    shellLayout: z.enum(artifactChatLayouts).default('floating'),
+  }).default({ enabled: false, includeShell: true, shellLayout: 'floating' }),
+  mcp: artifactAppMcpSchema.default({ enabled: false, servers: [] }),
   database: z.object({
     enabled: z.boolean().default(false),
     dialect: artifactDatabaseDialectSchema.default('sqlite'),
@@ -134,6 +141,7 @@ export interface ArtifactsApi {
   runApiCollection(id: string, collection: string, variables?: JsonMap, approveMutations?: boolean): Promise<JsonMap>;
   app(id: string): Promise<ArtifactAppConfig>;
   saveApp(id: string, config: ArtifactAppConfig): Promise<ArtifactAppSaveResult>;
+  requestAppMcp(id: string, request: ArtifactAppMcpRequest): Promise<Record<string, unknown>>;
   start(id: string): Promise<ArtifactRuntime>;
   stop(id: string): Promise<void>;
   installBrowser(): Promise<void>;

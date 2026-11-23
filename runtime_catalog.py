@@ -14,13 +14,12 @@ BASE_RUNTIME_PROVIDER_CATALOG: Dict[str, Dict[str, Any]] = {
         "env_var": "OPENAI_API_KEY",
         "default_model": "gpt-5.4",
         "models": [
-            "gpt-5.6-terra",
-            "gpt-5.6-sol",
-            "gpt-5.6-luna",
-            "gpt-5.5",
-            "gpt-5.4",
+            "gpt-6.1-terra",
             "gpt-6.1-sol",
-            "gpt-6-astra"
+            "gpt-6.1-astra",
+            "gpt-6.2-terra"
+            "gpt-6.2-sol",
+            "gpt-6.2-astra",
         ],
         "notes": "Uses the Responses API. Any compatible OpenAI model string is allowed.",
     },
@@ -30,13 +29,15 @@ BASE_RUNTIME_PROVIDER_CATALOG: Dict[str, Dict[str, Any]] = {
         "env_var": None,
         "default_model": "gpt-5.6-terra",
         "models": [
+            "gpt-5.6-luna",
             "gpt-5.6-terra",
             "gpt-5.6-sol",
-            "gpt-5.6-luna",
-            "gpt-5.5",
-            "gpt-5.4",
+            "gpt-6.1-terra"
             "gpt-6.1-sol",
-            "gpt-6-astra"
+            "gpt-6.1-astra",
+            "gpt-6.2-terra"
+            "gpt-6.2-sol",
+            "gpt-6.2-astra",
         ],
         "notes": (
             "Uses the locally installed Codex CLI and its ChatGPT-managed subscription session. "
@@ -88,6 +89,7 @@ BASE_RUNTIME_PROVIDER_CATALOG: Dict[str, Dict[str, Any]] = {
             "gemini-3.8-flash",
             "gemini-4-argon",
             "gemini-4-carbon",
+            "gemini-4-neon",
             "gemini-4-hydrogen",
         ],
         "notes": "Any valid Gemini model string is allowed.",
@@ -132,7 +134,7 @@ BASE_RUNTIME_PROVIDER_CATALOG: Dict[str, Dict[str, Any]] = {
             "gemma4:latest",
             "gemma4:e2b",
         ],
-        "notes": "Targets the Runpod Ollama endpoint at https://zql0xy4x10v0sp-11434.proxy.runpod.net/v1/chat/completions.",
+        "notes": "Targets the Runpod Ollama endpoint at https://oops-lol-it-had-0-dollaz-credit-anyway.proxy.runpod.net/v1/chat/completions.",
     },
 }
 

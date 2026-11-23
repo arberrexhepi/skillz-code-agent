@@ -21,7 +21,8 @@ export class ArtifactAgentExecution implements AgentExecution {
   private selection?: { provider: string; model: string };
   constructor(private readonly createSandbox: () => Promise<ArtifactSandbox>, private readonly log: (text: string) => void,
     private readonly prepareHost?: (context: AgentLaunch) => Promise<AgentLaunch>,
-    private readonly startPreview?: () => Promise<string>) {}
+    private readonly startPreview?: () => Promise<string>,
+    private readonly previewAction?: (action: unknown) => Promise<Record<string, unknown>>) {}
   async launch(context: AgentLaunch): Promise<ChildProcessWithoutNullStreams> {
     const generation = this.generation;
     this.baseContext = context;
@@ -85,14 +86,17 @@ export class ArtifactAgentExecution implements AgentExecution {
       }
     };
     if (preview) {
-      if (!this.startPreview || Object.keys(payload).some(key => key !== 'type' && key !== 'id')) {
-        reply({ payload: { ok: false, error: 'Start Preview accepts no arguments and is scoped to this artifact.' } });
-      } else {
-        void Promise.resolve().then(this.startPreview).then(
-          url => reply({ payload: { ok: true, status: 'running', url } }),
-          error => reply({ payload: { ok: false, error: error instanceof Error ? error.message : String(error) } }),
-        );
-      }
+      void Promise.resolve().then(async () => {
+        if (!this.startPreview || Object.keys(payload).some(key => !['type', 'id', 'action'].includes(key))) {
+          throw new Error('Preview actions are scoped to the current artifact.');
+        }
+        if (payload.action === undefined) return { ok: true, status: 'running', url: await this.startPreview() };
+        if (!this.previewAction) throw new Error('This artifact has no application verification broker.');
+        return this.previewAction(payload.action);
+      }).then(
+        value => reply({ payload: value }),
+        error => reply({ payload: { ok: false, error: error instanceof Error ? error.message : String(error) } }),
+      );
       return true;
     }
     if (payload.provider !== this.selection?.provider || payload.model !== this.selection?.model) { reply({ error: 'Model request does not match the selected runtime.' }); return true; }

@@ -8,12 +8,43 @@ export function attachArtifactAgent(app: Express): () => void {
     if (active.size >= 4) { response.status(429).json({ error: 'Too many chatbot requests are running.' }); return; }
     const payload = request.body;
     if (!payload || typeof payload !== 'object' || typeof payload.message !== 'string' || !payload.message.trim() || payload.message.length > 100_000) { response.status(400).json({ error: 'A message smaller than 100 KB is required.' }); return; }
-    const child = spawn('python3', ['-u', '/opt/skillz/artifact_app_agent.py'], { cwd: '/repo', env: process.env, shell: false, stdio: ['pipe', 'pipe', 'pipe'] }); active.add(child);
-    let output = '', errors = ''; const timeout = setTimeout(() => child.kill('SIGKILL'), 1_200_000);
-    child.stdout?.setEncoding('utf8'); child.stderr?.setEncoding('utf8'); child.stdout?.on('data', text => { output = (output + text).slice(-2_000_000); }); child.stderr?.on('data', text => { errors = (errors + text).slice(-10_000); });
-    child.on('error', error => { clearTimeout(timeout); active.delete(child); if (!response.headersSent) response.status(500).json({ error: error.message }); });
-    child.on('close', code => { clearTimeout(timeout); active.delete(child); if (response.headersSent) return; try { const value = JSON.parse(output.trim()); if (code !== 0 || value.error) response.status(502).json({ error: value.error || errors || `Chatbot exited with code ${code}.` }); else response.json(value); } catch { response.status(502).json({ error: errors || 'Chatbot returned invalid JSON.' }); } });
-    child.stdin?.end(JSON.stringify({ message: payload.message, history: Array.isArray(payload.history) ? payload.history : [], approveMutations: payload.approveMutations === true }));
+    const stream = request.get('accept')?.split(',').some(value => value.trim().split(';')[0] === 'application/x-ndjson') === true;
+    const child = spawn('python3', ['-u', '/opt/skillz/artifact_app_agent.py'],
+      { cwd: '/repo', env: process.env, shell: false, stdio: ['pipe', 'pipe', 'pipe'] });
+    active.add(child);
+    let output = '', errors = '';
+    const timeout = setTimeout(() => child.kill('SIGKILL'), 1_200_000);
+    const cleanup = () => { clearTimeout(timeout); active.delete(child); };
+    response.on('close', () => { if (!response.writableEnded) child.kill('SIGKILL'); });
+    child.stderr.setEncoding('utf8').on('data', text => { errors = (errors + text).slice(-10_000); });
+    child.stdin.on('error', () => { /* The close handler reports the child's result. */ });
+    if (stream) {
+      child.once('spawn', () => {
+        if (response.destroyed) return;
+        response.type('application/x-ndjson').set('cache-control', 'no-store').flushHeaders();
+        child.stdout.pipe(response, { end: false });
+      });
+    } else {
+      child.stdout.setEncoding('utf8').on('data', text => { output = (output + text).slice(-2_000_000); });
+    }
+    child.on('error', error => {
+      cleanup();
+      if (!response.headersSent && !response.destroyed) response.status(500).json({ error: error.message });
+    });
+    child.on('close', code => {
+      cleanup();
+      if (response.destroyed || response.writableEnded) return;
+      if (stream && response.headersSent) { response.end(); return; }
+      try {
+        const value = JSON.parse(output.trim());
+        if (code !== 0 || value.error) response.status(502).json({ error: value.error || errors || `Chatbot exited with code ${code}.` });
+        else response.json(value);
+      } catch { response.status(502).json({ error: errors || 'Chatbot returned invalid JSON.' }); }
+    });
+    child.stdin.end(JSON.stringify({
+      message: payload.message, history: Array.isArray(payload.history) ? payload.history : [],
+      approveMutations: payload.approveMutations === true, stream,
+    }));
   });
   return () => { for (const child of active) child.kill('SIGKILL'); active.clear(); };
 }

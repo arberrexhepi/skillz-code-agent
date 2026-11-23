@@ -77,7 +77,10 @@ def main() -> int:
     if not host_model and sys.argv[1:2] == ["--artifact-preview"]:
         from artifact_preview import configure_preview_start
         sys.argv.pop(1)
-        configure_preview_start(lambda: request_tool("artifact_preview", {}, timeout=600))
+        configure_preview_start(
+            lambda: request_tool("artifact_preview", {}, timeout=600),
+            lambda action: request_tool("artifact_preview", {"action": action}, timeout=600),
+        )
 
     class BrokerClient(agent.BaseModelClient):
         def __init__(self, **selection):

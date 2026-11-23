@@ -25,7 +25,16 @@ def external_execution_identity(action: dict) -> str | None:
     """Identify an actual tool operation, independent of provider text or catalog lookups."""
     kind = action.get("type")
     if kind == "artifact_preview":
-        return "artifact_preview:start"
+        operation = action.get("operation", "start")
+        payload = action.get("input") or {}
+        if not isinstance(payload, dict):
+            return None
+        if operation == "mcp":
+            identity = external_execution_identity({**payload, "type": "mcp"})
+            return f"artifact_preview:{identity}" if identity else None
+        if operation == "chat":
+            return "artifact_preview:chat:" + json.dumps(payload.get("message"))
+        return f"artifact_preview:{operation}" if operation in ("start", "restart") else None
     if kind == "mcp" and action.get("operation") in ("call", "read-resource", "get-prompt"):
         fields = ("operation", "server", "name", "uri")
         return "mcp:" + json.dumps([*(action.get(field) for field in fields), action.get("arguments") or {}], sort_keys=True)

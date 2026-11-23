@@ -328,6 +328,49 @@ class EmptyProviderRecoveryTests(unittest.TestCase):
             self.assertEqual(len(loop.history), 1)
             self.assertEqual(loop._conversation_compaction_count, 0)
 
+    def test_malformed_response_can_recover_after_a_blank_reply_and_validated_edit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "note.txt").write_text("original\n")
+            model = RecordingMessageModel([
+                "cat /repo/note.txt", "replace-lines note.txt:1-1 validated_change", "cat /repo/note.txt",
+                "", "", "finish Updated",
+            ])
+            reasons = ["STOP", "STOP", "STOP", "STOP", "MALFORMED_RESPONSE", "STOP"]
+            model.get_last_metrics = lambda: {"response": {"candidates": [{"finish_reason": reasons[len(model.calls) - 1]}]}}
+            trace = root / "trace.md"
+            with patch.dict(os.environ, {"SKILLZ_OBSERVABILITY_PATH": str(trace)}):
+                worker = TreeLoopPlannerWorker(model=model, root=root, max_turns=4, checkpoint_interval=0, verbose=False)
+                result = worker.run_task("Update the note")
+            self.assertTrue(result.ok, result.final_message)
+            self.assertTrue(result.validation.passed)
+            self.assertEqual((root / "note.txt").read_text(), "validated_change\n")
+            self.assertEqual(len(worker.history), 4)
+            self.assertEqual(worker.loop._conversation_compaction_count, 0)
+            retry = "\n".join(message["content"] for message in model.calls[-1])
+            self.assertIn("validated_change", retry)
+            self.assertIn("MALFORMED_RESPONSE", retry)
+            self.assertIn("one small executable text command", retry)
+            self.assertEqual(worker._observability_metrics["provider_protocol_failures"], 1)
+            self.assertEqual(worker.usage_accounting_state()["current_run"]["model_calls"], 6)
+
+    def test_failed_malformed_response_repair_keeps_the_provider_reason(self):
+        for reasons, detail in (
+            (["STOP", "MALFORMED_RESPONSE", "MALFORMED_RESPONSE", "MALFORMED_RESPONSE"], "after 2 targeted retries"),
+            (["STOP", "MALFORMED_RESPONSE", "STOP"], "the last retry returned no usable text"),
+        ):
+            with self.subTest(detail=detail), tempfile.TemporaryDirectory() as tmp:
+                model = RecordingMessageModel([""] * len(reasons))
+                model.get_last_metrics = lambda: {"response": {"candidates": [{"finish_reason": reasons[len(model.calls) - 1]}]}}
+                loop = TreeLoop(model=model, workspace_root=Path(tmp), max_turns=4, verbose=False)
+                result = loop.run("Current goal")
+                self.assertFalse(result.finished)
+                self.assertEqual(len(model.calls), len(reasons))
+                self.assertEqual(loop.history, [])
+                self.assertEqual(loop._conversation_compaction_count, 0)
+                self.assertIn("failed with MALFORMED_RESPONSE", result.finish_message)
+                self.assertIn(detail, result.finish_message)
+
     def test_persistent_protocol_failure_stays_bounded_with_source_preserved(self):
         with tempfile.TemporaryDirectory() as tmp:
             model = RecordingMessageModel(["", "", ""])

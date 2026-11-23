@@ -137,6 +137,25 @@ def test_artifact_preview_is_scoped_and_available_to_stable_execution(tmp_path):
         start.assert_called_once_with()
 
 
+def test_artifact_preview_verification_is_external_execution(tmp_path, monkeypatch):
+    catalog = {"operation": "list", "server": "game-tools"}
+    read = {"operation": "call", "server": "game-tools", "name": "read_board"}
+    chat = {"message": "Use game-tools/read_board"}
+    actions = [
+        {"operation": "mcp", "input": catalog},
+        {"operation": "mcp", "input": read},
+        {"operation": "chat", "input": chat},
+    ]
+    with patch("artifact_preview._request", return_value={"ok": True, "message": "Board verified"}) as request:
+        result, worker = run_execution_goal(tmp_path, monkeypatch, [
+            f"artifact-preview {action['operation']} {json.dumps(action['input'])}" for action in actions
+        ] + ["finish Board verified"])
+    assert [call.args[0] for call in request.call_args_list] == actions
+    assert result.status == "completed" and result.validation_passed
+    assert worker._execution_delivery.state()["external_executions"] == 2
+    assert not worker._has_mutation
+
+
 def test_actual_failed_route_check_still_blocks_execute_goal(tmp_path, monkeypatch):
     result, _ = run_execution_goal(tmp_path, monkeypatch, [
         "run-route-check /",

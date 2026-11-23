@@ -38,6 +38,7 @@ const api: WorkbenchApi = {
     runApiCollection: (id, collection, variables = {}, approveMutations = false) => ipcRenderer.invoke('artifacts:run-api-collection', id, collection, variables, approveMutations),
     app: (id) => ipcRenderer.invoke('artifacts:app', id),
     saveApp: (id, config) => ipcRenderer.invoke('artifacts:save-app', id, config),
+    requestAppMcp: (id, request) => ipcRenderer.invoke('artifacts:app-mcp-request', id, request),
     start: (id) => ipcRenderer.invoke('artifacts:start', id),
     stop: (id) => ipcRenderer.invoke('artifacts:stop', id),
     installBrowser: () => ipcRenderer.invoke('artifacts:install-browser'),

@@ -39,7 +39,7 @@ from codex_subscription import run_codex_subscription_completion
 from bridge_presentation import bridge_exchange
 from discovery_budget import DiscoveryBudget
 from mcp_runtime import invoke_mcp, mcp_guidance, model_mcp_result
-from artifact_preview import preview_guidance, start_artifact_preview
+from artifact_preview import preview_guidance, run_artifact_preview
 from shell_processes import PACKAGE_SHELL_GUIDANCE, install_shell_process_cleanup, run_managed_shell
 from proposal_runtime import ProposalRuntimeMixin
 from issue_proposals import PROPOSAL_GUIDANCE
@@ -9165,7 +9165,7 @@ class WorkingFolderAgent(ProposalRuntimeMixin):
                 return blocked_result
 
             if self.discovery_budget is not None and action_type == "artifact_preview":
-                return self._error_action_result(action_type, {"error": "Starting an artifact preview is available during goal execution."})
+                return self._error_action_result(action_type, {"error": "Artifact preview actions are available during goal execution."})
             if self.discovery_budget is not None and action_type == "mcp" and action.get("operation") == "call":
                 return self._error_action_result(action_type, {"error": "MCP tool execution is available during goal execution."})
             blocked_result = self._enforce_budget_and_mode(action_type)
@@ -9173,7 +9173,7 @@ class WorkingFolderAgent(ProposalRuntimeMixin):
                 return blocked_result
 
             if action_type == "artifact_preview":
-                payload = start_artifact_preview()
+                payload = run_artifact_preview(action)
                 return ActionResult(ok=payload["ok"], name=action_type, payload=payload)
             if action_type == "mcp":
                 payload = model_mcp_result(invoke_mcp(self.root, action))

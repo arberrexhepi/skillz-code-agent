@@ -12,6 +12,7 @@ import type { TerminalService } from './services/terminal';
 import type { WorkspaceService } from './services/workspace';
 import type { McpHost, McpScope } from './services/mcp';
 import type { McpServerSettings } from '../shared/mcp';
+import { artifactAppMcpRequestSchema } from '../shared/artifactAppMcp';
 
 interface Services {
   artifacts: ArtifactsService;
@@ -64,7 +65,7 @@ export function registerIpc(window: BrowserWindow, services: Services): void {
     });
   };
 
-  const artifactChannels = ['capabilities', 'install-capabilities', 'setup-progress', 'vault', 'save-provider-key', 'setup-download', 'docker-cleanup-plan', 'clean-docker', 'library', 'prebuilts', 'install-prebuilt', 'prebuilt-update-status', 'review-prebuilt-update', 'apply-prebuilt-update', 'choose-folder', 'choose-read-directory', 'access', 'process-scripts', 'save-access', 'save-runtime', 'create', 'apis', 'save-apis', 'blueprint-agent', 'run-api-collection', 'app', 'save-app', 'start', 'stop', 'install-browser', 'preview', 'input', 'reload', 'close-preview', 'reveal', 'git-status', 'git-initialize', 'git-history', 'git-file-diff', 'git-stage', 'git-stage-all', 'git-unstage', 'git-discard', 'git-commit', 'git-push', 'agent-start', 'agent-submit', 'agent-runtime', 'agent-planner', 'agent-worker', 'agent-reconfigure', 'agent-backoff', 'agent-stop'];
+  const artifactChannels = ['capabilities', 'install-capabilities', 'setup-progress', 'vault', 'save-provider-key', 'setup-download', 'docker-cleanup-plan', 'clean-docker', 'library', 'prebuilts', 'install-prebuilt', 'prebuilt-update-status', 'review-prebuilt-update', 'apply-prebuilt-update', 'choose-folder', 'choose-read-directory', 'access', 'process-scripts', 'save-access', 'save-runtime', 'create', 'apis', 'save-apis', 'blueprint-agent', 'run-api-collection', 'app', 'save-app', 'app-mcp-request', 'start', 'stop', 'install-browser', 'preview', 'input', 'reload', 'close-preview', 'reveal', 'git-status', 'git-initialize', 'git-history', 'git-file-diff', 'git-stage', 'git-stage-all', 'git-unstage', 'git-discard', 'git-commit', 'git-push', 'agent-start', 'agent-submit', 'agent-runtime', 'agent-planner', 'agent-worker', 'agent-reconfigure', 'agent-backoff', 'agent-stop'];
   const mcpScope = async (value: unknown): Promise<McpScope> => {
     const id = artifactId.optional().parse(value);
     return id ? { root: (await services.artifacts.library.find(id)).root, profile: `artifact:${id}` }
@@ -145,6 +146,8 @@ export function registerIpc(window: BrowserWindow, services: Services): void {
   handle('artifacts:run-api-collection', (_event, id: unknown, collection: unknown, variables: unknown = {}, approveMutations: unknown = false) => services.artifacts.runApiCollection(artifactId.parse(id), artifactId.parse(collection), z.record(z.string(), z.unknown()).parse(variables), z.boolean().parse(approveMutations)));
   handle('artifacts:app', (_event, id: unknown) => services.artifacts.library.app(artifactId.parse(id)));
   handle('artifacts:save-app', (_event, id: unknown, config: unknown) => services.artifacts.saveApp(artifactId.parse(id), artifactAppSchema.parse(config)));
+  handle('artifacts:app-mcp-request', (_event, id: unknown, request: unknown) =>
+    services.artifacts.requestAppMcp(artifactId.parse(id), artifactAppMcpRequestSchema.parse(request)));
   handle('artifacts:start', (_event, id: unknown) => services.artifacts.start(artifactId.parse(id)));
   handle('artifacts:stop', (_event, id: unknown) => services.artifacts.stop(artifactId.parse(id)));
   handle('artifacts:install-browser', () => services.artifacts.preview.installBrowser());

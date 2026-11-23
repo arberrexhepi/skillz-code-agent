@@ -119,6 +119,12 @@ In **App capabilities**, enable the in-app Skillz chatbot or database support at
 
 The chatbot uses `src/skillz.ts` to start a one-shot Python process inside the artifact container. That process discovers the current artifact command catalog, performs a bounded tool loop, and sends model requests through a token-scoped desktop broker; provider credentials and Codex auth are never mounted into the container. API GET requests and `db_query` are discovery commands. API write methods and `db_execute` are mutation commands and are rejected unless the caller explicitly approves mutations.
 
+**Include chatbot UI shell** is on by default when enabling the chatbot. Choose
+the floating pill, sidebar, or full workspace layout. The default scaffold
+mounts the selected layout and custom apps can mount and style the generated
+`SkillzChat` component. Uncheck the option when building a custom interface
+against the chat API.
+
 In **API Blueprints**, install GitHub, OpenAI, or Stripe quickstarts; paste an OpenAPI JSON document for conversion; define requests manually; or ask the dedicated Blueprint agent to create, inspect, update, and delete definitions. Opening this section switches the right panel into a constrained configuration mode. It receives the current blueprint document and may return only validated CRUD operations; it cannot edit artifact source, run shell commands, or manage credentials. The normal app-building agent remains a separate conversation and resumes unchanged when leaving API Blueprints.
 
 Each request has an ID, collection, method, URL templates, JSON Schemas, example input, header environment mappings, tests, extraction rules, and declarative before/after scripts. Blueprint changes are validated as a complete configuration before being saved. **Run & test** executes collection examples in order, carries variables forward, and reports every assertion. HTTP calls still use `/api/<id>` and WebSockets use `/ws/<id>`. The app advertises every HTTP request as `api_<id>` through `/_skillz/commands`, using GET as discovery and write methods as mutation unless explicitly overridden. Store provider credentials in Vault and reference service secrets by environment-variable name through `headerEnv`; neither Blueprint definitions nor the Blueprint agent receive secret values.
