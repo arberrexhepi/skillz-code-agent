@@ -19,6 +19,7 @@ _TS_RE = re.compile(
 )
 _PY_RE = re.compile(r'File "(?P<path>.+?)", line (?P<line>\d+)')
 _TS_SUFFIXES = {".ts", ".tsx", ".js", ".jsx"}
+_TS_SOURCE_SUFFIXES = _TS_SUFFIXES | {".mts", ".cts", ".mjs", ".cjs"}
 
 
 @dataclass
@@ -31,6 +32,11 @@ class BackendDiagnosticRun:
     stdout: str
     stderr: str
     diagnostics: List[Dict[str, Any]]
+    other_file_error_count: int = 0
+
+    @property
+    def scoped_returncode(self) -> int:
+        return 0 if self.other_file_error_count and not self.diagnostics else self.returncode
 
 
 def run_backend_diagnostics(
@@ -92,6 +98,9 @@ def _run_typescript_diagnostics(
 
     combined = "\n".join(part for part in [result.stdout, result.stderr] if part).strip()
     diagnostics = _parse_typescript_diagnostics(combined, root=root, target_path=normalized_path, limit=limit)
+    other_file_error_count = 0
+    if result.returncode in {1, 2} and not diagnostics:
+        other_file_error_count = _count_typescript_other_file_errors(combined, root=root, target=abs_path)
     return BackendDiagnosticRun(
         engine="tsc",
         path=normalized_path,
@@ -101,6 +110,7 @@ def _run_typescript_diagnostics(
         stdout=result.stdout,
         stderr=result.stderr,
         diagnostics=diagnostics,
+        other_file_error_count=other_file_error_count,
     )
 
 
@@ -125,14 +135,14 @@ def _parse_typescript_diagnostics(
     combined_output: str,
     *,
     root: Path,
-    target_path: str,
+    target_path: str | None,
     limit: int,
 ) -> List[Dict[str, Any]]:
     diagnostics: List[Dict[str, Any]] = []
-    normalized_target = normalize_repo_relative_path(root, target_path)
+    normalized_target = normalize_repo_relative_path(root, target_path) if target_path else None
     for match in _TS_RE.finditer(strip_ansi(combined_output or "")):
         diag_path = normalize_repo_relative_path(root, match.group("path"))
-        if diag_path != normalized_target:
+        if normalized_target is not None and diag_path != normalized_target:
             continue
         line = int(match.group("line"))
         column = int(match.group("column"))
@@ -156,6 +166,45 @@ def _parse_typescript_diagnostics(
         if len(diagnostics) >= limit:
             break
     return diagnostics
+
+
+def typescript_baseline(root: Path, path: str, *, timeout: int = 20) -> list[Dict[str, Any]]:
+    """Capture diagnostics across the affected TypeScript project before an edit."""
+    target = root / path
+    config = _find_nearest_tsconfig(root, target)
+    compiler = find_command("tsc", root=root, start_dir=config.parent if config else target.parent)
+    if not compiler or (not config and not target.is_file()):
+        return []
+    args = [compiler, "--noEmit", "--pretty", "false"]
+    if config is None:
+        result = _run_checked([*args, path], cwd=root, timeout=timeout)
+    else:
+        with tempfile.TemporaryDirectory(prefix="python-agent-baseline-") as temp:
+            build_info = str(Path(temp) / "baseline.tsbuildinfo")
+            result = _run_checked(
+                [*args, "--incremental", "--tsBuildInfoFile", build_info, "-p", str(config)],
+                cwd=root, timeout=timeout,
+            )
+    return _parse_typescript_diagnostics(
+        f"{result.stdout}\n{result.stderr}", root=root, target_path=None, limit=1000,
+    )
+
+
+def _count_typescript_other_file_errors(output: str, *, root: Path, target: Path) -> int:
+    """Accept only source diagnostics and their indented continuation lines."""
+    count = 0
+    for line in strip_ansi(output).splitlines():
+        if not line.strip():
+            continue
+        match = _TS_RE.fullmatch(line)
+        if match:
+            path = root / match.group("path")
+            if path.suffix.lower() not in _TS_SOURCE_SUFFIXES or path.resolve() == target:
+                return 0
+            count += 1
+        elif not count or not line.startswith((" ", "\t")) or line.lstrip().startswith("error TS"):
+            return 0
+    return count
 
 
 def _parse_python_diagnostics(combined_output: str, *, root: Path, target_path: str) -> List[Dict[str, Any]]:

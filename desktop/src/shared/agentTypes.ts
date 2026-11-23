@@ -85,6 +85,7 @@ export interface IssueSummary extends JsonMap {
 
 export interface WorkerState extends JsonMap {
   issue_proposals?: { proposals?: IssueProposal[]; error?: string };
+  runtime_capabilities?: JsonMap & { goal_start_skill_mode?: boolean; reasoning_summary_stream?: boolean };
   issue_context?: {
     active_durable_issue?: IssueSummary | null;
     focused_run_diagnostic_id?: string;
@@ -242,6 +243,7 @@ export interface PlannerState extends JsonMap {
   last_next_steps?: string[];
   execution_paused?: boolean;
   paused_failed_goal_id?: string;
+  paused_suspended_goal_id?: string;
   paused_failed_goal_title?: string;
   paused_failure_reason?: string;
   paused_plan?: PlannerPlan | null;
@@ -280,6 +282,7 @@ export interface RuntimeProviderOption extends JsonMap {
   default_model?: string;
   selection_model?: string;
   suggested_models?: string[];
+  reasoning_efforts?: Record<string, import('./reasoningPreferences').ReasoningEffort[]>;
   notes?: string;
   active?: boolean;
   active_model?: string;
@@ -309,6 +312,7 @@ export interface CodexSubscriptionStatus extends JsonMap {
   cli_path_source?: 'settings' | 'environment' | 'discovery';
   restart_required?: boolean;
   models?: string[];
+  reasoning_efforts?: RuntimeProviderOption['reasoning_efforts'];
   error?: string;
   status_text?: string;
 }
@@ -319,6 +323,11 @@ export interface AgentProgressMessage extends JsonMap {
   step?: number;
   turn?: number;
   action_type?: string;
+  phase?: string;
+  output_started?: boolean;
+  output_chars?: number;
+  draft_strategy?: string[];
+  reasoning_effort?: { requested: string; parameter: string | null; value: string | number | null };
   skill_name?: string;
   skill_mode?: string;
   path?: string;

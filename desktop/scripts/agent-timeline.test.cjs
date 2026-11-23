@@ -144,3 +144,96 @@ test('live thought is visible, untruncated, and previous thought is collapsible 
   assert.match(idle, /<details class="turn-thought last-thought">/);
   assert.match(idle, /Last turn thought/);
 });
+
+test('agent card shows waiting, streams into expandable details, and labels a dispatched tool', () => {
+  let state = initialAgentUiState;
+  const progress = (action_type, extra = {}) => {
+    state = reduceAgentUi(state, { type: 'progress', progress: { type: 'progress', action_type, domain: 'plan', turn: 1, ...extra } });
+  };
+  const card = () => renderToStaticMarkup(React.createElement(TurnThought, {
+    active: true, action: 'Goal 1/4', thought: state.turnThought,
+    progress: state.liveProgress, reasoning: state.reasoningSummary,
+  }));
+
+  progress('turn_thought', { thought: 'Starting planner goal' });
+  progress('model_call_start', { step: 2 });
+  assert.match(card(), /Waiting for model/);
+  assert.match(card(), /aria-label="Reasoning summary"/);
+  assert.match(card(), /Waiting for the model to send a reasoning summary/);
+  assert.match(card(), /class="turn-thought-note"[^>]*>Starting planner goal/);
+  const activityCount = state.activity.length;
+  progress('model_reasoning_summary', { thought: 'Checking which ' });
+  progress('model_reasoning_summary', { thought: 'Blender tools are available.' });
+  assert.match(card(), /Reasoning summary/);
+  assert.match(card(), /aria-expanded="true"/);
+  assert.match(card(), /class="turn-thought-copy"[^>]+>.*Checking which Blender tools are available/);
+  assert.equal(state.activity.length, activityCount);
+  assert.equal(state.liveProgress.step, 2);
+  progress('model_output_progress', { output_chars: 37 });
+  assert.match(card(), /Receiving command response/);
+  assert.match(card(), /37 characters received/);
+  assert.match(card(), /Checking which Blender tools are available/);
+
+  progress('model_call_finish');
+  progress('tool_start', { summary: 'Querying Blender MCP' });
+  assert.match(card(), /class="turn-thought-status" role="status">Querying Blender MCP/);
+  assert.match(card(), /class="turn-thought-note"[^>]*>Starting planner goal/);
+  assert.match(card(), /Checking which Blender tools are available/);
+  progress('tool_finish');
+  progress('model_call_start', { turn: 2, step: 7 });
+  progress('model_reasoning_summary', { thought: 'An old summary', turn: 1 });
+  assert.match(card(), /Waiting for model/);
+  assert.match(card(), /<span>Turn 2<\/span>/);
+  assert.match(card(), /Thought from turn 1/);
+  assert.doesNotMatch(card(), /An old summary|Querying Blender MCP|Checking which Blender tools/);
+});
+
+test('planner progress names the active call and keeps worker summaries out of it', () => {
+  let state = initialAgentUiState;
+  const progress = (action_type, extra = {}) => {
+    state = reduceAgentUi(state, { type: 'progress', progress: { type: 'progress', action_type, domain: 'planner', turn: 1, phase: 'Planning', ...extra } });
+  };
+  progress('model_call_start');
+  progress('model_reasoning_summary', { thought: 'Wrong model call', domain: 'plan' });
+  progress('model_call_finish', { domain: 'plan' });
+  assert.equal(state.reasoningSummary, undefined);
+  assert.equal(state.liveProgress.domain, 'planner');
+  progress('model_reasoning_summary', { thought: 'Ordering the goals' });
+  progress('model_output_progress', { output_chars: 37 });
+  const card = renderToStaticMarkup(React.createElement(TurnThought, {
+    active: true, action: 'submit', progress: state.liveProgress, reasoning: state.reasoningSummary,
+  }));
+  assert.match(card, /Planner call 1/);
+  assert.match(card, /Planning · Receiving planner response/);
+  assert.match(card, /Ordering the goals/);
+});
+
+test('agent card explains why a running older worker cannot send a reasoning summary', () => {
+  const card = renderToStaticMarkup(React.createElement(TurnThought, {
+    active: true, action: 'Goal 2/4', agentRestartNeeded: true,
+    progress: { type: 'progress', action_type: 'model_call_start', turn: 2 },
+  }));
+  assert.match(card, /aria-label="Reasoning summary"/);
+  assert.match(card, /Restart the agent to enable reasoning summaries/);
+});
+
+test('the agent card distinguishes a start-only stream from a counted response and labels a retry', () => {
+  let state = initialAgentUiState;
+  const update = (action_type, extra = {}) => {
+    state = reduceAgentUi(state, { type: 'progress', receivedAt: Date.now(),
+      progress: { type: 'progress', domain: 'plan', turn: 2, action_type, ...extra } });
+  };
+  const card = () => renderToStaticMarkup(React.createElement(TurnThought, {
+    active: true, action: 'Goal 1/4', progress: state.liveProgress, reasoning: state.reasoningSummary,
+  }));
+  update('model_call_start');
+  update('model_reasoning_summary', { thought: 'Some preliminary work.' });
+  update('model_output_start');
+  assert.match(card(), /Response counts will appear in a fresh agent session/);
+  assert.equal(state.liveProgress.lastModelUpdateAt, undefined);
+  update('model_call_finish', { summary: 'Turn 2 response rejected · malformed tool call (57,229 characters).', ok: false });
+  update('model_call_start', { phase: 'Retrying after malformed tool call' });
+  assert.match(card(), /Retrying after malformed tool call · Waiting for model/);
+  assert.doesNotMatch(card(), /Some preliminary work|Response counts will appear/);
+  assert.match(state.activity.at(-2).summary, /response rejected/);
+});

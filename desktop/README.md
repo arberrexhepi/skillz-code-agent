@@ -37,7 +37,7 @@ Agent chat uses 14px body/composer text, 13px code, and 11px supporting labels a
 
 Discovery choices, plan approvals/results, and issue lifecycle actions appear in collapsed workflow report cards, in conversation order. Expand a card for selections, outcomes, and original workflow text. New bridge messages carry explicit presentation boundaries so conversational replies appended to reports remain in the chat. The original bridge transcript is unchanged; older bridge messages use conservative format recognition.
 
-Operator-facing turn thoughts appear above the composer while work runs (collapsible when space is tight). Full thoughts remain readable, and Activity retains tool-level history. The beta loop forwards explicit `>>th` annotations; provider-internal reasoning is not displayed.
+The activity card above the composer shows live planner calls and TreeLoop worker turns while keeping the latest agent thought visible. It shows which tool is being dispatched, how much response text has arrived, and how long a model stream has been quiet, including the wait for its first update. OpenAI API, Gemini, and Codex subscription summaries appear in a scrollable dropdown when available. The separate **Draft strategy** dropdown shows recognized tags, step labels, and command names as the response arrives. TreeLoop carries prior results between goals locally. Activity retains planner and tool events.
 
 ## Artifacts
 
@@ -118,6 +118,12 @@ For artifacts with SQLite enabled, **Setup → Artifact capabilities** includes 
 In **App capabilities**, enable the in-app Skillz chatbot or database support at creation time or later. The workbench writes `.artifact/app.json` and adds only Sequelize plus the selected DBMS driver. SQLite files default to the ignored `.artifact-data/` directory. Other DBMS choices name an environment variable containing the connection URL. Saving an enabled capability automatically upgrades an older artifact's managed server runtime while preserving its frontend and custom server routes. Existing edits to migration-owned files receive a scoped checkpoint commit, followed by a runtime migration commit that also records the capability configuration; unrelated working-tree and staged changes stay outside both commits. **Install capabilities** prepares the host tools and shared Docker image, while this per-artifact migration happens during **Save capabilities**. Changing capabilities on a running app requires a preview restart so dependencies and broker grants are rebuilt.
 
 The chatbot uses `src/skillz.ts` to start a one-shot Python process inside the artifact container. That process discovers the current artifact command catalog, performs a bounded tool loop, and sends model requests through a token-scoped desktop broker; provider credentials and Codex auth are never mounted into the container. API GET requests and `db_query` are discovery commands. API write methods and `db_execute` are mutation commands and are rejected unless the caller explicitly approves mutations.
+
+**Include chatbot UI shell** is on by default when enabling the chatbot. Choose
+the floating pill, sidebar, or full workspace layout. The default scaffold
+mounts the selected layout and custom apps can mount and style the generated
+`SkillzChat` component. Uncheck the option when building a custom interface
+against the chat API.
 
 In **API Blueprints**, install GitHub, OpenAI, or Stripe quickstarts; paste an OpenAPI JSON document for conversion; define requests manually; or ask the dedicated Blueprint agent to create, inspect, update, and delete definitions. Opening this section switches the right panel into a constrained configuration mode. It receives the current blueprint document and may return only validated CRUD operations; it cannot edit artifact source, run shell commands, or manage credentials. The normal app-building agent remains a separate conversation and resumes unchanged when leaving API Blueprints.
 

@@ -108,7 +108,7 @@ A newly surfaced source diagnostic opens one bounded repair window, even when ex
 
 Beta goal and phase transitions start a fresh conversation with at most 4,000 characters of outcomes and 32,000 characters of complete retained read packets. Durable facts and full audit history remain available; later compaction only summarizes the current goal's turns. Shell and structured dependency commands record content changes (including already-dirty files, additions and deletions), invalidate cached source, and require verification when files changed. Dependency/generated directories are excluded from this repository change accounting. Explicit `cat`, `read-line-range`, and `ls` can inspect dependency files under `/repo/node_modules/`; broad repository searches still skip dependencies, and workspace containment and `.git` protections still apply.
 
-Provider recovery preserves the current conversation and retained source; a retry does not trigger compaction. Blank replies receive one retry, while Gemini `MALFORMED_FUNCTION_CALL` / `UNEXPECTED_TOOL_CALL` replies receive up to two targeted retries requesting one small text command, with a total ceiling of three recovery requests per execution turn. These requests retain usage accounting without spending execution turns or restarting discovery. Gemini native function calling is explicitly disabled (`mode=NONE`); host text commands remain available. Persistent failure pauses the current goal with its provider reason. Traces record response IDs, finish/block reasons, part types, and rejected protocol output; hidden reasoning content is excluded.
+Provider recovery preserves the current conversation and retained source without triggering compaction. Blank replies receive one retry. Gemini `MALFORMED_FUNCTION_CALL`, `MALFORMED_RESPONSE`, and `UNEXPECTED_TOOL_CALL` share a separate allowance of up to two targeted retries requesting one small text command. The total ceiling is three recovery requests per execution turn. These requests retain usage accounting without spending execution turns or restarting discovery. Gemini uses host text commands with native function calling disabled (`mode=NONE`). Persistent failure pauses the current goal with its provider reason, including when the last retry has no usable text. Traces record response IDs, finish/block reasons, part types, and rejected protocol output while excluding hidden reasoning content.
 
 An illustrative CLI exchange using the same planner workflow:
 
@@ -220,6 +220,7 @@ Packaged builds currently include the agent source but still require host Python
 | Generated dependency notices and release verification | [Third-party licenses](docs/third-party-licenses.md) |
 | Detailed implementation updates and compatibility behavior | [Development notes](docs/development-notes.md) |
 | Bundled and workspace-local skills | [Skills](skills/README.md) |
+| CLI, repository, and artifact MCP connections | [MCP](docs/mcp.md) |
 | Existing VS Code integration | [Extension](vscode-extension/README.md) |
 
 ## License and acknowledgments

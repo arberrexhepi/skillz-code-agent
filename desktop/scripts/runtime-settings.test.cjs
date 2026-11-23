@@ -6,6 +6,7 @@ const path = require('node:path');
 const { test } = require('node:test');
 const load = require('./load-ts.cjs');
 const { RuntimeSettingsService } = load(() => require('../src/main/services/runtimeSettings.ts'));
+const { readReasoningPreferences, saveReasoningPreference } = load(() => require('../src/main/services/reasoningPreferences.ts'));
 
 function fixture(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'skillz cli settings '));
@@ -91,4 +92,24 @@ test('shared helper environment refreshes saved CLI settings without modifying t
   assert.equal(base.CODEX_CLI_PATH, 'environment-cli');
   await settings.setCodexCliPath(null);
   assert.deepEqual(await settings.environment(base), base);
+});
+
+test('reasoning preferences persist per repo, provider, model and phase', async t => {
+  const { root } = fixture(t);
+  const artifact = fs.mkdtempSync(path.join(root, 'artifact '));
+  const current = { provider: 'gemini', model: 'gemini-4-hydrogen' };
+  const otherModel = { ...current, model: 'gemini-4-carbon' };
+  await Promise.all([
+    saveReasoningPreference(root, current, 'all', 'medium'),
+    saveReasoningPreference(root, current, 'verification', 'xhigh'),
+    saveReasoningPreference(root, otherModel, 'all', 'low'),
+    saveReasoningPreference(artifact, current, 'planning', 'high'),
+  ]);
+  assert.deepEqual((await readReasoningPreferences(root, current)).preferences, { all: 'medium', verification: 'xhigh' });
+  assert.deepEqual((await readReasoningPreferences(root, otherModel)).preferences, { all: 'low' });
+  assert.deepEqual((await readReasoningPreferences(root, { ...current, provider: 'openai' })).preferences, {});
+  assert.deepEqual((await readReasoningPreferences(artifact, current)).preferences, { planning: 'high' });
+  await saveReasoningPreference(root, current, 'verification', null);
+  const data = JSON.parse(fs.readFileSync(path.join(root, '.agent-reasoning.json'), 'utf8'));
+  assert.deepEqual(data.profiles, [{ ...current, efforts: { all: 'medium' } }, { ...otherModel, efforts: { all: 'low' } }]);
 });

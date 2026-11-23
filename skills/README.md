@@ -28,3 +28,8 @@ Notes:
 - The Markdown body becomes the cached payload returned by the skill.
 - Bundled skills in this folder are loaded automatically by both the stable runtime and the beta TreeLoop runtime.
 - Workspace-local skills under `<target-repo>/skills/*.md` are also loaded and can override bundled names.
+
+Use [artifact-chatbot](artifact-chatbot.md) for an artifact's in-app Skillz
+chatbot, including its UI shell, Express route, and Preview verification.
+Use [artifact-mcp-authoring](artifact-mcp-authoring.md) to write, classify,
+and verify custom MCP tools in the artifact.

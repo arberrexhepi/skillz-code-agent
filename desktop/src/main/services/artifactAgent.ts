@@ -10,7 +10,7 @@ export interface AgentExecution {
   stop(): Promise<void>;
   prepareRuntime?(provider: string, model: string): Promise<() => void>;
 }
-export interface AgentLaunch { agentRoot: string; scriptName: string; python: { executable: string; args: string[] }; env: NodeJS.ProcessEnv; options: AgentStartOptions }
+export interface AgentLaunch { agentRoot: string; scriptName: string; python: { executable: string; args: string[] }; env: NodeJS.ProcessEnv; options: AgentStartOptions; mcp?: boolean }
 export class ArtifactAgentExecution implements AgentExecution {
   private sandbox?: ArtifactSandbox;
   private child?: ChildProcessWithoutNullStreams;
@@ -19,7 +19,10 @@ export class ArtifactAgentExecution implements AgentExecution {
   private baseContext?: AgentLaunch;
   private generation = 0;
   private selection?: { provider: string; model: string };
-  constructor(private readonly createSandbox: () => Promise<ArtifactSandbox>, private readonly log: (text: string) => void, private readonly prepareHost?: (context: AgentLaunch) => Promise<AgentLaunch>) {}
+  constructor(private readonly createSandbox: () => Promise<ArtifactSandbox>, private readonly log: (text: string) => void,
+    private readonly prepareHost?: (context: AgentLaunch) => Promise<AgentLaunch>,
+    private readonly startPreview?: () => Promise<string>,
+    private readonly previewAction?: (action: unknown) => Promise<Record<string, unknown>>) {}
   async launch(context: AgentLaunch): Promise<ChildProcessWithoutNullStreams> {
     const generation = this.generation;
     this.baseContext = context;
@@ -30,7 +33,10 @@ export class ArtifactAgentExecution implements AgentExecution {
     const sandbox = await this.createSandbox(); this.sandbox = sandbox;
     const prepared = await sandbox.prepare(this.log, context.agentRoot);
     if (generation !== this.generation) { await sandbox.stop(); throw new Error('Agent start cancelled.'); }
-    const child = sandbox.spawn(prepared.docker, prepared.args, ['python3', '-u', '/opt/skillz/artifact_agent_entry.py', context.scriptName, '--provider', context.options.provider, '--model', context.options.model, '--root', '/repo', '--tools', '/opt/skillz/agent_tools.py', '--extension-bridge'], ['-i']);
+    const child = sandbox.spawn(prepared.docker, prepared.args, ['python3', '-u', '/opt/skillz/artifact_agent_entry.py', context.scriptName,
+      ...(context.mcp ? ['--mcp'] : []), ...(this.startPreview ? ['--artifact-preview'] : []),
+      '--provider', context.options.provider, '--model', context.options.model,
+      '--root', '/repo', '--tools', '/opt/skillz/agent_tools.py', '--extension-bridge'], ['-i']);
     this.child = child;
     child.once('exit', () => { if (this.child === child) void this.stop().catch(() => {}); });
     return child;
@@ -70,30 +76,66 @@ export class ArtifactAgentExecution implements AgentExecution {
     };
   }
   message(payload: Record<string, unknown>): boolean {
-    if (payload.type !== 'artifact_model_request') return false;
+    const preview = payload.type === 'artifact_preview_request';
+    if (!preview && payload.type !== 'artifact_model_request') return false;
     const context = this.context, child = this.child;
-    if (!context || !child || typeof payload.id !== 'string') return true;
-    const reply = (value: Record<string, unknown>) => { if (this.child === child && !child.stdin.destroyed) child.stdin.write(JSON.stringify({ ...value, type: 'artifact_model_response', id: payload.id }) + '\n'); };
+    if (!context || !child || typeof payload.id !== 'string' || payload.id.length > 80) return true;
+    const reply = (value: Record<string, unknown>) => {
+      if (this.child === child && !child.stdin.destroyed) {
+        child.stdin.write(JSON.stringify({ ...value, type: preview ? 'artifact_preview_response' : 'artifact_model_response', id: payload.id }) + '\n');
+      }
+    };
+    if (preview) {
+      void Promise.resolve().then(async () => {
+        if (!this.startPreview || Object.keys(payload).some(key => !['type', 'id', 'action'].includes(key))) {
+          throw new Error('Preview actions are scoped to the current artifact.');
+        }
+        if (payload.action === undefined) return { ok: true, status: 'running', url: await this.startPreview() };
+        if (!this.previewAction) throw new Error('This artifact has no application verification broker.');
+        return this.previewAction(payload.action);
+      }).then(
+        value => reply({ payload: value }),
+        error => reply({ payload: { ok: false, error: error instanceof Error ? error.message : String(error) } }),
+      );
+      return true;
+    }
     if (payload.provider !== this.selection?.provider || payload.model !== this.selection?.model) { reply({ error: 'Model request does not match the selected runtime.' }); return true; }
     if (this.models.size >= 8) { reply({ error: 'Too many simultaneous model requests.' }); return true; }
     const helper = spawnModelHelper(context.python.executable, [...context.python.args, path.join(context.agentRoot, 'artifact_model_host.py')], { cwd: context.agentRoot, env: context.env, windowsHide: true });
-    this.models.add(helper); let output = '', errors = ''; let final: Record<string, unknown> | undefined;
-    const timeout = setTimeout(() => { void terminate(helper); reply({ error: 'Model request timed out.' }); }, 1200000);
+    this.models.add(helper);
+    let output = '', errors = '', settled = false;
+    const finish = (value: Record<string, unknown>): void => {
+      if (settled) return;
+      settled = true;
+      reply(value);
+    };
+    let timeout = setTimeout(() => { void terminate(helper); finish({ error: 'Model request timed out.' }); }, 1200000);
     helper.stdout.setEncoding('utf8'); helper.stderr.setEncoding('utf8');
     helper.stdout.on('data', (text: string) => {
+      if (settled) return;
       output += text;
-      if (output.length > 16 * 1024 * 1024) { void terminate(helper); return; }
+      if (output.length > 16 * 1024 * 1024) { void terminate(helper); finish({ error: 'Model helper response exceeded 16 MB.' }); return; }
       let newline: number;
       while ((newline = output.indexOf('\n')) >= 0) {
         const line = output.slice(0, newline); output = output.slice(newline + 1);
-        try { const value = JSON.parse(line) as Record<string, unknown>; if ('progress' in value) reply(value); else final = value; }
+        try {
+          const value = JSON.parse(line) as Record<string, unknown>;
+          if ('progress' in value) reply(value);
+          else if (typeof value.text === 'string' || typeof value.error === 'string') {
+            // The complete reply is a protocol record. Helper and subprocess cleanup can finish separately.
+            finish(value);
+            clearTimeout(timeout);
+            timeout = setTimeout(() => { void terminate(helper); }, 5000);
+            return;
+          } else errors = 'Model helper returned an invalid response.';
+        }
         catch { errors = 'Model helper returned invalid JSON.'; }
       }
     });
     helper.stderr.on('data', (text: string) => { errors = (errors + text).slice(-3000); this.log(text); });
-    helper.on('error', (error) => reply({ error: error.message }));
-    helper.on('close', () => { clearTimeout(timeout); this.models.delete(helper); reply(final || { error: errors || 'Model helper returned an invalid response.' }); });
-    helper.stdin.on('error', (error) => reply({ error: error.message }));
+    helper.on('error', (error) => finish({ error: error.message }));
+    helper.on('close', () => { clearTimeout(timeout); this.models.delete(helper); finish({ error: errors || 'Model helper returned an invalid response.' }); });
+    helper.stdin.on('error', (error) => finish({ error: error.message }));
     helper.stdin.end(JSON.stringify(payload));
     return true;
   }

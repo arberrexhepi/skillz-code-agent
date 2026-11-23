@@ -231,6 +231,7 @@ CONTEXT:
   ingest-log <path>                 Parse a log file into run issues under /facts/log-issues
   run-check <build|lint|typecheck|test>  Run a finite project check and ingest issues
   run-route-check <route-or-url> [base=<url>]  Visit a route with Playwright and ingest browser/runtime issues
+  verify check-1,check-2 <command>    Run a tool for required checks in a verification goal
   expand <step_number>              Expand a history step
   expand <memory_id>                Expand a memory item
   drop                              Clear active context

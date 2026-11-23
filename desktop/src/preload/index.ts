@@ -3,6 +3,13 @@ import { contextBridge, ipcRenderer } from 'electron';
 import type { AgentEvent, TerminalEvent, WorkbenchApi } from '../shared/contracts';
 
 const api: WorkbenchApi = {
+  mcp: {
+    profile: (id) => ipcRenderer.invoke('mcp:profile', id),
+    save: (name, settings, id) => ipcRenderer.invoke('mcp:save', name, settings, id),
+    manage: (action, name, id) => ipcRenderer.invoke('mcp:manage', action, name, id),
+    inspect: (name, kind, id, query, offset) => ipcRenderer.invoke('mcp:inspect', name, kind, id, query, offset),
+    setup: () => ipcRenderer.invoke('mcp:setup'),
+  },
   artifacts: {
     capabilities: (selection, artifactId) => ipcRenderer.invoke('artifacts:capabilities', selection, artifactId),
     installCapabilities: (selection, artifactId) => ipcRenderer.invoke('artifacts:install-capabilities', selection, artifactId),
@@ -14,7 +21,7 @@ const api: WorkbenchApi = {
     cleanDocker: () => ipcRenderer.invoke('artifacts:clean-docker'),
     library: () => ipcRenderer.invoke('artifacts:library'),
     prebuilts: () => ipcRenderer.invoke('artifacts:prebuilts'),
-    installPrebuilt: (id, access, runtime) => ipcRenderer.invoke('artifacts:install-prebuilt', id, access, runtime),
+    installPrebuilt: (id, access, runtime, playwrightMcp) => ipcRenderer.invoke('artifacts:install-prebuilt', id, access, runtime, playwrightMcp),
     chooseFolder: () => ipcRenderer.invoke('artifacts:choose-folder'),
     prebuiltUpdateStatus: (id) => ipcRenderer.invoke('artifacts:prebuilt-update-status', id),
     reviewPrebuiltUpdate: (id) => ipcRenderer.invoke('artifacts:review-prebuilt-update', id),
@@ -31,6 +38,7 @@ const api: WorkbenchApi = {
     runApiCollection: (id, collection, variables = {}, approveMutations = false) => ipcRenderer.invoke('artifacts:run-api-collection', id, collection, variables, approveMutations),
     app: (id) => ipcRenderer.invoke('artifacts:app', id),
     saveApp: (id, config) => ipcRenderer.invoke('artifacts:save-app', id, config),
+    requestAppMcp: (id, request) => ipcRenderer.invoke('artifacts:app-mcp-request', id, request),
     start: (id) => ipcRenderer.invoke('artifacts:start', id),
     stop: (id) => ipcRenderer.invoke('artifacts:stop', id),
     installBrowser: () => ipcRenderer.invoke('artifacts:install-browser'),
@@ -39,6 +47,8 @@ const api: WorkbenchApi = {
     reload: (id) => ipcRenderer.invoke('artifacts:reload', id),
     closePreview: (id) => ipcRenderer.invoke('artifacts:close-preview', id),
     reveal: (id) => ipcRenderer.invoke('artifacts:reveal', id),
+    issues: (id) => ipcRenderer.invoke('artifacts:issues', id),
+    issueAction: (id, action, extras) => ipcRenderer.invoke('artifacts:issue-action', id, action, extras),
     gitStatus: (id) => ipcRenderer.invoke('artifacts:git-status', id),
     gitInitialize: (id) => ipcRenderer.invoke('artifacts:git-initialize', id),
     gitHistory: (id, limit = 75) => ipcRenderer.invoke('artifacts:git-history', id, limit),
@@ -99,6 +109,8 @@ const api: WorkbenchApi = {
     onCommand: (listener) => subscribe<'undo' | 'redo' | 'find'>('editor:command', listener),
   },
   agent: {
+    reasoningPreferences: (selection, artifactId) => ipcRenderer.invoke('agent:reasoning-preferences', selection, artifactId),
+    saveReasoningPreference: (selection, phase, effort, root, artifactId) => ipcRenderer.invoke('agent:save-reasoning-preference', selection, phase, effort, root, artifactId),
     start: (options) => ipcRenderer.invoke('agent:start', options),
     submit: (text) => ipcRenderer.invoke('agent:submit', text),
     plannerAction: (action, extras = {}) => ipcRenderer.invoke('agent:planner-action', action, extras),

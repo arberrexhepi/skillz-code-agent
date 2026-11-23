@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import stat
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -17,7 +20,7 @@ AUTO_COMPACT_CLOSED_ISSUE_DETAIL_LIMIT = 3
 AUTO_COMPACT_LIFECYCLE_NOTE_LIMIT = 2
 LEGACY_ISSUE_ID = "legacy-architecture"
 GLOBAL_ARCHITECTURE_ISSUE_ID = "global-architecture"
-REPO_FACTS_JSON_BLOCK_RE = re.compile(r"```json\s*(.*?)\s*```", re.DOTALL)
+REPO_FACTS_JSON_BLOCK_RE = re.compile(r"```json[ \t]*\r?\n(.*?)\r?\n[ \t]*```[ \t]*(?=\r?$)", re.DOTALL | re.MULTILINE)
 
 
 def _utc_timestamp() -> str:
@@ -131,6 +134,28 @@ class CompletedGoalCheckpoint:
     original_index: int = 0
     total_goal_count: int = 0
     source: str = "execution"
+    verification: Optional[Dict[str, Any]] = None
+    deferred_findings: List[Dict[str, Any]] = field(default_factory=list)
+    mutation_paths: List[str] = field(default_factory=list)
+
+    @classmethod
+    def from_execution(
+        cls, *, plan_summary: str, goal: Dict[str, Any], result: Dict[str, Any],
+        original_index: int, total_goal_count: int,
+    ) -> "CompletedGoalCheckpoint":
+        return cls(
+            goal_id=str(goal.get("goal_id") or "").strip(),
+            title=str(goal.get("title") or "").strip(),
+            goal_signature=str(goal.get("goal_signature") or "").strip(),
+            plan_summary=str(plan_summary or "").strip(),
+            final_message=str(result.get("final_message") or "").strip(),
+            validation_summary=str(result.get("validation_summary") or "").strip(),
+            original_index=int(original_index or 0),
+            total_goal_count=int(total_goal_count or 0),
+            verification=result.get("verification"),
+            deferred_findings=list(result.get("deferred_findings") or []),
+            mutation_paths=list(result.get("mutation_paths") or []),
+        )
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -144,6 +169,9 @@ class CompletedGoalCheckpoint:
             "original_index": self.original_index,
             "total_goal_count": self.total_goal_count,
             "source": self.source,
+            **({"verification": self.verification} if self.verification is not None else {}),
+            **({"deferred_findings": self.deferred_findings} if self.deferred_findings else {}),
+            **({"mutation_paths": self.mutation_paths} if self.mutation_paths else {}),
         }
 
     @classmethod
@@ -164,6 +192,9 @@ class CompletedGoalCheckpoint:
             original_index=int(item.get("original_index", 0) or 0),
             total_goal_count=int(item.get("total_goal_count", 0) or 0),
             source=str(item.get("source", "execution") or "execution").strip(),
+            verification=item["verification"] if isinstance(item.get("verification"), dict) else None,
+            deferred_findings=[finding for finding in (item.get("deferred_findings") or []) if isinstance(finding, dict)],
+            mutation_paths=[path for path in (item.get("mutation_paths") or []) if isinstance(path, str)],
         )
 
 
@@ -185,6 +216,8 @@ class IssueRecord:
     lifecycle_notes: List[str] = field(default_factory=list)
     facts: List[IssueFactRecord] = field(default_factory=list)
     completed_goals: List[CompletedGoalCheckpoint] = field(default_factory=list)
+    pending_approval: Optional[Dict[str, Any]] = None
+    approved_plan: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -204,6 +237,8 @@ class IssueRecord:
             "lifecycle_notes": list(self.lifecycle_notes),
             "facts": [record.to_persisted_dict() for record in sorted(self.facts, key=lambda item: (item.fact_type, item.key))],
             "completed_goals": [checkpoint.to_dict() for checkpoint in self.completed_goals],
+            **({"pending_approval": self.pending_approval} if self.status == ISSUE_STATUS_OPEN and self.pending_approval is not None else {}),
+            **({"approved_plan": self.approved_plan} if self.status == ISSUE_STATUS_OPEN and self.approved_plan is not None else {}),
         }
 
     def summary(self) -> Dict[str, Any]:
@@ -267,6 +302,8 @@ class IssueRecord:
             lifecycle_notes=[str(note) for note in item.get("lifecycle_notes", []) or [] if str(note).strip()],
             facts=facts,
             completed_goals=completed_goals,
+            pending_approval=item["pending_approval"] if status == ISSUE_STATUS_OPEN and isinstance(item.get("pending_approval"), dict) else None,
+            approved_plan=item["approved_plan"] if status == ISSUE_STATUS_OPEN and isinstance(item.get("approved_plan"), dict) else None,
         )
 
 
@@ -276,31 +313,50 @@ class IssueFactLedger:
     active_issue_id: str = ""
     issues: List[IssueRecord] = field(default_factory=list)
     migration: Dict[str, Any] = field(default_factory=dict)
+    pending_approval: Optional[Dict[str, Any]] = None
 
     @classmethod
     def empty(cls) -> "IssueFactLedger":
         return cls()
 
     @classmethod
-    def load(cls, path: Path) -> "IssueFactLedger":
-        if not path.exists() or not path.is_file():
+    def load(cls, path: Path, *, strict: bool = False) -> "IssueFactLedger":
+        if strict and path.is_symlink():
+            raise ValueError("repo_facts.md must be a regular workspace file to save a pending plan.")
+        if not path.is_file():
+            if strict and path.exists():
+                raise ValueError("repo_facts.md must be a regular workspace file to save a pending plan.")
             return cls.empty()
         try:
             text = path.read_text(encoding="utf-8")
-        except Exception:
+        except FileNotFoundError:
             return cls.empty()
-        return cls.from_markdown(text)
+        except (OSError, UnicodeError):
+            if strict:
+                raise
+            return cls.empty()
+        return cls.from_markdown(text, strict=strict)
 
     @classmethod
-    def from_markdown(cls, text: str) -> "IssueFactLedger":
+    def from_markdown(cls, text: str, *, strict: bool = False) -> "IssueFactLedger":
         if not str(text or "").strip():
             return cls.empty()
-        match = REPO_FACTS_JSON_BLOCK_RE.search(text)
+        match = REPO_FACTS_JSON_BLOCK_RE.search(text) or re.search(r"```json\s*(.*?)\s*```", text, re.DOTALL)
         candidate = match.group(1) if match else text.strip()
         try:
             payload = json.loads(candidate)
-        except Exception:
+        except ValueError as exc:
+            if strict:
+                raise ValueError("repo_facts.md contains invalid JSON. Repair it before saving a pending plan.") from exc
             return cls.empty()
+        if strict and not (
+            isinstance(payload, list)
+            or (isinstance(payload, dict) and (
+                isinstance(payload.get("facts"), list)
+                or (str(payload.get("schema_version")) == str(SCHEMA_VERSION) and isinstance(payload.get("issues"), list))
+            ))
+        ):
+            raise ValueError("repo_facts.md has an unsupported ledger format. Repair it before saving a pending plan.")
         return cls.from_payload(payload)
 
     @classmethod
@@ -326,6 +382,7 @@ class IssueFactLedger:
             active_issue_id=str(payload.get("active_issue_id", "") or "").strip(),
             issues=issues,
             migration=dict(payload.get("migration", {})) if isinstance(payload.get("migration"), dict) else {},
+            pending_approval=payload["pending_approval"] if isinstance(payload.get("pending_approval"), dict) else None,
         )
         if ledger.active_issue_id and ledger.get_issue(ledger.active_issue_id) is None:
             ledger.active_issue_id = ""
@@ -402,6 +459,7 @@ class IssueFactLedger:
             "active_issue_id": self.active_issue_id,
             "migration": dict(self.migration),
             "issues": [self._issue_to_persisted_dict(issue, keep_detailed_ids=keep_detailed_ids) for issue in issues],
+            **({"pending_approval": self.pending_approval} if self.pending_approval is not None else {}),
         }
 
     def to_markdown(self) -> str:
@@ -420,6 +478,77 @@ class IssueFactLedger:
 
     def total_fact_count(self) -> int:
         return sum(len(issue.facts) for issue in self.issues)
+
+    def pending_approval_for(self, issue_id: str) -> Optional[Dict[str, Any]]:
+        if not issue_id:
+            return self.pending_approval
+        issue = self.get_issue(issue_id)
+        return issue.pending_approval if issue is not None and issue.status == ISSUE_STATUS_OPEN else None
+
+    def save_pending_approval(
+        self, path: Path, issue_id: str, draft: Optional[Dict[str, Any]], *, expected_revision: str = "",
+    ) -> None:
+        current = self.pending_approval_for(issue_id)
+        if expected_revision and (current or {}).get("revision") != expected_revision:
+            raise ValueError("The saved plan changed. Continue the issue and review its current plan.")
+        if issue_id:
+            issue = self.get_issue(issue_id)
+            if issue is None or issue.status != ISSUE_STATUS_OPEN:
+                raise ValueError(f"Issue {issue_id} must be open to save a pending plan.")
+            if current == draft and issue.approved_plan is None:
+                return
+            issue.pending_approval = draft
+            issue.approved_plan = None
+        else:
+            if current == draft:
+                return
+            self.pending_approval = draft
+        self.save(path)
+
+    def approve_pending_plan(
+        self, path: Path, issue_id: str, snapshot: Dict[str, Any], *, expected_revision: str = "",
+    ) -> IssueRecord:
+        draft = self.pending_approval_for(issue_id)
+        if str((draft or {}).get("revision") or "") != expected_revision:
+            raise ValueError("The saved plan changed. Continue the issue and review its current plan.")
+        issue = self.get_issue(issue_id) if issue_id else self.active_issue()
+        if issue_id and (issue is None or issue.status != ISSUE_STATUS_OPEN):
+            raise ValueError(f"Issue {issue_id} must be open to approve its plan.")
+        if not issue_id and issue is not None and issue.pending_approval is not None:
+            raise ValueError("The active issue already has a saved plan. Continue the issue and review its current plan.")
+        plan = snapshot["plan"]
+        issue = self.ensure_issue_open(
+            request_summary=(issue.request_summary if issue else "") or plan["original_request"],
+            plan_summary=plan["summary"],
+            reuse_issue_id=issue_id,
+        )
+        if issue_id:
+            issue.pending_approval = None
+        else:
+            self.pending_approval = None
+        issue.approved_plan = snapshot
+        self.save(path)
+        return issue
+
+    def save(self, path: Path) -> None:
+        # Replacing a complete file prevents a stopped worker from leaving a
+        # truncated ledger when saving a plan for approval.
+        try:
+            mode = stat.S_IMODE(path.stat().st_mode)
+        except FileNotFoundError:
+            mode = None
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False,
+        ) as file:
+            temporary = Path(file.name)
+            try:
+                file.write(self.to_markdown())
+                file.close()
+                if mode is not None:
+                    temporary.chmod(mode)
+                os.replace(temporary, path)
+            finally:
+                temporary.unlink(missing_ok=True)
 
     def get_issue(self, issue_id: str) -> Optional[IssueRecord]:
         normalized = str(issue_id or "").strip()
@@ -637,6 +766,7 @@ class IssueFactLedger:
                 and existing.plan_summary == checkpoint.plan_summary
                 and checkpoint.goal_id
                 and existing.goal_id == checkpoint.goal_id
+                and not (checkpoint.goal_signature and existing.goal_signature)
             ):
                 match_index = index
                 break
@@ -671,6 +801,8 @@ class IssueFactLedger:
         if issue is None:
             raise KeyError(issue_id)
         issue.status = ISSUE_STATUS_CLOSED
+        issue.pending_approval = None
+        issue.approved_plan = None
         if not str(issue.closed_at or "").strip():
             issue.closed_at = _utc_timestamp()
         note_text = str(note or "").strip()
@@ -685,6 +817,8 @@ class IssueFactLedger:
         if issue is None:
             raise KeyError(issue_id)
         issue.status = ISSUE_STATUS_OPEN
+        issue.pending_approval = None
+        issue.approved_plan = None
         issue.closed_at = ""
         issue.reopen_count = int(issue.reopen_count or 0) + 1
         self.active_issue_id = issue.issue_id

@@ -8,6 +8,7 @@ import subprocess
 from subprocess import run as run_git
 from dataclasses import dataclass, field
 from pathlib import Path
+from reasoning_effort import REASONING_PREFERENCES_FILE
 
 
 EXCLUDED_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__", ".pytest_cache",
@@ -41,7 +42,9 @@ class RepositorySnapshot:
         for relative in paths:
             path = Path(relative)
             if (any(part in EXCLUDED_DIRS for part in path.parts)
-                    or path.parts[:2] == (".context", "observability")):
+                    or path.parts[:2] == (".context", "observability")
+                    or (len(path.parts) == 1 and (path.name == REASONING_PREFERENCES_FILE
+                        or path.name.startswith(REASONING_PREFERENCES_FILE + ".") and path.suffix == ".tmp"))):
                 continue
             target = root / path
             try:

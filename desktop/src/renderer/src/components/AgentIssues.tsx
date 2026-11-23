@@ -1,13 +1,16 @@
 import { useEffect, useRef, useState } from 'react';
 import { continuousIsActive } from '../../../shared/agentCore';
 import { issueManagementView, ISSUE_PROPOSALS_PATH, type ManagedIssue, type WorkspaceIssuesSnapshot } from '../../../shared/workspaceIssues';
+import type { WorkbenchApi } from '../../../shared/contracts';
 import { useAgentWorkspace } from '../agent/agentWorkspace';
 import { PathChip, PathText } from './PathText';
 import { IssueCreateForm } from './IssueCreateForm';
 import { AgentSuggestions } from './AgentSuggestions';
 
-export function AgentIssues({ workspaceRoot, revision, focusedIssueId, onOpenPath }: {
-  workspaceRoot: string; revision: number; focusedIssueId?: string; onOpenPath: (path: string) => void;
+export type AgentIssuesApi = Pick<WorkbenchApi['workspace'], 'issues' | 'issueAction'>;
+
+export function AgentIssues({ workspaceRoot, revision, focusedIssueId, onOpenPath, api }: {
+  workspaceRoot: string; revision: number; focusedIssueId?: string; onOpenPath: (path: string) => void; api?: AgentIssuesApi;
 }): React.JSX.Element {
   const agent = useAgentWorkspace();
   const [saved, setSaved] = useState<WorkspaceIssuesSnapshot>();
@@ -33,8 +36,9 @@ export function AgentIssues({ workspaceRoot, revision, focusedIssueId, onOpenPat
     let current = true;
     setLoading(true); setReadError('');
     void Promise.resolve().then(() => {
-      if (!window.workbench.workspace.issues) throw new Error('Restart the desktop app to load the saved Issues reader.');
-      return window.workbench.workspace.issues(workspaceRoot);
+      const source = api || window.workbench.workspace;
+      if (!source.issues) throw new Error('Restart the desktop app to load the saved Issues reader.');
+      return source.issues(workspaceRoot);
     }).then(next => {
       if (!current) return;
       if (next.workspaceRoot !== workspaceRoot) throw new Error('Workspace changed. Refresh Issues in the intended folder.');
@@ -42,7 +46,7 @@ export function AgentIssues({ workspaceRoot, revision, focusedIssueId, onOpenPat
     }).catch(error => { if (current) { setSaved(undefined); setReadError(cleanError(error)); } })
       .finally(() => { if (current) setLoading(false); });
     return () => { current = false; };
-  }, [workspaceRoot, revision, refresh]);
+  }, [workspaceRoot, revision, refresh, api]);
   useEffect(() => {
     if (focusedIssueId) { setExpandedIssueId(focusedIssueId); setQuery(focusedIssueId); setFilter('all'); setLimit(20); }
   }, [focusedIssueId]);
@@ -65,8 +69,9 @@ export function AgentIssues({ workspaceRoot, revision, focusedIssueId, onOpenPat
     try {
       if (agent.state.status === 'running') await agent.createIssue(summary.trim());
       else {
-        if (!window.workbench.workspace.issueAction) throw new Error('Restart the desktop app to enable offline issue changes.');
-        const next = await window.workbench.workspace.issueAction(workspaceRoot, 'create_issue', { summary: summary.trim() });
+        const source = api || window.workbench.workspace;
+        if (!source.issueAction) throw new Error('Restart the desktop app to enable offline issue changes.');
+        const next = await source.issueAction(workspaceRoot, 'create_issue', { summary: summary.trim() });
         if (mounted.current) setSaved(next);
       }
       if (mounted.current) { setSummary(''); reload(); }
@@ -81,8 +86,9 @@ export function AgentIssues({ workspaceRoot, revision, focusedIssueId, onOpenPat
       if (action === 'continue_issue' || agent.state.status === 'running') {
         if (!(await agent.plannerAction(action, { issue_id: issue.id }))) throw new Error(`Could not update ${issue.id}. Check the agent notice or runtime settings and retry.`);
       } else {
-        if (!window.workbench.workspace.issueAction) throw new Error('Restart the desktop app to enable offline issue changes.');
-        const next = await window.workbench.workspace.issueAction(workspaceRoot, action, { issue_id: issue.id });
+        const source = api || window.workbench.workspace;
+        if (!source.issueAction) throw new Error('Restart the desktop app to enable offline issue changes.');
+        const next = await source.issueAction(workspaceRoot, action, { issue_id: issue.id });
         if (mounted.current) setSaved(next);
       }
       reload();

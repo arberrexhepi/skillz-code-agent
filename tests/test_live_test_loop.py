@@ -286,6 +286,22 @@ class TreeLoopPlannerWorkerTests(unittest.TestCase):
             self.assertTrue(any("mode: aggregate" in output for output in first_turn_outputs))
             self.assertTrue(any("project_problems" in output for output in first_turn_outputs))
 
+    def test_artifact_chatbot_skill_reaches_the_next_worker_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model = FakeModelClient(["skill artifact-chatbot", "finish Ready to mount the shell."])
+            worker = TreeLoopPlannerWorker(
+                model=model,
+                root=Path(tmpdir),
+                max_turns=2,
+                checkpoint_interval=0,
+                thinking_mode="low",
+                verbose=False,
+            )
+            result = worker.run_task("Load the Skillz chatbot setup guidance.")
+            self.assertTrue(result.ok)
+            self.assertIn("POST /_skillz/agent/chat", model.calls[1]["prompt"])
+            self.assertIn("skillzChat.registerTargets", model.calls[1]["prompt"])
+
     def test_playground_os_can_discover_and_invoke_bibbity_boop_skill(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -1181,11 +1197,16 @@ class PlannerBridgeParityTests(unittest.TestCase):
 
             self.assertEqual(exit_code, 0)
             lines = [json.loads(line) for line in stdout.getvalue().splitlines() if line.strip()]
-            self.assertEqual(lines[1]["id"], "2")
-            self.assertIn("Plan Summary", lines[1]["message"])
-            self.assertEqual(lines[2]["id"], "3")
-            self.assertEqual(lines[2]["message"], "Plan rejected. Describe what should change and I will revise it.")
-            planner_state = lines[2]["state"]["planner"]
+            replies = {line["id"]: line for line in lines if "id" in line}
+            self.assertIn("Plan Summary", replies["2"]["message"])
+            self.assertEqual(replies["3"]["message"], "Plan rejected. Describe what should change and I will revise it.")
+            before_plan = lines[:lines.index(replies["2"])]
+            self.assertEqual(
+                [line["action_type"] for line in before_plan if line.get("domain") == "planner"],
+                ["model_call_start", "model_call_finish"],
+            )
+            self.assertTrue(any(line.get("action_type") == "plan_presented" for line in before_plan))
+            planner_state = replies["3"]["state"]["planner"]
             self.assertTrue(planner_state["awaiting_plan_revision"])
             self.assertIsNone(planner_state["pending_plan"])
 

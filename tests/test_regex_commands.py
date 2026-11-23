@@ -236,8 +236,51 @@ class RegexCommandsTests(unittest.TestCase):
         _, results, _ = worker.loop._execute_command_batch(command)
         self.assertFalse(results[0].ok)
         self.assertIn("find-regex", worker._active_mode_strategy()["steps"][0])
-        worker.loop._execute_command_batch('find-regex /repo/app.txt {"pattern":"\\\\d+"}')
+        _, recovery, _ = worker.loop._execute_command_batch('batch start\nfind-regex /repo/app.txt {"pattern":"\\\\d+"}')
+        self.assertTrue(all(result.ok for result in recovery))
+        self.assertTrue(worker.edit_batch_state()["active"])
         self.assertIsNone(worker._patch_resolution)
+
+    def test_remediation_preserves_a_regex_batch_across_turns_and_requires_the_failed_check(self):
+        companion = self.root / "companion.txt"
+        companion.write_text("old\n")
+        preview = "find-regex /repo/app.txt " + json.dumps({"pattern": r"\d+", "replacement": "0"})
+        replace_all = "replace-regex /repo/app.txt " + json.dumps({"pattern": r"\d+", "replacement": "0", "expected_matches": 2})
+        other_edit = {"type": "replace_regex", "path": "companion.txt", "pattern": "old", "replacement": "new"}
+        batch_edit = "edit-batch " + json.dumps({"operations": [other_edit]})
+        worker = TreeLoopPlannerWorker(model=TreeModel([
+            "run-check build",
+            'batch start\nreplace-regex /repo/companion.txt {"pattern":"old","replacement":"new"}',
+            f"{preview}\n{replace_all}",
+            f"batch start\n{batch_edit}\nbatch end\nfinish Premature",
+            "run-check build\nfinish Repaired",
+        ]), root=self.root, max_turns=5, checkpoint_interval=0, verbose=False)
+
+        def check(_action):
+            if self.path.read_text() == "name = 0\nother = 0\n" and companion.read_text() == "new\n":
+                return "exit_code=0\nissues=0"
+            worker.loop.bridge.tree.ingest_diagnostic_content(
+                "app.txt(1,1): error TS2322: Normalize the values", source_path="[run-check:build]",
+            )
+            return "exit_code=1\nissues=1"
+
+        with (
+            mock.patch.object(worker.loop, "_exec_run_check", side_effect=check),
+            mock.patch.object(worker.loop, "_run_backend_diagnostics_for_path", return_value="") as diagnose,
+        ):
+            result = worker.run_task("Repair the failing build with coordinated edits")
+
+        self.assertTrue(result.ok, result.final_message)
+        self.assertTrue(result.validation_passed)
+        start, rejected = worker.history[1].results
+        self.assertTrue(start.ok, start.output)
+        self.assertIn("discovery remediation active", rejected.output)
+        self.assertTrue(all(result.ok for result in worker.history[2].results))
+        repeated_start, _, end, finish = worker.history[3].results
+        self.assertIn("1 file(s) queued", repeated_start.output)
+        self.assertIn("host verified 2 file(s)", end.output)
+        self.assertIn("finish blocked: Validation failed", finish.output)
+        self.assertEqual([call.args[0] for call in diagnose.call_args_list], ["app.txt", "companion.txt"])
 
     def test_cli_and_stable_runtime_support_the_same_regex_actions(self):
         spec = self.root / "regex.json"

@@ -21,11 +21,11 @@ function fixture(t) {
   t.mock.method(tools,'dockerCommand',async()=> 'fixture-docker');
   t.mock.method(tools,'sandboxImageReady',async()=>state.image);
   t.mock.method(tools,'ensureSandboxImage',async(log)=>{calls.push(['image']);state.image=true;log('Image ready.');return {docker:'fixture-docker',image:'fixture'};});
-  t.mock.method(service,'probe',async(_python,env,selection)=>({sdkReady:selection.provider==='codex-subscription'||state.sdk,keyReady:selection.provider==='codex-subscription'||Boolean(env.GEMINI_API_KEY),keyName:selection.provider==='codex-subscription'?undefined:'GEMINI_API_KEY',label:selection.provider}));
+  t.mock.method(service,'probe',async(_python,env,selection)=>({sdkReady:selection.provider==='codex-subscription'||state.sdk,sdkUpdateAvailable:selection.provider==='gemini'&&state.sdkUpdateAvailable,keyReady:selection.provider==='codex-subscription'||Boolean(env.GEMINI_API_KEY),keyName:selection.provider==='codex-subscription'?undefined:'GEMINI_API_KEY',label:selection.provider}));
   t.mock.method(tools,'runLogged',async(exe,args,_cwd,log)=>{
     calls.push([exe,...args]);log('Installing capability.');
     if(args[1]==='venv'){const python=path.join(args[2],process.platform==='win32'?'Scripts/python.exe':'bin/python');fs.mkdirSync(path.dirname(python),{recursive:true});fs.writeFileSync(python,'fixture');}
-    if(args[1]==='pip')state.sdk=true;
+    if(args[1]==='pip'){state.sdk=true;state.sdkUpdateAvailable=false;}
   });
   return {root,service,state,calls,events,storage};
 }
@@ -39,6 +39,20 @@ test('inspection is read-only and installation provisions only missing capabilit
   assert.equal(after.items.find(item=>item.id==='provider').ready,true);assert.equal(after.items.find(item=>item.id==='credentials').ready,false);assert.equal(after.items.find(item=>item.id==='credentials').optional,true);assert.equal(after.ready,true);
   assert.equal(service.snapshot().running,false);assert.ok(events.some(event=>event.log.includes('Image ready')));assert.equal(calls.some(call=>call[0]==='browser'),false);
   const count=calls.length;await service.install(selection);assert.equal(calls.length,count);
+});
+
+test('Artifact Setup can upgrade an installed Gemini SDK', async t => {
+  const {root,service,state,calls}=fixture(t);
+  state.sdk=state.sdkUpdateAvailable=state.image=true;
+  const managedPython=path.join(root,'settings','python',process.platform==='win32'?'Scripts/python.exe':'bin/python');
+  fs.mkdirSync(path.dirname(managedPython),{recursive:true});
+  fs.writeFileSync(managedPython,'fixture');
+  const before=await service.status(selection);
+  assert.equal(before.ready,true);
+  assert.equal(before.items.find(item=>item.id==='provider').installable,true);
+  const after=await service.install(selection);
+  assert.deepEqual(calls,[[managedPython,'-m','pip','install','--disable-pip-version-check','--upgrade','google-genai']]);
+  assert.equal(after.items.find(item=>item.id==='provider').installable,false);
 });
 
 test('keys use encrypted host settings, never appear in readiness results, and reach only the selected helper environment',async(t)=>{

@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
+import tempfile
 from types import MethodType
 import unittest
 
-from main import WorkingFolderAgent
+from main import AgentConfig, WorkingFolderAgent
+from tests.test_tree_loop_messages import RecordingMessageModel
 
 
 class FakeTranscriptModel:
@@ -52,6 +56,37 @@ class StableWorkerTranscriptTests(unittest.TestCase):
         self.assertEqual([item["role"] for item in second_call], ["user", "assistant", "user"])
         self.assertEqual(second_call[0]["content"], "FULL CONTEXT: Fix cache")
         self.assertEqual(second_call[2]["content"], "INCREMENTAL UPDATE: Fix cache")
+
+    def test_stable_worker_runs_more_than_four_edits_in_one_model_turn(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            writes = [{"type": "write_file", "path": f"sample-{i}.txt", "content": str(i)} for i in range(6)]
+            action = [{"type": "begin_edit_batch"}, *writes, {"type": "end_edit_batch"}, {"type": "finish", "message": "Done"}]
+            model = RecordingMessageModel([json.dumps({"thought": "Write fixture files", "actions": action})])
+            config = AgentConfig("gemini", "fixture", root, Path(__file__).resolve().parents[1] / "agent_tools.py", max_steps=1, quiet=True)
+            worker = WorkingFolderAgent(model, config)
+            result = worker.run_task("Write the fixture files")
+            self.assertTrue(result.ok, result.final_message)
+            self.assertEqual(len(model.calls), 1)
+            self.assertEqual([(root / write["path"]).read_text() for write in writes], [str(i) for i in range(6)])
+
+    def test_stable_worker_retries_provider_rejection_even_if_the_json_is_valid(self):
+        model = RecordingMessageModel([
+            '{"action":{"type":"finish","message":"Rejected response"}}',
+            '{"action":{"type":"finish","message":"Recovered response"}}',
+        ])
+        model.get_last_metrics = lambda: {"response": {"candidates": [
+            {"finish_reason": "MALFORMED_RESPONSE" if len(model.calls) == 1 else "STOP"}
+        ]}}
+        with tempfile.TemporaryDirectory() as directory:
+            config = AgentConfig("gemini", "fixture", Path(directory), Path(__file__).resolve().parents[1] / "agent_tools.py",
+                                 max_steps=2, quiet=True)
+            worker = WorkingFolderAgent(model, config)
+            result = worker.run_task("Report the result")
+        self.assertTrue(result.ok)
+        self.assertEqual(result.final_message, "Recovered response")
+        self.assertIn("MALFORMED_RESPONSE", worker.history[0].result.payload["error"])
+        self.assertEqual(len(model.calls), 2)
 
 
 if __name__ == "__main__":

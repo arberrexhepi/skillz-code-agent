@@ -3,6 +3,7 @@ import { useEffect, useId, useMemo, useState } from 'react';
 import { useAgentWorkspace } from '../../agent/agentWorkspace';
 import type { RuntimeSelection } from '../../agent/agentWorkspace';
 import type { CodexSubscriptionStatus, RuntimeOptionsPayload } from '../../../../shared/agentTypes';
+import { RuntimeReasoningSettings } from './RuntimeReasoningSettings';
 
 const CODEX_SUBSCRIPTION_PROVIDER = 'codex-subscription';
 
@@ -22,7 +23,7 @@ export function RuntimeDrawer({ onClose }: { onClose: () => void }): React.JSX.E
   };
   return <section className="runtime-drawer">
     <header><div><span>RUNTIME</span><strong>Execution environment</strong></div><button type="button" className="icon-button" aria-label="Close runtime settings" onClick={onClose}>×</button></header>
-    <RuntimeSelectionFields value={value} onChange={selectRuntime} options={agent.state.runtimeOptions} disabled={busy} status={agent.state.status} requireRestart={running} onReadyChange={setReady} showBackend={false} />
+    <RuntimeSelectionFields value={value} onChange={selectRuntime} options={agent.state.runtimeOptions} disabled={busy} status={agent.state.status} requireRestart={running} onReadyChange={setReady} showBackend={false} reasoningScope={{ artifactId: agent.artifactId }} />
     {running ? <><p className="runtime-provider-note" role="status">Active: {agent.runtime.provider} · {agent.runtime.model}{changed ? '. Apply your selection to change the running agent.' : ''}</p><button type="button" className="primary-button compact" disabled={!ready || busy || !changed} onClick={() => void agent.switchRuntime(selection.provider, selection.model)}>Apply to running agent</button></> : <p className="runtime-provider-note">Start agent or send a message to use this selection.</p>}
     <label>Backend<select value={agent.runtime.backendScript} disabled={running || busy} onChange={(event) => agent.setRuntime({ backendScript: event.target.value })}><option value="main.py">Stable runtime</option><option value="main_v2.py">Beta TreeLoop</option><option value="live_test_loop.py">Live TreeLoop</option></select></label>
     <div className="runtime-backoff"><label>Token backoff (K)<input type="number" min="0" value={limit} onChange={(event) => setLimit(Math.max(0, Number(event.target.value)))} /></label><button type="button" onClick={() => void agent.setBackoff(limit > 0, limit)}>{limit > 0 ? 'Enable' : 'Disable'}</button></div>
@@ -32,7 +33,7 @@ export function RuntimeDrawer({ onClose }: { onClose: () => void }): React.JSX.E
 }
 
 /** Shared provider/model/auth controls; selecting a runtime never starts or reconfigures an agent. */
-export function RuntimeSelectionFields({ value, onChange, options, disabled = false, status = 'stopped', requireRestart = false, onReadyChange, showBackend = true }: {
+export function RuntimeSelectionFields({ value, onChange, options, disabled = false, status = 'stopped', requireRestart = false, onReadyChange, showBackend = true, reasoningScope }: {
   value: RuntimeSelection;
   onChange: (value: RuntimeSelection) => void;
   options?: RuntimeOptionsPayload;
@@ -41,6 +42,7 @@ export function RuntimeSelectionFields({ value, onChange, options, disabled = fa
   requireRestart?: boolean;
   onReadyChange: (ready: boolean) => void;
   showBackend?: boolean;
+  reasoningScope?: { artifactId?: string };
 }): React.JSX.Element {
   const { provider, model } = value;
   const [codexStatus, setCodexStatus] = useState<CodexSubscriptionStatus>();
@@ -51,6 +53,8 @@ export function RuntimeSelectionFields({ value, onChange, options, disabled = fa
   useEffect(() => { setCliPath(codexStatus?.configured_cli_path || ''); }, [codexStatus?.configured_cli_path]);
   const providers = options?.providers?.filter((item) => !item.hidden) || [];
   const providerOption = useMemo(() => providers.find((item) => item.key === provider), [provider, providers]);
+  const efforts = (provider === CODEX_SUBSCRIPTION_PROVIDER ? codexStatus?.reasoning_efforts?.[model] : undefined)
+    ?? providerOption?.reasoning_efforts?.[model];
   const modelOptions = useMemo(() => uniqueModels([
     ...(provider === CODEX_SUBSCRIPTION_PROVIDER ? codexStatus?.models || [] : []),
     providerOption?.selection_model, providerOption?.active_model, providerOption?.default_model,
@@ -118,6 +122,8 @@ export function RuntimeSelectionFields({ value, onChange, options, disabled = fa
   return <div className="runtime-selection-fields">
     <label>Provider<select value={provider} disabled={disabled} onChange={(event) => selectProvider(event.target.value)}>{providerKeys.map((key) => <option value={key} key={key}>{providers.find((item) => item.key === key)?.label || key}</option>)}</select></label>
     <label>Model<select value={model} disabled={!modelOptions.length || disabled} onChange={(event) => onChange({ ...value, model: event.target.value })}>{modelOptions.map((item) => <option value={item} key={item}>{item}</option>)}</select></label>
+    {reasoningScope && provider && model && <RuntimeReasoningSettings key={`${provider}:${model}`} provider={provider} model={model}
+      artifactId={reasoningScope.artifactId} efforts={efforts} />}
     {provider === CODEX_SUBSCRIPTION_PROVIDER && <CodexSubscriptionCard
       status={requireRestart ? codexStatus : codexStatus && { ...codexStatus, restart_required: false }} busy={codexStatusBusy || disabled} onRefresh={refreshCodexStatus} onSignIn={signInToCodex}
       cliPath={cliPath} cliError={cliError} cliNotice={cliNotice}

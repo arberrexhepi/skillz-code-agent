@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from live_test_loop import TreeLoopPlannerWorker
 from tests.test_live_test_loop import FakeModelClient
@@ -18,6 +19,58 @@ def check(ok: bool, kind: str = "diagnose", scope: str = "broken.py") -> Command
 
 
 class ValidationEvidenceTests(unittest.TestCase):
+    def test_automatic_compiler_failure_survives_a_read_until_the_edited_file_passes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            worker = TreeLoopPlannerWorker(model=FakeModelClient([
+                "write /repo/fixed.py value =\ndiagnose /repo/fixed.py",
+                "cat /repo/fixed.py\nfinish Premature",
+                "write /repo/fixed.py value = 1\ndiagnose /repo/fixed.py\nfinish Repaired",
+            ]), root=root, max_turns=4, checkpoint_interval=0, verbose=False)
+
+            result = worker.run_task("Repair the source")
+
+            self.assertTrue(result.ok, result.final_message)
+            self.assertIn("invalid syntax", worker.history[0].results[0].output)
+            failed_check = worker.history[0].results[1]
+            self.assertEqual(failed_check.tool_action["type"], "diagnose")
+            self.assertFalse(failed_check.ok)
+            self.assertIn("invalid syntax", failed_check.output)
+            self.assertIn("finish blocked: Validation failed: diagnose fixed.py", worker.history[1].results[-1].output)
+            self.assertIn("issues=0", worker.history[2].results[1].output)
+            self.assertEqual(len(worker.history), 3)
+            self.assertTrue(result.validation.passed)
+            self.assertFalse(worker._validation_evidence.failures)
+
+    def test_successful_mutation_can_be_read_and_verified_in_the_same_turn(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            worker = TreeLoopPlannerWorker(model=FakeModelClient([
+                "write /repo/note.txt updated\ncat /repo/note.txt\nfinish Verified",
+            ]), root=Path(tmp), max_turns=1, checkpoint_interval=0, verbose=False)
+
+            result = worker.run_task("Update and verify the note")
+
+            self.assertTrue(result.ok, result.final_message)
+            self.assertIn("updated", worker.history[0].results[1].output)
+            self.assertTrue(result.validation.passed)
+
+    def test_same_turn_finish_reviews_the_edited_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "context.txt").write_text("context")
+            worker = TreeLoopPlannerWorker(model=FakeModelClient([
+                "cat /repo/context.txt",
+                "write /repo/note.txt updated\nfinish Verified",
+            ]), root=root, max_turns=2, checkpoint_interval=0, verbose=False)
+
+            with patch.object(worker, "_run_toolbelt_command", return_value={"ok": True, "data": {}}) as review:
+                result = worker.run_task("Update the note")
+
+            self.assertTrue(result.ok, result.final_message)
+            self.assertEqual(review.call_count, 2)
+            review.assert_any_call("git-diff", "--path", "note.txt")
+            review.assert_any_call("review", "--path", "note.txt", "--limit", "20")
+
     def test_read_only_failed_diagnostic_stays_failed_through_inspection_and_finish(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -70,6 +123,18 @@ class ValidationEvidenceTests(unittest.TestCase):
         evidence.observe(check(False))
         self.assertFalse(snapshot.failures)
         self.assertTrue(evidence.failures)
+
+    def test_corrected_named_smoke_script_replaces_only_its_earlier_failure(self):
+        evidence = ValidationEvidence()
+        def smoke(name, command, ok):
+            return CommandResult(ok, "exit_code=0" if ok else "exit_code=1", "write", tool_action={
+                "type": "run_shell", "command": command, "check_name": name,
+            })
+        evidence.observe(smoke("backend", "node smoke.ts", False))
+        evidence.observe(smoke("assets", "node wrong-payload.js", False))
+        evidence.observe(smoke("backend", "npx tsx smoke.ts", True))
+        self.assertIn("assets", evidence.failure_summary())
+        self.assertNotIn("backend", evidence.failure_summary())
 
     def test_passing_a_route_on_another_server_does_not_clear_the_failure(self):
         evidence = ValidationEvidence()

@@ -2,6 +2,8 @@ import type { AgentBridgeState, IssueProposal, IssueSummary } from './agentTypes
 import type { RepoFactsIssue, RepoFactsLedger } from './repoFacts';
 
 export const ISSUE_PROPOSALS_PATH = '.agent-issue-proposals.json';
+export const WORKSPACE_ISSUE_ACTIONS = ['create_issue', 'close_issue', 'reopen_issue'] as const;
+export type WorkspaceIssueAction = typeof WORKSPACE_ISSUE_ACTIONS[number];
 export const isRepositoryScope = (id: string): boolean => ['global-architecture', 'legacy-architecture'].includes(id);
 export type ManagedIssue = Omit<RepoFactsIssue, 'facts' | 'repositoryScope'> & { factCount: number };
 export interface WorkspaceIssuesSnapshot {

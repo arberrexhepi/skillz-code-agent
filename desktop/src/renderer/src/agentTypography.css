@@ -23,7 +23,7 @@
 .agent-panel .markdown-message th, .agent-panel .markdown-message td { padding: 6px 8px; }
 .agent-panel .agent-empty h3 { font-size: 16px; }
 .agent-panel .agent-empty p { max-width: 330px; }
-.agent-panel .prompt-box textarea { min-height: 100px; padding-bottom: 30px; }
+.agent-panel .prompt-box textarea { min-height: 68px; }
 .agent-panel .composer-heading span, .agent-panel .composer-heading small, .agent-panel .composer-meta,
 .agent-panel .eyebrow, .agent-panel .status-pill, .agent-panel .agent-context-strip,
 .agent-panel .agent-context-strip strong { font-size: var(--chat-label-size); }

@@ -4,7 +4,7 @@ import type { GitFileDiff, GitStatus } from '../../../shared/contracts';
 import { FileNavigationContext, PathChip } from './PathText';
 import { GitPanel, type GitPanelApi } from './GitPanel';
 
-export function ArtifactRepository({ id, root, onStatus }: { id: string; root: string; onStatus: (status: GitStatus | null) => void }): React.JSX.Element {
+export function ArtifactRepository({ id, root, onStatus, requestedPath }: { id: string; root: string; onStatus: (status: GitStatus | null) => void; requestedPath?: string }): React.JSX.Element {
   const [revision, setRevision] = useState(0);
   const [diff, setDiff] = useState<GitFileDiff | null>(null);
   const [staged, setStaged] = useState(false);
@@ -30,6 +30,7 @@ export function ArtifactRepository({ id, root, onStatus }: { id: string; root: s
     try { setDiff(await api.fileDiff(path, isStaged)); setStaged(isStaged); }
     catch (cause) { setError(clean(cause)); }
   }, [api]);
+  useEffect(() => { if (requestedPath) void openDiff(requestedPath, false); }, [requestedPath, openDiff]);
   const discarded = useCallback(async (path: string): Promise<void> => {
     if (diff?.path === path) setDiff(null);
     setRevision(value => value + 1);

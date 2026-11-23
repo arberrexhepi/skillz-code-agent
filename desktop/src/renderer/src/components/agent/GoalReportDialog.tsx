@@ -34,9 +34,10 @@ export function GoalReportDialog({ handoff, onClose }: GoalReportDialogProps): R
           <div className="goal-report-list">
             {handoff.goalResults.map((result, index) => {
               const complete = result.status === 'completed';
+              const suspended = result.status === 'suspended';
               return (
                 <article className="goal-report-item" key={result.goal_id || index}>
-                  <header><span className={complete ? 'complete' : 'failed'}>{complete ? '✓' : '!'}</span><div><small>GOAL {index + 1}</small><strong><PathText>{result.title || result.goal_id || 'Untitled goal'}</PathText></strong></div><em>{result.status || 'unknown'}</em></header>
+                  <header><span className={complete ? 'complete' : suspended ? 'suspended' : 'failed'} aria-hidden="true">{complete ? '✓' : suspended ? 'Ⅱ' : '!'}</span><div><small>GOAL {index + 1}</small><strong><PathText>{result.title || result.goal_id || 'Untitled goal'}</PathText></strong></div><em>{result.status || 'unknown'}</em></header>
                   {result.final_message && <MarkdownMessage content={result.final_message} />}
                   <dl>
                     {result.validation_summary && <><dt>Validation</dt><dd><PathText>{result.validation_summary}</PathText></dd></>}

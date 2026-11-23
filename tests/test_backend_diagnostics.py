@@ -165,7 +165,7 @@ class BackendDiagnosticsTests(unittest.TestCase):
             self.assertEqual(len(diagnostics), 1)
             self.assertEqual(diagnostics[0].get("path"), "src/useTodoOperations.test.ts")
 
-    def test_working_folder_agent_diagnose_action_treats_silent_nonzero_backend_as_green(self) -> None:
+    def test_working_folder_agent_diagnose_action_reports_silent_nonzero_exit(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             target = root / "src" / "pages" / "Dashboard.test.tsx"
@@ -198,12 +198,47 @@ class BackendDiagnosticsTests(unittest.TestCase):
             ):
                 result = agent._handle_diagnose_action({"type": "diagnose", "path": "src/pages/Dashboard.test.tsx"})
 
-            self.assertTrue(result.ok)
+            self.assertFalse(result.ok)
             self.assertEqual(result.payload.get("diagnostics"), [])
-            self.assertEqual(
-                result.payload.get("summary"),
-                "Backend tsc diagnostics found no issues in src/pages/Dashboard.test.tsx.",
+            self.assertEqual(result.payload.get("code"), "DIAGNOSTIC_COMMAND_FAILED")
+            self.assertEqual(result.payload.get("returncode"), 2)
+
+    def test_working_folder_agent_diagnose_scopes_other_file_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "panel.ts").write_text("export const panel = 1;\n")
+            agent = WorkingFolderAgent(
+                FakeModelClient(),
+                AgentConfig(
+                    provider="local",
+                    model="test-model",
+                    root=root,
+                    tool_script=Path(__file__).resolve().parents[1] / "agent_tools.py",
+                    quiet=True,
+                ),
             )
+            other_error = "legacy.ts(4,1): error TS2322: Type mismatch\n  Property is incompatible.\n"
+            for extra, expected_ok in (
+                ("", True),
+                ("panel.ts(1,1): error TS2322: In-scope failure\n", False),
+                ("error TS2688: Cannot find type definition file\n", False),
+                ("tsconfig.json(5,1): error TS5023: Unknown compiler option\n", False),
+                ("TypeError: Compiler crashed\n", False),
+            ):
+                with self.subTest(extra=extra):
+                    compiler = subprocess.CompletedProcess(["tsc"], 2, other_error + extra, "")
+                    with (
+                        mock.patch("diagnostics.backends.find_command", return_value="tsc"),
+                        mock.patch("diagnostics.backends._run_checked", return_value=compiler),
+                    ):
+                        result = agent._handle_diagnose_action({"type": "diagnose", "path": "panel.ts"})
+
+                    self.assertEqual(result.ok, expected_ok)
+                    self.assertEqual(result.payload["returncode"], 0 if expected_ok else 2)
+                    if expected_ok:
+                        self.assertEqual(result.payload["compiler_returncode"], 2)
+                        self.assertEqual(result.payload["other_file_error_count"], 1)
+                        self.assertNotIn("legacy.ts", json.dumps(result.payload))
 
     def test_automatic_backend_diagnostics_are_recorded_as_diagnose_not_run_shell(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -295,7 +330,7 @@ class BackendDiagnosticsTests(unittest.TestCase):
             self.assertIsInstance(latest, dict)
             self.assertEqual(latest.get("path"), "src/useTodoOperations.test.ts")
 
-    def test_tree_loop_diagnose_treats_silent_nonzero_backend_as_clean(self) -> None:
+    def test_tree_loop_diagnose_reports_silent_nonzero_exit(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             target = root / "src" / "pages" / "Dashboard.test.tsx"
@@ -326,7 +361,7 @@ class BackendDiagnosticsTests(unittest.TestCase):
 
             self.assertEqual(
                 output,
-                "engine=tsc\npath=src/pages/Dashboard.test.tsx\nissues=0\nexit_code=0",
+                "diagnose: engine=tsc\npath=src/pages/Dashboard.test.tsx\nissues=0\nexit_code=2\nDiagnostic command failed without output.",
             )
             self.assertIsNone(loop._signal_state.get("latest_diagnostics"))
 

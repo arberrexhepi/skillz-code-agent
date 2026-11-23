@@ -1,12 +1,22 @@
-import { promises as fs } from 'node:fs';
+import { constants as fileConstants, promises as fs } from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { artifactId, artifactApisSchema, artifactAgentRuntimeSchema, artifactAccessSchema, artifactAppSchema, defaultArtifactApp, type ArtifactAccess, createArtifactSchema, type ArtifactApis, type ArtifactAppConfig, type ArtifactAppSaveResult, type ArtifactLibrary, type ArtifactRecord, type CreateArtifact, type PrebuiltArtifact } from '../../shared/artifacts';
 import { git } from './artifactProcess';
 import { managedPrebuiltPath, prebuiltBaselineFile, readBundledSource, writeSourceSnapshot } from './artifactPrebuiltSource';
+import { artifactMcpSourcePath } from '../../shared/artifactAppMcp';
 
 const manifestName = '.skillz-artifacts.json';
 const author = ['-c', 'user.name=skillz Workbench', '-c', 'user.email=workbench@localhost'];
+const chatShellDirectory = 'src/skillz-chat';
+const chatShellFiles = ['index.tsx', 'controller.ts', 'transport.ts', 'chat.css'];
+const mcpStarter = '.artifact/mcp-server-starter.py';
+async function optionalStat(file: string) {
+  return fs.lstat(file).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === 'ENOENT') return undefined;
+    throw error;
+  });
+}
 async function emptyArtifactDirectory(directory: string): Promise<boolean> {
   // Finder may write this metadata as soon as the user opens an otherwise empty folder.
   return (await fs.readdir(directory, { withFileTypes: true })).every(entry => entry.name === '.DS_Store' && entry.isFile());
@@ -32,7 +42,9 @@ async function writeText(file: string, value: string): Promise<void> {
 export class ArtifactLibraryService {
   private queue: Promise<unknown> = Promise.resolve();
   private legacyPrebuiltIds = new Map<string, string | undefined>();
-  constructor(private readonly settingsFile: string, private readonly template: string, private readonly contextHome: string, private readonly prebuiltHome = path.join(path.dirname(template), 'prebuilt-artifacts')) {}
+  constructor(private readonly settingsFile: string, private readonly template: string, private readonly contextHome: string,
+    private readonly prebuiltHome = path.join(path.dirname(template), 'prebuilt-artifacts'),
+    private readonly enablePlaywrightMcp?: (id: string, root: string) => Promise<void>) {}
   private serial<T>(operation: () => Promise<T>): Promise<T> { const pending = this.queue.then(operation); this.queue = pending.catch(() => {}); return pending; }
   async library(): Promise<ArtifactLibrary> {
     let settings: { root?: string };
@@ -124,7 +136,7 @@ export class ArtifactLibraryService {
     if (!(await this.prebuilts()).some(item => item.id === artifactId.parse(id))) throw new Error('Unknown prebuilt artifact.');
     return path.join(this.prebuiltHome, id);
   }
-  async installPrebuilt(id: string, access: ArtifactAccess, runtime?: import('../../shared/artifacts').CreateArtifact['runtime']): Promise<ArtifactRecord> {
+  async installPrebuilt(id: string, access: ArtifactAccess, runtime?: CreateArtifact['runtime'], playwrightMcp?: boolean): Promise<ArtifactRecord> {
     const preset = (await this.prebuilts()).find(item => item.id === artifactId.parse(id));
     if (!preset) throw new Error('Unknown prebuilt artifact.');
     const source = path.join(this.prebuiltHome, id);
@@ -133,11 +145,12 @@ export class ArtifactLibraryService {
     const checked = artifactAccessSchema.parse(access);
     if (preset.requiresWriteAccess && !checked.directories.some(directory => directory.access === 'write')) throw new Error('Share at least one repository with Allow changes enabled.');
     if (preset.requiresProcessProxy && !checked.directories.some(directory => directory.allowProcessProxy)) throw new Error('Share at least one repository with Allow Process Proxy enabled.');
-    return this.createFrom({ title: preset.title, prompt: preset.description, sourceRoot: '', shareFacts: false, shareMemory: false, runtime, access: checked }, source, 'Install prebuilt artifact', preset.id);
+    return this.createFrom({ title: preset.title, prompt: preset.description, sourceRoot: '', shareFacts: false, shareMemory: false, runtime, access: checked, playwrightMcp }, source, 'Install prebuilt artifact', preset.id);
   }
   private createFrom(raw: CreateArtifact, source: string, initialCommit: string, prebuiltId?: string): Promise<ArtifactRecord> {
     return this.serial(async () => {
-      const options = createArtifactSchema.parse(raw);
+      const { playwrightMcp, ...options } = createArtifactSchema.parse(raw);
+      if (playwrightMcp && !this.enablePlaywrightMcp) throw new Error('The artifact installer has no MCP host.');
       const library = await this.library();
       if (!library.root) throw new Error('Configure an artifact folder first.');
       if ((options.shareFacts || options.shareMemory) && !options.sourceRoot) throw new Error('Open a source workspace before sharing context.');
@@ -151,12 +164,22 @@ export class ArtifactLibraryService {
         throw new Error(`Artifact destination must be an empty directory: ${root}`);
       }
       const sourceBaseline = prebuiltId ? await readBundledSource(source) : undefined;
+      const app = artifactAppSchema.parse(options.app || defaultArtifactApp());
+      const installChatShell = app.chatbot.enabled && app.chatbot.includeShell;
       // Preserve incomplete scaffolds on failure; never delete user files to retry.
       // Newer Node runtimes reject an existing directory with errorOnExist, even when empty.
       // Copy each entry into the reserved directory, retaining exclusive creation for every entry.
       for (const entry of await fs.readdir(source)) {
         if (entry === ".git" || (prebuiltId && !managedPrebuiltPath(entry))) continue;
-        await fs.cp(path.join(source, entry), path.join(root, entry), { recursive: true, errorOnExist: true, force: false, filter: (entry) => (!prebuiltId || managedPrebuiltPath(path.relative(source, entry).split(path.sep).join('/'))) && !['node_modules', '.DS_Store'].includes(path.basename(entry)) && (source !== this.template || path.basename(entry) !== 'package-lock.json') });
+        await fs.cp(path.join(source, entry), path.join(root, entry), {
+          recursive: true, errorOnExist: true, force: false,
+          filter: (entry) => {
+            const relative = path.relative(source, entry).split(path.sep).join('/');
+            return (!prebuiltId || managedPrebuiltPath(relative)) && !['node_modules', '.DS_Store'].includes(path.basename(entry))
+              && (source !== this.template || (relative !== mcpStarter && path.basename(entry) !== 'package-lock.json'
+                && (installChatShell || relative !== chatShellDirectory)));
+          },
+        });
       }
       if (prebuiltId) {
         for (const relative of ['.artifact/app.json', '.artifact/apis.json']) {
@@ -164,7 +187,6 @@ export class ArtifactLibraryService {
           if (await fs.lstat(from).then(stat => stat.isFile() && !stat.isSymbolicLink(), () => false)) { await fs.mkdir(path.dirname(path.join(root, relative)), { recursive: true }); await fs.copyFile(from, path.join(root, relative)); }
         }
       }
-      const app = artifactAppSchema.parse(options.app || defaultArtifactApp());
       await this.writeAppForRoot(root, app);
       const createdAt = new Date().toISOString();
       await writeJson(path.join(root, 'artifact.json'), { version: 1, id, title: options.title, prompt: options.prompt, createdAt, prebuiltId });
@@ -179,6 +201,7 @@ export class ArtifactLibraryService {
       await git(root, 'add', '--', '.');
       await git(root, ...author, 'commit', '-m', initialCommit);
       if (sourceBaseline) await writeSourceSnapshot(prebuiltBaselineFile(path.dirname(this.settingsFile), root), { version: 1, root, prebuiltId, files: sourceBaseline });
+      if (playwrightMcp) await this.enablePlaywrightMcp?.(id, root);
       // Existing child repository is registered as a gitlink, not added as ordinary files.
       await git(library.root, '-c', 'protocol.file.allow=always', 'submodule', 'add', `./${id}`, id);
       await git(library.root, 'submodule', 'absorbgitdirs', '--', id);
@@ -265,7 +288,6 @@ export class ArtifactLibraryService {
   }
   private async writeAppForRoot(root: string, config: ArtifactAppConfig): Promise<void> {
     const validated = artifactAppSchema.parse(config);
-    await writeJson(path.join(root, '.artifact/app.json'), validated);
     const packageFile = path.join(root, 'package.json');
     const manifest = await readJson(packageFile) as { dependencies?: Record<string, string>; [key: string]: unknown };
     const dependencies = { ...(manifest.dependencies || {}) };
@@ -277,7 +299,34 @@ export class ArtifactLibraryService {
       dependencies.sequelize = '^6.37.7';
       const [name, version] = drivers[validated.database.dialect]; dependencies[name] = version;
     } else delete dependencies.sequelize;
+    for (const relative of await this.missingMcpSources(root, validated)) {
+      const file = path.join(root, relative);
+      const directory = path.dirname(file);
+      await fs.mkdir(directory, { recursive: true });
+      if (await fs.realpath(directory) !== directory) throw new Error(`MCP source directory must stay inside the artifact: ${relative}`);
+      try { await fs.copyFile(path.join(this.template, mcpStarter), file, fileConstants.COPYFILE_EXCL); }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST' || !(await optionalStat(file))?.isFile()) throw error;
+      }
+    }
     await writeJson(packageFile, { ...manifest, dependencies });
+    await writeJson(path.join(root, '.artifact/app.json'), validated);
+  }
+  private async missingMcpSources(root: string, config: ArtifactAppConfig): Promise<string[]> {
+    const missing: string[] = [];
+    if (!config.mcp.enabled) return missing;
+    for (const server of config.mcp.servers) {
+      if (server.source !== 'artifact') continue;
+      const relative = artifactMcpSourcePath(server.id);
+      for (const directory of ['mcp', path.dirname(relative)]) {
+        const stat = await optionalStat(path.join(root, directory));
+        if (stat && !stat.isDirectory()) throw new Error(`MCP source path must be a real directory: ${directory}`);
+      }
+      const stat = await optionalStat(path.join(root, relative));
+      if (stat && !stat.isFile()) throw new Error(`MCP source must be a regular file: ${relative}`);
+      if (!stat) missing.push(relative);
+    }
+    return missing;
   }
   private async appRuntimeReady(root: string): Promise<boolean> {
     const required = ['.artifact/runtime.json', 'server/agent.ts', 'server/database.ts', 'src/skillz.ts'];
@@ -289,13 +338,56 @@ export class ArtifactLibraryService {
   }
   private async commitPaths(root: string, message: string, files: string[]): Promise<string | undefined> {
     if (!(await git(root, 'status', '--porcelain', '--untracked-files=all', '--', ...files))) return undefined;
-    await git(root, 'add', '-A', '--', ...files);
-    await git(root, ...author, 'commit', '--only', '-m', message, '--', ...files);
+    const tracked = new Set((await git(root, 'ls-files', '-z', '--', ...files)).split('\0'));
+    const present = await Promise.all(files.map(relative => fs.lstat(path.join(root, relative)).then(() => true, error => {
+      if (error.code === 'ENOENT') return false;
+      throw error;
+    })));
+    const paths = files.filter((relative, index) => tracked.has(relative) || present[index]);
+    if (!paths.length) return undefined;
+    await git(root, 'add', '-A', '--', ...paths);
+    await git(root, ...author, 'commit', '--only', '-m', message, '--', ...paths);
     return git(root, 'rev-parse', 'HEAD');
   }
+  private async missingChatShellFiles(root: string): Promise<string[]> {
+    const stat = (relative: string) => fs.lstat(path.join(root, relative)).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === 'ENOENT') return undefined;
+      throw error;
+    });
+    for (const relative of ['src', chatShellDirectory]) {
+      const directory = await stat(relative);
+      if (directory && (!directory.isDirectory() || directory.isSymbolicLink())) throw new Error(`Chatbot UI path must be a directory: ${relative}`);
+    }
+    const missing = [];
+    for (const file of chatShellFiles) {
+      const relative = `${chatShellDirectory}/${file}`;
+      const target = await stat(relative);
+      if (target && (!target.isFile() || target.isSymbolicLink())) throw new Error(`Chatbot UI path must be a regular file: ${relative}`);
+      if (!target) missing.push(relative);
+    }
+    return missing;
+  }
   private async migrateAppRuntime(root: string, config: ArtifactAppConfig): Promise<ArtifactAppSaveResult> {
-    if (await this.appRuntimeReady(root)) return { migrated: false };
-    const managed = ['.artifact/runtime.json', 'server/agent.ts', 'server/database.ts', 'server/gateway.ts', 'server/schema.ts', 'src/skillz.ts'];
+    const upgradeBase = !await this.appRuntimeReady(root);
+    const indexRelative = 'server/index.ts';
+    const indexFile = path.join(root, indexRelative);
+    let index = await fs.readFile(indexFile, 'utf8').catch((error: NodeJS.ErrnoException) => {
+      if (error.code === 'ENOENT') return '';
+      throw error;
+    });
+    const mcpFiles = ['server/mcp.ts', 'src/mcp.ts'];
+    const hasMcpFiles = await Promise.all(mcpFiles.map(relative => fs.lstat(path.join(root, relative))
+      .then(stat => stat.isFile() && !stat.isSymbolicLink(), () => false)));
+    const upgradeMcp = (config.mcp.enabled || (!index && upgradeBase)) &&
+      (!index.includes('attachArtifactMcp(app, root)') || !index.includes('closeMcp();') || !hasMcpFiles.every(Boolean));
+    const chatShell = config.chatbot.enabled && config.chatbot.includeShell ? await this.missingChatShellFiles(root) : [];
+    if (!upgradeBase && !upgradeMcp && !chatShell.length) return { migrated: false };
+    const mcpSources = await this.missingMcpSources(root, config);
+    const managed = [
+      ...(upgradeBase ? ['.artifact/runtime.json', 'server/agent.ts', 'server/database.ts', 'server/gateway.ts', 'server/schema.ts', 'src/skillz.ts'] : []),
+      ...(upgradeMcp ? mcpFiles : []),
+      ...chatShell,
+    ];
     const replacements = new Map<string, string>();
     for (const relative of managed) {
       const source = path.join(this.template, relative);
@@ -303,14 +395,8 @@ export class ArtifactLibraryService {
       if (!sourceStat.isFile() || sourceStat.isSymbolicLink()) throw new Error(`Artifact template runtime file is invalid: ${relative}`);
       replacements.set(relative, await fs.readFile(source, 'utf8'));
     }
-    const indexRelative = 'server/index.ts';
-    const indexFile = path.join(root, indexRelative);
-    let index = await fs.readFile(indexFile, 'utf8').catch((error: NodeJS.ErrnoException) => {
-      if (error.code === 'ENOENT') return '';
-      throw error;
-    });
     if (!index) index = await fs.readFile(path.join(this.template, indexRelative), 'utf8');
-    else {
+    else if (upgradeBase) {
       if (!index.includes("from './agent'")) {
         const updated = index.replace(/(import\s+\{\s*attachGateway\s*\}\s+from\s+['"]\.\/gateway['"];?)/, "$1\nimport { attachArtifactAgent } from './agent';\nimport { closeDatabase } from './database';");
         if (updated === index) throw new Error('The artifact server entry point was customized beyond automatic migration. Restore server/index.ts or ask the artifact agent to merge the current template runtime.');
@@ -327,7 +413,21 @@ export class ArtifactLibraryService {
       if (!index.includes('await closeDatabase();')) index = index.replace(/(async\s+function\s+stop\(\)\s*\{[^}]*?closeGateway\(\);)/, '$1 await closeDatabase();');
       if (!index.includes('closeAgent();') || !index.includes('await closeDatabase();')) throw new Error('The artifact server shutdown handler was customized beyond automatic migration. Restore server/index.ts or ask the artifact agent to merge the current template runtime.');
     }
-    replacements.set(indexRelative, index);
+    if (upgradeMcp) {
+      if (!/from\s+['"]\.\/mcp['"]/.test(index)) {
+        index = index.replace(/(import\s+\{\s*attachArtifactAgent\s*\}\s+from\s+['"]\.\/agent['"];?)/, "$1\nimport { attachArtifactMcp } from './mcp';");
+      }
+      if (!index.includes('attachArtifactMcp(app, root)')) {
+        index = index.replace(/(const\s+closeAgent\s*=\s*attachArtifactAgent\(app\);)/, '$1\nconst closeMcp = await attachArtifactMcp(app, root);');
+      }
+      if (!index.includes('closeMcp();')) {
+        index = index.replace(/(async\s+function\s+stop\(\)\s*\{[^}]*?closeAgent\(\);)/, '$1 closeMcp();');
+      }
+      if (!/from\s+['"]\.\/mcp['"]/.test(index) || !index.includes('attachArtifactMcp(app, root)') || !index.includes('closeMcp();')) {
+        throw new Error('Merge the Artifact MCP startup and shutdown hooks into the customized server/index.ts before enabling MCP.');
+      }
+    }
+    if (upgradeBase || upgradeMcp) replacements.set(indexRelative, index);
     const changed: string[] = [];
     for (const [relative, next] of replacements) {
       const target = path.join(root, relative);
@@ -339,21 +439,26 @@ export class ArtifactLibraryService {
       const previous = stat ? await fs.readFile(target, 'utf8') : undefined;
       if (previous !== next) changed.push(relative);
     }
-    const commitScope = [...managed, indexRelative, '.gitignore', '.artifact/app.json', 'package.json'];
+    const runtimePaths = upgradeBase || upgradeMcp ? [indexRelative, '.gitignore', 'package.json'] : [];
+    const commitScope = [...managed, ...runtimePaths, ...mcpSources, '.artifact/app.json'];
     const checkpointCommit = await this.commitPaths(root, 'Checkpoint artifact before runtime migration', commitScope);
     for (const relative of changed) await writeText(path.join(root, relative), replacements.get(relative)!);
-    const ignoreFile = path.join(root, '.gitignore');
-    const ignore = await fs.readFile(ignoreFile, 'utf8').catch((error: NodeJS.ErrnoException) => { if (error.code === 'ENOENT') return ''; throw error; });
-    if (!ignore.split(/\r?\n/).includes('.artifact-data/')) await writeText(ignoreFile, `${ignore}${ignore && !ignore.endsWith('\n') ? '\n' : ''}.artifact-data/\n`);
+    if (upgradeBase || upgradeMcp) {
+      const ignoreFile = path.join(root, '.gitignore');
+      const ignore = await fs.readFile(ignoreFile, 'utf8').catch((error: NodeJS.ErrnoException) => { if (error.code === 'ENOENT') return ''; throw error; });
+      if (!ignore.split(/\r?\n/).includes('.artifact-data/')) await writeText(ignoreFile, `${ignore}${ignore && !ignore.endsWith('\n') ? '\n' : ''}.artifact-data/\n`);
+    }
     await this.writeAppForRoot(root, config);
-    const commit = await this.commitPaths(root, 'Upgrade artifact app runtime to v1', commitScope);
+    const message = upgradeMcp ? 'Install artifact app MCP runtime' : upgradeBase ? 'Upgrade artifact app runtime to v1' : 'Install Skillz chatbot UI shell';
+    const commit = await this.commitPaths(root, message, commitScope);
     if (!commit) throw new Error('Artifact runtime migration produced no Git commit.');
     return { migrated: true, commit, ...(checkpointCommit ? { checkpointCommit } : {}) };
   }
   async app(id: string): Promise<ArtifactAppConfig> { return this.appForRoot((await this.find(id)).root); }
   saveApp(id: string, config: ArtifactAppConfig): Promise<ArtifactAppSaveResult> { return this.serial(async () => {
     const root = (await this.find(id)).root; const validated = artifactAppSchema.parse(config);
-    const result = validated.chatbot.enabled || validated.database.enabled ? await this.migrateAppRuntime(root, validated) : { migrated: false };
+    const result = validated.chatbot.enabled || validated.database.enabled || validated.mcp.enabled
+      ? await this.migrateAppRuntime(root, validated) : { migrated: false };
     if (!result.migrated) await this.writeAppForRoot(root, validated);
     return result;
   }); }
