@@ -23,12 +23,13 @@ STRUCTURED EDITS (real mutation dispatch):
     complete replacement declaration
   >>>
   edit-batch {"atomic":true,"operations":[{"type":"replace_snippet","path":"src/App.tsx","old_text":"exact source","new_text":"replacement","expected_hash":"..."}]}
-  edit-batch dispatches operations in order and defaults to atomic rollback on failure.
+  edit-batch dispatches operations in order and defaults to atomic rollback on failure. A batch that edits TSX checks the final staged syntax before publishing.
+  Numeric replace_range/delete_range use the batch-start source by default. Supply expected_text for a later range based on text produced by an earlier operation, or use replace_snippet.
   Operations also support insert_before/insert_after with anchor_text/new_text,
   replace_symbol, create_file, and the existing `mutate <json-tool-action>` schema.
   Python symbol edits use AST; JS/TS/JSX/TSX edits require the local TypeScript parser.
   Ambiguous, stale-hash, or unparseable symbol edits fail without changing source.
-  Use `batch start` / `batch end` for related commands across turns; diagnostics run at batch end.
+  Use `batch start` / `batch end` to stage related commands across turns. Read the staged source when a preceding edit changed the range you intend to replace.
 '''
 
 ADVANCED_COMMAND_GRAMMAR += r'''

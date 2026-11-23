@@ -27,10 +27,13 @@ import time
 from json import JSONDecoder
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
 
 from discovery.analysis import collect_symbols_for_file
 from discovery.common import is_directory_link, try_read_text
+
+if TYPE_CHECKING:
+    from mutations.staging import StagedFiles
 
 _CAT_MAX_FULL_LINES = 200
 _CAT_MAX_FULL_CHARS = 20000
@@ -283,6 +286,7 @@ class ContextTree:
 
     def __init__(self, workspace_root: Path) -> None:
         self.workspace_root = workspace_root.resolve()
+        self.staged_files: StagedFiles | None = None
         self._root = DirNode(name="")
         self._skills: Dict[str, SkillDefinition] = {}
 
@@ -495,6 +499,9 @@ class ContextTree:
         if rel_path is None:
             return node
 
+        staged = self.staged_files.lookup(rel_path) if self.staged_files else None
+        if staged is not None:
+            return self._hydrate_repo_file(rel_path, staged) if staged.is_file() else None
         target = self.workspace_root if not rel_path else self._safe_repo_target(rel_path, explicit=True)
         if target is None or not target.exists():
             return None
@@ -508,6 +515,11 @@ class ContextTree:
         """Yield forward-slash virtual paths while scanning disk independently of the index."""
         rel_path = self._repo_relative_path(path)
         if rel_path is None:
+            return
+        staged = self.staged_files.lookup(rel_path) if self.staged_files else None
+        if staged is not None:
+            if staged.is_file():
+                yield rel_path, staged
             return
         target = self.workspace_root if not rel_path else self._safe_repo_target(rel_path)
         if target is None or not target.exists():
@@ -532,9 +544,18 @@ class ContextTree:
             dirnames[:] = safe_dirs
             for filename in sorted(filenames):
                 candidate_rel = (current_rel / filename).as_posix()
-                candidate = self._safe_repo_target(candidate_rel)
+                candidate = self.staged_files.lookup(candidate_rel) if self.staged_files else None
+                if candidate is None:
+                    candidate = self._safe_repo_target(candidate_rel)
                 if candidate is not None and candidate.is_file():
                     yield candidate_rel, candidate
+        if self.staged_files:
+            prefix = rel_path.rstrip("/") + "/" if rel_path else ""
+            for relative, initial in self.staged_files.originals.items():
+                if relative.startswith(prefix) and initial.kind == "missing":
+                    candidate = self.staged_files.directory / relative
+                    if candidate.is_file() and not (self.workspace_root / relative).exists():
+                        yield relative, candidate
 
     def preload_files(self, rel_paths: Sequence[str]) -> int:
         """Eagerly load content for specific files (e.g., planner-selected hot files)."""

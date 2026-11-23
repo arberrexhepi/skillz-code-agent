@@ -41,6 +41,8 @@ from discovery.dispatch import DISCOVERY_ACTION_TYPES, execute_discovery_action
 from mcp_runtime import invoke_mcp, mcp_guidance, model_mcp_result
 from mutation_text import PARSE_ERROR_PREFIX, is_text_mutation
 from mutation_runtime import EXPLICIT_MUTATION_TYPES, execute_mutation, compact_mutation_result
+from mutations.staging import StageConflict, StagedFiles, anchored_range
+from execution_evidence import repository_observation
 from project_diagnostics import run_backend_diagnostics
 from model_result_delivery import ReadWorkingSet, prepare_model_result, render_packet
 from model_output_progress import ModelOutputObserver, ModelOutputProgress
@@ -394,7 +396,7 @@ RULES:
 13a. Context compaction retains at most 48,000 characters of recent read packets. Large scans can evict earlier source; requesting them cannot pin previous ranges. Keep one bounded edit surface in view. Use read-symbol or read-context for a specific missing identifier instead of reloading every declaration before editing. Novel reads and context restoration are not task delivery; heed the execution delivery checkpoint and its focused-read allowance.
 14. If a bounded edit fails twice or keeps duplicating content, stop stretching the same range edit. Re-read the surrounding region, widen the inspected range, and either do one clean `replace-lines` pass or rewrite the full file with `write`.
 15. Strategy placeholders like `{{s1}}` are raw upstream text plus a few safe text transforms. You may use `.stdout`, `.trim()`, `.replace("old", "new")`, `.split('\n').filter(line => ...).join('\n')`, numeric indexing like `.split('\n')[0]`, and regex capture extraction like `.match(/pattern/)[1]`, but do not invent arbitrary code execution inside placeholders.
-16. Use `batch start` before a cluster of related file fixes and `batch end` after the cluster is landed and verified. Batch related edits together, then run one finite verification step such as `diagnose /repo/src/file.tsx`, `run-check typecheck`, or `run-check build`.
+16. Use `batch start` before a cluster of related file fixes and `batch end` to validate and publish the staged edits. Edits run in order. Read staged source for an overlapping range changed by a prior edit, or use an exact patch. Run project checks after `batch end` publishes the files.
 16a. After editing a `.ts`, `.tsx`, `.js`, `.jsx`, or `.py` file, prefer `diagnose <path>` when you need backend file-targeted diagnostics that do not rely on an editor.
 16b. If diagnostics fail at `batch end`, the batch is closed. A queued `diagnose` for the same file can reuse that result. Use the findings and any queued inspection results to plan the repair, then rerun validation after editing.
 17. When working from a large trace or many diagnostics, maintain composure. It is normal for new downstream errors to appear after one fix lands. Do not panic, do not restart from scratch, and do not treat each new error as proof the last fix was wrong. Read the next grounded error, fix the next issue, and keep moving.
@@ -801,7 +803,7 @@ class TreeLoop:
         self._conversation_char_budget = int(os.getenv("TREELOOP_MESSAGE_CONTEXT_CHARS", "120000") or "120000")
         self._total_reads = 0
         self._total_writes = 0
-        self._deferred_diagnostic_paths: set[str] = set()
+        self._range_reads: dict[str, dict[int, tuple[str, str]]] = {}
         self._same_turn_halt_reason = ""
         self._external_stop_reason = ""
         self._delivery_attempt_reason = ""
@@ -1263,6 +1265,7 @@ class TreeLoop:
 
     def begin_goal_handoff(self) -> None:
         """Retain bounded evidence and outcomes, never the prior goal's raw dialogue."""
+        self.discard_staged_edits()
         self._handoff_summary = summarize_handoff(self.history[self._conversation_history_start:])
         self._conversation_history_start = len(self.history)
         self._conversation_messages.clear()
@@ -1912,6 +1915,8 @@ class TreeLoop:
             # Observers may replace output with a real failure or a recovery block.
             prepare_model_result(preview, result)
             self._read_working_set.record(preview, result)
+            if result.command_type == "read" and (observation := repository_observation(preview, result)) and observation.source_lines:
+                self._remember_range(observation.source_path, observation.source_lines)
             if annotation is None and not blocked_reason:
                 if not result.ok:
                     blocked_reason = result.output or "command failed"
@@ -1992,6 +1997,7 @@ class TreeLoop:
             r.tool_action.pop("_changed_paths", None)
             r.tool_action.pop("_change_accounting", None)
             r.tool_action.pop("_batch_diagnostic_paths", None)
+            r.tool_action.pop("_staged_paths", None)
         if self.tool_dispatcher:
             try:
                 dispatched = self.tool_dispatcher(r)
@@ -2020,7 +2026,7 @@ class TreeLoop:
             r.ok = payload["ok"]
             return json.dumps(payload, ensure_ascii=False)
         if action_type in DISCOVERY_ACTION_TYPES:
-            payload = execute_discovery_action(action, root=self.workspace_root)
+            payload = self._exec_discovery(action)
             r.ok = bool(payload.get("ok", True))
             return json.dumps(payload, indent=2)
         if action_type == "propose_issue":
@@ -2059,7 +2065,7 @@ class TreeLoop:
         elif action_type == "end_edit_batch":
             message = self._exec_end_edit_batch(action)
         elif action_type == "finish":
-            message = ""  # finish is handled by the loop
+            message = "finish: end the active edit batch before finishing" if self.bridge.tree.staged_files else ""
         elif action_type == "set_fact":
             message = ""  # facts are already written to the tree
         else:
@@ -2090,16 +2096,107 @@ class TreeLoop:
         return bool(re.search(r"\bissues=[1-9]\d*", message)) or "backend_diagnostics_warning" in message
 
     def _exec_begin_edit_batch(self) -> str:
+        if self.bridge.tree.staged_files is None:
+            self.bridge.tree.staged_files = StagedFiles(self.workspace_root)
         self._signal_state["edit_batch_mode"] = True
-        return "edit batch started; group related fixes, then verify before ending the batch"
+        return "edit batch started; edits are staged until batch end"
+
+    def discard_staged_edits(self) -> None:
+        stage = self.bridge.tree.staged_files
+        self.bridge.tree.staged_files = None
+        if stage:
+            paths = list(stage.originals)
+            stage.close()
+            for path in paths:
+                self._range_reads.pop(path, None)
+                self._refresh_recent_file_context(path)
+        self._signal_state["edit_batch_mode"] = False
 
     def _exec_end_edit_batch(self, action: Dict[str, Any]) -> str:
+        action["_changed_paths"] = []
+        stage = self.bridge.tree.staged_files
+        if stage:
+            try:
+                changes = stage.changes()
+                errors = stage.syntax_errors(changes)
+                if errors:
+                    action["_batch_diagnostic_paths"] = sorted({item["path"] for item in errors})
+                    findings = "\n".join(f"- {item['path']}:{item['line']}:{item['column']} {item['code']} {item['message']}" for item in errors)
+                    return (f"end_edit_batch: staged TSX syntax check failed (issues={len(errors)}). No files were written. "
+                            f"The staged batch is still open for repair.\n{findings}")
+                action["_changed_paths"] = stage.publish(changes)
+            except StageConflict as exc:
+                self.discard_staged_edits()
+                return f"end_edit_batch: {exc} The staged batch was discarded and the external edit was preserved."
+            except (OSError, ValueError) as exc:
+                return f"end_edit_batch: {exc} The staged batch is still open."
+            self.bridge.tree.staged_files = None
+            stage.close()
+            self.diagnostic_provenance.changed_paths.update(action["_changed_paths"])
+            for path in action["_changed_paths"]:
+                self.bridge.on_write_complete(path)
+                self._refresh_recent_file_context(path)
         self._signal_state["edit_batch_mode"] = False
-        paths = sorted(self._deferred_diagnostic_paths)
-        self._deferred_diagnostic_paths.clear()
-        diagnostics = {path: self._run_backend_diagnostics_for_path(path, trigger_action="batch end") for path in paths}
+        diagnostics = {}
+        for path in action["_changed_paths"]:
+            if (self.workspace_root / path).is_file():
+                diagnostics[path] = self._run_backend_diagnostics_for_path(path, trigger_action="batch end")
+            elif self.backend_check_observer is not None:
+                self.backend_check_observer(path, True, "File removed from the workspace.", [])
         action["_batch_diagnostic_paths"] = [path for path, message in diagnostics.items() if message.startswith("backend_diagnostics ")]
         return "\n".join(["edit batch ended; deferred diagnostics completed", *filter(None, diagnostics.values())])
+
+    def _edit_target(self, path: str) -> Path:
+        stage = self.bridge.tree.staged_files
+        return stage.include(path) if stage else self.workspace_root / path
+
+    def _record_text_edit(self, action: dict, path: str) -> None:
+        if self.bridge.tree.staged_files:
+            action["_changed_paths"] = []
+            action["_staged_paths"] = [path]
+        else:
+            self.bridge.on_write_complete(path)
+            self._refresh_recent_file_context(path)
+
+    def _exec_discovery(self, action: dict) -> dict:
+        stage = self.bridge.tree.staged_files
+        for key in ("path", "file_path"):
+            path = action.get(key)
+            if stage and isinstance(path, str):
+                if staged := stage.lookup(path.removeprefix("/repo/").removeprefix("repo/")):
+                    return execute_discovery_action({**action, key: staged.relative_to(stage.directory).as_posix()}, root=stage.directory)
+        return execute_discovery_action(action, root=self.workspace_root)
+
+    def _remember_range(self, path: str, lines: tuple[tuple[int, str], ...]) -> None:
+        stage = self.bridge.tree.staged_files
+        staged = stage.lookup(path) if stage else None
+        try:
+            target = staged or (self.workspace_root / path).resolve()
+            if not staged and not target.is_relative_to(self.workspace_root):
+                return
+            revision = hashlib.sha256(target.read_text(encoding="utf-8").encode("utf-8")).hexdigest()
+        except (OSError, UnicodeError):
+            return
+        self._range_reads.setdefault(path, {}).update({line: (text, revision) for line, text in lines})
+
+    def _expected_range(self, path: str, first: int, last: int, before: list[str], current: str) -> tuple[list[str], bool]:
+        observed = self._range_reads.get(Path(path).as_posix(), {})
+        source_end = min(last, max(len(before), max(observed, default=0)))
+        revision = hashlib.sha256(current.encode("utf-8")).hexdigest()
+        baseline_current = current.splitlines() == before
+        expected = []
+        allow_position = True
+        for line in range(first, source_end + 1):
+            if line in observed:
+                text, seen_revision = observed[line]
+                allow_position &= seen_revision == revision
+            elif line <= len(before):
+                text = before[line - 1]
+                allow_position &= baseline_current
+            else:
+                return [], False
+            expected.append(text)
+        return expected, allow_position
 
     def _exec_write_file(self, action: Dict[str, Any]) -> str:
         rel_path = action.get("path", "")
@@ -2115,11 +2212,10 @@ class TreeLoop:
         except ValueError:
             return f"write_file: path escapes workspace: {rel_path}"
 
+        target = self._edit_target(rel_path)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
-        # Invalidate tree cache so next cat sees the new content
-        self.bridge.on_write_complete(rel_path)
-        self._refresh_recent_file_context(rel_path)
+        self._record_text_edit(action, rel_path)
         size = len(content.encode("utf-8"))
         return self._append_backend_diagnostics(
             f"wrote {rel_path} ({size} bytes)",
@@ -2147,11 +2243,20 @@ class TreeLoop:
         except ValueError:
             return f"replace_lines: path escapes workspace: {rel_path}"
 
+        target = self._edit_target(rel_path)
         if not target.exists():
             return f"replace_lines: file not found: {rel_path}"
 
         original_text = target.read_text(encoding="utf-8")
         lines = original_text.splitlines()
+        requested_range = (start_line, end_line)
+        if stage := self.bridge.tree.staged_files:
+            before = stage.originals[target.relative_to(stage.directory).as_posix()].data.decode("utf-8").splitlines()
+            expected, allow_position = self._expected_range(rel_path, start_line, end_line, before, original_text)
+            try:
+                start_line, end_line = anchored_range(lines, start_line, end_line, expected, allow_position=allow_position)
+            except ValueError as exc:
+                return f"replace_lines: {rel_path}: {exc}"
         if start_line > len(lines):
             return f"replace_lines: start line out of bounds for {rel_path} ({len(lines)} total lines)"
 
@@ -2162,8 +2267,7 @@ class TreeLoop:
             updated += "\n"
 
         target.write_text(updated, encoding="utf-8")
-        self.bridge.on_write_complete(rel_path)
-        self._refresh_recent_file_context(rel_path)
+        self._record_text_edit(action, rel_path)
         replaced_end = min(end_line, len(lines))
         original_span = max(0, replaced_end - start_line + 1)
         replacement_span = len(replacement_lines)
@@ -2174,7 +2278,8 @@ class TreeLoop:
             f"replaced lines {start_line}-{replaced_end} in {rel_path} "
             f"with {replacement_span} line(s); "
             f"line delta {line_delta:+d}; "
-            f"re-read lines {verify_start}-{verify_end}",
+            f"re-read lines {verify_start}-{verify_end}"
+            + (f"; re-anchored from {requested_range[0]}-{requested_range[1]}" if requested_range != (start_line, end_line) else ""),
             rel_path,
             trigger_action="replace-lines",
         )
@@ -2192,6 +2297,7 @@ class TreeLoop:
         except ValueError:
             return f"patch_file: path escapes workspace: {rel_path}"
 
+        target = self._edit_target(rel_path)
         if not target.exists():
             return f"patch_file: file not found: {rel_path}"
 
@@ -2208,35 +2314,60 @@ class TreeLoop:
 
         updated = original.replace(search, replace, 1)
         target.write_text(updated, encoding="utf-8")
-        self.bridge.on_write_complete(rel_path)
-        self._refresh_recent_file_context(rel_path)
+        self._record_text_edit(action, rel_path)
         return self._append_backend_diagnostics(f"patched {rel_path}", rel_path, trigger_action="patch")
 
     def _exec_explicit_mutation(self, action: Dict[str, Any]) -> str:
         action_type = str(action.get("type", ""))
+        stage = self.bridge.tree.staged_files
         try:
-            result, paths = execute_mutation(action, self.workspace_root)
+            planned = action
+            if stage:
+                if action_type == "batch_mutate" and isinstance(action.get("operations"), list):
+                    planned = {**action, "operations": [self._anchor_staged_operation(stage, operation) for operation in action["operations"]]}
+                else:
+                    planned = self._anchor_staged_operation(stage, action)
+            result, paths = execute_mutation(planned, self.workspace_root, stage=stage)
         except (ValueError, TypeError, OSError) as exc:
             return f"{action_type}: {exc}"
-        action["_changed_paths"] = paths
+        action["_changed_paths"] = [] if stage else paths
         for path in paths:
-            self.bridge.on_write_complete(path)
-            self._refresh_recent_file_context(path)
+            if not stage:
+                self.bridge.on_write_complete(path)
+                self._refresh_recent_file_context(path)
+        if stage:
+            action["_staged_paths"] = paths
         detail = json.dumps(compact_mutation_result(result), ensure_ascii=False)
         if not result["ok"]:
             return f"{action_type}: mutation failed; rolled_back={result['rolled_back']}\n{detail}"
         message = f"applied {action_type.replace('_', ' ')}: {result['applied_count']} operation(s)\n{detail}"
         for path in paths:
-            if (self.workspace_root / path).is_file():
+            target = stage.lookup(path) if stage else self.workspace_root / path
+            if target is not None and target.is_file():
                 message = self._append_backend_diagnostics(message, path, trigger_action=action_type)
-            elif self.backend_check_observer is not None and not (self.workspace_root / path).exists():
+            elif not stage and self.backend_check_observer is not None and not target.exists():
                 self.backend_check_observer(path, True, "File removed from the workspace.", [])
         return message
 
+    def _anchor_staged_operation(self, stage: StagedFiles, operation: Any) -> Any:
+        if (not isinstance(operation, dict) or operation.get("type") not in {"replace_range", "delete_range"}
+                or "expected_text" in operation):
+            return operation
+        path = operation.get("path") or operation.get("file_path")
+        first, last = operation.get("start_line"), operation.get("end_line")
+        if not isinstance(path, str) or not isinstance(first, int) or not isinstance(last, int) or first < 1 or last < first:
+            return operation
+        path = path.removeprefix("/repo/").removeprefix("repo/")
+        target = stage.include(path)
+        if not target.is_file():
+            return operation
+        before = stage.originals[target.relative_to(stage.directory).as_posix()].data.decode("utf-8").splitlines()
+        expected, allow_position = self._expected_range(path, first, last, before, target.read_text(encoding="utf-8"))
+        return operation if allow_position else {**operation, "expected_text": "\n".join(expected) + "\n" if expected else ""}
+
     def _append_backend_diagnostics(self, message: str, rel_path: str, *, trigger_action: str) -> str:
         if self._signal_state.get("edit_batch_mode"):
-            self._deferred_diagnostic_paths.add(rel_path)
-            return f"{message}; diagnostics deferred until batch end"
+            return f"{message}; staged; diagnostics deferred until batch end"
         diagnostic_message = self._run_backend_diagnostics_for_path(rel_path, trigger_action=trigger_action)
         if not diagnostic_message:
             return message

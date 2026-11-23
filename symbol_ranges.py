@@ -3,9 +3,23 @@
 from __future__ import annotations
 
 import ast
+from contextlib import contextmanager
+from contextvars import ContextVar
 import json
 import subprocess
 from pathlib import Path
+
+
+_COMPILER_ROOT: ContextVar[Path | None] = ContextVar("compiler_root", default=None)
+
+
+@contextmanager
+def typescript_lookup_root(root: Path):
+    token = _COMPILER_ROOT.set(root)
+    try:
+        yield
+    finally:
+        _COMPILER_ROOT.reset(token)
 
 
 _TYPESCRIPT_RANGE = r"""
@@ -14,15 +28,16 @@ const path = require('node:path');
 const {pathToFileURL} = require('node:url');
 const p = JSON.parse(fs.readFileSync(0, 'utf8'));
 async function main() {
-let ts = require(require.resolve('typescript', {paths: [p.root, p.harness]}));
-let sf, api, snapshot;
+const searchPaths = [p.root, p.compilerRoot, p.harness];
+let ts = require(require.resolve('typescript', {paths: searchPaths}));
+let sf, api, snapshot, diagnostics;
 try {
 if (ts.createSourceFile) {
   sf = ts.createSourceFile(p.path, p.text, ts.ScriptTarget.Latest, true);
-  if (sf.parseDiagnostics.length) { process.stdout.write('null'); return; }
+  diagnostics = sf.parseDiagnostics;
 } else {
   // TypeScript 7 exposes syntax trees through its native compiler API.
-  const resolve = name => pathToFileURL(require.resolve(name, {paths: [p.root, p.harness]})).href;
+  const resolve = name => pathToFileURL(require.resolve(name, {paths: searchPaths})).href;
   ts = await import(resolve('typescript/unstable/ast'));
   const {API} = await import(resolve('typescript/unstable/sync'));
   const file = path.resolve(p.root, p.path);
@@ -31,8 +46,19 @@ if (ts.createSourceFile) {
   snapshot = api.updateSnapshot({openFiles: [file]});
   const project = snapshot.getDefaultProjectForFile(file);
   sf = project && project.program.getSourceFile(file);
-  if (!sf || project.program.getSyntacticDiagnostics(file).length) { process.stdout.write('null'); return; }
+  if (!sf) throw new Error('TypeScript did not load the target file');
+  diagnostics = project.program.getSyntacticDiagnostics(file);
 }
+if (p.name === undefined) {
+  const findings = diagnostics.slice(0, 8).map(d => {
+    const pos = sf.getLineAndCharacterOfPosition(d.start ?? d.pos ?? 0);
+    return {line: pos.line + 1, column: pos.character + 1, code: `TS${d.code}`,
+            message: d.text ?? ts.flattenDiagnosticMessageText(d.messageText, ' ')};
+  });
+  process.stdout.write(JSON.stringify(findings));
+  return;
+}
+if (diagnostics.length) { process.stdout.write('null'); return; }
 const hits = [];
 function walk(node, parents = []) {
   let name = node.name && node.name.getText(sf);
@@ -70,8 +96,26 @@ walk(sf);
 process.stdout.write(JSON.stringify(hits.length === 1 ? hits[0] : null));
 } finally { if (snapshot) snapshot.dispose(); if (api) api.close(); }
 }
-main().catch(() => { process.exitCode = 1; });
+main().catch(error => { process.stderr.write(String(error)); process.exitCode = 1; });
 """
+
+
+def _typescript_request(path: Path, text: str, root: Path, **parameters):
+    result = subprocess.run(["node", "-e", _TYPESCRIPT_RANGE], input=json.dumps({
+        "path": str(path), "text": text, "root": str(root), "compilerRoot": str(_COMPILER_ROOT.get() or root),
+        "harness": str(Path(__file__).parent / "desktop"), **parameters,
+    }), capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15)
+    if result.returncode != 0:
+        raise ValueError(result.stderr.splitlines()[0] if result.stderr else "TypeScript parser failed")
+    return json.loads(result.stdout)
+
+
+def typescript_syntax_errors(path: Path, text: str, *, root: Path) -> list[dict]:
+    """Parse proposed text without resolving imports or type-checking the project."""
+    try:
+        return _typescript_request(path, text, root)
+    except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+        raise ValueError(f"TypeScript syntax check unavailable for {path.relative_to(root)}. Install the project's TypeScript dependencies. {exc}") from exc
 
 
 def exact_symbol_range(path: Path, text: str, name: str, kind: str = "", *, root: Path) -> tuple[int, int] | None:
@@ -109,11 +153,7 @@ def exact_symbol_range(path: Path, text: str, name: str, kind: str = "", *, root
     if path.suffix.lower() not in {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"}:
         return None
     try:
-        result = subprocess.run(["node", "-e", _TYPESCRIPT_RANGE], input=json.dumps({
-            "path": str(path), "text": text, "name": name, "kind": kind,
-            "root": str(root), "harness": str(Path(__file__).parent / "desktop"),
-        }), capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10)
-        span = json.loads(result.stdout) if result.returncode == 0 else None
+        span = _typescript_request(path, text, root, name=name, kind=kind)
         return tuple(span) if isinstance(span, list) and len(span) == 2 else None
     except (OSError, ValueError, subprocess.TimeoutExpired):
         return None
