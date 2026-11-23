@@ -200,13 +200,13 @@ class MutationTextTests(unittest.TestCase):
     def test_runtime_never_dispatches_writes_from_an_unterminated_batch(self):
         from tests.test_tree_loop_messages import RecordingMessageModel
 
-        model = RecordingMessageModel([
-            's1: write /repo/first.txt first\ns2: write /repo/second.txt <<<\n  incomplete',
-        ])
+        malformed = 's1: write /repo/first.txt first\ns2: write /repo/second.txt <<<\n  incomplete'
+        model = RecordingMessageModel([malformed, malformed])
         loop = TreeLoop(model=model, workspace_root=self.root, verbose=False, max_turns=1)
         run = loop.run('Apply the edits')
         self.assertFalse((self.root / 'first.txt').exists())
         self.assertFalse((self.root / 'second.txt').exists())
+        self.assertEqual(len(model.calls), 2)
         self.assertFalse(run.turns[0].results[0].ok)
 
 

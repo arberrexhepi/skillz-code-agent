@@ -57,7 +57,7 @@ present_plan:
         \"depends_on\": [\"goal-0\"],
         \"preserve_context\": true,
                             \"parallelizable\": false,
-                            \"estimated_scope\": \"read\" | \"write\" | \"mixed\" | \"validation\",
+                            \"estimated_scope\": \"read\" | \"write\" | \"mixed\" | \"validation\" | \"execute\",
         \"delegation_notes\": [\"specific worker guidance\"],
                             \"success_signals\": [\"observable signs this goal is done\"],
                             \"relevant_fact_keys\": [\"durable_repo_fact_key\"]
@@ -154,7 +154,7 @@ present_plan:
 <depends_on>goal-0</depends_on>
 <preserve_context>true|false</preserve_context>
 <parallelizable>true|false</parallelizable>
-<estimated_scope>read|write|mixed|validation</estimated_scope>
+<estimated_scope>read|write|mixed|validation|execute</estimated_scope>
 <delegation_note>specific worker guidance</delegation_note>
 <success_signal>observable sign this goal is done</success_signal>
 <relevant_fact_key>durable_repo_fact_key</relevant_fact_key>
@@ -205,7 +205,8 @@ You are writing the planner's close-out after delegated goal execution.
 Return exactly one JSON object:
 {
   "summary": "short overall summary",
-  "next_steps": ["specific next step", "specific next step"]
+  "next_steps": ["unfinished action already within the user's request"],
+  "optional_next_steps": ["specific follow-up that would need user approval"]
 }
 """.strip()
     return """
@@ -213,8 +214,8 @@ You are writing the planner's close-out after delegated goal execution.
 Return tags only, no JSON, no markdown:
 <final_summary>
 <summary>short overall summary</summary>
-<next_step>specific next step</next_step>
-<next_step>specific next step</next_step>
+<next_step>unfinished action already within the user's request</next_step>
+<optional_next_step>specific follow-up that would need user approval</optional_next_step>
 </final_summary>
 """.strip()
 
@@ -277,6 +278,7 @@ def parse_final_summary_response(text: str) -> Dict[str, Any]:
     return {
         "summary": _extract_first_value(block, "summary"),
         "next_steps": _extract_all_values(block, "next_step"),
+        "optional_next_steps": _extract_all_values(block, "optional_next_step"),
     }
 
 

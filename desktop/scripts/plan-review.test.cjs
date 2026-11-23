@@ -47,12 +47,12 @@ test('approval and change controls are disabled during another action or executi
     assert.match(html, /disabled=""[^>]*>Suggest plan changes/);
   }
 });
-test('paused plans retain a compact preview with review and revision controls', () => {
+test('paused plans put Resume next to the full plan review', () => {
   const html = render({ execution_paused: true, paused_plan: reviewPlan, resume_checkpoint: { next_goal_index: 4 } });
   assert.match(html, /Execution paused/);
   assert.match(html, /Review full plan/);
-  assert.match(html, /Suggest plan changes/);
-  assert.doesNotMatch(html, /Validate regression coverage/);
+  assert.match(html, /Resume at goal 4/);
+  assert.doesNotMatch(html, /Suggest plan changes|Validate regression coverage/);
 });
 test('no stale decision is shown without a pending or paused plan', () => {
   const html = render({});
@@ -67,4 +67,13 @@ test('paused plan shows the actual stop reason and validation blocker before rev
   assert.match(html, /100 model turns in this attempt/);
   assert.match(html, /An edit batch is still open/);
   assert.match(html, /Completed goals are saved/);
+});
+
+test('an exhausted goal has a suspended status and a direct resume action', () => {
+  const html = render({ execution_paused: true, paused_plan: reviewPlan, paused_suspended_goal_id: 'goal-2',
+    last_completed_results: [{ goal_id: 'goal-2', status: 'suspended', title: 'Export scene', final_message: 'Read allowance exhausted.' }],
+    resume_checkpoint: { next_goal_index: 2, mode: 'resume_suspended_goal' } });
+  assert.match(html, /Suspended goal.*Export scene/);
+  assert.match(html, /Resume at goal 2/);
+  assert.doesNotMatch(html, /Failed goal|Retry/);
 });

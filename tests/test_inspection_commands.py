@@ -102,6 +102,14 @@ class InspectionCommandTests(unittest.TestCase):
             self.assertFalse(result.ok, output)
             self.assertEqual(path.read_text(), before)
 
+    def test_large_atomic_edit_batch_rolls_back_when_a_late_edit_fails(self):
+        operations = [{"type": "create_file", "path": f"sample-{i}.txt", "content": str(i)} for i in range(34)]
+        operations.append({"type": "replace_snippet", "path": "app.py", "old_text": "missing anchor", "new_text": "bad"})
+        result, output = self.execute("edit-batch " + json.dumps({"operations": operations}))
+        self.assertFalse(result.ok)
+        self.assertIn('"rolled_back": true', output)
+        self.assertEqual(list(self.root.glob("sample-*.txt")), [])
+
     def test_edit_symbol_heredoc_preserves_strategy_payload(self):
         raw = "s1: edit-symbol /repo/app.py target <<<\ndef target():\n    return 'literal -> s2, braces {}'\n>>>\ns1 -> s2: read-symbol /repo/app.py target"
         plan = parse_strategy(raw)

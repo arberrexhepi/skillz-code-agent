@@ -478,6 +478,10 @@ class IssueScopedFactsTests(unittest.TestCase):
 
             self.assertIsNotNone(mutation_skill)
             self.assertEqual(mutation_skill["modes"], ["surgical_text", "structural_code", "filesystem", "coordinated_batch"])
+            self.assertTrue(any(item["name"] == "artifact-chatbot" for item in available_skills))
+            chatbot = agent._execute_action({"type": "skill", "name": "artifact-chatbot"})
+            self.assertTrue(chatbot.ok)
+            self.assertIn("POST /_skillz/agent/chat", chatbot.payload["content"])
 
     def test_stable_runtime_skill_action_returns_markdown_payload(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

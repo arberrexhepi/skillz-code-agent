@@ -20,7 +20,7 @@ export async function dockerCommand(): Promise<string> {
   }
   throw new Error('Docker was not found. Install Docker Desktop, enable Linux containers, and start it before running artifacts.');
 }
-async function sandboxDefinition(source: string) {
+async function sandboxDefinition(source: string, appMcp = false) {
   // Copy only distributed harness code. Never send the checkout, .env, credentials, or Git data to the Docker builder.
   const files: { name: string; content: Buffer }[] = [];
   async function collect(directory: string, prefix = ''): Promise<void> {
@@ -33,11 +33,12 @@ async function sandboxDefinition(source: string) {
   await collect(source);
   files.push({ name: 'process-proxy/npm-proxy.cjs', content: Buffer.from(artifactProcessProxyScript) });
   files.push({ name: 'prepare-dependencies.cjs', content: Buffer.from(artifactDependenciesScript) });
+  if (appMcp) files.push({ name: 'requirements-mcp.txt', content: await fs.readFile(path.join(source, 'requirements-mcp.txt')) });
   const dockerfile = `FROM node:22.20.0-bookworm
-RUN apt-get update && apt-get install -y --no-install-recommends python3 ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends python3 ${appMcp ? 'python3-venv ' : ''}ca-certificates && rm -rf /var/lib/apt/lists/*
 RUN command -v python3 && command -v make && command -v g++ && test -f /usr/local/include/node/node.h
 RUN mkdir -p /repo/node_modules && chmod 1777 /repo/node_modules
-COPY harness /opt/skillz
+${appMcp ? 'COPY harness/requirements-mcp.txt /tmp/requirements-mcp.txt\nRUN python3 -m venv /opt/skillz-mcp && /opt/skillz-mcp/bin/python -m pip install --no-cache-dir -r /tmp/requirements-mcp.txt\n' : ''}COPY harness /opt/skillz
 RUN mkdir -p /opt/skillz/bin && ln -s /opt/skillz/process-proxy/npm-proxy.cjs /opt/skillz/bin/npm && chmod 755 /opt/skillz/process-proxy/npm-proxy.cjs
 ENV PYTHONUNBUFFERED=1 PYTHONIOENCODING=utf-8 PYTHONDONTWRITEBYTECODE=1 HOME=/tmp/skillz-home PATH=/opt/skillz/bin:$PATH
 WORKDIR /repo
@@ -47,8 +48,8 @@ WORKDIR /repo
   const image = 'skillz-artifact:' + hash.digest('hex').slice(0, 20);
   return { image, files, dockerfile };
 }
-export async function artifactRuntimeImage(source = harnessRoot()): Promise<string> {
-  return (await sandboxDefinition(source)).image;
+export async function artifactRuntimeImage(source = harnessRoot(), appMcp = false): Promise<string> {
+  return (await sandboxDefinition(source, appMcp)).image;
 }
 export function artifactDependencyVolume(root: string): string {
   return 'skillz-artifact-deps-' + createHash('sha256').update(root).digest('hex').slice(0, 20);
@@ -57,11 +58,11 @@ export async function sandboxImageReady(docker: string, source = harnessRoot()):
   const { image } = await sandboxDefinition(source);
   return command(docker, ['image', 'inspect', image], source).then(() => true, () => false);
 }
-export async function ensureSandboxImage(log: (text: string) => void, source = harnessRoot()): Promise<{ docker: string; image: string }> {
+export async function ensureSandboxImage(log: (text: string) => void, source = harnessRoot(), appMcp = false): Promise<{ docker: string; image: string }> {
   const docker = await dockerCommand();
   try { if (await command(docker, ['info', '--format', '{{.OSType}}'], source) !== 'linux') throw new Error('Linux containers required'); }
   catch { throw new Error('Docker is not ready. Start Docker Desktop with Linux containers, wait for its engine to be running, and retry. Artifact execution remains stopped.'); }
-  const { image, files, dockerfile } = await sandboxDefinition(source);
+  const { image, files, dockerfile } = await sandboxDefinition(source, appMcp);
   if (!builds.has(image)) builds.set(image, (async () => {
     try { await command(docker, ['image', 'inspect', image], source); return image; } catch { /* Build the trusted runtime. */ }
     const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'skillz-sandbox-build-'));
@@ -108,8 +109,8 @@ export class ArtifactSandbox {
   private cancelled = false;
   private stopping?: Promise<void>;
   constructor(readonly root: string, readonly reads: ReadDirectory[], readonly context: string, private readonly processProxy?: { url: string; token: string }, private readonly modelBroker?: { url: string; token: string; provider: string; model: string }, readonly repository?: ReadDirectory) {}
-  async prepare(log: (text: string) => void, source?: string): Promise<{ docker: string; args: string[] }> {
-    const { docker, image } = await ensureSandboxImage(log, source);
+  async prepare(log: (text: string) => void, source?: string, appMcp = false): Promise<{ docker: string; args: string[] }> {
+    const { docker, image } = await ensureSandboxImage(log, source, appMcp);
     this.docker = docker;
     if (this.cancelled) throw new Error('Artifact start cancelled.');
     const ownerRoot = await fs.realpath(this.root);

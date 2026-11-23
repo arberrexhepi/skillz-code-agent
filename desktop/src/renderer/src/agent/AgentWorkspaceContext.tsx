@@ -17,9 +17,10 @@ interface AgentWorkspaceProviderProps {
   api?: WorkbenchApi['agent'];
   initialRuntime?: RuntimeSelection;
   savedRuntime?: RuntimeSelection;
+  artifactId?: string;
 }
 
-export function AgentWorkspaceProvider({ children, api = window.workbench.agent, initialRuntime = defaultRuntime, savedRuntime }: AgentWorkspaceProviderProps): React.JSX.Element {
+export function AgentWorkspaceProvider({ children, api = window.workbench.agent, initialRuntime = defaultRuntime, savedRuntime, artifactId }: AgentWorkspaceProviderProps): React.JSX.Element {
   const [state, dispatch] = useReducer(reduceAgentUi, initialAgentUiState);
   const [runtime, setRuntimeState] = useState(initialRuntime);
   const [backoff, setBackoffState] = useState<AgentBackoff>();
@@ -31,7 +32,7 @@ export function AgentWorkspaceProvider({ children, api = window.workbench.agent,
 
   useEffect(() => api.onEvent((event: AgentEvent) => {
     if (event.type === 'state') dispatch({ type: 'bridge-state', state: event.state });
-    if (event.type === 'progress') dispatch({ type: 'progress', progress: event.payload });
+    if (event.type === 'progress') dispatch({ type: 'progress', progress: event.payload, receivedAt: Date.now() });
     if (event.type === 'status') {
       if (event.status === 'stopped') dispatch({ type: 'reset' });
       else dispatch({ type: 'status', status: event.status, message: event.message });
@@ -177,6 +178,7 @@ export function AgentWorkspaceProvider({ children, api = window.workbench.agent,
   const value = useMemo<AgentWorkspaceValue>(() => ({
     state,
     runtime,
+    artifactId,
     backoff,
     setRuntime: (next) => setRuntimeState((current) => ({ ...current, ...next })),
     start,
@@ -190,7 +192,7 @@ export function AgentWorkspaceProvider({ children, api = window.workbench.agent,
     switchRuntime,
     setBackoff,
     clearNotice: () => dispatch({ type: 'notice', message: '' }),
-  }), [backoff, createIssue, decideIssueProposal, plannerAction, runSuggestedAction, setBackoff, start, state, submit, switchRuntime, workerAction, runtime, api]);
+  }), [artifactId, backoff, createIssue, decideIssueProposal, plannerAction, runSuggestedAction, setBackoff, start, state, submit, switchRuntime, workerAction, runtime, api]);
 
   return <AgentWorkspaceContext.Provider value={value}>{children}</AgentWorkspaceContext.Provider>;
 }

@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Dict, List, Sequence
 
 from tree_commands import CommandResult
-from tree_loop import MAX_EXECUTABLE_COMMANDS_PER_TURN, TreeLoop, Turn, extract_commands
+from tree_loop import MAX_NON_EDIT_COMMANDS_PER_TURN, TreeLoop, Turn, extract_commands
 
 
 class RecordingMessageModel:
@@ -58,7 +58,7 @@ class TreeLoopMessageTranscriptTests(unittest.TestCase):
     def test_oversized_command_batch_is_rejected_before_any_reads_execute(self) -> None:
         oversized_batch = "\n".join(
             f'find /repo -name "missing-{index}.tsx"'
-            for index in range(MAX_EXECUTABLE_COMMANDS_PER_TURN + 1)
+            for index in range(MAX_NON_EDIT_COMMANDS_PER_TURN + 1)
         )
         model = RecordingMessageModel([oversized_batch, "finish recovered"])
         with tempfile.TemporaryDirectory() as tmp:
@@ -243,6 +243,41 @@ class TreeLoopMessageTranscriptTests(unittest.TestCase):
         self.assertEqual(result.turns[0].results[-1].command_type, "finish")
         self.assertIn("FORMAT REPAIR REQUIRED", model.calls[1][-1]["content"])
         self.assertNotIn("planning_only", result.turns[0].commands_issued)
+
+    def test_missing_strategy_step_is_repaired_in_the_same_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            model = RecordingMessageModel([
+                "s1:\ns1 -> s2: finish The note was written",
+                "s1: write note.txt created\ns1 -> s2: finish The note was written",
+            ])
+            result = TreeLoop(model=model, workspace_root=root, max_turns=1, verbose=False).run("Write the note")
+            self.assertTrue((root / "note.txt").exists())
+        self.assertTrue(result.finished)
+        self.assertEqual(len(result.turns), 1)
+        self.assertIn("missing command", model.calls[1][-1]["content"])
+        self.assertIn("No commands from that response were executed", model.calls[1][-1]["content"])
+
+    def test_source_properties_and_error_labels_do_not_start_strategies(self) -> None:
+        self.assertEqual(extract_commands("setupCode: 'return {}'\nSyntaxError: Unexpected token '<'\ns1.a: cat /repo/note.txt"),
+                         "s1.a: cat /repo/note.txt")
+
+    def test_malformed_batches_cannot_be_replaced_by_a_completion_claim(self) -> None:
+        for malformed, diagnostic in (
+            ('write partial.txt first\nedit-batch {"operations":\nfinish Done', "Malformed `edit-batch`"),
+            ('s9 -> s1: write partial.txt first\ns1 -> s2: finish Done', "depends on undefined step"),
+            ('s1 -> s2: write partial.txt first\ns2 -> s1: finish Done', "circular dependencies"),
+            ('write partial.txt first\ns1: finish Done', "has no step label"),
+            ('s1: write partial.txt first\ns1 -> s2: sqlite app.db', "unknown command `sqlite`"),
+        ):
+            with self.subTest(malformed=malformed), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                model = RecordingMessageModel([malformed, "finish Done"])
+                result = TreeLoop(model=model, workspace_root=root, max_turns=5, verbose=False).run("Write the note")
+                self.assertFalse(result.finished)
+                self.assertFalse((root / "partial.txt").exists())
+                self.assertIn(diagnostic, result.finish_message)
+                self.assertEqual(len(model.calls), 2)
 
     def test_prose_only_output_is_repaired_before_it_becomes_an_invalid_turn(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

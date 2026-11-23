@@ -13,6 +13,8 @@ import type { CodexSubscriptionStatus, JsonMap, RuntimeOptionsPayload } from '..
 import type { WorkspaceService } from './workspace';
 import { pythonEnvironment, resolvePythonCommand } from './python';
 import type { RuntimeSettingsService } from './runtimeSettings';
+import type { McpBroker, McpHost } from './mcp';
+import { terminate } from './artifactProcess';
 
 interface PendingRequest {
   resolve: (response: AgentResponse) => void;
@@ -29,12 +31,15 @@ export class AgentService {
   private launchGeneration = 0;
   private readonly pending = new Map<string, PendingRequest>();
   private state: AgentBridgeState = { planner: {}, transcript: [] };
+  private mcpBroker?: McpBroker;
 
   constructor(
     private readonly workspace: WorkspaceService,
     private readonly emit: (event: AgentEvent) => void,
     private readonly runtimeSettings?: RuntimeSettingsService,
     private readonly execution?: AgentExecution,
+    private readonly mcp?: McpHost,
+    private readonly mcpProfile = 'repo',
   ) {}
 
   async start(options: AgentStartOptions): Promise<AgentResponse> {
@@ -56,12 +61,12 @@ export class AgentService {
     this.buffer = '';
     this.state = { planner: {}, transcript: [] };
     this.emit({ type: 'status', status: 'starting' });
-    const child = this.execution ? await this.execution.launch({ agentRoot, scriptName, python, env, options }).catch((error) => {
+    const child = this.execution ? await this.execution.launch({ agentRoot, scriptName, python, env, options, mcp: Boolean(this.mcp) }).catch((error) => {
       if (generation === this.launchGeneration) this.emit({ type: 'status', status: 'error', message: error instanceof Error ? error.message : String(error) });
       throw error;
     }) : spawn(python.executable, [
       ...python.args,
-      script,
+      ...(this.mcp ? [path.join(agentRoot, 'artifact_agent_entry.py'), scriptName, '--mcp-only'] : [script]),
       '--provider', options.provider,
       '--model', options.model,
       '--root', this.workspace.requireRoot(),
@@ -74,11 +79,12 @@ export class AgentService {
     });
     if (generation !== this.launchGeneration) { await this.execution?.stop(); child.kill(); throw new Error('Agent start cancelled.'); }
     this.process = child;
+    this.mcpBroker = this.mcp?.broker({ root: this.workspace.requireRoot(), profile: this.mcpProfile });
     this.processCodexPath = env.CODEX_CLI_PATH || '';
 
     child.stdin.on('error', (error) => this.handleExit(child, new Error(`Agent input closed: ${error.message}`)));
     child.stdout.setEncoding('utf8');
-    child.stdout.on('data', (chunk: string) => this.handleStdout(chunk));
+    child.stdout.on('data', (chunk: string) => { if (this.process === child) this.handleStdout(chunk); });
     child.stderr.setEncoding('utf8');
     child.stderr.on('data', (chunk: string) => {
       const message = chunk.trim();
@@ -192,17 +198,20 @@ export class AgentService {
     this.launchGeneration += 1;
     this.stopping = true;
     const wasRunning = Boolean(this.process);
+    this.mcpBroker?.stop();
+    this.mcpBroker = undefined;
     await this.execution?.stop();
     if (!this.process) {
       if (wasRunning) { this.state = { planner: {}, transcript: [] }; this.emit({ type: 'status', status: 'stopped' }); }
       return;
     }
-    this.process.kill();
+    const child = this.process;
     this.process = null;
     this.buffer = '';
     this.rejectPending(new Error('Python agent stopped.'));
     this.state = { planner: {}, transcript: [] };
     this.emit({ type: 'status', status: 'stopped' });
+    await terminate(child);
   }
 
   private request(type: string, payload: Record<string, unknown>): Promise<AgentResponse> {
@@ -225,6 +234,10 @@ export class AgentService {
       if (!line) continue;
       try {
         const payload = JSON.parse(line) as Record<string, unknown>;
+        if (payload.type === 'mcp_request') {
+          this.handleMcp(payload);
+          continue;
+        }
         if (this.execution?.message(payload)) continue;
         if (isBridgeState(payload.state)) {
           this.state = payload.state;
@@ -250,6 +263,8 @@ export class AgentService {
   private handleExit(source: ChildProcessWithoutNullStreams, error: Error): void {
     if (this.process !== source) return;
     const intentional = this.stopping;
+    this.mcpBroker?.stop();
+    this.mcpBroker = undefined;
     this.process = null;
     this.buffer = '';
     this.rejectPending(error);
@@ -259,6 +274,21 @@ export class AgentService {
   private rejectPending(error: Error): void {
     for (const request of this.pending.values()) request.reject(error);
     this.pending.clear();
+  }
+
+  private handleMcp(payload: Record<string, unknown>): void {
+    const child = this.process;
+    const id = payload.id;
+    const action = payload.action;
+    if (!child || typeof id !== 'string' || id.length > 80 || !action || typeof action !== 'object' || Array.isArray(action)) return;
+    const reply = (result: Record<string, unknown>): void => {
+      if (this.process === child && !child.stdin.destroyed) child.stdin.write(JSON.stringify({ type: 'mcp_response', id, payload: result }) + '\n');
+    };
+    if (!this.mcpBroker || JSON.stringify(action).length > 64 * 1024) {
+      reply({ ok: false, error: 'MCP is unavailable or the request is too large.' });
+      return;
+    }
+    void this.mcpBroker.invoke(id, action as Record<string, unknown>).then(reply);
   }
 
   private agentRoot(): string {

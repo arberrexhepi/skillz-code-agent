@@ -1,6 +1,8 @@
 import { z } from 'zod';
 import type { AgentEvent, AgentResponse, AgentStartOptions, GitCommit, GitDiscardResult, GitFileDiff, GitStatus } from './contracts';
 import type { JsonMap, RuntimeOptionsPayload } from './agentTypes';
+import type { WorkspaceIssueAction, WorkspaceIssuesSnapshot } from './workspaceIssues';
+import { artifactAppMcpSchema, type ArtifactAppMcpRequest } from './artifactAppMcp';
 
 export const artifactId = z.string().regex(/^[a-z0-9][a-z0-9-]{0,63}$/);
 const shape = z.record(z.string(), z.unknown());
@@ -38,9 +40,15 @@ export const artifactBlueprintChatMessageSchema = z.object({ role: z.enum(['user
 export type ArtifactBlueprintChatMessage = z.infer<typeof artifactBlueprintChatMessageSchema>;
 export interface ArtifactBlueprintAgentResult { message: string; config: ArtifactApis; changes: string[]; }
 export const artifactDatabaseDialectSchema = z.enum(['sqlite', 'postgres', 'mysql', 'mariadb', 'mssql']);
+export const artifactChatLayouts = ['floating', 'sidebar', 'workspace'] as const;
 export const artifactAppSchema = z.object({
   version: z.literal(1),
-  chatbot: z.object({ enabled: z.boolean().default(false) }).default({ enabled: false }),
+  chatbot: z.object({
+    enabled: z.boolean().default(false),
+    includeShell: z.boolean().default(true),
+    shellLayout: z.enum(artifactChatLayouts).default('floating'),
+  }).default({ enabled: false, includeShell: true, shellLayout: 'floating' }),
+  mcp: artifactAppMcpSchema.default({ enabled: false, servers: [] }),
   database: z.object({
     enabled: z.boolean().default(false),
     dialect: artifactDatabaseDialectSchema.default('sqlite'),
@@ -61,9 +69,9 @@ export type ReadDirectory = z.infer<typeof readDirectorySchema>;
 export type ReadDirectoryChoice = ReadDirectory & { packageScripts: string[] };
 export interface PrebuiltArtifact { id: string; title: string; description: string; previousTitles?: string[]; requiresWriteAccess: boolean; requiresProcessProxy?: boolean; usesAgentRuntime?: boolean; }
 export type ArtifactAccess = z.infer<typeof artifactAccessSchema>;
-export const createArtifactSchema = z.object({ title: z.string().trim().min(1).max(120), prompt: z.string().trim().min(1).max(20000), sourceRoot: z.string().max(4096), shareFacts: z.boolean(), shareMemory: z.boolean(), runtime: artifactAgentRuntimeSchema.optional(), access: artifactAccessSchema.optional(), app: artifactAppSchema.optional() });
+export const createArtifactSchema = z.object({ title: z.string().trim().min(1).max(120), prompt: z.string().trim().min(1).max(20000), sourceRoot: z.string().max(4096), shareFacts: z.boolean(), shareMemory: z.boolean(), runtime: artifactAgentRuntimeSchema.optional(), access: artifactAccessSchema.optional(), app: artifactAppSchema.optional(), playwrightMcp: z.boolean().optional() });
 export type CreateArtifact = z.infer<typeof createArtifactSchema>;
-export interface ArtifactRecord extends CreateArtifact { id: string; root: string; createdAt: string; prebuiltId?: string; contextMode: 'links' | 'junction' | 'snapshot' | 'unavailable' | 'none'; contextWarning?: string }
+export interface ArtifactRecord extends Omit<CreateArtifact, 'playwrightMcp'> { id: string; root: string; createdAt: string; prebuiltId?: string; contextMode: 'links' | 'junction' | 'snapshot' | 'unavailable' | 'none'; contextWarning?: string }
 export interface ArtifactLibrary { root: string; artifacts: ArtifactRecord[] }
 export interface ArtifactRuntime { id: string; status: 'stopped' | 'installing' | 'starting' | 'running' | 'error'; url?: string; error?: string; logs: string }
 export const artifactSetupSelectionSchema = z.object({ provider: z.enum(['openai', 'codex-subscription', 'gemini', 'anthropic', 'meta', 'local', 'ollama', 'ollama-local', 'ollama-runpod']), model: z.string().min(1).max(200) });
@@ -97,7 +105,7 @@ export const prebuiltUpdateRequestSchema = z.object({
 });
 export type PrebuiltUpdateRequest = z.infer<typeof prebuiltUpdateRequestSchema>;
 export interface PrebuiltUpdateResult { updatedFiles: number; backup: string }
-export type ArtifactEvent = { type: 'setup'; progress: ArtifactSetupProgress } | { type: 'runtime'; runtime: ArtifactRuntime } | { type: 'runtime-setup'; id: string } | { type: 'runtime-selection'; record: ArtifactRecord } | { type: 'prebuilt-updated'; id: string } | { type: 'apis'; id: string } | { type: 'agent'; id: string; event: AgentEvent };
+export type ArtifactEvent = { type: 'setup'; progress: ArtifactSetupProgress } | { type: 'runtime'; runtime: ArtifactRuntime } | { type: 'runtime-setup'; id: string } | { type: 'runtime-selection'; record: ArtifactRecord } | { type: 'prebuilt-updated'; id: string } | { type: 'apis'; id: string } | { type: 'issues'; id: string } | { type: 'agent'; id: string; event: AgentEvent };
 export const previewInputSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('click'), x: z.number().min(0).max(3000), y: z.number().min(0).max(3000) }),
   z.object({ type: z.literal('wheel'), dx: z.number().min(-3000).max(3000), dy: z.number().min(-3000).max(3000) }),
@@ -119,7 +127,7 @@ export interface ArtifactsApi {
   chooseFolder(): Promise<ArtifactLibrary | null>;
   create(options: CreateArtifact): Promise<ArtifactRecord>;
   prebuilts(): Promise<PrebuiltArtifact[]>;
-  installPrebuilt(id: string, access: ArtifactAccess, runtime?: z.infer<typeof artifactAgentRuntimeSchema>): Promise<ArtifactRecord>;
+  installPrebuilt(id: string, access: ArtifactAccess, runtime?: z.infer<typeof artifactAgentRuntimeSchema>, playwrightMcp?: boolean): Promise<ArtifactRecord>;
   prebuiltUpdateStatus(id: string): Promise<PrebuiltUpdateStatus>;
   reviewPrebuiltUpdate(id: string): Promise<PrebuiltUpdateReview>;
   applyPrebuiltUpdate(id: string, request: PrebuiltUpdateRequest): Promise<PrebuiltUpdateResult>;
@@ -134,6 +142,7 @@ export interface ArtifactsApi {
   runApiCollection(id: string, collection: string, variables?: JsonMap, approveMutations?: boolean): Promise<JsonMap>;
   app(id: string): Promise<ArtifactAppConfig>;
   saveApp(id: string, config: ArtifactAppConfig): Promise<ArtifactAppSaveResult>;
+  requestAppMcp(id: string, request: ArtifactAppMcpRequest): Promise<Record<string, unknown>>;
   start(id: string): Promise<ArtifactRuntime>;
   stop(id: string): Promise<void>;
   installBrowser(): Promise<void>;
@@ -142,6 +151,8 @@ export interface ArtifactsApi {
   reload(id: string): Promise<void>;
   closePreview(id: string): Promise<void>;
   reveal(id: string): Promise<void>;
+  issues(id: string): Promise<WorkspaceIssuesSnapshot>;
+  issueAction(id: string, action: WorkspaceIssueAction, extras: JsonMap): Promise<WorkspaceIssuesSnapshot>;
   gitStatus(id: string): Promise<GitStatus>;
   gitInitialize(id: string): Promise<GitStatus>;
   gitHistory(id: string, limit?: number): Promise<GitCommit[]>;

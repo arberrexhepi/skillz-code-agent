@@ -1,5 +1,6 @@
 """Proposal persistence is the scope boundary, not the user's later decision."""
 import json
+import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,7 +11,9 @@ import pytest
 from issue_facts import IssueFactLedger
 from issue_proposals import IssueProposalStore
 from live_test_loop import TreeLoopPlannerWorker
-from main import ActionResult, WorkingFolderAgent, _handle_bridge_planner_action
+from main import ActionResult, AgentConfig, WorkerRunResult, WorkingFolderAgent, _handle_bridge_planner_action
+from planner import PlannerAgent, PlannerGoal, PlannerPlan
+from tests.test_tree_loop_messages import RecordingMessageModel
 from tree_commands import CommandResult
 from tree_loop import TreeLoop, extract_commands
 
@@ -158,6 +161,33 @@ def test_identical_failure_never_reopens_gate_but_changed_failure_does(tmp_path)
     assert worker._pending_verification
 
 
+def test_focused_typescript_check_does_not_reopen_deferred_project_failure(tmp_path):
+    worker = worker_with_diagnostics(tmp_path)
+    (tmp_path / "panel.ts").write_text("export const panel = 1;\n")
+    observe_failure(worker)
+    assert dispatch_proposal(worker).ok
+    assert worker._proposal_diagnostics()[0]["status"] == "deferred"
+
+    command = "diagnose panel.ts"
+    result = worker.loop.bridge.execute_single(command)
+    compiler = subprocess.CompletedProcess(["tsc"], 2, "legacy.ts(4,1): error TS2339: Property missing\n", "")
+    with (
+        patch("diagnostics.backends.find_command", return_value="tsc"),
+        patch("diagnostics.backends._run_checked", return_value=compiler),
+    ):
+        result.output = worker._dispatch_tool_action(result)
+        assert worker.loop._run_backend_diagnostics_for_path("panel.ts", trigger_action="batch end") == ""
+    worker._observe_command_result(command, result)
+
+    assert result.ok
+    assert "\nexit_code=0\n" in result.output
+    assert "compiler_exit_code=2" in result.output
+    assert "other_file_errors=1" in result.output
+    assert "legacy.ts" not in result.output
+    assert worker._proposal_diagnostics()[0]["status"] == "deferred"
+    assert finish(worker).ok
+
+
 def test_mixed_diagnostics_keep_in_scope_failure_blocking(tmp_path):
     worker = worker_with_diagnostics(tmp_path, mixed=True)
     observe_failure(worker)
@@ -167,6 +197,82 @@ def test_mixed_diagnostics_keep_in_scope_failure_blocking(tmp_path):
     assert worker._pending_verification
     assert not finish(worker).ok
     assert worker.loop._signal_state["unresolved_issue_count"] == 1
+
+
+def test_goal_cannot_defer_type_error_it_introduced_in_an_unedited_consumer(tmp_path):
+    worker = TreeLoopPlannerWorker(model=Mock(), root=tmp_path, verbose=False)
+    worker._current_task = "Change the exported panel"
+    api = tmp_path / "api.ts"
+    api.write_text("export const panel = { title: 'Panel' };\n")
+    (tmp_path / "consumer.ts").write_text("import { panel } from './api';\npanel.title;\n")
+    (tmp_path / "tsconfig.json").write_text("{}")
+    legacy = "legacy.ts(4,1): error TS2339: Property missing\n"
+    regression = "consumer.ts(2,7): error TS2339: Property 'title' does not exist on type '{}'.\n"
+
+    def compile_project(command, **_kwargs):
+        return subprocess.CompletedProcess(command, 2, legacy + (regression if "title" not in api.read_text() else ""), "")
+
+    write = "write /repo/api.ts export const panel = {};"
+    result = worker.loop.bridge.execute_single(write)
+    with (
+        patch("diagnostics.backends.find_command", return_value="tsc"),
+        patch("diagnostics.backends._run_checked", side_effect=compile_project),
+    ):
+        result.output = worker.loop._dispatch_tool_with_progress(result, 1)
+        worker._observe_command_result(write, result)
+    assert result.ok
+    assert worker.loop.diagnostic_provenance.changed_paths == {"api.ts"}
+    worker.loop.bridge.tree.ingest_diagnostic_content(legacy + regression, source_path="[run-check:typecheck]")
+    observe_failure(worker)
+    diagnostics = worker._proposal_diagnostics()
+    denied = dispatch_proposal(worker, diagnostics)
+    assert not denied.ok
+    assert "Cannot defer diagnostics without pre-edit evidence" in denied.output
+    assert not worker.proposal_state()["proposals"]
+    assert dispatch_proposal(worker, [item for item in diagnostics if item["file"] == "legacy.ts"]).ok
+    assert [item["file"] for item in worker._proposal_diagnostics() if item["status"] != "deferred"] == ["consumer.ts"]
+    assert not finish(worker).ok
+
+
+def test_preexisting_error_can_be_deferred_after_an_edit_moves_its_line(tmp_path):
+    worker = TreeLoopPlannerWorker(model=Mock(), root=tmp_path, verbose=False)
+    worker._current_task = "Add a module header"
+    (tmp_path / "app.py").write_text("broken =\n")
+    result = CommandResult(True, "", "write", needs_tool=True, tool_action={
+        "type": "write_file", "path": "app.py", "content": "# Module header\nbroken =\n",
+    })
+    result.output = worker.loop._dispatch_tool_with_progress(result, 1)
+    worker._observe_command_result("write /repo/app.py", result)
+    diagnostics = worker._proposal_diagnostics()
+    assert diagnostics[0]["line"] == "2"
+    assert dispatch_proposal(worker, diagnostics).ok
+
+
+@pytest.mark.parametrize("resumed", [False, True])
+def test_classic_worker_cannot_defer_a_syntax_error_from_its_write(tmp_path, resumed):
+    target = tmp_path / "app.py"
+    target.write_text("value = 1\n")
+    config = AgentConfig("gemini", "fixture", tmp_path, Path(__file__).resolve().parents[1] / "agent_tools.py", quiet=True)
+    worker = WorkingFolderAgent(Mock(), config)
+    worker._current_task = "Update app.py"
+    worker.configure_goal_diagnostics("issue-001:app")
+    worker._start_new_run()
+    result = worker._execute_action({"type": "write_file", "path": "app.py", "content": "value =\n"})
+    assert result.ok
+    if resumed:
+        worker._current_task = "Resume the same goal after its partial edit"
+        worker._start_new_run()
+    diagnose = {"type": "diagnose", "path": "app.py"}
+    diagnostic = worker._execute_action(diagnose)
+    assert not diagnostic.ok
+    worker._set_active_error(diagnose, diagnostic)
+    ids = [item["id"] for item in worker._proposal_diagnostics()]
+    assert ids
+    proposal = worker._execute_action({"type": "propose_issue", **ACTION, "run_issue_ids": ids})
+    assert not proposal.ok
+    assert "Cannot defer diagnostics without pre-edit evidence" in json.dumps(proposal.payload)
+    assert worker.active_error is not None
+    assert not worker.proposal_state()["proposals"]
 
 
 def test_failed_proposal_dispatch_does_not_clear_validation_or_remediation(tmp_path):
@@ -194,6 +300,62 @@ def test_deferral_does_not_hide_same_diagnostic_in_a_different_goal(tmp_path):
     assert worker._proposal_diagnostics()[0]["status"] == "deferred"
     worker._current_task = "Repair the legacy type error"
     assert worker._proposal_diagnostics()[0]["status"] == "open"
+
+
+def test_linked_deferral_updates_only_final_verifier_and_gets_an_optional_followup(tmp_path):
+    model = RecordingMessageModel([
+        "verify check-1 run-check test",
+        "finish The legacy type error is irrelevant to the issue intent. Possible next step: fix the legacy type separately.",
+    ])
+    worker = TreeLoopPlannerWorker(model=model, root=tmp_path, max_turns=3, verbose=False)
+    planner = PlannerAgent(Mock(), SimpleNamespace(root=tmp_path, provider="gemini"), lambda: worker, json.loads)
+    implementation = PlannerGoal("implement", "Update the panel", "Apply the panel change", "Requested change", estimated_scope="write")
+    intermediate = PlannerGoal("inspect", "Inspect the panel", "Confirm the panel structure", "Review the work", estimated_scope="read")
+    verifier = PlannerGoal("verify", "Verify the issue", "Check that the panel works", "Validate the requested outcome",
+                           estimated_scope="validation", success_signals=["The panel test passes"], parallelizable=True)
+    plan = PlannerPlan("Improve the panel", "Panel plan", goals=[implementation, intermediate, verifier])
+    run_verification = worker.run_task
+
+    def run(task):
+        if "Planner goal 3/3" in task:
+            return run_verification(task)
+        worker._current_task = task
+        if "Planner goal 1/3" in task:
+            worker._has_mutation = True
+            worker._validation_after_mutation = True
+            worker.loop.bridge.tree.ingest_diagnostic_content(
+                "legacy.ts(4,1): error TS2339: Property missing", source_path="[run-check:typecheck]",
+            )
+            observe_failure(worker)
+            assert dispatch_proposal(worker).ok
+            assert finish(worker).ok
+        else:
+            assert "Deferred diagnostic" not in task
+        validation = worker._finalize_validation(SimpleNamespace(finished=True))
+        return WorkerRunResult(
+            ok=validation.passed, task_satisfied=validation.passed, final_message="Goal finished",
+            validation_ran=True, validation_passed=validation.passed, validation=validation,
+        )
+
+    with (
+        patch.object(worker, "run_task", side_effect=run),
+        patch.object(worker.loop, "_exec_run_check", return_value="Panel tests passed\nexit_code=0\nissues=0"),
+        patch.object(planner, "_plan_next_goal_guidance", return_value=""),
+        patch.object(planner, "_synthesize_final_summary", return_value="Done"),
+    ):
+        result = planner._execute_plan(plan, checkpoint_results=[], resumed=False)
+    assert not intermediate.delegation_notes
+    assert len(verifier.delegation_notes) == 1
+    assert "Legacy type error" in verifier.delegation_notes[0]
+    assert verifier.success_signals == ["The panel test passes"]
+    assert len(model.calls) == 2
+    assert "Review the deferred findings" in json.dumps(model.calls[-1])
+    assert "irrelevant to the issue intent" in result
+    assert "Possible next step" in result
+    completed = planner.session.last_completed_results
+    assert [item.status for item in completed] == ["completed"] * 3
+    saved = IssueFactLedger.load(tmp_path / "repo_facts.md").issues[0].completed_goals[0]
+    assert saved.deferred_findings == completed[0].deferred_findings
 
 
 @pytest.mark.parametrize("worker_type", [WorkingFolderAgent, TreeLoopPlannerWorker])

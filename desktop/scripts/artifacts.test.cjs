@@ -114,6 +114,62 @@ test('legacy artifacts migrate managed runtime files while preserving app code a
   assert.equal((await library.app(artifact.id)).chatbot.enabled,true);
 });
 
+test('chatbot UI is included by default and can be installed later without replacing app code', async t => {
+  const { root, library } = fixture(t);
+  await library.configure(path.join(root, 'library'));
+  const defaults = { prompt: 'Build an app', sourceRoot: '', shareFacts: false, shareMemory: false };
+  const included = await library.create({ ...defaults, title: 'Chat', app: { version: 1, chatbot: { enabled: true } } });
+  assert.deepEqual((await library.app(included.id)).chatbot, { enabled: true, includeShell: true, shellLayout: 'floating' });
+  assert.equal(fs.existsSync(path.join(included.root, 'src/skillz-chat/index.tsx')), true);
+  const custom = await library.create({ ...defaults, title: 'Custom chat', app: { version: 1, chatbot: { enabled: true, includeShell: false } } });
+  const shell = path.join(custom.root, 'src/skillz-chat');
+  assert.equal(fs.existsSync(shell), false);
+  assert.equal((await library.app(custom.id)).chatbot.enabled, true);
+  const app = path.join(custom.root, 'src/App.tsx');
+  const original = 'export default function App(){return <main>My app</main>}\n';
+  fs.writeFileSync(app, original);
+  const installed = await library.saveApp(custom.id, { version: 1, chatbot: { enabled: true, shellLayout: 'workspace' } });
+  assert.ok(installed.migrated && installed.commit);
+  assert.match(await git(custom.root, 'show', '--name-only', '--pretty=format:', installed.commit), /src\/skillz-chat\/index.tsx/);
+  assert.equal(fs.readFileSync(app, 'utf8'), original);
+  assert.equal((await library.app(custom.id)).chatbot.shellLayout, 'workspace');
+  const stylesheet = path.join(shell, 'chat.css');
+  fs.appendFileSync(stylesheet, '\n/* app theme */\n');
+  await library.saveApp(custom.id, { version: 1, chatbot: { enabled: true, includeShell: false, shellLayout: 'sidebar' } });
+  assert.equal((await library.app(custom.id)).chatbot.includeShell, false);
+  assert.match(fs.readFileSync(stylesheet, 'utf8'), /app theme/);
+  const restored = await library.saveApp(custom.id, { version: 1, chatbot: { enabled: true, shellLayout: 'sidebar' } });
+  assert.equal(restored.migrated, false);
+  assert.match(fs.readFileSync(stylesheet, 'utf8'), /app theme/);
+});
+
+test('Create MCP server scaffolds only artifact-local entries and preserves authored tools on save', async t => {
+  const { root, library } = fixture(t);
+  await library.configure(path.join(root, 'library'));
+  const artifact = await library.create({ title: 'Local tools', prompt: 'Build local tools', sourceRoot: '', shareFacts: false, shareMemory: false });
+  const local = { id: 'game-tools', transport: 'stdio', source: 'artifact', chatbot: true };
+  const connected = { id: 'existing-tool', transport: 'stdio', command: 'node', args: ['custom.mjs'] };
+  const config = { version: 1, mcp: { enabled: true, servers: [local, connected] } };
+  await library.saveApp(artifact.id, config);
+  const file = path.join(artifact.root, 'mcp/game-tools/server.py');
+  assert.match(fs.readFileSync(file, 'utf8'), /readOnlyHint=True/);
+  assert.match(fs.readFileSync(file, 'utf8'), /readOnlyHint=False/);
+  assert.equal((await library.app(artifact.id)).mcp.servers[0].source, 'artifact');
+  assert.equal(fs.existsSync(path.join(artifact.root, 'mcp/existing-tool/server.py')), false);
+  assert.equal(fs.existsSync(path.join(artifact.root, '.artifact/mcp-server-starter.py')), false);
+  const authored = '# This artifact has a custom tool.\n';
+  fs.appendFileSync(file, authored);
+  await library.saveApp(artifact.id, config);
+  assert.ok(fs.readFileSync(file, 'utf8').endsWith(authored));
+  await library.saveApp(artifact.id, { version: 1, mcp: { enabled: true, servers: [] } });
+  assert.ok(fs.readFileSync(file, 'utf8').endsWith(authored));
+  await assert.rejects(library.saveApp(artifact.id, { version: 1, mcp: {
+    enabled: true, servers: [{ ...local, id: '../outside' }],
+  } }));
+  const newApp = await library.create({ title: 'Fresh local tools', prompt: 'Build local tools', sourceRoot: '', shareFacts: false, shareMemory: false, app: config });
+  assert.match(fs.readFileSync(path.join(newApp.root, 'mcp/game-tools/server.py'), 'utf8'), /def get_note/);
+});
+
 test('context snapshots refresh after atomic replacement and do not require symlinks', async(t)=>{
   const {root,library}=fixture(t);await library.configure(path.join(root,'library'));const source=path.join(root,'source');fs.mkdirSync(source);fs.writeFileSync(path.join(source,'repo_facts.md'),'First');
   const original=fs.promises.symlink;t.mock.method(fs.promises,'symlink',async(target,destination,type)=>{if(type==='file')throw Object.assign(new Error('No symlink privilege'),{code:'EPERM'});return original(target,destination,type);});
@@ -123,7 +179,9 @@ test('context snapshots refresh after atomic replacement and do not require syml
 });
 test('artifact agents share no processes, roots, conversations, or observability destinations',async(t)=>{
   const {root,library}=fixture(t);await library.configure(path.join(root,'library'));
-  const one=await library.create({title:'First agent',prompt:'Build one',sourceRoot:'',shareFacts:false,shareMemory:false});const two=await library.create({title:'Second agent',prompt:'Build two',sourceRoot:'',shareFacts:false,shareMemory:false});
+  const one=await library.create({title:'First agent',prompt:'Build one',sourceRoot:'',shareFacts:false,shareMemory:false,
+    app:{version:1,chatbot:{enabled:true,shellLayout:'sidebar'},mcp:{enabled:true,servers:[{id:'fixture-mcp',transport:'stdio',command:'node',chatbot:true}]}}});
+  const two=await library.create({title:'Second agent',prompt:'Build two',sourceRoot:'',shareFacts:false,shareMemory:false});
   const {ArtifactsService,RuntimeSettingsService}=load(()=>({...require('../src/main/services/artifacts.ts'),...require('../src/main/services/runtimeSettings.ts')}));const events=[];const service=new ArtifactsService(library,new RuntimeSettingsService(path.join(root,'runtime.json')),event=>events.push(event));
   const harness=path.join(root,'harness');fs.mkdirSync(harness);fs.writeFileSync(path.join(harness,'agent_tools.py'),'');fs.writeFileSync(path.join(harness,'main.py'),`import json, sys, os
 root = sys.argv[sys.argv.index('--root') + 1]
@@ -136,7 +194,14 @@ for line in sys.stdin:
     const [first,alsoFirst,second]=await Promise.all([service.agent(one.id),service.agent(one.id),service.agent(two.id)]);assert.equal(first,alsoFirst);assert.notEqual(first,second);first.agentRoot=()=>harness;second.agentRoot=()=>harness;first.execution=undefined;second.execution=undefined;
     const [a,b]=await Promise.all([service.startAgent(one.id,{provider:'fixture',model:'fixture'}),service.startAgent(two.id,{provider:'fixture',model:'fixture'})]);assert.equal(a.root,one.root);assert.equal(b.root,two.root);assert.notEqual(a.memory,b.memory);
     const result=await service.submit(one.id,'Visualize tables ë');assert.match(result.text,/Visualize tables ë/);assert.match(result.text,/Shared source context is read-only/);assert.equal(result.root,one.root);
-    await first.stop();assert.equal((await service.submit(two.id,'Still running')).root,two.root);assert.ok(events.some(event=>event.type==='agent'&&event.id===one.id));assert.ok(events.some(event=>event.type==='agent'&&event.id===two.id));
+    assert.match(result.text,/Tools and resources can be run manually in App capabilities/);
+    assert.match(result.text,/To let the installed Skillz chatbot use a server/);
+    assert.match(result.text,/skill artifact-chatbot in Beta TreeLoop/);
+    assert.match(result.text,/selected sidebar shell is in src\/skillz-chat/);
+    await first.stop();const isolated=await service.submit(two.id,'Still running');assert.equal(isolated.root,two.root);
+    assert.doesNotMatch(isolated.text,/Artifact MCP runs inside/);
+    assert.doesNotMatch(isolated.text,/selected .* shell is in/);
+    assert.ok(events.some(event=>event.type==='agent'&&event.id===one.id));assert.ok(events.some(event=>event.type==='agent'&&event.id===two.id));
   } finally {await service.dispose();}
 });
 

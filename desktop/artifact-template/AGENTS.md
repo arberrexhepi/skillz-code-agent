@@ -8,6 +8,10 @@ Add or modify API Blueprints in .artifact/apis.json. Each request has a unique i
 
 Read .artifact/app.json for generated app capabilities. When `chatbot.enabled` is true, use `askSkillz` from `src/skillz.ts`; its Python process runs inside Docker and receives model output through the desktop's credential broker. When `database.enabled` is true, Sequelize and the selected DBMS driver are installed. `db_query` is a discovery command and `db_execute` is a mutation command. Non-SQLite connection URLs come from the named environment variable.
 
+For in-app chatbot setup or troubleshooting, load the bundled
+`artifact-chatbot` skill before inspecting files. It covers the generated
+`SkillzChat` shell, custom targets, the app server, and Preview checks.
+
 Optional source context is mounted read-only at /context; never expose other source-workspace files. This artifact's own repo_facts.md and memory_observability.md are separate. Do not change or commit the parent library or other artifacts. Run npm run build after edits; use the desktop Preview to view the result.
 
 ## Typography in Preview
@@ -23,3 +27,22 @@ For tools that manage local development servers, a folder grant may separately e
 Use `list_files` and `read_file` with `/reads/<id>/relative/path` to inspect granted files. The browser client `src/files.ts` exposes `files.roots()`, `files.list(id, path)`, `files.readText(id, path)`, `files.read(id, path)`, and `files.writeText(id, path, content, expectedSha256)`. Write only when a root reports `access: 'write'`; the SHA-256 precondition prevents overwriting a concurrent change. The artifact's own `repo` root stays read only through this gateway. Use folder IDs and relative paths in the UI, never native host paths.
 
 Preserve the file gateway and the dynamic port/host environment settings in `server/index.ts`. Docker mounts enforce read-only grants even when backend code uses `node:fs`, spawns a subprocess, or runs build scripts. Use `npm run build` inside the agent session. Container dependencies live in a separate Docker volume; native Windows/macOS node_modules are not used. Reach services on the host through `host.docker.internal`, not container localhost.
+
+## Artifact MCP
+
+When `.artifact/app.json` enables Artifact MCP, the app installs its own MCP
+server and client inside the preview container. Configure app connections in
+Workbench **App capabilities**. Use the manual capability browser there or
+call `artifactMcp()` from `src/mcp.ts` to run tools and read resources from the
+app. MCP clients can connect to the preview URL at `/_skillz/mcp`.
+
+For custom app tools, load `artifact-mcp-authoring`. **Create MCP server**
+installs an editable FastMCP starter at `mcp/<server-id>/server.py` and
+registers it in `.artifact/app.json`. The skill covers tool annotations,
+app state access, and manual runner and chatbot verification.
+
+Servers with **Allow in Skillz chatbot** enabled are also available to the
+installed chatbot through `askSkillz()` in `src/skillz.ts`. Expose a user
+confirmation for tools that can change data. Restart the preview after
+changing the app's MCP settings. Executables and loopback HTTP endpoints are
+resolved inside this container.

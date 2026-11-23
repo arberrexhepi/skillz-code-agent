@@ -8,10 +8,13 @@ const { chromium } = require('playwright');
 let server, browser, url;
 before(async () => {
   const bundle = await build({ entryPoints: [path.join(__dirname, 'fixtures/artifact-runtime-selection.tsx')], bundle: true,
-    write: false, format: 'esm', platform: 'browser', jsx: 'automatic', define: { 'process.env.NODE_ENV': '"development"' } });
+    outdir: 'fixture', write: false, format: 'esm', platform: 'browser', jsx: 'automatic', define: { 'process.env.NODE_ENV': '"development"' } });
+  const script = bundle.outputFiles.find(file => file.path.endsWith('.js')).contents;
+  const styles = bundle.outputFiles.find(file => file.path.endsWith('.css')).contents;
   server = createServer((request, response) => {
-    response.setHeader('content-type', request.url === '/fixture.js' ? 'text/javascript' : 'text/html');
-    response.end(request.url === '/fixture.js' ? bundle.outputFiles[0].contents : '<!doctype html><div id="root"></div><script type="module" src="/fixture.js"></script>');
+    if (request.url === '/fixture.js') { response.setHeader('content-type', 'text/javascript'); response.end(script); }
+    else if (request.url === '/fixture.css') { response.setHeader('content-type', 'text/css'); response.end(styles); }
+    else { response.setHeader('content-type', 'text/html'); response.end('<!doctype html><meta charset="utf-8"><link rel="stylesheet" href="/fixture.css"><div id="root"></div><script type="module" src="/fixture.js"></script>'); }
   });
   await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
   url = `http://127.0.0.1:${server.address().port}`;
@@ -45,6 +48,32 @@ async function openRuntime(session) {
   return session.locator('.runtime-drawer');
 }
 const starts = rows => rows.filter(row => row.type === 'start');
+
+test('reasoning choices save immediately and follow the selected model and artifact', async t => {
+  const { page, session, requests } = await fixture(t);
+  const runtime = await openRuntime(session);
+  const all = runtime.getByRole('combobox', { name: 'All', exact: true });
+  const verification = runtime.getByRole('combobox', { name: 'Verification worker', exact: true });
+  const model = runtime.getByRole('combobox', { name: /^Model/ });
+  await all.selectOption('low');
+  await verification.selectOption('high');
+  assert.equal(await verification.inputValue(), 'high');
+  await model.selectOption('fixture-new');
+  await all.selectOption('medium');
+  assert.equal(await all.locator('option[value=high]').count(), 0);
+  await model.selectOption('fixture-old');
+  await all.locator('option:checked').filter({ hasText: 'Low' }).waitFor({ state: 'attached' });
+  assert.equal(await verification.inputValue(), 'high');
+  assert.equal(await runtime.getByRole('combobox', { name: 'Discovery', exact: true }).inputValue(), '');
+  await page.getByRole('button', { name: 'Studio two', exact: false }).click();
+  const otherRuntime = await openRuntime(page.locator('.artifact-session:not([hidden])'));
+  assert.equal(await otherRuntime.getByRole('combobox', { name: 'All', exact: true }).inputValue(), '');
+  assert.deepEqual(await requests(), [
+    { id: 'one', type: 'reasoning:fixture-old:all:low' },
+    { id: 'one', type: 'reasoning:fixture-old:verification:high' },
+    { id: 'one', type: 'reasoning:fixture-new:all:medium' },
+  ]);
+});
 
 test('Config save reaches the existing Agent panel start and stays isolated from other artifacts and the source', async t => {
   const { page, session, requests } = await fixture(t);
@@ -110,4 +139,22 @@ test('an explicit Agent panel choice after a Config save is honored on startup',
   await runtime.getByRole('button', { name: 'Start agent', exact: true }).click();
   await session.getByText('Preserved conversation one', { exact: true }).waitFor();
   assert.equal(starts(await requests())[0].selection.model, 'fixture-old');
+});
+
+test('open artifacts show their own issue history and use the artifact for offline and agent actions', async t => {
+  const { page, session, requests } = await fixture(t);
+  await session.getByRole('button', { name: 'Issues', exact: true }).click();
+  await session.getByText('Saved issue for studio one', { exact: true }).waitFor();
+  await session.getByRole('button', { name: 'Details for issue-042' }).click();
+  await session.getByText('Completed goals', { exact: false }).waitFor();
+  await session.getByRole('button', { name: 'Close issue-042' }).click();
+  await session.getByRole('button', { name: 'Reopen issue-042' }).click();
+  assert.deepEqual(await requests(), [{ id: 'one', type: 'close_issue' }, { id: 'one', type: 'reopen_issue' }]);
+  await session.getByRole('button', { name: 'Continue issue-042' }).click();
+  await session.getByText('Runtime connected', { exact: false }).waitFor();
+  assert.deepEqual((await requests()).at(-1), { id: 'one', type: 'continue_issue' });
+  await page.getByRole('button', { name: 'Studio two', exact: false }).click();
+  await session.getByRole('button', { name: 'Issues', exact: true }).click();
+  await session.getByText('Saved issue for studio two', { exact: true }).waitFor();
+  assert.equal(await session.getByText('Saved issue for studio one', { exact: true }).count(), 0);
 });

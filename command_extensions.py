@@ -23,7 +23,7 @@ STRUCTURED EDITS (real mutation dispatch):
     complete replacement declaration
   >>>
   edit-batch {"atomic":true,"operations":[{"type":"replace_snippet","path":"src/App.tsx","old_text":"exact source","new_text":"replacement","expected_hash":"..."}]}
-  edit-batch accepts 1-32 operations and defaults to atomic rollback on failure.
+  edit-batch dispatches operations in order and defaults to atomic rollback on failure.
   Operations also support insert_before/insert_after with anchor_text/new_text,
   replace_symbol, create_file, and the existing `mutate <json-tool-action>` schema.
   Python symbol edits use AST; JS/TS/JSX/TSX edits require the local TypeScript parser.
@@ -41,7 +41,7 @@ REGEX FIND / REPLACE (Python regex, JSON preserves backslashes and newlines):
   flags: i (ignore case), m (line anchors), s (dot matches newline), x (verbose), a (ASCII).
   Replacement capture references use Python syntax: \\1 or \\g<name> in JSON, not $1.
   Find supports offset/limit paging and before/after context. Each command targets one file.
-  replace-regex defaults to expected_matches=1; multiple matches require an explicit exact count.
+  replace-regex applies to every match in the file. Use the exact match_count from find-regex as expected_matches for a replace-all; the default is 1.
   Prefer previewing with find-regex and reuse its file_hash as expected_hash.
   replace_regex is also an edit-batch operation; atomic rollback and normal verification apply.
   Evaluation is limited to 2 seconds, 2 MiB source, 10000 matches, and 4 MiB output.
@@ -69,8 +69,8 @@ def extension_action(verb: str, rest: str) -> dict:
             raise ValueError('Usage: edit-batch {"atomic":true,"operations":[...]}')
         if set(payload) - {"atomic", "operations"}:
             raise ValueError("edit-batch accepts only atomic and operations")
-        if not 1 <= len(payload["operations"]) <= 32:
-            raise ValueError("edit-batch requires 1-32 operations")
+        if not payload["operations"]:
+            raise ValueError("edit-batch requires at least one operation")
         return {"type": "batch_mutate", "atomic": payload.get("atomic", True), "operations": payload["operations"]}
     if verb == "edit-symbol":
         header, separator, content = rest.partition("\n")

@@ -118,12 +118,13 @@ class ShellBlockExecutionTests(unittest.TestCase):
     def test_unterminated_script_never_executes_a_preceding_write(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            loop = TreeLoop(model=RecordingMessageModel(["write first.txt must-not-land\nshell cat <<'MISSING'\nfinish fake"]),
+            loop = TreeLoop(model=RecordingMessageModel(["write first.txt must-not-land\nshell cat <<'MISSING'\nfinish fake", "finish fake"]),
                             workspace_root=root, max_turns=1, verbose=False, allow_shell=True)
             result = loop.run("Reject incomplete command blocks")
             self.assertFalse(result.finished)
             self.assertFalse((root / "first.txt").exists())
             self.assertEqual(result.turns[0].results[0].command_type, "error")
+            self.assertIn("Unterminated shell heredoc", result.finish_message)
 
     def test_multiline_shell_keeps_shell_access_and_git_guards(self):
         with tempfile.TemporaryDirectory() as tmp:

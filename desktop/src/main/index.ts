@@ -6,6 +6,7 @@ import { app, BrowserWindow, Menu, screen, shell, type MenuItemConstructorOption
 import { registerIpc } from './ipc';
 import { AgentService } from './services/agent';
 import { RuntimeSettingsService } from './services/runtimeSettings';
+import { McpHost } from './services/mcp';
 import { GitService } from './services/git';
 import { TerminalService } from './services/terminal';
 import { WorkspaceService } from './services/workspace';
@@ -69,16 +70,18 @@ function createWindow(): void {
   const git = new GitService(workspace);
   const terminal = new TerminalService(workspace, (event) => send('terminal:event', event));
   const runtimeSettings = new RuntimeSettingsService(path.join(app.getPath('userData'), 'runtime-settings.json'));
-  const agent = new AgentService(workspace, (event) => send('agent:event', event), runtimeSettings);
+  const mcp = new McpHost(path.join(app.getPath('userData'), 'mcp-python'));
+  const agent = new AgentService(workspace, (event) => send('agent:event', event), runtimeSettings, undefined, mcp);
   const artifactLibrary = new ArtifactLibraryService(
     path.join(app.getPath('userData'), 'artifact-settings.json'),
     app.isPackaged ? path.join(process.resourcesPath, 'artifact-template') : path.join(app.getAppPath(), 'artifact-template'),
     path.join(app.getPath('userData'), 'artifact-contexts'),
     app.isPackaged ? path.join(process.resourcesPath, 'prebuilt-artifacts') : path.join(app.getAppPath(), 'prebuilt-artifacts'),
+    (id, root) => mcp.enablePlaywright({ root, profile: `artifact:${id}` }),
   );
-  const artifacts = new ArtifactsService(artifactLibrary, runtimeSettings, (event) => send('artifacts:event', event), () => workspace.current()?.root || '');
+  const artifacts = new ArtifactsService(artifactLibrary, runtimeSettings, (event) => send('artifacts:event', event), () => workspace.current()?.root || '', mcp);
   const disposeFrameSecurity = installArtifactFrameSecurity(window.webContents, () => artifacts.previewOrigins());
-  registerIpc(window, { workspace, git, terminal, agent, artifacts });
+  registerIpc(window, { workspace, git, terminal, agent, artifacts, mcp });
 
   window.webContents.setWindowOpenHandler(({ url }) => {
     let target = '';

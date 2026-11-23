@@ -73,7 +73,7 @@ class ExecutionStagnationGuardTests(unittest.TestCase):
     def test_recovery_allows_one_focused_read_then_blocks_exploration(self):
         worker = self._worker()
         stop_reasons = []
-        worker.loop.request_stop = stop_reasons.append
+        worker.loop.request_delivery_attempt = stop_reasons.append
         worker._execution_stagnation = {
             "reason": "test",
             "focused_reads_used": 0,

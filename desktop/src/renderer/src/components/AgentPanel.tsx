@@ -1,5 +1,5 @@
 import { PathText } from './PathText';
-import { useEffect, useRef, useState } from 'react';
+import { useLayoutEffect, useRef, useState } from 'react';
 import { agentHandoff, continuousIsActive } from '../../../shared/agentCore';
 import { conversationTimeline } from '../../../shared/agentTimeline';
 import { useAgentWorkspace } from '../agent/agentWorkspace';
@@ -16,19 +16,26 @@ export function AgentPanel({ label = 'WORKSPACE AGENT' }: { label?: string }): R
   const [autoEnabled, setAutoEnabled] = useState(false);
   const [autoMaxTurns, setAutoMaxTurns] = useState(String(DEFAULT_AUTO_MAX_TURNS));
   const [showRuntime, setShowRuntime] = useState(false);
-  const transcriptRef = useRef<HTMLDivElement>(null);
+  const conversationRef = useRef<HTMLDivElement>(null);
+  const followConversation = useRef(true);
   const { bridge, pendingAction, status, notice } = agent.state;
   const continuous = bridge.planner.continuous_mode;
+  const capabilities = bridge.planner.worker_state?.runtime_capabilities;
+  const agentRestartNeeded = Boolean(capabilities?.goal_start_skill_mode && !capabilities.reasoning_summary_stream);
   const composerBusy = Boolean(pendingAction || continuousIsActive(bridge));
   const timeline = conversationTimeline(bridge);
   const handoff = agentHandoff(bridge);
+  const { turnThought, liveProgress, reasoningSummary, draftStrategy } = agent.state;
+  const activityVisible = Boolean(pendingAction || bridge.planner.executing || liveProgress);
   const workingLabel = bridge.planner.executing
     ? `Goal ${bridge.planner.executing_goal_index || handoff.completedGoalCount + 1}/${bridge.planner.executing_goal_count || handoff.totalGoalCount || '?'}: ${bridge.planner.executing_goal_title || 'Executing plan'}`
     : pendingAction;
 
-  useEffect(() => {
-    transcriptRef.current?.scrollTo({ top: transcriptRef.current.scrollHeight, behavior: 'smooth' });
-  }, [bridge.transcript, bridge.planner.last_execution_summary]);
+  useLayoutEffect(() => {
+    const conversation = conversationRef.current;
+    if (conversation && followConversation.current) conversation.scrollTop = conversation.scrollHeight;
+  }, [bridge.transcript, bridge.planner.last_execution_summary, bridge.planner.pending_plan, activityVisible,
+    turnThought, liveProgress, reasoningSummary, draftStrategy]);
 
   const submit = async (): Promise<void> => {
     const text = prompt.trim();
@@ -50,8 +57,13 @@ export function AgentPanel({ label = 'WORKSPACE AGENT' }: { label?: string }): R
         {continuousIsActive(bridge) && <strong>Auto {continuous?.cycle || 0}/{continuous?.max_cycles || '∞'}</strong>}
       </div>
       {showRuntime && <RuntimeDrawer onClose={() => setShowRuntime(false)} />}
-      <div className="agent-main">
-        <div className="transcript" ref={transcriptRef}>
+      <div className="agent-main" ref={conversationRef} tabIndex={0} role="region" aria-label="Agent conversation"
+        onScroll={({ currentTarget, target }) => {
+          if (target === currentTarget) {
+            followConversation.current = currentTarget.scrollHeight - currentTarget.scrollTop - currentTarget.clientHeight <= 24;
+          }
+        }}>
+        <div className="transcript">
           {timeline.length === 0 && !handoff.discovery && (
             <div className="agent-empty"><span>✦</span><h3>Work from intent.</h3><p>Ask for a change, investigation, or plan. Decisions stay here; execution detail moves into the workspace dock.</p></div>
           )}
@@ -59,30 +71,34 @@ export function AgentPanel({ label = 'WORKSPACE AGENT' }: { label?: string }): R
             ? <WorkflowReportCard key={item.id} report={item} />
             : <article className={`message ${item.entry.role}`} key={item.id}><header>{item.entry.role === 'user' ? 'You' : 'Agent'}</header><MarkdownMessage content={item.entry.content} /></article>)}
         </div>
-        <TurnThought active={Boolean(pendingAction || bridge.planner.executing)} action={workingLabel} thought={agent.state.turnThought} />
+        <TurnThought active={activityVisible} action={workingLabel}
+          thought={turnThought} progress={liveProgress} reasoning={reasoningSummary}
+          draftStrategy={draftStrategy} agentRestartNeeded={agentRestartNeeded} />
         <AgentDecisionCard />
       </div>
       {notice && <div className="agent-notice" role="status"><div className="notice-copy"><PathText>{notice}</PathText></div><button type="button" aria-label="Dismiss notice" onClick={agent.clearNotice}>×</button></div>}
       <div className="composer-shell">
         <div className="composer-heading"><span>NEW INSTRUCTION</span><small>{label === 'ARTIFACT AGENT' ? 'This artifact' : 'Workspace-wide'}</small></div>
         <div className="prompt-box">
-        <textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} onKeyDown={(event) => {
-          if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void submit(); }
-        }} placeholder={status === 'running' ? 'Ask the agent…' : 'Describe what you want to build…'} rows={3} />
-        <AgentComposerControls
-          autoEnabled={autoEnabled}
-          maxTurns={autoMaxTurns}
-          disabled={composerBusy}
-          onAutoEnabledChange={setAutoEnabled}
-          onMaxTurnsChange={setAutoMaxTurns}
-        />
-        <button
-          type="button"
-          className="send-button"
-          aria-label={autoEnabled ? 'Start auto run' : 'Send instruction'}
-          disabled={!prompt.trim() || composerBusy}
-          onClick={() => void submit()}
-        >↑</button>
+          <textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} onKeyDown={(event) => {
+            if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void submit(); }
+          }} placeholder={status === 'running' ? 'Ask the agent…' : 'Describe what you want to build…'} rows={3} />
+          <div className="composer-toolbar">
+            <AgentComposerControls
+              autoEnabled={autoEnabled}
+              maxTurns={autoMaxTurns}
+              disabled={composerBusy}
+              onAutoEnabledChange={setAutoEnabled}
+              onMaxTurnsChange={setAutoMaxTurns}
+            />
+            <button
+              type="button"
+              className="send-button"
+              aria-label={autoEnabled ? 'Start auto run' : 'Send instruction'}
+              disabled={!prompt.trim() || composerBusy}
+              onClick={() => void submit()}
+            >↑</button>
+          </div>
         </div>
       </div>
     </aside>

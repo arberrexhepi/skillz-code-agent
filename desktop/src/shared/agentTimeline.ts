@@ -81,10 +81,12 @@ function legacyParts(entry: AgentTranscriptEntry, previous: TimelineItem | undef
   if (/^Plan Summary\n- /.test(content) && content.includes('\nGoals\n') && content.includes('\nApproval\n')) {
     return [workflow('plan', 'offered', 'Goal plan', { summary: content.split('\n')[1].replace(/^- /, '') })];
   }
-  if (/^Goal \d+\/\d+ (?:Completed|Failed)\n- Title:/.test(content) && content.includes('\n- Worker result:')) {
+  if (/^Goal \d+\/\d+ (?:Completed|Failed|Suspended)\n- Title:/.test(content) && content.includes('\n- Worker result:')) {
     const summary = state.planner.last_execution_summary?.trim();
     const hasSummary = summary && content.endsWith(`\n\n${summary}`);
-    const report = workflow('plan', /^Goal \d+\/\d+ Failed\n/m.test(content) ? 'failed' : 'complete', 'Goal plan');
+    const status = /^Goal \d+\/\d+ Failed\n/m.test(content) ? 'failed'
+      : /^Goal \d+\/\d+ Suspended\n/m.test(content) ? 'suspended' : 'complete';
+    const report = workflow('plan', status, 'Goal plan');
     return hasSummary ? [{ ...report, content: content.slice(0, -summary.length).trim() }, { kind: 'message', content: summary }] : [report];
   }
   if (/^(?:Created|Closed|Reopened|Activated) issue\s+issue-[\w-]+/.test(content)) return [workflow('issue', 'complete', content.split('.')[0])];

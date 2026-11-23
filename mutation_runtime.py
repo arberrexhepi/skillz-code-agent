@@ -20,8 +20,8 @@ def execute_mutation(action: dict, root: Path) -> tuple[dict, list[str]]:
     if "root" in action:
         raise ValueError("Mutations cannot override the mounted workspace root")
     source = action.get("operations") if action.get("type") == "batch_mutate" else [action]
-    if not isinstance(source, list) or not 1 <= len(source) <= 32:
-        raise ValueError("A mutation batch requires 1-32 operations")
+    if not isinstance(source, list) or not source:
+        raise ValueError("A mutation batch requires at least one operation")
     operations = []
     for item in source:
         if not isinstance(item, dict) or "root" in item:

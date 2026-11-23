@@ -471,6 +471,9 @@
 .artifact-repository-empty { color: #788694; }
 .artifact-repository-empty > span { color: #67a687; font-size: 36px; }
 .artifact-repository-empty h2 { color: #d2dbe2; font-size: 19px; font-weight: 560; }
+.artifact-issues { flex: 1; min-height: 0; overflow: auto; }
+.artifact-issues > .panel-heading { position: sticky; top: 0; z-index: 1; background: #0d1115; }
+.artifact-issues .issues-panel { box-sizing: border-box; max-width: 760px; margin-inline: auto; padding: 8px 16px 20px; }
 
 @media (max-width: 1250px) {
   .artifacts-layout { grid-template-columns: 210px minmax(0,1fr); }
@@ -905,3 +908,32 @@
 .artifact-update-file summary::before { content:'▸'; color:#9cadb9; }
 .artifact-update-file[open] summary::before { content:'▾'; }
 .artifact-update-file summary code { margin-right:auto; }
+.artifact-mcp-settings { display: grid; gap: 10px; padding: 8px 0; }
+.artifact-mcp-settings > p, .artifact-mcp-inspector > p { margin: 0; line-height: 1.55; }
+.artifact-mcp-server, .artifact-mcp-inspector, .artifact-mcp-inspector fieldset {
+  min-width: 0; border: 1px solid var(--artifact-border, #262d35); border-radius: 8px; padding: 12px;
+}
+.artifact-mcp-server { margin: 0; background: #10171a; }
+.artifact-mcp-server legend { padding: 0 5px; color: var(--bright); font-size: 12px; }
+.artifact-mcp-settings label, .artifact-mcp-inspector label {
+  display: grid; gap: 5px; min-width: 0; margin: 0 0 8px; color: var(--text); font-size: 12px;
+}
+.artifact-mcp-settings :is(input:not([type=checkbox]), select, textarea),
+.artifact-mcp-inspector :is(input:not([type=checkbox]), select, textarea) {
+  width: 100%; min-width: 0; padding: 7px 8px; border: 1px solid #344052;
+  border-radius: 6px; background: #0d1218; color: var(--bright); font: inherit;
+}
+.artifact-mcp-settings textarea, .artifact-mcp-inspector textarea { resize: vertical; font-family: ui-monospace, monospace; }
+.artifact-mcp-server-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-top: 8px; }
+.artifact-mcp-server-actions label, .artifact-mcp-inspector label.artifact-mcp-approve { display: flex; align-items: center; gap: 6px; margin: 0; }
+.artifact-mcp-inspector label.artifact-mcp-approve { margin-bottom: 8px; }
+.artifact-mcp-settings button, .artifact-mcp-inspector button {
+  width: fit-content; max-width: 100%; border: 1px solid #344052; border-radius: 6px; padding: 6px 9px;
+  background: #18222a; color: var(--text); font-size: 11px; overflow-wrap: anywhere;
+}
+.artifact-mcp-inspector { display: grid; gap: 10px; margin-top: 20px; background: var(--artifact-panel, #101419); }
+.artifact-mcp-inspector h3, .artifact-mcp-inspector li p { margin: 0; }
+.artifact-mcp-inspector code { overflow-wrap: anywhere; }
+.artifact-mcp-inspector ul { display: grid; gap: 8px; max-height: 260px; overflow: auto; padding: 0; margin: 0; list-style: none; }
+.artifact-mcp-inspector li p { margin-top: 4px; }
+.artifact-mcp-inspector pre { max-height: 360px; overflow: auto; margin: 0; padding: 10px; background: #0c1116; white-space: pre-wrap; overflow-wrap: anywhere; }

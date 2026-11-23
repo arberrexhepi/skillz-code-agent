@@ -2,11 +2,25 @@
 import hashlib
 import json
 
+from diagnostic_provenance import DiagnosticProvenance
 from issue_facts import IssueFactLedger
 from issue_proposals import IssueProposalStore, diagnostic_fingerprint
 
 
 class ProposalRuntimeMixin:
+    def configure_goal_diagnostics(self, key: str) -> None:
+        self._diagnostic_goal_key = key
+
+    def _initial_diagnostic_provenance(self) -> DiagnosticProvenance:
+        key = getattr(self, "_diagnostic_goal_key", "")
+        previous = getattr(self, "_last_goal_diagnostic_provenance", None)
+        if key and previous is not None and previous[0] == key:
+            return previous[1]
+        provenance = DiagnosticProvenance(self.root)
+        if key:
+            self._last_goal_diagnostic_provenance = (key, provenance)
+        return provenance
+
     def _proposal_store(self):
         return IssueProposalStore(self.root)
 
@@ -33,19 +47,55 @@ class ProposalRuntimeMixin:
         error = getattr(self, "active_error", None)
         return [{**item, "id": "run-" + diagnostic_fingerprint(item)[:16]} for item in (getattr(error, "diagnostics", None) or [])]
 
+    def _proposal_provenance(self):
+        return getattr(getattr(self, "loop", self), "diagnostic_provenance", None)
+
     def _apply_proposal_deferrals(self, diagnostics):
-        return self._proposal_store().apply_deferrals(diagnostics, scope=self._proposal_scope(), active_issue_id=self._proposal_active_issue_id())
+        provenance = self._proposal_provenance()
+        return self._proposal_store().apply_deferrals(
+            diagnostics, scope=self._proposal_scope(), active_issue_id=self._proposal_active_issue_id(),
+            may_defer=provenance.may_defer if provenance is not None else None,
+        )
+
+    def _active_deferred_proposals(self):
+        scope = self._proposal_scope()
+        active_issue_id = self._proposal_active_issue_id()
+        provenance = self._proposal_provenance()
+        return [
+            item for item in self._proposal_store().snapshot()
+            if scope in item["scopes"] and item.get("accepted_issue_id") != active_issue_id
+            and (provenance is None or all(provenance.may_defer(diagnostic) for diagnostic in item.get("diagnostics", [])))
+        ]
 
     def _proposal_deferral_summary(self):
-        proposals = [item for item in self._proposal_store().snapshot()
-                     if self._proposal_scope() in item["scopes"] and item.get("accepted_issue_id") != self._proposal_active_issue_id()]
+        proposals = self._active_deferred_proposals()
         if not proposals:
             return ""
         return f" {len(proposals)} unrelated finding(s) recorded separately ({', '.join(item['proposal_id'] for item in proposals)}); not current-goal gates. Broader checks may still fail."
 
+    def current_goal_deferred_findings(self):
+        return [
+            {
+                "id": item["proposal_id"],
+                "summary": item["summary"],
+                "reason": item["reason"][:500],
+                "evidence": item["evidence"][:800],
+                "paths": item["paths"][:8],
+            }
+            for item in self._active_deferred_proposals()
+            if item["diagnostic_fingerprints"]
+        ]
+
     def propose_issue(self, action):
-        proposal = self._proposal_store().propose(action, diagnostics=self._proposal_diagnostics(), scope=self._proposal_scope(),
-            parent_issue_id=self._proposal_active_issue_id(), goal=str(getattr(self, "_current_task", "") or ""))
+        diagnostics = self._proposal_diagnostics()
+        provenance = self._proposal_provenance()
+        if provenance is not None:
+            provenance.observe(diagnostics)
+        proposal = self._proposal_store().propose(
+            action, diagnostics=diagnostics, scope=self._proposal_scope(),
+            parent_issue_id=self._proposal_active_issue_id(), goal=str(getattr(self, "_current_task", "") or ""),
+            may_defer=provenance.may_defer if provenance is not None else None,
+        )
         refresh = getattr(self, "_refresh_proposal_deferrals", None)
         if callable(refresh):
             refresh()

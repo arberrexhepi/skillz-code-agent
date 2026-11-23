@@ -17,6 +17,7 @@ _LOCK = RLock()
 PROPOSALS_FILENAME = ".agent-issue-proposals.json"
 PROPOSAL_GUIDANCE = """Scope boundary: unrelated findings must not expand the current goal.
 Use propose-issue {"summary":"...","reason":"Why outside this goal","evidence":"Already observed evidence","run_issue_ids":["run-..."]} to persist an agent suggestion and defer the linked diagnostics immediately.
+Errors introduced by this goal stay with this goal. After edits, linked deferrals require pre-edit diagnostic evidence.
 Use paths for findings without run diagnostics. Do not investigate further just to write a suggestion. Do not invent evidence.
 Once proposed, those findings are not validation or completion gates, even while awaiting user acceptance or after Ignore. Do not re-read, reclassify, fix, or resolve them for this goal. Continue focused validation of the requested change; do not claim the broader failing check passed.
 Only the user can accept or ignore proposals. Proposals are not executable issues."""
@@ -80,7 +81,8 @@ class IssueProposalStore:
             if os.path.exists(temporary):
                 os.unlink(temporary)
 
-    def propose(self, action: dict, *, diagnostics: list[dict], scope: str, parent_issue_id: str, goal: str) -> dict:
+    def propose(self, action: dict, *, diagnostics: list[dict], scope: str, parent_issue_id: str, goal: str,
+                may_defer: Callable[[dict], bool] | None = None) -> dict:
         text = {}
         for key, limit in (("summary", 500), ("reason", 4000), ("evidence", 12000)):
             value = action.get(key)
@@ -97,6 +99,12 @@ class IssueProposalStore:
         if any(item not in indexed for item in ids):
             raise ValueError("Unknown run diagnostic id; use the ids in the current diagnostic evidence")
         linked = [deepcopy(indexed[item]) for item in dict.fromkeys(ids)]
+        blocked = [item["id"] for item in linked if may_defer is not None and not may_defer(item)]
+        if blocked:
+            raise ValueError(
+                "Cannot defer diagnostics without pre-edit evidence after this goal changed the workspace: "
+                + ", ".join(blocked) + ". Resolve these findings and rerun the failing check."
+            )
         fingerprints = sorted(diagnostic_fingerprint(item) for item in linked)
         identity = fingerprints or [text["summary"], text["evidence"], sorted(paths)]
         fingerprint = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
@@ -137,7 +145,8 @@ class IssueProposalStore:
             self._save(proposals)
             return deepcopy(proposal)
 
-    def apply_deferrals(self, diagnostics: list[dict], *, scope: str, active_issue_id: str = "") -> list[dict]:
+    def apply_deferrals(self, diagnostics: list[dict], *, scope: str, active_issue_id: str = "",
+                        may_defer: Callable[[dict], bool] | None = None) -> list[dict]:
         matches = {}
         for proposal in self.snapshot():
             if scope in proposal["scopes"] and (not active_issue_id or proposal.get("accepted_issue_id") != active_issue_id):
@@ -147,7 +156,7 @@ class IssueProposalStore:
         for original in diagnostics:
             item = dict(original)
             proposal_id = matches.get(diagnostic_fingerprint(item))
-            if proposal_id and item.get("status") != "resolved":
+            if proposal_id and item.get("status") != "resolved" and (may_defer is None or may_defer(item)):
                 item.update(status="deferred", proposal_id=proposal_id)
             output.append(item)
         return output

@@ -39,7 +39,8 @@ const mount = async (paused = false) => {
   // Only the fields used by this component are needed in this isolated fixture.
   const agent = {
     state: { ...initialAgentUiState, bridge: { transcript: [], planner: paused
-      ? { execution_paused: true, paused_plan: reviewPlan }
+      ? { execution_paused: true, paused_plan: reviewPlan, paused_suspended_goal_id: 'goal-2',
+          last_completed_results: [{ goal_id: 'goal-2', status: 'suspended', title: 'Update export', final_message: 'Read allowance exhausted.' }] }
       : { pending_plan: reviewPlan } } },
     plannerAction: (name: string) => { calls += 1; action = name; return response; },
   } as AgentWorkspaceValue;
@@ -63,11 +64,18 @@ const cases: Array<[string, (fixture: Awaited<ReturnType<typeof mount>>) => Prom
     assert(!isOpen(), 'Escape did not dismiss during execution');
     assert(fixture.count() === 1, 'Dismissing sent another action');
   }],
-  ['Resume dismisses immediately while execution continues', async (fixture) => {
+  ['Paused card resumes directly and keeps revisions in the plan review', async (fixture) => {
+    assert(host.textContent?.includes('Suspended goal'), 'Paused card does not identify the suspended goal');
+    assert(!host.textContent?.includes('Suggest plan changes'), 'Revision shortcut is still on the paused card');
     await click('Review full plan ↗');
+    assert(!host.querySelector('dialog')?.textContent?.includes('Resume'), 'Resume is still in the dialog');
+    await click('Suggest plan changes');
+    assert(Boolean(input()), 'Paused plan review did not offer revision feedback');
+    await click('Close plan review');
     await click('Resume');
     assert(!isOpen(), 'Resume left the dialog open');
-    assert(fixture.action() === 'continue_issue', 'Wrong resume action');
+    assert(fixture.action() === 'resume_execution', 'Wrong resume action');
+    assert(button('Resume').disabled && fixture.count() === 1, 'Resume did not lock while running');
   }, true],
   ['Rejection dismisses before acknowledgement', async () => {
     await click('Review full plan ↗');

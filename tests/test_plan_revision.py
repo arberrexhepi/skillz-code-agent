@@ -60,7 +60,7 @@ class PlanRevisionTests(unittest.TestCase):
         self.planner._handle_intake_turn.assert_not_called()
 
     def test_stale_review_cannot_approve_reject_or_resume_another_plan(self):
-        for action in ("approve_plan", "reject_plan", "continue_issue"):
+        for action in ("approve_plan", "reject_plan", "continue_issue", "resume_execution"):
             with self.subTest(action=action), self.assertRaisesRegex(ValueError, "plan changed"):
                 self.action(action=action, expected_plan={"summary": "Stale"})
         self.planner.execute_pending_plan.assert_not_called()

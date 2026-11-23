@@ -25,6 +25,8 @@ import webbrowser
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
+from reasoning_effort import REASONING_EFFORTS, resolve_reasoning_effort
+
 
 CODEX_SUBSCRIPTION_PROVIDER = "codex-subscription"
 _MACOS_BUNDLED_CODEX = Path("/Applications/ChatGPT.app/Contents/Resources/codex")
@@ -321,6 +323,22 @@ def _model_names(payload: Mapping[str, Any]) -> List[str]:
     return models
 
 
+def _model_reasoning_efforts(payload: Mapping[str, Any]) -> Dict[str, List[str]]:
+    result: Dict[str, List[str]] = {}
+    items = payload.get("data")
+    for item in items if isinstance(items, list) else []:
+        if not isinstance(item, dict) or item.get("hidden") is True:
+            continue
+        model = str(item.get("model") or item.get("id") or "").strip()
+        options = item.get("supportedReasoningEfforts")
+        if model and isinstance(options, list):
+            result[model] = list(dict.fromkeys(["auto", *(
+                option["reasoningEffort"] for option in options
+                if isinstance(option, dict) and option.get("reasoningEffort") in REASONING_EFFORTS
+            )]))
+    return result
+
+
 def _cli_version(executable: str) -> str:
     try:
         result = subprocess.run(
@@ -374,6 +392,7 @@ def codex_subscription_status(*, timeout: float = 10.0) -> Dict[str, Any]:
                 )
             models = session.request("model/list", {"limit": 100, "includeHidden": False})
             status["models"] = _model_names(models)
+            status["reasoning_efforts"] = _model_reasoning_efforts(models)
     except Exception as exc:
         # A quick status still distinguishes a valid ChatGPT session if an older
         # app-server build cannot provide the richer account payload.
@@ -615,6 +634,7 @@ def run_codex_subscription_completion(
     messages: Sequence[Mapping[str, str]],
     timeout: Optional[float] = None,
     progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    on_summary: Optional[Callable[[str], None]] = None,
 ) -> Tuple[str, Dict[str, Any]]:
     executable = resolve_codex_executable()
     auth = quick_chatgpt_auth_status(executable)
@@ -631,9 +651,7 @@ def run_codex_subscription_completion(
         except ValueError:
             effective_timeout = 600.0
     effective_timeout = max(0.1, float(effective_timeout))
-    effort = str(thinking_mode or "medium").strip().lower()
-    if effort in {"", "auto", "none", "minimal"}:
-        effort = "low" if effort in {"none", "minimal"} else "medium"
+    effort = resolve_reasoning_effort(CODEX_SUBSCRIPTION_PROVIDER, model, thinking_mode)["value"]
 
     prompt = _render_backend_prompt(system, messages)
     with tempfile.TemporaryDirectory(prefix="skillz-codex-") as temp_dir:
@@ -649,8 +667,6 @@ def run_codex_subscription_completion(
             "read-only",
             "--model",
             model,
-            "-c",
-            f'model_reasoning_effort="{effort}"',
             "--cd",
             temp_dir,
             "--json",
@@ -660,8 +676,23 @@ def run_codex_subscription_completion(
         ]
         if os.environ.get("SKILLZ_CODEX_MODEL_ONLY") == "1":
             args[1:1] = _model_only_cli_overrides()
+        if effort is not None:
+            args[-1:-1] = ["-c", f"model_reasoning_effort={json.dumps(effort)}"]
+        if on_summary is not None:
+            args[-1:-1] = ["-c", 'model_reasoning_summary="auto"', "-c", "show_raw_agent_reasoning=false"]
+
+        def forward(event: Dict[str, Any]) -> None:
+            # exec JSONL's reasoning item exposes the public summary only.
+            item = event.get("item")
+            if on_summary is not None and event.get("type") == "item.completed" and isinstance(item, dict):
+                summary = item.get("text")
+                if item.get("type") == "reasoning" and isinstance(summary, str) and summary.strip():
+                    on_summary(summary.strip() + "\n\n")
+            if progress_callback is not None:
+                progress_callback(event)
+
         cli_env = _clean_cli_environment()
-        if progress_callback is None:
+        if progress_callback is None and on_summary is None:
             result = subprocess.run(
                 args,
                 input=prompt,
@@ -678,7 +709,7 @@ def run_codex_subscription_completion(
                 prompt=prompt,
                 timeout=effective_timeout,
                 env=cli_env,
-                progress_callback=progress_callback,
+                progress_callback=forward,
             )
         events: List[Dict[str, Any]] = []
         for line in result.stdout.splitlines():

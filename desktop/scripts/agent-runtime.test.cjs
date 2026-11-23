@@ -136,15 +136,20 @@ test('artifact runtime switches validate host setup and commit selection and cre
   });
   fs.writeFileSync(path.join(root, 'agent_tools.py'), '');
   fs.writeFileSync(path.join(root, 'main_v2.py'), '');
-  fs.writeFileSync(path.join(root, 'artifact_model_host.py'), `import json, sys, os
+  fs.writeFileSync(path.join(root, 'artifact_model_host.py'), `import json, sys, os, time
 request = json.load(sys.stdin)
 if '--check' in sys.argv:
     result = {'error': 'Provider SDK missing'} if request['model'] == 'missing-sdk' else {'ready': True}
 else:
     result = {'text': '|'.join([request['provider'], request['model'], os.environ['FIXTURE_PROVIDER']])}
 print(json.dumps(result), flush=True)
+if request.get('hold_exit'):
+    deadline = time.monotonic() + 3
+    while not os.path.exists('reply-received') and time.monotonic() < deadline:
+        time.sleep(0.01)
+    open('helper-exited', 'w').close()
 `);
-  fs.writeFileSync(path.join(root, 'bridge.py'), `import json, sys
+  fs.writeFileSync(path.join(root, 'bridge.py'), `import json, os, sys
 provider, model = 'codex-subscription', 'gpt-5.4'
 for line in sys.stdin:
     request = json.loads(line)
@@ -155,13 +160,16 @@ for line in sys.stdin:
         else:
             provider, model = request['provider'], request['model']
     elif request['type'] == 'submit':
-        result = {'id': request['id'], 'type': 'artifact_model_request', 'provider': provider, 'model': model, 'system': 'fixture', 'messages': []}
+        result = {'id': request['id'], 'type': 'artifact_model_request', 'provider': provider, 'model': model, 'system': 'fixture', 'messages': [], 'hold_exit': request.get('text') == 'original prompt'}
     elif request['type'] == 'artifact_model_response':
-        result.update(ok='error' not in request, text=request.get('text'), message=request.get('error', ''))
+        result.update(ok='error' not in request, text=request.get('text'), message=request.get('error', ''), helper_waiting=not os.path.exists('helper-exited'))
+        open('reply-received', 'w').close()
     print(json.dumps(result), flush=True)
 `);
   assert.equal((await service.start({ provider: 'codex-subscription', model: 'gpt-5.4', backendScript: 'main_v2.py' })).ok, true);
-  assert.equal((await service.submit('original prompt')).text, 'codex-subscription|gpt-5.4|codex-subscription');
+  const original = await service.submit('original prompt');
+  assert.equal(original.text, 'codex-subscription|gpt-5.4|codex-subscription');
+  assert.equal(original.helper_waiting, true, 'the final response should arrive before helper exit');
   assert.equal((await service.reconfigureRuntime('gemini', 'reject-bridge')).ok, false);
   assert.equal((await service.submit('after failed apply')).text, 'codex-subscription|gpt-5.4|codex-subscription');
   await assert.rejects(service.reconfigureRuntime('gemini', 'missing-sdk'), /Provider SDK missing/);

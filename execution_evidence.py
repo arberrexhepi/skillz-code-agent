@@ -10,6 +10,7 @@ import shlex
 from dataclasses import dataclass
 
 from discovery.dispatch import DISCOVERY_ACTION_TYPES
+from shell_processes import npm_script
 from tree_commands import CommandResult
 
 
@@ -18,6 +19,35 @@ REPOSITORY_READ_COMMANDS = {
 }
 SOURCE_READ_COMMANDS = {"cat", "read-line-range", "read_file", "read_symbol", "read_context", "find_regex"}
 EMPTY_SEARCH_OUTPUTS = {"", "(empty)", "(no matches)", "(no symbol matches)", "(no symbols found)"}
+
+
+def external_execution_identity(action: dict) -> str | None:
+    """Identify an actual tool operation, independent of provider text or catalog lookups."""
+    kind = action.get("type")
+    if kind == "run_route_check" and action.get("_route_checked"):
+        return "route:" + json.dumps([action.get("target"), action.get("base_url")])
+    if kind == "artifact_preview":
+        operation = action.get("operation", "start")
+        payload = action.get("input") or {}
+        if not isinstance(payload, dict):
+            return None
+        if operation == "mcp":
+            identity = external_execution_identity({**payload, "type": "mcp"})
+            return f"artifact_preview:{identity}" if identity else None
+        if operation == "chat":
+            return "artifact_preview:chat:" + json.dumps(payload.get("message"))
+        return f"artifact_preview:{operation}" if operation in ("start", "restart") else None
+    if kind == "mcp" and action.get("operation") in ("call", "read-resource", "get-prompt"):
+        fields = ("operation", "server", "name", "uri")
+        return "mcp:" + json.dumps([*(action.get(field) for field in fields), action.get("arguments") or {}], sort_keys=True)
+    if kind == "run_shell" and action.get("operation") not in ("status", "stop"):
+        command = action.get("command", "")
+        if isinstance(command, str):
+            command = command.removeprefix("--background ")
+        script = npm_script(command)
+        if script is not None:
+            return "npm:" + json.dumps(script[0])
+    return None
 
 
 @dataclass(frozen=True)

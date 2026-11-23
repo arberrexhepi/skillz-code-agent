@@ -1,7 +1,6 @@
 const assert = require('node:assert/strict');
 const { before, after, test } = require('node:test');
 const { createServer } = require('node:http');
-const { readFileSync } = require('node:fs');
 const path = require('node:path');
 const { build } = require('esbuild');
 const { chromium } = require('playwright');
@@ -9,10 +8,11 @@ const { chromium } = require('playwright');
 let server, browser, url;
 before(async () => {
   const bundle = await build({ entryPoints: [path.join(__dirname, 'fixtures/artifact-runtime-selection.tsx')], bundle: true,
-    write: false, format: 'esm', platform: 'browser', jsx: 'automatic', define: { 'process.env.NODE_ENV': '"development"' } });
-  const css = ['styles', 'artifacts', 'pathChips'].map(name => readFileSync(path.join(__dirname, `../src/renderer/src/${name}.css`), 'utf8')).join('\n');
+    write: false, outdir: 'fixture-out', format: 'esm', platform: 'browser', jsx: 'automatic', define: { 'process.env.NODE_ENV': '"development"' } });
+  const javascript = bundle.outputFiles.find(file => file.path.endsWith('.js')).contents;
+  const css = bundle.outputFiles.find(file => file.path.endsWith('.css')).contents;
   server = createServer((request, response) => {
-    if (request.url === '/fixture.js') { response.setHeader('content-type', 'text/javascript'); response.end(bundle.outputFiles[0].contents); }
+    if (request.url === '/fixture.js') { response.setHeader('content-type', 'text/javascript'); response.end(javascript); }
     else if (request.url === '/fixture.css') { response.setHeader('content-type', 'text/css'); response.end(css); }
     else if (request.url === '/preview') { response.setHeader('content-type', 'text/html'); response.end('<!doctype html><body style="background:#14191e;color:#aab8c3;font:18px system-ui;padding:32px"><h1>Studio preview</h1><p>Preview stays mounted while inspecting agent activity.</p>'); }
     else { response.setHeader('content-type', 'text/html'); response.end('<!doctype html><link rel="stylesheet" href="/fixture.css"><div id="root"></div><script type="module" src="/fixture.js"></script>'); }
@@ -84,6 +84,187 @@ test('activity stays isolated by artifact and continues collecting in a hidden s
   assert.equal(await panel.getByRole('button', { name: /^Agent activity/ }).getAttribute('aria-expanded'), 'true');
   assert.equal(await panel.getByText('Studio two command', { exact: true }).count(), 0);
   assert.equal(await panel.getByText('Source workspace command', { exact: true }).count(), 0);
+});
+
+test('agent card keeps the last thought visible when streamed reasoning is collapsed during a tool call', async t => {
+  const { page, session } = await fixture(t);
+  const card = session.getByRole('region', { name: 'Current turn thought' });
+  const update = (action_type, payload = {}) => emit(page, 'one', {
+    type: 'progress', payload: { type: 'progress', action_type, turn: 1, ...payload },
+  });
+
+  await update('turn_thought', { thought: 'I will inspect the Blender connection.' });
+  await update('model_call_start', { step: 2, reasoning_effort: { requested: 'low', parameter: 'thinking_level', value: 'low' } });
+  await card.getByText('Waiting for model', { exact: true }).waitFor();
+  await card.getByText('Reasoning effort low', { exact: true }).waitFor();
+  const thought = card.getByText('I will inspect the Blender connection.', { exact: true });
+  assert.equal(await thought.isVisible(), true);
+  const disclosure = card.getByRole('button', { name: 'Reasoning summary' });
+  const details = card.getByRole('region', { name: 'Reasoning summary' });
+  await details.getByText('Waiting for the model to send a reasoning summary.').waitFor();
+  await update('model_reasoning_summary', { thought: 'Checking the workspace.\n'.repeat(40) });
+  await details.getByText(/Checking the workspace/).waitFor();
+  assert.equal(await details.evaluate(el => el.scrollHeight > el.clientHeight && el.clientHeight <= 140), true);
+  await disclosure.click();
+  await update('model_call_finish');
+  await update('tool_start', { step: 5, summary: 'Querying Blender MCP' });
+  await card.getByText('Querying Blender MCP', { exact: true }).waitFor();
+  assert.equal(await thought.isVisible(), true);
+  assert.equal(await disclosure.getAttribute('aria-expanded'), 'false');
+  await disclosure.click();
+  await details.waitFor();
+  assert.equal(await thought.isVisible(), true);
+});
+
+test('planner waiting and response phases appear in the agent card and Activity', async t => {
+  const { page, session } = await fixture(t);
+  await page.clock.install();
+  await session.getByRole('button', { name: /^Agent activity/ }).click();
+  const activity = session.getByRole('region', { name: 'Artifact agent activity' });
+  const card = session.getByRole('region', { name: 'Current turn thought' });
+  const update = (action_type, extra = {}) => emit(page, 'one', {
+    type: 'progress',
+    payload: { type: 'progress', domain: 'planner', action_type, turn: 1, phase: 'Planning', ...extra },
+  });
+
+  await update('model_call_start', { summary: 'Planning · Waiting for model' });
+  await card.getByText('Planner call 1', { exact: true }).waitFor();
+  await activity.locator('.live-activity').getByText('Planning · Waiting for model').waitFor();
+  await page.clock.fastForward(6000);
+  await card.getByText(/Waiting \d+s for the first model update/).waitFor();
+  await activity.locator('.live-activity').getByText(/Waiting \d+s for the first model update/).waitFor();
+  await update('model_reasoning_summary', { thought: 'Ordering the goals.' });
+  await card.getByRole('region', { name: 'Reasoning summary' }).getByText('Ordering the goals.').waitFor();
+  await page.clock.fastForward(6000);
+  await card.getByText('Planning · Waiting for planner response').waitFor();
+  await activity.locator('.live-activity').getByText(/Last model update \d+s ago/).waitFor();
+  await update('model_output_progress', { output_chars: 37 });
+  await card.getByText('Planning · Receiving planner response').waitFor();
+  await card.getByText('37 characters received').waitFor();
+  await update('model_output_progress', { output_chars: 120 });
+  await activity.locator('.live-activity').getByText('120 characters received').waitFor();
+  await page.clock.fastForward(6000);
+  await card.getByText('Planning · Waiting for more response text').waitFor();
+  await card.getByText(/120 characters received · Last model update \d+s ago/).waitFor();
+  await update('model_call_finish', { summary: 'Planning · Model response received' });
+  await update('plan_presented', { domain: 'plan', summary: 'Plan ready · 3 goals' });
+  await activity.getByText('Plan ready · 3 goals').waitFor();
+  assert.equal(await activity.locator('.live-activity').count(), 0);
+  await update('goal_handoff', { domain: 'plan', turn: undefined, summary: 'Carrying prior goal results into Rebuild.' });
+  await card.getByText('Carrying prior goal results into Rebuild.').waitFor();
+  await activity.locator('.live-activity').getByText('Carrying prior goal results into Rebuild.').waitFor();
+});
+
+test('draft strategy streams separately from reasoning and stays visible during tool dispatch', async t => {
+  const { page, session } = await fixture(t);
+  await page.clock.install();
+  const card = session.getByRole('region', { name: 'Current turn thought' });
+  const update = (action_type, extra = {}) => emit(page, 'one', {
+    type: 'progress',
+    payload: { type: 'progress', domain: 'plan', action_type, turn: 2, ...extra },
+  });
+
+  await update('model_call_start', { step: 1 });
+  await card.getByText('Draft strategy', { exact: true }).click();
+  const draft = card.getByRole('region', { name: 'Draft strategy' });
+  const reasoning = card.getByRole('region', { name: 'Reasoning summary' });
+  await draft.getByText('Waiting for command tags.').waitFor();
+  await update('model_reasoning_summary', { thought: 'Inspecting the workspace.' });
+  await update('model_output_progress', { output_chars: 60, draft_strategy: ['>>th:', '>>pl:', 's1: read-line-range'] });
+  await draft.getByText('s1: read-line-range', { exact: false }).waitFor();
+  assert.equal(await reasoning.getByText('Inspecting the workspace.').isVisible(), true);
+  assert.equal(await card.getByText('Running tool').count(), 0);
+  await update('model_output_progress', { output_chars: 120, draft_strategy: ['s1 -> s2: mcp'] });
+  await draft.getByText('s1 -> s2: mcp', { exact: false }).waitFor();
+  assert.deepEqual(await draft.locator('li code').allTextContents(), ['>>th:', '>>pl:', 's1: read-line-range', 's1 -> s2: mcp']);
+  await page.clock.fastForward(6000);
+  await card.getByText('Waiting for model to finish response').waitFor();
+  await update('model_response_received');
+  await card.getByText('Checking commands before dispatch').waitFor();
+  await update('model_call_finish', { ok: false, summary: 'Response rejected' });
+  await update('model_call_start', { step: 6, phase: 'Retrying after malformed tool call' });
+  await card.getByText(/Retrying after malformed tool call/).waitFor();
+  assert.equal(await card.getByText('s1: read-line-range', { exact: false }).count(), 0);
+  await update('model_output_progress', { output_chars: 37, draft_strategy: ['s1: mcp'] });
+  await update('model_call_finish', { ok: true });
+  await update('tool_start', { summary: 'Querying Blender MCP' });
+  await card.getByText('Querying Blender MCP', { exact: true }).waitFor();
+  const preview = card.locator('.turn-thought-draft');
+  if (await preview.getAttribute('open') === null) await preview.locator('summary').click();
+  await draft.getByText('s1: mcp', { exact: true }).waitFor();
+});
+
+test('long activity fits its panel and both open streams can scroll into the conversation', async t => {
+  const { page, session } = await fixture(t);
+  await page.setViewportSize({ width: 1060, height: 560 });
+  const panel = session.locator('.agent-panel');
+  const conversation = panel.getByRole('region', { name: 'Agent conversation' });
+  const card = panel.getByRole('region', { name: 'Current turn thought' });
+  const update = (action_type, extra = {}) => emit(page, 'one', {
+    type: 'progress', payload: { type: 'progress', domain: 'plan', action_type, turn: 9, ...extra },
+  });
+  const file = 'src/motion/' + 'long-directory-name/'.repeat(5) + 'persistence.ts';
+  await emit(page, 'one', { type: 'status', status: 'running' });
+  await emit(page, 'one', { type: 'state', state: {
+    planner: { executing: true, executing_goal_index: 2, executing_goal_count: 3, executing_goal_title: 'Finalize ' + file },
+    transcript: [{ role: 'assistant', content: 'Read the current project requirements.' }],
+  } });
+  await update('turn_thought', { thought: `Inspect ${file} before running the typecheck. `.repeat(7) });
+  await update('model_call_start');
+  await update('model_reasoning_summary', { thought: 'Checking the persistence layer before touching the public API.\n'.repeat(30) });
+  const entries = Array.from({ length: 24 }, (_, i) => `s${i + 1}: read-line-range`);
+  await update('model_output_progress', { output_chars: 27115, draft_strategy: entries });
+  await emit(page, 'one', { type: 'stderr', message: 'Transient model failure (HTTP 429). Waiting 60s before retrying ' + file });
+
+  const reasoning = card.getByRole('region', { name: 'Reasoning summary' });
+  await card.locator('.turn-thought-draft > summary').click();
+  const draft = card.getByRole('region', { name: 'Draft strategy' });
+  await draft.waitFor();
+  assert.equal(await card.getByRole('button', { name: 'Reasoning summary' }).getAttribute('aria-expanded'), 'true');
+  for (const region of [reasoning, draft]) {
+    assert.ok(await region.evaluate(el => el.clientHeight <= 140 && el.scrollHeight > el.clientHeight));
+  }
+  assert.ok(await panel.evaluate(el => {
+    const boundary = el.getBoundingClientRect();
+    const children = el.querySelectorAll('.agent-main, .turn-thought, .agent-notice, .prompt-box, .send-button');
+    return [...children].every(child => {
+      const { left, right } = child.getBoundingClientRect();
+      return left >= boundary.left && right <= boundary.right;
+    });
+  }));
+  assert.ok(await conversation.evaluate(el => el.scrollHeight > el.clientHeight && el.scrollWidth <= el.clientWidth + 1));
+  await reasoning.scrollIntoViewIfNeeded();
+  await reasoning.evaluate(el => { el.scrollTop = 0; });
+  await reasoning.hover();
+  await page.mouse.wheel(0, 80);
+  await page.waitForFunction(() => {
+    const el = document.querySelector('.artifact-session:not([hidden]) [aria-label="Reasoning summary"].turn-thought-copy');
+    return el.scrollTop > 0;
+  });
+  // The conversation has its own scroll track beside the independently
+  // scrollable streams, even when a wheel gesture starts inside a stream.
+  await conversation.hover({ position: { x: 3, y: 12 } });
+  const beforeChain = await conversation.evaluate(el => el.scrollTop);
+  assert.ok(await conversation.evaluate(el => el.scrollHeight - el.clientHeight - el.scrollTop > 5));
+  await page.mouse.wheel(0, 250);
+  await page.waitForFunction(before => document.querySelector('.artifact-session:not([hidden]) .agent-main').scrollTop > before, beforeChain);
+
+  await draft.locator('li').last().scrollIntoViewIfNeeded();
+  assert.equal(await draft.locator('li').last().textContent(), 's24: read-line-range');
+  assert.ok(await draft.evaluate(el => el.scrollTop > 0));
+  await conversation.evaluate(el => el.scrollTop === 0 || new Promise(resolve => {
+    el.addEventListener('scroll', () => resolve(true), { once: true });
+    el.scrollTop = 0;
+  }));
+  await update('model_output_progress', { output_chars: 27118, draft_strategy: ['s25: mcp'] });
+  assert.equal(await conversation.evaluate(el => el.scrollTop), 0);
+  assert.equal(await panel.getByRole('button', { name: 'Send instruction' }).isVisible(), true);
+
+  if (process.env.SKILLZ_AGENT_CARD_SNAPSHOT) {
+    await page.setViewportSize({ width: 1340, height: 940 });
+    await card.scrollIntoViewIfNeeded();
+    await panel.screenshot({ path: process.env.SKILLZ_AGENT_CARD_SNAPSHOT });
+  }
 });
 
 test('activity sits below the preview beside the conversation, preserves the iframe, and fits a narrow window', async t => {
