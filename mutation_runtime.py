@@ -6,6 +6,8 @@ from pathlib import Path
 import os
 
 from mutations import batch_mutate
+from mutations.staging import StagedFiles
+from symbol_ranges import typescript_lookup_root
 
 
 EXPLICIT_MUTATION_TYPES = frozenset({
@@ -16,7 +18,7 @@ EXPLICIT_MUTATION_TYPES = frozenset({
 _PATH_KEYS = {"path", "file_path", "old_path", "new_path", "source_path", "destination_path"}
 
 
-def execute_mutation(action: dict, root: Path) -> tuple[dict, list[str]]:
+def execute_mutation(action: dict, root: Path, *, stage: StagedFiles | None = None) -> tuple[dict, list[str]]:
     if "root" in action:
         raise ValueError("Mutations cannot override the mounted workspace root")
     source = action.get("operations") if action.get("type") == "batch_mutate" else [action]
@@ -41,7 +43,10 @@ def execute_mutation(action: dict, root: Path) -> tuple[dict, list[str]]:
         if operation.get("type") == "replace_symbol":
             operation.setdefault("symbol_kind", "")
         operations.append(operation)
-    result = batch_mutate(operations, root=root, atomic=bool(action.get("atomic", False)))
+    with typescript_lookup_root(root):
+        result = batch_mutate(stage.prepare_operations(operations) if stage else operations,
+            root=stage.directory if stage else root, atomic=bool(action.get("atomic", False)),
+            validate_tsx=stage is None and action.get("type") == "batch_mutate")
     changed = set()
     if not result.get("rolled_back"):
         for operation, outcome in zip(operations, result["operations"]):

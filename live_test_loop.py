@@ -2197,8 +2197,7 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
         return sorted(skills, key=lambda item: (-int(item.get("priority", 0)), str(item.get("name", ""))))
 
     def _reset_guard_state(self, *, clear_budget_usage: bool = False) -> None:
-        self.loop._signal_state["edit_batch_mode"] = False
-        self.loop._deferred_diagnostic_paths.clear()
+        self.loop.discard_staged_edits()
         self._proposal_validation_checkpoint = None
         self._task_satisfied = False
         self._completion_check_pending = False
@@ -2978,7 +2977,8 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
         if action_type == "run_shell" and verification_check:
             return self.loop._exec_run_shell(action, allow_process_changes=False, verification_check=True)
         if action_type in DISCOVERY_ACTION_TYPES:
-            payload = execute_discovery_action(action, root=self.root)
+            loop = getattr(self, "loop", None)
+            payload = loop._exec_discovery(action) if loop else execute_discovery_action(action, root=self.root)
             result.ok = bool(payload.get("ok", True))
             return json.dumps(payload, indent=2)
 
@@ -3131,6 +3131,13 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
 
         action = result.tool_action or {}
         action_type = str(action.get("type", "") or "")
+        if staged_paths := action.get("_staged_paths"):
+            for path in staged_paths:
+                self._queue_edit_batch_verification(path)
+            self._task_satisfied = False
+            self._refresh_loop_steering()
+            self._emit_step_progress(command, result)
+            return
         if action_type in EDIT_BATCH_CONTROLS:
             self._refresh_loop_steering()
             self._emit_step_progress(command, result)
@@ -3702,6 +3709,20 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
 
     def _exec_end_edit_batch(self, action: Dict[str, Any]) -> str:
         diagnostics = self.loop._exec_end_edit_batch(action)
+        if self.loop.bridge.tree.staged_files is not None:
+            return diagnostics
+        if diagnostics.startswith("end_edit_batch:"):
+            self._edit_batch_mode = False
+            self._edit_batch_pending = {}
+            self._refresh_loop_steering()
+            return diagnostics
+        if published := action.get("_changed_paths"):
+            self._has_mutation = True
+            self._edit_batch_pending = {}
+            for path in published:
+                self._queue_edit_batch_verification(path)
+        else:
+            self._edit_batch_pending = {}
         ok, message = self._verify_and_close_edit_batch(source="end_edit_batch", diagnostics=diagnostics)
         if not ok:
             return f"end_edit_batch: {message}"

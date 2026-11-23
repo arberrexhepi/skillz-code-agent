@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any, Callable
+from symbol_ranges import typescript_lookup_root
 
 from .filesystem_ops import copy_file, create_file, delete_file, fill_template, rename_file
 from .models import BatchMutationResult, MutationResult, make_mutation_result
-from .batch_state import BatchState
+from .batch_state import BatchState, operation_paths
+from .staging import StagedFiles, anchored_range
 from .structural_ops import insert_symbol_member, rename_symbol, replace_symbol
 from .regex_ops import replace_regex
 from .text_ops import (
@@ -49,8 +51,42 @@ def batch_mutate(
     *,
     atomic: bool = False,
     root: Path | str | None = None,
+    validate_tsx: bool = True,
 ) -> BatchMutationResult:
     workspace_root = Path(root or Path.cwd()).resolve()
+    if not validate_tsx:
+        return _apply_batch(operations, atomic=atomic, workspace_root=workspace_root)
+    stage = None
+    try:
+        paths = [path for operation in operations for path in operation_paths(operation)]
+        if not any(Path(path).suffix.lower() == ".tsx" for path in paths):
+            return _apply_batch(operations, atomic=atomic, workspace_root=workspace_root)
+        stage = StagedFiles(workspace_root)
+        staged_operations = stage.prepare_operations(operations)
+        with typescript_lookup_root(workspace_root):
+            result = _apply_batch(staged_operations, atomic=atomic, workspace_root=stage.directory)
+        if not result["ok"] and atomic:
+            return result
+        changes = stage.changes()
+        if diagnostics := stage.syntax_errors(changes):
+            return _staged_failure(atomic, "TSX_SYNTAX_ERROR", diagnostics)
+        stage.publish(changes)
+        return result
+    except (AttributeError, OSError, ValueError, RuntimeError) as exc:
+        return _staged_failure(atomic, "BATCH_STAGING_FAILED", [{"message": str(exc)}])
+    finally:
+        if stage is not None:
+            stage.close()
+
+
+def _staged_failure(atomic: bool, code: str, diagnostics: list[dict]) -> BatchMutationResult:
+    error = make_mutation_result(operation_id="batch:staging", file_path=str(diagnostics[0].get("path", "")),
+        mutation_type="batch_mutate", ok=False, applied=False, reason=code.lower(),
+        diagnostics=[{"code": code, **item} for item in diagnostics])
+    return {"ok": False, "atomic": atomic, "operations": [error], "applied_count": 0, "failed_count": 1, "rolled_back": False}
+
+
+def _apply_batch(operations: list[dict[str, Any]], *, atomic: bool, workspace_root: Path) -> BatchMutationResult:
     results: list[MutationResult] = []
     rolled_back = False
     try:
@@ -66,7 +102,10 @@ def batch_mutate(
         try:
             result = state.guard(operation, index)
             if result is None:
-                result = _dispatch_operation(state.prepare(operation), root=workspace_root, index=index)
+                prepared = state.prepare(operation)
+                result = _resolve_range(state, prepared, index)
+                if result is None:
+                    result = _dispatch_operation(prepared, root=workspace_root, index=index)
                 post_error = state.record(operation, result, index)
             else:
                 post_error = None
@@ -105,6 +144,33 @@ def batch_mutate(
         "failed_count": failed_count,
         "rolled_back": rolled_back,
     }
+
+
+def _resolve_range(state: BatchState, operation: dict, index: int) -> MutationResult | None:
+    kind = operation.get("type")
+    name = operation.get("file_path") or operation.get("path")
+    if kind not in {"replace_range", "delete_range"} or name not in state.paths:
+        return None
+    target = state.paths[name]
+    current, initial = state.contents[target], state.snapshots[target]
+    explicit = operation.pop("expected_text", None)
+    if current.kind != "file" or (explicit is None and current == initial):
+        return None
+    first, last = operation.get("start_line"), operation.get("end_line")
+    if not isinstance(first, int) or not isinstance(last, int) or first < 1 or last < first:
+        return None
+    try:
+        expected = explicit.splitlines() if isinstance(explicit, str) else initial.data.decode("utf-8").splitlines()[first - 1:last]
+        if not expected or last - first + 1 != len(expected):
+            expected = []
+        operation["start_line"], operation["end_line"] = anchored_range(
+            current.data.decode("utf-8").splitlines(), first, last, expected, allow_position=explicit is None and current == initial,
+        )
+        return None
+    except ValueError as exc:
+        return make_mutation_result(operation_id=f"batch:{index}:{kind}", file_path=name, mutation_type=kind,
+            ok=False, applied=False, reason="stale_range", drift_detected=True,
+            diagnostics=[{"code": "STALE_RANGE", "message": str(exc)}])
 
 
 def _dispatch_operation(operation: dict[str, Any], *, root: Path, index: int) -> MutationResult:
