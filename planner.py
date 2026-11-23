@@ -1536,7 +1536,7 @@ class PlannerAgent:
         }
 
     @staticmethod
-    def _successful_worker_actions(history_slice: List[Dict[str, Any]] | List[Any]) -> Iterable[Dict[str, Any]]:
+    def _successful_worker_actions(history_slice: List[Dict[str, Any]] | List[Any], *, include_applied: bool = False) -> Iterable[Dict[str, Any]]:
         candidates: List[tuple[Any, Any]] = []
         for item in history_slice:
             action = getattr(item, "action", None)
@@ -1558,12 +1558,12 @@ class PlannerAgent:
                 result_ok = bool(result.get("ok", False))
             else:
                 result_ok = bool(getattr(result, "ok", False))
-            if result_ok:
+            if result_ok or (include_applied and action.get("_changed_paths")):
                 yield action
 
     @staticmethod
     def _history_has_successful_workspace_mutation(history_slice: List[Dict[str, Any]] | List[Any]) -> bool:
-        for action in PlannerAgent._successful_worker_actions(history_slice):
+        for action in PlannerAgent._successful_worker_actions(history_slice, include_applied=True):
             if "_changed_paths" in action:
                 if action["_changed_paths"]:
                     return True
@@ -1574,10 +1574,8 @@ class PlannerAgent:
     @staticmethod
     def _worker_mutation_paths(history_slice: List[Any]) -> List[str]:
         paths = []
-        for action in PlannerAgent._successful_worker_actions(history_slice):
+        for action in PlannerAgent._successful_worker_actions(history_slice, include_applied=True):
             kind = str(action.get("type") or "")
-            if kind not in _WORKSPACE_MUTATIONS and kind != "run_shell":
-                continue
             if "_changed_paths" in action:
                 paths.extend(action["_changed_paths"])
             elif kind in _WORKSPACE_MUTATIONS:
