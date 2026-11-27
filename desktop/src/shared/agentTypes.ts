@@ -194,6 +194,7 @@ export interface VerificationCheckResult {
   status: 'pass' | 'fail' | 'blocked' | 'unverified' | 'not_run' | 'pending';
   attempts: number;
   mcp_backed?: boolean;
+  browser_backed?: boolean;
   mcp_attempts?: number;
   mcp_attempt_checkpoint?: number;
   reused_from?: string[];
@@ -207,6 +208,7 @@ export interface VerificationCheckResult {
 export interface VerificationReport {
   checks: VerificationCheckResult[];
   attempt_limit?: number;
+  awaiting_manual_approval?: boolean;
   mcp_session?: {
     decisions: Array<{ turn: number; calls: number; decision: 'continue' | 'stop'; reason: string; evidence?: string[] }>;
   };

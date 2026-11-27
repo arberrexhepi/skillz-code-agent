@@ -3009,6 +3009,8 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
                 verification.invoke_setup_mcp(dispatched_action, lambda candidate: invoke_mcp(self.root, candidate))
                 if setup else invoke_mcp(self.root, dispatched_action)
             )
+            if verification is not None:
+                verification.observe_mcp_availability(action, payload)
             if setup:
                 payload = verification.record_setup(action, payload)
             if verification_check:

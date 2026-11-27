@@ -22,10 +22,11 @@ function displayCheck(check: VerificationCheckResult): VerificationCheckResult {
   return check;
 }
 
-export function VerificationChecklist({ report, legacyLog, onProceed, busy }: {
+export function VerificationChecklist({ report, legacyLog, onProceed, onApproveClose, busy }: {
   report: VerificationReport;
   legacyLog?: string;
   onProceed?: () => void;
+  onApproveClose?: () => void;
   busy?: boolean;
 }): React.JSX.Element {
   const checks = report.checks.map(displayCheck);
@@ -33,6 +34,7 @@ export function VerificationChecklist({ report, legacyLog, onProceed, busy }: {
   const nextSteps = checks.filter(check => check.status !== 'pass' && check.next_step);
   const notes = [report.worker_notes, ...(report.follow_up || [])].filter(Boolean);
   const checkpoints = report.mcp_session?.decisions || [];
+  const awaitingManualApproval = Boolean(report.awaiting_manual_approval);
   const legacyDetails = !report.stop_reason && legacyLog;
   const missing = checks.filter(check => check.status === 'unverified').length;
   const stopReason = report.stop_reason || (legacyDetails && missing > 0
@@ -73,13 +75,20 @@ export function VerificationChecklist({ report, legacyLog, onProceed, busy }: {
         </li>;
       })}
     </ul>
+    {awaitingManualApproval && <section className="verification-manual-approval" aria-label="Manual approval required">
+      <strong>Manual approval required</strong>
+      <p>Playwright verification has unverified or failed checks. Waiting for manual approval to close the issue.</p>
+      {onApproveClose && <div className="decision-buttons">
+        <button type="button" className="primary-button" disabled={busy} onClick={onApproveClose}>Approve &amp; close issue</button>
+      </div>}
+    </section>}
     {nextSteps.length > 0 && <section className="verification-next-steps" aria-label="Verification next steps">
       <strong>Next steps</strong>
       {nextSteps.map(check => <div key={check.id}>
         <span>{check.id.replace(/^check-/, 'Check ')}</span>
         <p><PathText>{check.next_step || ''}</PathText></p>
       </div>)}
-      {onProceed && <div className="decision-buttons">
+      {!awaitingManualApproval && onProceed && <div className="decision-buttons">
         <button type="button" disabled={busy} onClick={onProceed}>Proceed with next steps</button>
       </div>}
     </section>}

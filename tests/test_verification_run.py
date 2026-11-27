@@ -1514,3 +1514,357 @@ def test_long_typescript_diagnostic_keeps_the_actionable_continuation():
     check = run.record(ids, kind="run_check", ok=False, output=output)["checks"][0]
     assert [error["path"] for error in check["source_errors"]] == ["src/App.tsx", "src/main.tsx"]
     assert "Property 'renderStyle' is missing" in check["evidence"]
+
+
+def test_tree_browser_check_literal_script_and_measurement_verdicts(tmp_path, monkeypatch):
+    header = json.dumps({
+        "route": "/",
+        "viewport": {"width": 1200, "height": 800},
+        "reducedMotion": "reduce",
+        "steps": [
+            {"type": "click", "selector": "button:has-text('Architecture')", "label": "Open Architecture"},
+            {"type": "evaluate", "label": "Measure centering"},
+        ],
+    })
+    script = 'async () => ({ verification_results: { "check-1": { status: "pass", evidence: "Delta 0.2px <= 1px." } } })'
+    worker = tree_worker(tmp_path, monkeypatch, [
+        f"verify check-1 artifact-preview browser-check {header} <<<\n{script}\n>>>",
+    ])
+    requirement = "At settled hits, the active card center is within one CSS pixel of the canvas center."
+    observed_payload = {
+        "ok": True,
+        "observations": [
+            {"type": "click", "label": "Open Architecture", "selector": "button:has-text('Architecture')"},
+            {"type": "evaluate", "label": "Measure centering"},
+        ],
+        "measurements": [{"label": "Measure centering", "value": {"verification_results": {"check-1": {"status": "pass", "evidence": "Delta 0.2px <= 1px."}}}}],
+        "verification_results": {"check-1": {"status": "pass", "evidence": "Delta 0.2px <= 1px."}},
+    }
+    with patch("artifact_preview._request", return_value=observed_payload) as request:
+        worker.configure_verification([requirement])
+        result = worker.run_task("Measure card centering")
+
+    assert result.ok, result.final_message
+    sent = request.call_args.args[0]
+    assert sent["operation"] == "browser-check"
+    assert sent["input"]["reducedMotion"] == "reduce"
+    assert sent["input"]["steps"][1]["script"] == script
+    assert result.verification["checks"][0]["evidence"] == "Delta 0.2px <= 1px."
+    assert result.verification["checks"][0]["browser_backed"] is True
+
+
+def test_managed_browser_visibility_only_does_not_false_pass_measurement_check():
+    requirement = "At settled hits, the active card center is within one CSS pixel of the canvas center."
+    run = VerificationRun([requirement], managed_browser=True)
+    action = {"type": "artifact_preview", "operation": "browser-check", "input": {"route": "/", "steps": []}}
+    ids = run.begin_checks(["check-1"], action=action)
+    output = {
+        "ok": True,
+        "observations": [
+            {"type": "click", "label": "Start playback", "selector": "button"},
+            {"type": "assert-visible", "label": "First card visible", "selector": ".card"},
+        ],
+    }
+    state = run.record(ids, kind="artifact_preview", ok=True, output=output, action=action)
+    assert state["checks"][0]["status"] == "unverified"
+    assert "evaluate" in state["checks"][0]["next_step"]
+    final_state = run.snapshot(final=True)
+    assert final_state["awaiting_manual_approval"] is True
+
+
+def test_unavailable_playwright_mcp_steers_guidance_to_managed_browser_check():
+    run = VerificationRun(["Verify layout bounds in Preview"], managed_browser=True)
+    run.observe_mcp_availability({"type": "mcp", "operation": "servers"}, {"ok": True, "servers": []})
+    guidance = run.guidance(tree_commands=True)
+    assert "Playwright MCP is unavailable in this workspace; use managed artifact-preview browser-check instead" in guidance
+    assert "playwright-verification" in guidance
+    assert "browser_navigate and browser_snapshot" not in guidance
+
+
+def test_unverified_playwright_verification_awaits_manual_approval_not_proceed(tmp_path, monkeypatch):
+    worker = tree_worker(tmp_path, monkeypatch, [
+        'verify check-1 artifact-preview browser-check {"route":"/","steps":[{"type":"evaluate","label":"Measure"}]}',
+        "finish Could not measure animation frames.",
+    ])
+    planner, plan, goal = planner_goal(worker, tmp_path)
+    goal.success_signals = ["At settled hits, the active card center is within one CSS pixel of the canvas center."]
+    issue = worker.ensure_issue_for_plan(original_request=plan.original_request, plan_summary=plan.summary)
+    planner.session.active_issue_id = issue["issue_id"]
+    unverified_output = {
+        "ok": True,
+        "observations": [{"type": "evaluate", "label": "Measure"}],
+        "verification_results": {
+            "check-1": {
+                "status": "unverified",
+                "evidence": "Card center offset could not be sampled.",
+                "next_step": "Sample card and canvas bounds after settle.",
+            },
+        },
+    }
+    with (
+        patch("artifact_preview._request", return_value=unverified_output),
+        patch.object(planner, "_planner_complete", return_value='{"summary":"Verification incomplete.","next_steps":["Rerun check"]}'),
+    ):
+        execution_summary = planner._execute_plan(plan, checkpoint_results=[], resumed=False, issue_prepared=True)
+
+    assert planner.session.execution_paused
+    report = planner._paused_verification_report()
+    assert report["awaiting_manual_approval"] is True
+    assert "Manual Approval Required" in execution_summary
+    assert "Proceed with next steps" not in execution_summary
+
+    with pytest.raises(ValueError, match="awaiting manual approval"):
+        planner.proceed_with_verification_next_steps()
+
+    reply = planner.continue_conversation("Proceed with next steps")
+    assert "awaiting manual approval" in reply
+    assert planner.session.execution_paused
+
+    exchanges = []
+    closed_msg = _handle_bridge_planner_action(
+        planner=planner,
+        transcript=[],
+        request={"action": "approve_verification_close", "expected_plan": planner._plan_payload(plan)},
+        add_exchange=lambda role, body: exchanges.append((role, body)),
+    )
+    assert exchanges[0] == ("user", "Approve and close issue")
+    assert "Manual approval received." in closed_msg
+    assert issue["issue_id"] in closed_msg
+    assert not planner.session.execution_paused
+    assert planner.session.active_issue_id == ""
+
+
+def test_continuous_mode_stops_for_manual_approval_on_failed_playwright_verification(tmp_path, monkeypatch):
+    worker = tree_worker(tmp_path, monkeypatch, [
+        'verify check-1 artifact-preview browser-check {"route":"/","steps":[{"type":"evaluate","label":"Measure"}]}',
+        "finish Centering failed.",
+    ])
+    planner, plan, goal = planner_goal(worker, tmp_path)
+    goal.success_signals = ["At settled hits, the active card center is within one CSS pixel of the canvas center."]
+    plan.not_in_scope = ["Implementation changes"]
+    issue = {"request_summary": "Verify centering", "plan_summary": "Verify centering"}
+
+    def present_plan():
+        planner.session.pending_plan = plan
+        return "Plan ready"
+
+    failed_output = {
+        "ok": True,
+        "observations": [{"type": "evaluate", "label": "Measure"}],
+        "verification_results": {
+            "check-1": {
+                "status": "fail",
+                "evidence": "Card center differed by 18px on X.",
+                "next_step": "Check camera offset calculation.",
+            },
+        },
+    }
+    with (
+        patch.object(planner, "_create_or_select_continuous_issue", return_value=issue),
+        patch.object(planner, "_handle_intake_turn", side_effect=present_plan),
+        patch("artifact_preview._request", return_value=failed_output) as request,
+    ):
+        report = planner.start_continuous(max_cycles=4)
+
+    assert request.call_count == 1
+    assert planner.continuous_state.stop_reason == "awaiting_manual_approval"
+    assert "awaiting manual approval to close the issue" in report
+    assert "continuing with the verification next steps" not in report
+    assert planner.session.execution_paused
+
+
+def test_browser_check_strict_mode_and_eval_timeout_record_unverified_not_fail():
+    run = VerificationRun([
+        "Overview final conversation step shows handoff and outcome captions.",
+        "Goal Worker routing arrivals show the requested caption.",
+    ], managed_browser=True)
+    action = {"type": "artifact_preview", "operation": "browser-check", "input": {"route": "/", "steps": []}}
+
+    strict_output = {
+        "ok": False,
+        "verifierError": True,
+        "observations": [{"type": "click", "label": "Open Architecture", "selector": "button"}],
+        "error": "Fast-forward: Error: locator.press: Error: strict mode violation: locator('input[type=range]') resolved to 2 elements",
+    }
+    state1 = run.record(run.begin_checks(["check-1"], action=action), kind="artifact_preview", ok=False, output=strict_output, action=action)
+    assert state1["checks"][0]["status"] == "unverified"
+    assert "Verifier error:" in state1["checks"][0]["evidence"]
+    assert "Narrow the Playwright selector" in state1["checks"][0]["next_step"]
+
+    timeout_output = {
+        "ok": False,
+        "verifierError": True,
+        "observations": [{"type": "click", "label": "Open Goal Worker", "selector": "button"}],
+        "error": "Record frames: Error: Evaluate step timed out after 15000ms.",
+    }
+    state2 = run.record(run.begin_checks(["check-2"], action=action), kind="artifact_preview", ok=False, output=timeout_output, action=action)
+    assert state2["checks"][1]["status"] == "unverified"
+    assert "Increase timeoutMs (up to 90000)" in state2["checks"][1]["next_step"]
+
+
+def test_browser_check_normalizes_invalid_script_observations_to_host_steps():
+    run = VerificationRun(["Presentation events highlights both outgoing edges together."], managed_browser=True)
+    action = {"type": "artifact_preview", "operation": "browser-check", "input": {"route": "/", "steps": []}}
+    output = {
+        "ok": True,
+        "observations": [
+            {"type": "click", "label": "Open Architecture", "selector": "button"},
+            {"type": "evaluate", "label": "Verify Overview observations"},
+        ],
+        "verification_results": {
+            "check-1": {
+                "status": "pass",
+                "evidence": "Highlighted presentation-live and presentation-queue together.",
+                "browser_observations": [{"node": "presentation", "edges": ["presentation-live", "presentation-queue"]}],
+            },
+        },
+    }
+    state = run.record(run.begin_checks(["check-1"], action=action), kind="artifact_preview", ok=True, output=output, action=action)
+    assert state["checks"][0]["status"] == "pass"
+    assert state["checks"][0]["browser_observations"] == output["observations"]
+
+
+def test_nonzero_shell_exit_surfaces_stderr_error_line():
+    run = VerificationRun(["Every animated edge exists in the current graph."], managed_browser=True)
+    action = {"type": "run_shell", "command": "node check.js"}
+    output = {
+        "returncode": 1,
+        "stdout": "",
+        "stderr": "node:internal/modules/cjs/loader:1228\nError: Cannot find module '@xyflow/react'\n    at Module._resolveFilename",
+    }
+    state = run.record(run.begin_checks(["check-1"], action=action), kind="run_shell", ok=False, output=output, action=action)
+    assert state["checks"][0]["status"] == "unverified"
+    assert "Cannot find module '@xyflow/react'" in state["checks"][0]["evidence"]
+
+
+def test_unbound_managed_browser_check_runs_as_setup_without_consuming_check_attempts(tmp_path, monkeypatch):
+    inspect_header = json.dumps({
+        "route": "/",
+        "steps": [{"type": "evaluate", "label": "Inspect live edge classes"}],
+    })
+    inspect_script = 'async () => ({ edgeClass: "react-flow__edge architecture-active nopan inactive" })'
+    verify_header = json.dumps({
+        "route": "/",
+        "steps": [{"type": "evaluate", "label": "Verify repair edge activation"}],
+    })
+    verify_script = 'async () => ({ verification_results: { "check-1": { status: "pass", evidence: "Repair edge toggled architecture-active." } } })'
+    worker = tree_worker(tmp_path, monkeypatch, [
+        "artifact-preview start",
+        f"artifact-preview browser-check {inspect_header} <<<\n{inspect_script}\n>>>",
+        f"verify check-1 artifact-preview browser-check {verify_header} <<<\n{verify_script}\n>>>",
+    ])
+    inspect_output = {
+        "ok": True,
+        "observations": [{"type": "evaluate", "label": "Inspect live edge classes"}],
+        "measurements": [{"label": "Inspect live edge classes", "value": {"edgeClass": "react-flow__edge architecture-active nopan inactive"}}],
+    }
+    verify_output = {
+        "ok": True,
+        "observations": [{"type": "evaluate", "label": "Verify repair edge activation"}],
+        "verification_results": {"check-1": {"status": "pass", "evidence": "Repair edge toggled architecture-active."}},
+    }
+    with (
+        patch("artifact_preview._start", return_value={"ok": True, "status": "running", "url": PREVIEW_URL}),
+        patch("artifact_preview._request", side_effect=[inspect_output, verify_output]) as request,
+    ):
+        worker.configure_verification(["The repair edge activates on recorded same-goal correction evidence."])
+        result = worker.run_task("Verify repair edge behavior")
+
+    assert result.ok, result.final_message
+    assert request.call_count == 2
+    assert result.verification["setup_calls_used"] == 2
+    assert result.verification["tool_calls_used"] == 1
+    assert result.verification["checks"][0]["attempts"] == 1
+    assert result.verification["checks"][0]["status"] == "pass"
+    # Confirm preview URL and unbound inspection measurements were visible to the verification turn.
+    third_turn_prompt = json.dumps(worker.model.calls[-1])
+    assert PREVIEW_URL in third_turn_prompt
+    assert "architecture-active" in third_turn_prompt
+
+
+def test_managed_browser_check_earns_extension_on_distinct_evidence_but_not_repeats():
+    reqs = [
+        "The repair edge follows same-goal correction evidence.",
+        "Repeated inconclusive probe stops at 3 attempts.",
+        "Repeated identical failure stops at 2 attempts.",
+    ]
+    run = VerificationRun(reqs, managed_browser=True)
+    action = {"type": "artifact_preview", "operation": "browser-check", "input": {"route": "/", "steps": []}}
+    obs = [{"type": "evaluate", "label": "Inspect repair edge"}]
+
+    # Check 1: distinct progress across 3 attempts earns extension to 5 and passes on attempt 4.
+    long_evidence = (
+        "Controlled retry observed states: "
+        + json.dumps([
+            {"row": 1, "edge": "react-flow__edge react-flow__edge-worker-route nopan inactive", "active": False},
+            {"row": 2, "edge": "react-flow__edge react-flow__edge-worker-route architecture-active nopan inactive", "active": True},
+            {"row": 3, "edge": "react-flow__edge react-flow__edge-worker-route nopan inactive", "active": False},
+        ])
+        + " — tail-marker-preserved-past-500-chars: " + ("x" * 180) + " END_MARKER"
+    )
+    assert len(long_evidence) > 550
+    for status, evidence in [
+        ("unverified", "Real attempt 454e809a rows 23-24 had different goal IDs."),
+        ("fail", "Controlled retry missing toolName kept edge class nopan inactive."),
+        ("fail", long_evidence),
+    ]:
+        run.begin_turn()
+        ids = run.begin_checks(["check-1"], action=action)
+        state = run.record(
+            ids, kind="artifact_preview", ok=True,
+            output={"ok": True, "observations": obs, "verification_results": {"check-1": {"status": status, "evidence": evidence}}},
+            action=action,
+        )
+        run.finish_turn()
+        assert run.idle_turns == 0
+
+    check1 = state["checks"][0]
+    assert check1["attempts"] == 3
+    assert check1["retryable"] is True
+    assert check1["attempt_limit"] == 5
+    assert "END_MARKER" in check1["evidence"]
+
+    # Attempt 4 passes and is accepted by all_required_checks_passed.
+    ids = run.begin_checks(["check-1"], action=action)
+    run.record(
+        ids, kind="artifact_preview", ok=True,
+        output={"ok": True, "observations": obs, "verification_results": {"check-1": {"status": "pass", "evidence": "Repair edge toggled architecture-active on row 2 only."}}},
+        action=action,
+    )
+    assert run.checks["check-1"].verdict.status == "pass"
+    assert run.checks["check-1"].attempts == 4
+
+    # Check 2: identical unverified error 3 times does NOT earn extension.
+    for _ in range(3):
+        ids = run.begin_checks(["check-2"], action=action)
+        state = run.record(
+            ids, kind="artifact_preview", ok=True,
+            output={"ok": True, "observations": obs, "verification_results": {"check-2": {"status": "unverified", "evidence": "Same missing selector"}}},
+            action=action,
+        )
+    check2 = state["checks"][1]
+    assert check2["attempts"] == 3
+    assert check2["retryable"] is False
+    assert check2["stop_reason"] == "The check used all 3 attempts."
+
+    # Check 3: identical failure twice stops immediately at 2 attempts.
+    for _ in range(2):
+        ids = run.begin_checks(["check-3"], action=action)
+        state = run.record(
+            ids, kind="artifact_preview", ok=True,
+            output={"ok": True, "observations": obs, "verification_results": {"check-3": {"status": "fail", "evidence": "Card offset 18px"}}},
+            action=action,
+        )
+    check3 = state["checks"][2]
+    assert check3["attempts"] == 2
+    assert check3["retryable"] is False
+    assert check3["stop_reason"] == "The same failure was observed again."
+
+    # Also verify all_required_checks_passed accepts a browser_backed check passing on attempt 4.
+    single = VerificationRun([reqs[0]], managed_browser=True)
+    for status, ev in [("unverified", "probe 1"), ("fail", "probe 2"), ("fail", "probe 3"), ("pass", "passed on 4")]:
+        ids = single.begin_checks(["check-1"], action=action)
+        single.record(ids, kind="artifact_preview", ok=True,
+                      output={"ok": True, "observations": obs, "verification_results": {"check-1": {"status": status, "evidence": ev}}},
+                      action=action)
+    assert all_required_checks_passed([reqs[0]], single.snapshot(final=True))

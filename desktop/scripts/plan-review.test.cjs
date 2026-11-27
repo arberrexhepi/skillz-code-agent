@@ -128,3 +128,21 @@ test('older missing verdicts appear as unverified and retain their original repo
   assert.match(html, /Original run report.*Original text for a saved run/);
   assert.doesNotMatch(html, /data-status="fail"/);
 });
+
+test('unverified or failed Playwright verification waits for manual approval to close instead of Proceed with next steps', () => {
+  const result = pausedVerification.last_completed_results[0];
+  const html = render({
+    ...pausedVerification,
+    last_completed_results: [{
+      ...result,
+      verification: {
+        ...result.verification,
+        awaiting_manual_approval: true,
+      },
+    }],
+  });
+  assert.match(html, /Manual approval required/);
+  assert.match(html, /Waiting for manual approval to close the issue/);
+  assert.match(html, /Approve &amp; close issue/);
+  assert.doesNotMatch(html, /Proceed with next steps/);
+});

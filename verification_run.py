@@ -16,6 +16,7 @@ from verification_session import MAX_MCP_VERIFICATION_CALLS, McpCheckBudget, Mcp
 MAX_VERIFICATION_TURNS = 12
 MAX_VERIFICATION_TOOL_CALLS = 16
 MAX_VERIFICATION_ATTEMPTS = 3
+MAX_MANAGED_BROWSER_ATTEMPTS = 5
 MAX_TURNS_WITHOUT_EVIDENCE = 5
 MAX_VERIFICATION_SETUP_CALLS = 6
 NATIVE_CHECKS = frozenset({"run_check", "run_route_check", "diagnose"})
@@ -47,6 +48,41 @@ _APPROVED_EXIT_CHECK = re.compile(
     re.IGNORECASE,
 )
 _BROWSER_INTERACTION = re.compile(r"\b(?:click\w*|interact\w*|navigat\w*|workflow|open(?:s|ing)? a project)\b", re.I)
+_BROWSER_MENTION = re.compile(r"\b(?:browser|playwright)\b", re.I)
+_BROWSER_MEASUREMENT_REQUIREMENT = re.compile(
+    r"\b(?:css\s+pixel|within\s+(?:\d+|one|two|three)\s+(?:css\s+)?pixel|pixel(?:s)?\b|"
+    r"bounding\s+box|bounds\b|frame\s+sample|animation\s+frame|eased\s+movement|"
+    r"viewport\s+scale|scale\s+stays|stays\s+constant|reduced\s+motion|manual\s+pan|"
+    r"inter-label\s+gap|headroom|clearance|overlap(?:s|ping)?|collision)\b",
+    re.I,
+)
+_BROWSER_ASSERTION_TYPES = frozenset({"assert-visible", "assert-hidden", "assert-text", "assert-focused", "evaluate"})
+_BROWSER_TRANSITION_TYPES = frozenset({"click", "goto", "fill", "select", "press", "drag", "wheel"})
+_BROWSER_VERIFIER_ERROR_RE = re.compile(
+    r"strict mode violation|Evaluate step timed out|Evaluate step returned \d+ bytes|\b(?:SyntaxError|ReferenceError)\b",
+    re.I,
+)
+_SHELL_ERROR_LINE_RE = re.compile(
+    r"(?m)^\s*(?:[A-Za-z_]*Error|Cannot find module|ERR_[A-Z_]+)[: ].+$",
+)
+
+
+def _normalize_browser_observations(items: Any) -> list[dict[str, str]]:
+    if not isinstance(items, list) or len(items) > 24:
+        return []
+    normalized: list[dict[str, str]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        step_type = _bounded(item.get("type"))
+        label = _bounded(item.get("label"))
+        if not (step_type and label):
+            continue
+        entry = {"type": step_type, "label": label}
+        if item.get("selector") is not None:
+            entry["selector"] = _bounded(item.get("selector"))
+        normalized.append(entry)
+    return normalized
 
 
 def _approved_exit_commands(requirement: str) -> list[list[str]]:
@@ -61,7 +97,7 @@ def _shell_commands(command: Any) -> list[list[str]]:
 
 
 def _browser_assertion_count(requirement: str) -> int:
-    if not re.search(r"\b(?:browser|playwright)\b", requirement, re.I):
+    if not _BROWSER_MENTION.search(requirement):
         return 0
     if re.search(r"\b(?:home|landing)\b", requirement, re.I) and re.search(r"\b(?:viewport|workspace)\b", requirement, re.I):
         return 2
@@ -76,13 +112,18 @@ def _browser_observations_match(requirement: str, observations: Any) -> bool:
         return False
     assertions = [
         index for index, item in enumerate(observations)
-        if item.get("type") == "assert-visible" and _bounded(item.get("label")) and _bounded(item.get("selector"))
+        if item.get("type") in _BROWSER_ASSERTION_TYPES and _bounded(item.get("label"))
+        and (item.get("type") == "evaluate" or _bounded(item.get("selector")))
     ]
-    transition_types = ("click",) if count == 2 or re.search(r"\bclick\w*\b", requirement, re.I) else ("click", "goto")
+    transition_types = ("click",) if count == 2 or re.search(r"\bclick\w*\b", requirement, re.I) else tuple(_BROWSER_TRANSITION_TYPES)
     transitions = [index for index, item in enumerate(observations) if item.get("type") in transition_types and _bounded(item.get("label"))]
     if count == 2:
         return any(
-            before < position < after and observations[before]["selector"] != observations[after]["selector"]
+            before < position < after
+            and (
+                observations[before].get("selector") != observations[after].get("selector")
+                or observations[before].get("label") != observations[after].get("label")
+            )
             for position in transitions for before in assertions for after in assertions
         )
     return bool(assertions and (not _BROWSER_INTERACTION.search(requirement) or any(position < assertions[-1] for position in transitions)))
@@ -95,13 +136,21 @@ def _playwright_tool(action: dict) -> str:
     return ""
 
 
+def _is_managed_browser_check(action: dict | None) -> bool:
+    return bool(
+        isinstance(action, dict)
+        and action.get("type") == "artifact_preview"
+        and action.get("operation") == "browser-check"
+    )
+
+
 def is_verification_setup(action: dict, *, unbound: bool = False) -> bool:
     tool = _playwright_tool(action)
     return (
         action.get("type") == "artifact_preview" and action.get("operation", "start") == "start"
         or tool in _PLAYWRIGHT_SETUP_TOOLS
         or tool in _PLAYWRIGHT_INPUT_TOOLS
-        or (unbound and tool == "browser_evaluate")
+        or (unbound and (tool == "browser_evaluate" or _is_managed_browser_check(action)))
     )
 
 
@@ -253,6 +302,7 @@ def all_required_checks_passed(requirements: Sequence[str], report: Any) -> bool
         and check.get("requirement") == requirement and check.get("status") == "pass"
         and bool(_bounded(check.get("evidence"))) and type(check.get("attempts")) is int
         and 1 <= check["attempts"] <= (MAX_MCP_VERIFICATION_CALLS if check.get("mcp_backed") is True
+                                      else MAX_MANAGED_BROWSER_ATTEMPTS if check.get("browser_backed") is True
                                       else MAX_VERIFICATION_ATTEMPTS)
         and _browser_observations_match(requirement, check.get("browser_observations"))
         for index, (requirement, check) in enumerate(zip(required, checks), 1)
@@ -336,6 +386,16 @@ def _tool_findings(value: Any, verdicts: dict, errors: list[str], *, depth: int 
             errors.append(_bounded(detail or value.get("message") or value.get("summary")))
         if type(value.get("returncode")) is int and value["returncode"] != 0:
             errors.append(f"Process exited with code {value['returncode']}.")
+            for stderr_key in ("stderr", "stderr_tail"):
+                stderr_text = value.get(stderr_key)
+                if isinstance(stderr_text, str) and stderr_text.strip():
+                    matches = _SHELL_ERROR_LINE_RE.findall(stderr_text)
+                    snippet = matches[-1] if matches else next(
+                        (line for line in reversed(stderr_text.splitlines()) if line.strip()), ""
+                    )
+                    if snippet:
+                        errors.append(_bounded(snippet))
+                        break
         for key in ("data", "result", "structuredContent", "content", "stdout", "text"):
             _tool_findings(value.get(key), verdicts, errors, depth=depth + 1, accept_verdicts=accept_verdicts)
         for key in ("stderr", "stderr_tail", "error", "error_lines", "error_or_warning_lines", "warn_or_error_lines"):
@@ -372,9 +432,13 @@ class VerificationCheck:
     attempts: int = 0
     native_attempts: int = 0
     mcp_backed: bool = False
+    browser_backed: bool = False
+    managed_browser_backed: bool = False
+    managed_browser_limit: int = MAX_VERIFICATION_ATTEMPTS
     mcp_budget: McpCheckBudget = field(default_factory=McpCheckBudget)
     verdict: Verdict | None = None
     seen: set[tuple[str, str]] = field(default_factory=set)
+    unverified_observations: set[str] = field(default_factory=set)
     repeated_failure: bool = False
     source_errors: list[dict[str, str]] = field(default_factory=list)
     browser_observations: list[dict[str, str]] = field(default_factory=list)
@@ -385,12 +449,16 @@ class VerificationCheck:
     reused_from: list[str] = field(default_factory=list)
 
     @property
+    def attempt_limit(self) -> int:
+        return self.managed_browser_limit if self.managed_browser_backed else MAX_VERIFICATION_ATTEMPTS
+
+    @property
     def retryable(self) -> bool:
         return self.can_attempt(mcp=self.mcp_backed)
 
     def can_attempt(self, *, mcp: bool) -> bool:
         return (
-            (not self.mcp_budget.stop_reason if mcp else self.native_attempts < MAX_VERIFICATION_ATTEMPTS)
+            (not self.mcp_budget.stop_reason if mcp else self.native_attempts < self.attempt_limit)
             and not (self.repeated_failure or self.shell_retry_rejected)
             and (self.verdict is None or self.verdict.status in {"fail", "unverified"})
         )
@@ -403,13 +471,24 @@ class VerificationCheck:
             return "The same failure was observed again."
         if self.shell_retry_rejected:
             return "An exit status was already recorded for this command."
-        return self.mcp_budget.stop_reason or f"The check used all {MAX_VERIFICATION_ATTEMPTS} attempts."
+        return self.mcp_budget.stop_reason or f"The check used all {self.attempt_limit} attempts."
+
+    def maybe_extend_managed_browser_limit(self) -> None:
+        if (
+            self.managed_browser_backed
+            and not self.mcp_backed
+            and not self.repeated_failure
+            and self.native_attempts >= self.managed_browser_limit
+            and self.managed_browser_limit < MAX_MANAGED_BROWSER_ATTEMPTS
+            and (len(self.seen) + len(self.unverified_observations)) >= 2
+        ):
+            self.managed_browser_limit = MAX_MANAGED_BROWSER_ATTEMPTS
 
 
 class VerificationRun:
     def __init__(self, requirements: Sequence[str], *, review_deferred: bool = False, managed_browser: bool = True,
                  inherited_checks: dict[str, dict] | None = None) -> None:
-        self.checks = {f"check-{index}": VerificationCheck(requirement)
+        self.checks = {f"check-{index}": VerificationCheck(requirement, browser_backed=bool(_BROWSER_MENTION.search(requirement)))
                        for index, requirement in enumerate(dict.fromkeys(requirements), 1)}
         for check in self.checks.values():
             prior = (inherited_checks or {}).get(check.requirement)
@@ -436,13 +515,31 @@ class VerificationRun:
         self._fixture_error = ""
         self._fixture_error_result: dict = {}
         self._inconclusive_output = ""
+        self._latest_browser_measurements = ""
         self._result_format_issue = ""
         self.review_deferred = review_deferred
         self.managed_browser = managed_browser
+        self._playwright_verification = any(check.browser_backed for check in self.checks.values())
+        self._playwright_mcp_unavailable = False
         self._reporting = False
         self.observed_source_paths: set[str] = set()
         self.repair_handoff: dict | None = None
         self.proposed_repair_targets: list[str] = []
+
+    def observe_mcp_availability(self, action: dict, output: Any) -> None:
+        if not isinstance(output, dict):
+            return
+        if action.get("type") == "mcp" and action.get("operation") == "servers" and output.get("ok") is True:
+            servers = output.get("servers")
+            if isinstance(servers, list) and not any(
+                (isinstance(item, dict) and item.get("name") == "playwright") or item == "playwright"
+                for item in servers
+            ):
+                self._playwright_mcp_unavailable = True
+        elif _playwright_tool(action):
+            self._playwright_verification = True
+            if output.get("ok") is False and "unavailable" in str(output.get("error") or "").lower():
+                self._playwright_mcp_unavailable = True
 
     def observe_source(self, path: str) -> None:
         if path and path != ".":
@@ -526,7 +623,7 @@ class VerificationRun:
             repeated = any(check.repeated_failure for check in checks)
             exhausted = any(
                 check.mcp_budget.stop_reason or (
-                    not check.mcp_backed and check.native_attempts >= MAX_VERIFICATION_ATTEMPTS
+                    not check.mcp_backed and check.native_attempts >= check.attempt_limit
                     and check.stop_detail and not check.repeated_failure
                 ) for check in checks
             )
@@ -553,6 +650,8 @@ class VerificationRun:
 
     def begin_setup(self, action: dict) -> dict:
         tool = _playwright_tool(action)
+        if tool or action.get("type") == "artifact_preview":
+            self._playwright_verification = True
         if tool in _PLAYWRIGHT_INPUT_TOOLS:
             if self._browser_origin is None:
                 raise ValueError("Navigate to the local preview with Playwright before sending browser input.")
@@ -646,6 +745,12 @@ class VerificationRun:
                 return {"ok": True, "ready": ready, "fixture": details}
             return {"ok": False, "error": VERIFICATION_FIXTURE_GUIDANCE}
         if not tool:
+            if _is_managed_browser_check(action):
+                if isinstance(output.get("measurements"), list) and output["measurements"]:
+                    encoded = json.dumps(output["measurements"], ensure_ascii=False)
+                    self._latest_browser_measurements = encoded[:2500] + (" [truncated]" if len(encoded) > 2500 else "")
+                self._mark_setup_progress("browser-inspect")
+                return output
             url = output.get("url")
             origin = _loopback_origin(url)
             self._preview_url = url if origin is not None else ""
@@ -765,56 +870,105 @@ class VerificationRun:
         native_summary = _bounded(output.get("summary") if isinstance(output, dict) else output)
         source_errors = compiler_errors(output) if kind in {"run_shell", "run_check", "diagnose"} else []
         browser = kind == "artifact_preview" and action.get("operation") == "browser-check"
+        route_check = kind == "run_route_check"
+        is_browser_tool = browser or route_check or bool(_playwright_tool(action))
+        if is_browser_tool:
+            self._playwright_verification = True
         mcp = _is_mcp_check(action)
         for key in ids:
             check = self.checks[key]
+            if is_browser_tool:
+                check.browser_backed = True
+            if browser:
+                check.managed_browser_backed = True
             supplied = verdicts.get(key)
             record = supplied if isinstance(supplied, dict) else {}
             status = record.get("status")
-            evidence = _bounded(record.get("evidence"))
+            evidence = _bounded(record.get("evidence"), 900)
             next_step = _bounded(record.get("next_step"))
             commands = _approved_exit_commands(check.requirement) if kind == "run_shell" else []
             approved_shell = bool(commands and _shell_commands(action.get("command")) == commands)
             observed_exit = isinstance(output, dict) and type(output.get("returncode")) is int
             if approved_shell and observed_exit and not unavailable:
                 check.shell_exit_observed = True
-            observations = output.get("observations") if browser and isinstance(output, dict) else None
+            host_observations = _normalize_browser_observations(output.get("observations") if browser and isinstance(output, dict) else None)
+            record_observations = _normalize_browser_observations(record.get("browser_observations"))
             custom_browser = self._custom_browser_check_allowed(action) and status == "pass" and bool(evidence)
             if custom_browser:
-                observations = record.get("browser_observations")
-            if not isinstance(observations, list) or len(observations) > 8 or any(not isinstance(item, dict) for item in observations):
-                observations = []
+                observations = record_observations
+            elif browser:
+                observations = record_observations or host_observations
             else:
-                observations = [{field: _bounded(item.get(field)) for field in ("type", "label", "selector")} for item in observations]
+                observations = []
+            ran_evaluate = browser and any(item.get("type") == "evaluate" for item in host_observations)
             if unavailable:
+                default_unavailable = (
+                    "Install the Playwright inspection browser in artifact Setup, or enable Playwright MCP, then rerun the check."
+                    if browser else ""
+                )
                 verdict = Verdict("blocked", next((error for error in errors if error), "") or _bounded(output)
-                                  or "The verification tool is unavailable.", next_step)
+                                  or "The verification tool is unavailable.", next_step or default_unavailable)
             elif errors or not ok:
                 details = (
                     (source_errors[0]["evidence"] if source_errors else "")
                     or next((error for error in reversed(errors) if error), "")
                     or _bounded(output) or "The verification tool failed."
                 )
-                if browser and isinstance(output, dict) and (incident := _browser_failure(output)):
+                incident = _browser_failure(output) if browser and isinstance(output, dict) else ""
+                if incident:
                     details = _bounded(f"{incident} — {details}")
                 if status == "fail" and evidence and evidence != details:
                     details = _bounded(f"{evidence} ({details})")
+                browser_verifier_error = (
+                    browser and not incident and not (status == "fail" and evidence)
+                    and (
+                        (isinstance(output, dict) and output.get("verifierError") is True)
+                        or bool(_BROWSER_VERIFIER_ERROR_RE.search(details))
+                    )
+                )
                 observed_failure = (
                     bool(status == "fail" and evidence)
                     or bool(source_errors)
                     or (approved_shell and observed_exit and output["returncode"] != 0)
                     or kind in NATIVE_CHECKS
-                    or (browser and isinstance(output, dict) and isinstance(output.get("observations"), list))
+                    or (browser and not browser_verifier_error and isinstance(output, dict) and isinstance(output.get("observations"), list))
                 )
+                verifier_next_step = next_step
+                if not verifier_next_step:
+                    if re.search(r"strict mode violation", details, re.I):
+                        verifier_next_step = "Narrow the Playwright selector to match a single element (for example label:has-text('...') input or role=...) and rerun the check."
+                    elif re.search(r"Evaluate step timed out", details, re.I):
+                        verifier_next_step = "Increase timeoutMs (up to 90000) on the run or evaluate step and rerun the check."
+                    else:
+                        verifier_next_step = "Fix the verifier error and rerun the check."
                 verdict = (Verdict("fail", details, next_step) if observed_failure else Verdict(
                     "unverified", f"Verifier error: {details}",
-                    "Fix the verifier error and rerun the check.",
+                    verifier_next_step,
                 ))
             elif status == "unverified" and evidence:
                 verdict = Verdict(status, evidence, next_step or "Resolve the verifier error and retry this check.")
+            elif browser and status in ("fail", "blocked") and evidence:
+                verdict = Verdict(status, evidence, next_step)
+            elif browser and status == "pass" and evidence and isinstance(output, dict) and output.get("ok") is True and _browser_observations_match(check.requirement, observations):
+                verdict = Verdict("pass", evidence)
+            elif ran_evaluate:
+                verdict = Verdict(
+                    "unverified",
+                    "Managed browser evaluate ran without returning a verification_results verdict for this check.",
+                    "Return verification_results with status and measured evidence for this check from the evaluate step.",
+                )
             elif browser and isinstance(output, dict) and output.get("ok") is True and observations and _browser_observations_match(check.requirement, observations):
-                observed = [item["label"] for item in observations if isinstance(item, dict) and _bounded(item.get("label"))]
-                verdict = Verdict("pass", _bounded("Managed browser observed " + " → ".join(observed)))
+                if _BROWSER_MEASUREMENT_REQUIREMENT.search(check.requirement) and not any(
+                    item.get("type") in {"evaluate", "assert-focused"} for item in observations
+                ):
+                    verdict = Verdict(
+                        "unverified",
+                        "Managed browser visibility steps alone do not establish the required measurement or motion check.",
+                        "Use a browser-check evaluate step to measure the required bounds, scale, or frames and return verification_results.",
+                    )
+                else:
+                    observed = [item["label"] for item in observations if isinstance(item, dict) and _bounded(item.get("label"))]
+                    verdict = Verdict("pass", _bounded("Managed browser observed " + " → ".join(observed)))
             elif browser or _browser_assertion_count(check.requirement):
                 if custom_browser and observations and _browser_observations_match(check.requirement, observations):
                     verdict = Verdict("pass", evidence)
@@ -841,6 +995,12 @@ class VerificationRun:
                 check.latest_unverified = verdict.evidence
                 if check.verdict is None or check.verdict.status == "unverified":
                     check.verdict = verdict
+                if browser and supplied and evidence:
+                    norm_unverified = verdict.evidence.casefold()
+                    if norm_unverified not in check.unverified_observations:
+                        check.unverified_observations.add(norm_unverified)
+                        if self.mcp_session is None:
+                            self._new_evidence = True
                 progress = record.get("progress")
                 new_progress = False
                 if ok and not unavailable and not errors and self.mcp_session is not None and mcp and isinstance(progress, dict):
@@ -852,6 +1012,7 @@ class VerificationRun:
                         new_progress = True
                 if mcp:
                     check.mcp_budget.review(new_evidence=new_progress)
+                check.maybe_extend_managed_browser_limit()
                 continue
 
             check.latest_unverified = ""
@@ -875,9 +1036,18 @@ class VerificationRun:
                 # Reporting a different failure still needs a distinct, meaningful observation
                 # to earn continuation. The first observed failure permits a focused follow-up.
                 check.mcp_budget.review(new_evidence=new_progress)
+            if verdict.status == "fail":
+                check.maybe_extend_managed_browser_limit()
         state = self.snapshot()
         if self._result_format_issue:
             state["result_format_issue"] = self._result_format_issue
+        if browser and isinstance(output, dict) and isinstance(output.get("measurements"), list) and output["measurements"]:
+            encoded = json.dumps(output["measurements"], ensure_ascii=False)
+            self._latest_browser_measurements = encoded[:2500] + (" [truncated]" if len(encoded) > 2500 else "")
+            if any(self.checks[key].verdict is None or self.checks[key].verdict.status != "pass" for key in ids):
+                state["latest_browser_measurements"] = self._latest_browser_measurements
+        elif browser:
+            self._latest_browser_measurements = ""
         if kind == "mcp":
             inconclusive = isinstance(output, dict) and any(self.checks[key].latest_unverified for key in ids)
             self._inconclusive_output = _bounded_mcp_text(output) if inconclusive else ""
@@ -936,6 +1106,8 @@ class VerificationRun:
                 "retryable": check.retryable and not final,
                 **({"mcp_backed": True, "mcp_attempts": check.mcp_budget.attempts,
                     "mcp_attempt_checkpoint": check.mcp_budget.checkpoint} if check.mcp_backed else {}),
+                **({"browser_backed": True} if check.browser_backed else {}),
+                **({"attempt_limit": check.managed_browser_limit} if check.managed_browser_backed and check.managed_browser_limit > MAX_VERIFICATION_ATTEMPTS else {}),
                 **({"progress_evidence": check.progress_evidence} if check.progress_evidence else {}),
                 **({"stop_reason": stop_detail} if stop_detail else {}),
                 **({"latest_attempt": check.latest_unverified} if status == "fail" and check.latest_unverified else {}),
@@ -943,6 +1115,11 @@ class VerificationRun:
                 **({"browser_observations": check.browser_observations} if check.browser_observations else {}),
                 **({"reused_from": check.reused_from} if check.reused_from else {}),
             })
+        awaiting_manual_approval = bool(
+            final
+            and not self.passed
+            and (self._playwright_verification or any(check.browser_backed for check in self.checks.values()))
+        )
         return {
             "passed": self.passed, "turns_used": self.turns,
             "turn_limit": self.max_turns if self.mcp_session is not None else self.turn_limit,
@@ -952,6 +1129,7 @@ class VerificationRun:
             **({"setup_call_limit": MAX_VERIFICATION_SETUP_CALLS} if self.mcp_session is None else {}),
             "turns_without_new_evidence": self.idle_turns, "attempt_limit": MAX_VERIFICATION_ATTEMPTS,
             "checks": checks,
+            **({"awaiting_manual_approval": True} if awaiting_manual_approval else {}),
             **({"mcp_session": self.mcp_session.snapshot(calls=self.tool_calls + self.setup_calls)} if self.mcp_session is not None else {}),
             **({"stop_reason": stop_reason} if stop_reason else {}),
             **({"worker_notes": notes.strip()[:2000]} if final and notes.strip() else {}),
@@ -970,19 +1148,37 @@ class VerificationRun:
             )
         command = (
             "Use verify check-1,check-2 <tool command>, for example verify check-1 run-check test. "
-            "Send Playwright JavaScript as a literal block to preserve regex and string escapes:\n"
-            'verify check-1 mcp {"operation":"call","server":"playwright","name":"browser_evaluate"} <<<\n'
-            '() => ({ verification_results: { "check-1": { status: document.title ? "pass" : "fail", '
-            'evidence: "Observed page title: " + document.title } } })\n'
-            ">>>"
+            "Load `skill playwright-verification` for detailed browser verification patterns. "
+            "Send JavaScript as a literal <<< … >>> block to preserve regex and string escapes:\n"
+            + (
+                'verify check-2 artifact-preview browser-check {"route":"/","viewport":{"width":1200,"height":800},'
+                '"steps":[{"type":"click","selector":"button","label":"Open view"},{"type":"evaluate","label":"Measure layout"}]} <<<\n'
+                'async () => ({ verification_results: { "check-2": { status: "pass", evidence: "Measured bounds" } } })\n'
+                ">>>"
+                if self.managed_browser and self._playwright_mcp_unavailable else
+                'verify check-1 mcp {"operation":"call","server":"playwright","name":"browser_evaluate"} <<<\n'
+                '() => ({ verification_results: { "check-1": { status: document.title ? "pass" : "fail", '
+                'evidence: "Observed page title: " + document.title } } })\n'
+                ">>>"
+            )
             if tree_commands else
-            'Use an action with type "verify", a "checks" array of check IDs, and the existing tool action under "action".'
+            'Use an action with type "verify", a "checks" array of check IDs, and the existing tool action under "action". '
+            'Load skill "playwright-verification" for detailed browser verification patterns.'
         )
         browser_guidance = (
             "Start a managed artifact preview as a separate setup action. Starting it publishes a URL and consumes no check attempt. "
-            + ("For browser interaction requirements, use artifact-preview browser-check with JSON containing route and steps. "
-               if tree_commands else
-               'For browser interaction requirements, use artifact_preview with operation "browser-check" and an input containing route and steps. ')
+            "You can also run an unbound artifact-preview browser-check without verify to inspect live DOM classes or real local data before binding assertions (counts against setup calls, not check attempts). "
+            "Do not probe the container shell for local Playwright/Chromium, run npx playwright install, or fetch host preview ports from the container. "
+            + (
+                "For browser interaction, layout, animation, focus, drag, wheel, or reduced-motion verification, use artifact-preview browser-check "
+                "with JSON containing route, optional viewport/reducedMotion/colorScheme/timeoutMs, and up to 24 steps: "
+                "goto, click, fill, select, press, hover, drag, wheel, wait, assert-visible, assert-hidden, assert-text, assert-focused, and evaluate. "
+                "Return verification_results from an evaluate step for measured checks (TreeLoop supports a trailing <<< … >>> script block when one evaluate step omits script). "
+                if tree_commands else
+                'For browser verification, use artifact_preview with operation "browser-check" and input containing route, '
+                'optional viewport/reducedMotion/colorScheme/timeoutMs, and up to 24 steps (goto, click, fill, select, press, hover, drag, wheel, wait, '
+                'assert-visible, assert-hidden, assert-text, assert-focused, evaluate). Return verification_results from an evaluate step for measured checks. '
+            )
             if self.managed_browser else
             'For browser interaction requirements, use a Playwright tool or script and include observed steps in the check verdict as "browser_observations". '
         )
@@ -1008,6 +1204,8 @@ class VerificationRun:
             )
         if self._inconclusive_output:
             state["inconclusive_tool_output"] = self._inconclusive_output
+        if self._latest_browser_measurements:
+            state["latest_browser_measurements"] = self._latest_browser_measurements
         if self._result_format_issue:
             state["result_format_issue"] = self._result_format_issue
         coverage_guidance = ""
@@ -1019,24 +1217,10 @@ class VerificationRun:
                 "Reuse the current fixture and preconditions already established. "
                 "If a prerequisite is unavailable, report the exact blocker for that check.\n"
             )
-        return (
-            "VERIFICATION GOAL\n" + command + "\n" + coverage_guidance + fixture_recovery +
-            'For custom scripts print one stdout line VERIFICATION_RESULTS: {"check-1":{"status":"pass","evidence":"observed result"}}. '
-            'For MCP, return a result object with a verification_results map or emit the same marked text. '
-            'Keep bound Playwright results compact. Return only verdicts or progress for the checks the call actually covers. '
-            'Put per-check browser_observations inside its verdict, and use a separate call for large DOM snapshots. '
-            'Each MCP-backed check earns more attempts only when it produces new check-specific evidence. '
-            'Setup and all checks share a capped session budget. Cover independent checks early, and avoid repeating passed or closed checks. '
-            'Checks marked reused_from passed in earlier goals on the current source. Run only outstanding checks. '
-            'If a tool completes a check step before '
-            'you can give a verdict, return status "unverified" and include progress {"milestone":"stable step name",'
-            '"evidence":"concrete observation from this tool call"} on that check. '
-            'Use "fail" only when a valid assertion reproduces a product failure. Verify selectors in the source or live DOM, '
-            'confirm fixture identity and prerequisites, and use "unverified" with a concrete next_step for an inconclusive probe. '
-            'If one interaction is a prerequisite for another check, give the dependent check its own verified fixture and preconditions '
-            'or report it as unverified with the missing prerequisite. Use "blocked" for an unavailable prerequisite or environment. '
-            'Include evidence and a concrete next_step per outstanding check, especially when nearing a budget limit. A successful tool call alone '
-            "does not establish a verdict. Use Playwright MCP browser_navigate and browser_snapshot without verify to explore the local preview. "
+        playwright_mcp_guidance = (
+            "Playwright MCP is unavailable in this workspace; use managed artifact-preview browser-check instead (including evaluate, drag, wheel, press, viewport, and reducedMotion). "
+            if self._playwright_mcp_unavailable and self.managed_browser else
+            "Use Playwright MCP browser_navigate and browser_snapshot without verify to explore the local preview. "
             "These setup calls leave check attempts available and share the overall call budget once the MCP session opens. "
             "For real pointer or keyboard input, use Playwright browser_click, browser_drag, or browser_press_key in the preview session. "
             "Use browser_select_option for a native select when the tool is available. "
@@ -1047,6 +1231,29 @@ class VerificationRun:
             "and the playhead being inside its range before clicking Split. Use bound browser_evaluate for measurements and assertions. "
             "Verify independent observations before risky interactions, using short separate calls in one turn. "
             "An unbound browser_evaluate can return a compact observation without supplying fixture readiness or a check verdict. "
+            + VERIFICATION_FIXTURE_GUIDANCE + " "
+        )
+        return (
+            "VERIFICATION GOAL\n" + command + "\n" + coverage_guidance + fixture_recovery +
+            'For custom scripts print one stdout line VERIFICATION_RESULTS: {"check-1":{"status":"pass","evidence":"observed result"}}. '
+            'For MCP or browser-check evaluate steps, return a result object with a verification_results map or emit the same marked text. '
+            'Keep bound Playwright results compact. Return only verdicts or progress for the checks the call actually covers. '
+            'Put per-check browser_observations inside its verdict, and use a separate call for large DOM snapshots. '
+            'Each MCP-backed check earns more attempts only when it produces new check-specific evidence. '
+            'Setup and all checks share a capped session budget. Cover independent checks early, and avoid repeating passed or closed checks. '
+            'Checks marked reused_from passed in earlier goals on the current source. Run only outstanding checks. '
+            'If a tool completes a check step before '
+            'you can give a verdict, return status "unverified" and include progress {"milestone":"stable step name",'
+            '"evidence":"concrete observation from this tool call"} on that check. '
+            'Use "fail" only when a valid assertion reproduces a product failure. Verify selectors, active/inactive CSS classes, '
+            'data attributes, and synthetic fixture fields against the rendering source/CSS before asserting (third-party libraries '
+            'may retain classes such as inactive alongside app-defined active classes), confirm fixture identity and prerequisites, '
+            'and use "unverified" with observed classes/values and a concrete next_step for an inconclusive probe. '
+            'If one interaction is a prerequisite for another check, give the dependent check its own verified fixture and preconditions '
+            'or report it as unverified with the missing prerequisite. Use "blocked" for an unavailable prerequisite or environment. '
+            'Include evidence and a concrete next_step per outstanding check, especially when nearing a budget limit. A successful tool call alone '
+            "does not establish a verdict. "
+            + playwright_mcp_guidance +
             "When one script covers several checks, isolate each check with try/catch and return all accumulated results, "
             'including "unverified" with the verifier error for any check needing a retry. '
             "For each assertion return "
@@ -1054,7 +1261,7 @@ class VerificationRun:
             'For a browser workflow include "browser_observations" with observed assertion and transition steps. '
             "Check visible state after interactions and after reload when persistence is required. "
             "Bind each check to its actual assertion, and propagate script errors. "
-            + browser_guidance + VERIFICATION_FIXTURE_GUIDANCE + " " +
+            + browser_guidance +
             'Use steps such as {"type":"assert-visible","selector":"...","label":"Project Home"}, '
             '{"type":"click","selector":"...","label":"Open project"}, then assert the workspace in the same browser session. '
             "A plain route load only covers route health. "

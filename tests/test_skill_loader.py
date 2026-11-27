@@ -93,3 +93,16 @@ class MarkdownSkillLoaderTests(unittest.TestCase):
             skills = load_markdown_skills_from_dir(skill_dir)
 
             self.assertEqual(skills, [])
+
+    def test_bundled_playwright_verification_skill_loads_and_renders_modes(self) -> None:
+        bundled_dir = Path(__file__).resolve().parents[1] / "skills"
+        skills = {skill.name: skill for skill in load_markdown_skills_from_dir(bundled_dir)}
+
+        self.assertIn("playwright-verification", skills)
+        skill = skills["playwright-verification"]
+        self.assertEqual(skill.modes, ["managed_preview", "playwright_mcp", "measurements_and_motion"])
+        self.assertIn("artifact-preview browser-check", skill.render(mode="managed_preview"))
+        self.assertIn("0 check attempts", skill.render(mode="managed_preview"))
+        self.assertIn("architecture-active", skill.render(mode="managed_preview"))
+        self.assertIn("browser_navigate", skill.render(mode="playwright_mcp"))
+        self.assertIn("getBoundingClientRect", skill.render(mode="measurements_and_motion"))

@@ -66,7 +66,7 @@ class GoalVerificationFacts:
             }:
                 return self._stamp()
         elif (kind == "run_check" and self.commands) or (
-            kind == "artifact_preview" and action.get("operation") == "mcp"
+            kind == "artifact_preview" and action.get("operation") in {"mcp", "browser-check"}
         ):
             return self._stamp()
         return ""
@@ -101,6 +101,7 @@ class GoalVerificationFacts:
         output = _output_object(output)
         if not output:
             return
+        managed_browser = kind == "artifact_preview" and action.get("operation") == "browser-check"
         tool = action.get("input") if kind == "artifact_preview" else action
         browser = isinstance(tool, dict) and tool.get("server") == "playwright"
         if browser:
@@ -115,20 +116,21 @@ class GoalVerificationFacts:
         _tool_findings(result, verdicts, errors)
         if not verdicts or source != self._stamp():
             return
+        fallback_observations = output.get("observations") if managed_browser else None
         for key, record in verdicts.items():
             requirement = self.requirements.get(key)
             if not requirement or _approved_exit_commands(requirement) or not isinstance(record, dict):
                 continue
             status = record.get("status")
             evidence = _bounded(record.get("evidence"))
-            observations = record.get("browser_observations")
+            raw_observations = record.get("browser_observations") if record.get("browser_observations") is not None else fallback_observations
             observations = [
-                {field: _bounded(item.get(field)) for field in ("type", "label", "selector")}
-                for item in observations[:8] if isinstance(item, dict) and _bounded(item.get("type")) and _bounded(item.get("label"))
-            ] if isinstance(observations, list) else []
+                {field: _bounded(item.get(field)) for field in ("type", "label", "selector") if item.get(field) is not None or field != "selector"}
+                for item in raw_observations[:24] if isinstance(item, dict) and _bounded(item.get("type")) and _bounded(item.get("label"))
+            ] if isinstance(raw_observations, list) else []
             if status not in ("pass", "fail") or not evidence:
                 continue
-            if status == "pass" and (not ok or errors or (browser and not observations)
+            if status == "pass" and (not ok or errors or ((browser or managed_browser) and not observations)
                                      or not _browser_observations_match(requirement, observations)):
                 continue
             self._put(source, {"requirement": requirement}, status, evidence, observations)

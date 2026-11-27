@@ -9630,6 +9630,8 @@ class WorkingFolderAgent(ProposalRuntimeMixin):
                         verification.invoke_setup_mcp(dispatched_action, lambda candidate: invoke_mcp(self.root, candidate))
                         if setup else invoke_mcp(self.root, dispatched_action)
                     )
+                if verification is not None:
+                    verification.observe_mcp_availability(action, payload)
                 if setup:
                     payload = verification.record_setup(action, payload)
                 if not verification_check:
@@ -10124,7 +10126,7 @@ def _handle_bridge_planner_action(
         return message
     if getattr(getattr(planner, "session", None), "pending_discovery_extension", None) is not None and action_name in {
         "approve_plan", "reject_plan", "revise_plan", "select_discovery_mode", "skip_discovery",
-        "retry_failed_goal", "resume_execution", "proceed_verification_next_steps",
+        "retry_failed_goal", "resume_execution", "proceed_verification_next_steps", "approve_verification_close",
     }:
         raise ValueError("Discovery is awaiting an extension decision. Review the current request before continuing.")
     if action_name in {"accept_issue_proposal", "ignore_issue_proposal"}:
@@ -10132,10 +10134,13 @@ def _handle_bridge_planner_action(
         decision = "accept" if action_name == "accept_issue_proposal" else "ignore"
         proposal = planner.worker.decide_issue_proposal(proposal_id, decision)
         return f"Suggestion {proposal_id} {proposal['status']}." + (f" Created {proposal['accepted_issue_id']} without changing the active task." if decision == "accept" else "")
-    plan_actions = {"approve_plan", "reject_plan", "continue_issue", "revise_plan", "resume_execution", "proceed_verification_next_steps"}
-    if action_name in plan_actions and ("expected_plan" in request or action_name in {"revise_plan", "proceed_verification_next_steps"}):
+    plan_actions = {
+        "approve_plan", "reject_plan", "continue_issue", "revise_plan",
+        "resume_execution", "proceed_verification_next_steps", "approve_verification_close",
+    }
+    if action_name in plan_actions and ("expected_plan" in request or action_name in {"revise_plan", "proceed_verification_next_steps", "approve_verification_close"}):
         paused_plan = planner.session.paused_plan if planner.session.execution_paused else None
-        current = paused_plan if action_name in {"resume_execution", "proceed_verification_next_steps"} else planner.session.pending_plan or paused_plan
+        current = paused_plan if action_name in {"resume_execution", "proceed_verification_next_steps", "approve_verification_close"} else planner.session.pending_plan or paused_plan
         if current is None or planner.session.executing or request.get("expected_plan") != planner._plan_payload(current):
             raise ValueError("The plan changed. Review the current plan before deciding.")
     if action_name == "revise_plan":
@@ -10154,6 +10159,11 @@ def _handle_bridge_planner_action(
     if action_name == "proceed_verification_next_steps":
         add_exchange("user", "Proceed with next steps")
         message = planner.proceed_with_verification_next_steps()
+        add_exchange("assistant", message)
+        return message
+    if action_name == "approve_verification_close":
+        add_exchange("user", "Approve and close issue")
+        message = planner.approve_verification_close()
         add_exchange("assistant", message)
         return message
     if action_name in {"retry_failed_goal", "resume_execution"}:

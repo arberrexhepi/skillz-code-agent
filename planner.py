@@ -1033,7 +1033,19 @@ class PlannerAgent:
         if self.session.execution_paused and self.session.paused_plan is not None:
             if text.lower() in {"retry", "/retry", "resume", "/resume", "continue", "/continue"}:
                 return self.resume_paused_execution()
-            if proceed_with_next_steps and self._paused_verification_report():
+            if self._paused_verification_awaits_manual_approval():
+                normalized_request = (request or text).strip().lower().rstrip(".!")
+                if normalized_request in {
+                    "approve", "approve and close", "approve and close issue",
+                    "approve close", "close issue", "manual approval",
+                }:
+                    return self.approve_verification_close()
+                if proceed_with_next_steps:
+                    return (
+                        "Playwright verification has unverified or failed checks and is awaiting manual approval to close the issue. "
+                        "Use Approve & close issue to close manually, or Resume to rerun verification."
+                    )
+            elif proceed_with_next_steps and self._paused_verification_report():
                 return self.proceed_with_verification_next_steps()
             if not self._is_rejection(text):
                 return self.request_plan_revision(text)
@@ -2298,10 +2310,57 @@ class PlannerAgent:
                 return result.verification
         return {}
 
+    def _paused_verification_awaits_manual_approval(self) -> bool:
+        report = self._paused_verification_report()
+        return bool(report.get("awaiting_manual_approval"))
+
+    def approve_verification_close(self) -> str:
+        if self.session.executing:
+            raise ValueError("A plan is already executing.")
+        report = self._paused_verification_report()
+        if not report:
+            raise ValueError("No paused verification report is awaiting manual approval.")
+        active_issue_id = str(self.session.active_issue_id or "").strip()
+        close_note = "Manually approved to close after Playwright verification."
+        closed_id = ""
+        if active_issue_id:
+            close_issue = getattr(self.worker, "close_issue", None)
+            close_active_issue = getattr(self.worker, "close_active_issue", None)
+            if callable(close_issue):
+                issue = close_issue(active_issue_id, note=close_note)
+                closed_id = str((issue or {}).get("issue_id", active_issue_id) or active_issue_id)
+            elif callable(close_active_issue):
+                issue = close_active_issue(note=close_note)
+                closed_id = str((issue or {}).get("issue_id", active_issue_id) or active_issue_id)
+            else:
+                closed_id = active_issue_id
+        else:
+            close_active_issue = getattr(self.worker, "close_active_issue", None)
+            if callable(close_active_issue):
+                issue = close_active_issue(note=close_note)
+                closed_id = str((issue or {}).get("issue_id", "") or "")
+        self._discard_discovery_extension()
+        self.session.last_completed_plan = self.session.paused_plan
+        self._clear_pending_plan()
+        self.session.last_presented_plan = None
+        self.session.awaiting_plan_revision = False
+        self.session.plan_revision_feedback = []
+        self.session.last_next_steps = []
+        self.session.last_auto_next_steps = []
+        self._clear_paused_execution()
+        self.session.active_issue_id = ""
+        if closed_id:
+            return f"Manual approval received. Closed issue {closed_id}."
+        return "Manual approval received. Paused verification approved and closed."
+
     def proceed_with_verification_next_steps(self) -> str:
         if self.session.executing:
             raise ValueError("A plan is already executing.")
         report = self._paused_verification_report()
+        if report.get("awaiting_manual_approval"):
+            raise ValueError(
+                "Unverified or failed Playwright verification is awaiting manual approval to close the issue, or Resume to rerun."
+            )
         checks = report.get("checks", [])
         outstanding = [check for check in checks if check["status"] != "pass" and check.get("next_step")]
         if not outstanding:
@@ -3131,6 +3190,12 @@ class PlannerAgent:
                     self.continuous_state.latest_review_decision = review.decision
                 if self.session.paused_suspended_goal_id:
                     self.continuous_state.stop_reason = "goal_suspended"
+                    break
+                if review.decision != "accepted" and self._paused_verification_awaits_manual_approval():
+                    self.continuous_state.stop_reason = "awaiting_manual_approval"
+                    output.append(
+                        f"Cycle {cycle}: Playwright verification has unverified or failed checks and is awaiting manual approval to close the issue."
+                    )
                     break
                 if review.decision != "accepted" and not verification_followup_used:
                     checks = self._paused_verification_report().get("checks", [])
@@ -3999,6 +4064,13 @@ class PlannerAgent:
                     check["next_step"] for check in failed_result.verification["checks"]
                     if check["status"] != "pass"
                 ]
+                if failed_result.verification.get("awaiting_manual_approval"):
+                    return (
+                        f"Execution paused at verification goal {failed_result.title}. "
+                        "Manual Approval Required: Playwright verification has unverified or failed checks "
+                        "and is awaiting manual approval to close the issue.\n\n"
+                        f"{failed_result.final_message}"
+                    )
                 return f"Execution paused at verification goal {failed_result.title}.\n\n{failed_result.final_message}"
             partial_changes = bool(failed_result.touched_paths)
             self.session.last_next_steps = [
@@ -4106,7 +4178,17 @@ class PlannerAgent:
             "Execution Summary",
             f"- {summary}",
         ]
-        if next_steps:
+        awaiting_manual_approval = any(
+            isinstance(result.verification, dict) and result.verification.get("awaiting_manual_approval")
+            for result in results
+        )
+        if awaiting_manual_approval:
+            lines.extend([
+                "",
+                "Manual Approval Required",
+                "- Playwright verification has unverified or failed checks. Review the verification checklist and manually approve to close the issue, or resume to rerun verification.",
+            ])
+        elif next_steps:
             lines.extend(["", "Next Steps"])
             lines.extend(f"{index}. {item}" for index, item in enumerate(next_steps, start=1))
             lines.extend(["", "Say “Proceed with next steps” to plan these actions."])

@@ -370,12 +370,38 @@ class TreeCommandParser:
         argument = parts[1] if len(parts) > 1 else ""
         action = {"type": "artifact_preview", "operation": operation}
         if operation in {"mcp", "chat", "browser-check"}:
+            header, delimiter, script = argument.partition("\n")
+            literal_script: Optional[str] = None
+            raw_json = argument
+            if operation == "browser-check" and delimiter and header.rstrip().endswith("<<<"):
+                raw_json = header.rstrip().removesuffix("<<<").strip()
+                body, _, end = script.rstrip().rpartition("\n")
+                if end.strip() != ">>>" or not body.strip():
+                    return CommandResult(False, "Preview browser-check literal script must be a nonempty <<< … >>> block.", "error")
+                literal_script = body
             try:
-                payload = json.loads(argument)
-            except ValueError:
-                payload = None
+                payload = json.loads(raw_json)
+            except ValueError as exc:
+                hint = (
+                    " Put JavaScript in a literal <<< … >>> block after the JSON header, "
+                    "or escape backslashes inside JSON strings."
+                    if operation == "browser-check" and isinstance(exc, json.JSONDecodeError) and exc.msg.startswith("Invalid \\escape") else ""
+                )
+                return CommandResult(False, f"Preview {operation} requires a JSON object. {exc}{hint}", "error")
             if not isinstance(payload, dict):
                 return CommandResult(False, f"Preview {operation} requires a JSON object.", "error")
+            if literal_script is not None:
+                steps = payload.get("steps")
+                if not isinstance(steps, list):
+                    return CommandResult(False, "Preview browser-check with a literal script requires a steps array.", "error")
+                targets = [step for step in steps if isinstance(step, dict) and step.get("type") == "evaluate" and "script" not in step]
+                if len(targets) != 1:
+                    return CommandResult(
+                        False,
+                        "Preview browser-check with a literal <<< … >>> script requires exactly one evaluate step omitting script.",
+                        "error",
+                    )
+                targets[0]["script"] = literal_script
             action["input"] = payload
         elif operation not in {"start", "restart"} or argument:
             return CommandResult(False, "Usage: artifact-preview start|restart|mcp <JSON>|chat <JSON>|browser-check <JSON>", "error")
@@ -1388,6 +1414,10 @@ class TreeCommandParser:
             mcp = self._cmd_mcp(nested[1] if len(nested) == 2 else "")
             if not mcp.ok:
                 return mcp
+        elif nested[0].lower() == "artifact-preview":
+            preview = self._cmd_artifact_preview(nested[1] if len(nested) == 2 else "")
+            if not preview.ok:
+                return preview
         return CommandResult(True, "[dispatch: verification]", "read", needs_tool=True,
                              tool_action={"type": "verify", "checks": parts[0].split(","), "command": parts[1]})
 
@@ -1501,7 +1531,11 @@ def collapse_heredocs(lines: List[str]) -> List[str]:
             header = physical[0].rstrip()
             strategy_header = _STRATEGY_LINE_RE.match(header.lstrip())
             command = strategy_header.group("body") if strategy_header else header
-            if is_literal_patch(command) or re.match(r"^\s*(?:verify\s+\S+\s+)?mcp(?:\s|<<<$|$)", command, re.I):
+            if is_literal_patch(command) or re.match(
+                r"^\s*(?:verify\s+\S+\s+)?(?:mcp|artifact-preview\s+browser-check)(?:\s|<<<$|$)",
+                command,
+                re.I,
+            ):
                 result.append(block)
             else:
                 prefix = header[:-3].rstrip()

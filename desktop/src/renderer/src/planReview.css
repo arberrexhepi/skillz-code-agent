@@ -44,6 +44,8 @@
 .verification-notes { padding: 7px 2px 0; color: #a1b0a9; }
 .verification-notes summary { width: fit-content; cursor: pointer; color: #bac9c2; }
 .verification-notes p { margin-top: 5px; white-space: pre-wrap; }
+.verification-manual-approval { display: grid; gap: 6px; padding: 10px 10px 8px; margin-top: 6px; border: 1px solid #4a5c54; border-radius: 8px; background: #ffffff05; min-width: 0; }
+.verification-manual-approval p { margin: 0; color: #c7d4ce; }
 .verification-next-steps { display: grid; gap: 6px; padding: 10px 2px 2px; min-width: 0; }
 .verification-next-steps > div:not(.decision-buttons) { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 8px; }
 .verification-next-steps > div > span { color: #a1b0a9; font-variant-numeric: tabular-nums; }
