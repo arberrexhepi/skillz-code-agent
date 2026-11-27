@@ -22,6 +22,7 @@ RECOVERY_READ_ALLOWANCE = 2
 RECOVERY_READ_LINES = 120
 RECOVERY_READ_CHARS = 6000
 MAX_VERIFICATION_REPORT_TURNS = 3
+MAX_RUNTIME_PROGRESS_TURNS = 6
 
 
 @dataclass
@@ -46,6 +47,7 @@ class ExecutionProgress:
     diagnostic_repair: DiagnosticRepair | None = None
     diagnostic_fingerprints: set[str] = field(default_factory=set)
     external_executions: set[str] = field(default_factory=set)
+    runtime_progress_turns: int = 0
     verification_passes: dict[str, str] = field(default_factory=dict)
     verification_report_turns: int = 0
     fresh_verification_pass: bool = False
@@ -76,21 +78,26 @@ class ExecutionProgress:
         return True
 
     def observe_turn(self, commands: Sequence[str], results: Sequence[CommandResult], *,
-                     edit_attempted: bool = False, allow_external_progress: bool = True) -> None:
+                     edit_attempted: bool = False, goal_scope: str = "") -> None:
         executions = {identity for result in results if result.ok
                       and (identity := external_execution_identity(result.tool_action or {})) is not None}
-        novel_execution = allow_external_progress and bool(executions - self.external_executions)
+        novel_execution = bool(executions - self.external_executions)
+        execution_delivered = novel_execution and goal_scope in {"", "execute"}
         self.external_executions.update(executions)
         self.fresh_verification_pass = False
         if edit_attempted:
             self.verification_passes.clear()
-        if edit_attempted or novel_execution:
+        if edit_attempted or execution_delivered:
             self.read_only_turns = self.repository_reads = self.read_chars = self.context_replacements = self.focused_reads_used = 0
             self.source_lines.clear()
             self.targets.clear()
             self.diagnostic_repair = None
             self.diagnostic_fingerprints.clear()
             self.verification_report_turns = 0
+        elif novel_execution and goal_scope in {"write", "mixed"} and self.runtime_progress_turns < MAX_RUNTIME_PROGRESS_TURNS:
+            # Runtime work can establish what needs editing. It earns time
+            # without restarting the delivery timer or refilling source reads.
+            self.runtime_progress_turns += 1
         else:
             self.read_only_turns += 1
         if edit_attempted:
@@ -101,7 +108,7 @@ class ExecutionProgress:
                 self.fresh_verification_pass = True
         if self.fresh_verification_pass and self.recovering and self.verification_report_turns < MAX_VERIFICATION_REPORT_TURNS:
             self.verification_report_turns += 1
-        if novel_execution:
+        if execution_delivered:
             return
         for command, result in zip(commands, results):
             observation = repository_observation(command, result)
@@ -145,6 +152,7 @@ class ExecutionProgress:
             "source_lines_returned": {path: len(lines) for path, lines in self.source_lines.items()},
             "context_replacements": self.context_replacements,
             "external_executions": len(self.external_executions),
+            "runtime_progress_turns": self.runtime_progress_turns,
             "verification_passes": list(self.verification_passes.values())[-6:],
             "verification_report_turns": self.verification_report_turns,
             "focused_reads_remaining": max(0, RECOVERY_READ_ALLOWANCE - self.focused_reads_used),
@@ -179,9 +187,13 @@ class ExecutionProgress:
                 "A whole-file reread is unnecessary. Rerunning the same failed check does not renew this repair window. "
                 "After the fix, rerun the failed check. If repair is unavailable, report the specific blocker."
             )
+        runtime = (
+            f"{self.runtime_progress_turns} of {MAX_RUNTIME_PROGRESS_TURNS} runtime progress turns used. "
+            if self.runtime_progress_turns else ""
+        )
         return (
-            f"{status}: {self.read_only_turns} completed execution turns, {self.repository_reads} repository reads "
-            f"and {self.context_replacements} context replacements since the last edit attempt or new external execution. "
+            f"{status}: {self.read_only_turns} turns counted toward the delivery limit, {self.repository_reads} repository reads "
+            f"and {self.context_replacements} context replacements. {runtime}"
             "Reading new or evicted source does not reset this allowance. Use the current bounded edit surface to make the "
             "requested change; you do not need the entire file in context. If context is missing, name the exact target "
             "and missing identifier/anchor, then request a small read-symbol or read-context window. "
@@ -197,6 +209,13 @@ class ExecutionProgress:
             repair = self.diagnostic_repair
             return (f"diagnostic repair stalled at {repair.path}:{repair.line}: the bounded inspection/repair window expired "
                     f"without an edit attempt or completed answer ({self.read_only_turns} execution turns, {self.repository_reads} repository reads).")
+        if self.runtime_progress_turns:
+            return (
+                f"execution delivery stalled: {self.read_only_turns} turns counted toward the delivery limit "
+                f"after crediting {self.runtime_progress_turns} turns with new runtime operations. "
+                f"The bounded recovery allowance was exhausted ({self.repository_reads} repository reads, "
+                f"{self.context_replacements} context replacements)."
+            )
         return (
             f"execution delivery stalled: {self.read_only_turns} execution turns without an edit attempt, new external execution, or completed answer; "
             f"{self.repository_reads} repository reads and {self.context_replacements} context replacements. "

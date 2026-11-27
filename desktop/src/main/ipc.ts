@@ -51,6 +51,8 @@ export function registerIpc(window: BrowserWindow, services: Services): void {
     'agent:reconfigure-runtime', 'agent:configure-backoff', 'agent:runtime-options', 'agent:reasoning-preferences', 'agent:save-reasoning-preference',
     'agent:codex-subscription-status', 'agent:codex-subscription-login', 'agent:stop',
     'agent:choose-codex-cli', 'agent:set-codex-cli-path',
+    'agent:gemini-subscription-status', 'agent:gemini-subscription-login', 'agent:gemini-subscription-logout',
+    'agent:choose-gemini-cli', 'agent:set-gemini-cli-path',
     'mcp:profile', 'mcp:save', 'mcp:manage', 'mcp:inspect', 'mcp:setup',
   ]) ipcMain.removeHandler(channel);
   for (const channel of ['terminal:write', 'terminal:resize', 'terminal:dispose']) ipcMain.removeAllListeners(channel);
@@ -383,6 +385,20 @@ export function registerIpc(window: BrowserWindow, services: Services): void {
     return selection.canceled ? null : selection.filePaths[0] || null;
   });
   handle('agent:set-codex-cli-path', (_event, candidate: unknown) => services.agent.setCodexCliPath(
+    z.string().trim().min(1).max(4096).refine((value) => !value.includes('\0')).nullable().parse(candidate),
+  ));
+  handle('agent:gemini-subscription-status', () => services.agent.geminiSubscriptionStatus());
+  handle('agent:gemini-subscription-login', () => services.agent.geminiSubscriptionLogin());
+  handle('agent:gemini-subscription-logout', () => services.agent.geminiSubscriptionLogout());
+  handle('agent:choose-gemini-cli', async () => {
+    const selection = await dialog.showOpenDialog(window, {
+      title: 'Locate Gemini CLI',
+      buttonLabel: 'Choose Gemini CLI',
+      properties: ['openFile', 'showHiddenFiles'],
+    });
+    return selection.canceled ? null : selection.filePaths[0] || null;
+  });
+  handle('agent:set-gemini-cli-path', (_event, candidate: unknown) => services.agent.setGeminiCliPath(
     z.string().trim().min(1).max(4096).refine((value) => !value.includes('\0')).nullable().parse(candidate),
   ));
   handle('agent:stop', () => services.agent.stop());

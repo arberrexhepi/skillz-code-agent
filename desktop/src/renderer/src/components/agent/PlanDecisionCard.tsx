@@ -86,7 +86,8 @@ export function PlanDecisionCard(): React.JSX.Element {
     {plan && <section className="agent-decision plan-decision">
       <header><span>DECISION</span><strong>{title}</strong><small>{plan.goals?.length || 0} goals</small></header>
       {plan.summary && <p className="plan-preview-summary"><PathText>{plan.summary}</PathText></p>}
-      <PlanPauseReason planner={planner} />
+      <PlanPauseReason planner={planner} busy={busy || Boolean(plan.dependency_errors?.length)}
+        onProceed={() => void act('proceed_verification_next_steps', plan)} />
       <div className="decision-buttons">
         {planner.execution_paused && <button type="button" className="primary-button" disabled={busy || Boolean(plan.dependency_errors?.length)} onClick={() => void act('resume_execution', plan)}>{resumeLabel}</button>}
         <button type="button" className={planner.execution_paused ? undefined : 'primary-button'} onClick={() => openReview()}>Review full plan ↗</button>
@@ -104,9 +105,11 @@ export function PlanDecisionCard(): React.JSX.Element {
           <div><h2 id={labelId} ref={heading} tabIndex={-1}>Plan review</h2><div className="plan-review-subtitle"><span>{review.goals?.length || 0} goals</span>{planner.execution_paused ? 'Execution paused' : 'Review before execution'}</div></div>
           <button type="button" onClick={close} aria-label="Close plan review"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true"><path d="m4 4 8 8M12 4l-8 8" /></svg></button>
         </header>
-        <div className="plan-review-body" tabIndex={0} role="region" aria-label="Full plan details"><PlanDetails plan={review} /></div>
-        <footer>
+        <div className="plan-review-body" tabIndex={0} role="region" aria-label="Full plan details">
           <PlanPauseReason planner={planner} />
+          <PlanDetails plan={review} />
+        </div>
+        <footer>
           {changed && !sending && <p role="status">The plan has changed. Close this review and open the current plan before deciding.</p>}
           {error && <p role="alert" className="plan-error"><PathText>{agent.state.notice || error}</PathText> Your feedback is preserved.</p>}
           {editing ? <form onSubmit={(event) => { event.preventDefault(); if (!changed) void act('revise_plan', review); }}>

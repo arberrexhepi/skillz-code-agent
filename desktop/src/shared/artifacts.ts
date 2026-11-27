@@ -74,7 +74,7 @@ export type CreateArtifact = z.infer<typeof createArtifactSchema>;
 export interface ArtifactRecord extends Omit<CreateArtifact, 'playwrightMcp'> { id: string; root: string; createdAt: string; prebuiltId?: string; contextMode: 'links' | 'junction' | 'snapshot' | 'unavailable' | 'none'; contextWarning?: string }
 export interface ArtifactLibrary { root: string; artifacts: ArtifactRecord[] }
 export interface ArtifactRuntime { id: string; status: 'stopped' | 'installing' | 'starting' | 'running' | 'error'; url?: string; error?: string; logs: string }
-export const artifactSetupSelectionSchema = z.object({ provider: z.enum(['openai', 'codex-subscription', 'gemini', 'anthropic', 'meta', 'local', 'ollama', 'ollama-local', 'ollama-runpod']), model: z.string().min(1).max(200) });
+export const artifactSetupSelectionSchema = z.object({ provider: z.enum(['openai', 'codex-subscription', 'gemini', 'gemini-subscription', 'anthropic', 'meta', 'local', 'ollama', 'ollama-local', 'ollama-runpod']), model: z.string().min(1).max(200) });
 export type ArtifactSetupSelection = z.infer<typeof artifactSetupSelectionSchema>;
 export const artifactVaultProviderSchema = z.enum(['openai', 'gemini', 'anthropic', 'meta']);
 export type ArtifactVaultProvider = z.infer<typeof artifactVaultProviderSchema>;

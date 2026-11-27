@@ -61,6 +61,43 @@ def test_missing_close_retries_without_dispatching_any_of_the_draft(tmp_path):
     assert not (tmp_path / "trailer.txt").exists()
 
 
+def test_ambiguous_inline_patch_can_retry_as_a_literal_patch(tmp_path):
+    class Model:
+        command_response_framing = True
+        calls = 0
+
+        def complete_messages(self, system, messages):
+            self.calls += 1
+            assert "patch /repo/rules.txt --literal <<<" in system
+            if self.calls == 1:
+                commands = "s1: write /repo/ready.txt ready\ns1 -> s2: patch /repo/rules.txt A -> B -> C -> A -> D -> C"
+            else:
+                assert not (tmp_path / "ready.txt").exists()
+                assert target.read_text() == "A -> B -> C\n"
+                repair = messages[-1]["content"]
+                assert "Malformed `patch` command" in repair
+                assert "patch <path> --literal <<<" in repair
+                assert "=== REPLACE ===" in repair
+                commands = (
+                    "s1: write /repo/ready.txt ready\ns1 -> s2: patch /repo/rules.txt --literal <<<\n"
+                    "A -> B -> C\n=== REPLACE ===\nA -> D -> C\n>>>\ns2 -> s3: finish Updated the rules"
+                )
+            return f"{BEGIN_COMMANDS}\n{commands}\n{END_COMMANDS}"
+
+    target = tmp_path / "rules.txt"
+    target.write_text("A -> B -> C\n")
+    model = Model()
+    loop = TreeLoop(model=model, workspace_root=tmp_path, max_turns=1, verbose=False)
+    loop._append_backend_diagnostics = lambda message, *args, **kwargs: message
+
+    result = loop.run("Update the rules and write the ready marker")
+
+    assert model.calls == 2
+    assert result.finished
+    assert target.read_text() == "A -> D -> C\n"
+    assert (tmp_path / "ready.txt").read_text() == "ready"
+
+
 @pytest.mark.parametrize("strategy, expected_reads", [
     ("s1: cat /repo/note.txt\ns1 -> s2: finish {summary}", ["First note"]),
     ("s1: cat /repo/note.txt, cat /repo/other.txt, finish {summary}", ["First note", "Second note"]),

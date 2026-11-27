@@ -11,7 +11,12 @@ import pytest
 
 from artifact_preview import preview_guidance
 from live_test_loop import TreeLoopPlannerWorker
-from execution_progress import ExecutionProgress
+from execution_progress import (
+    ExecutionProgress,
+    MAX_RUNTIME_PROGRESS_TURNS,
+    READ_ONLY_RECOVERY_TURNS,
+    RECOVERY_TURN_ALLOWANCE,
+)
 from main import AgentConfig, WorkingFolderAgent
 from planner import PlannerAgent, PlannerGoal, PlannerPlan
 from tests.test_tree_loop_messages import RecordingMessageModel
@@ -160,6 +165,9 @@ def test_artifact_preview_verification_is_external_execution(tmp_path, monkeypat
         {"operation": "mcp", "input": catalog},
         {"operation": "mcp", "input": read},
         {"operation": "chat", "input": chat},
+        {"operation": "browser-check", "input": {"route": "/", "steps": [
+            {"type": "assert-visible", "selector": "#board", "label": "Game board"},
+        ]}},
     ]
     with patch("artifact_preview._request", return_value={"ok": True, "message": "Board verified"}) as request:
         result, worker = run_execution_goal(tmp_path, monkeypatch, [
@@ -167,7 +175,7 @@ def test_artifact_preview_verification_is_external_execution(tmp_path, monkeypat
         ] + ["finish Board verified"])
     assert [call.args[0] for call in request.call_args_list] == actions
     assert result.status == "completed" and result.validation_passed
-    assert worker._execution_delivery.state()["external_executions"] == 2
+    assert worker._execution_delivery.state()["external_executions"] == 3
     assert not worker._has_mutation
 
 
@@ -190,3 +198,50 @@ def test_repeat_external_calls_do_not_renew_recovery():
     for _ in range(11):
         progress.observe_turn(["mcp snapshot"], [result])
     assert progress.exhausted
+
+
+@pytest.mark.parametrize("scope", ["write", "mixed"])
+def test_write_goal_can_reproduce_in_the_browser_before_editing(scope, tmp_path, monkeypatch):
+    note = tmp_path / "note.txt"
+    note.write_text("original\n")
+    catalog = 'mcp {"operation":"list","server":"playwright"}'
+    ceiling = READ_ONLY_RECOVERY_TURNS + RECOVERY_TURN_ALLOWANCE
+    probes = [
+        "mcp " + json.dumps({"operation": "call", "server": "playwright", "name": "browser_evaluate",
+                             "arguments": {"function": f"() => document.querySelector('.step-{index}')?.textContent"}})
+        for index in range(MAX_RUNTIME_PROGRESS_TURNS)
+    ]
+    commands = [catalog, *probes, "cat /repo/note.txt", *[catalog] * (ceiling - 3),
+                "replace-lines note.txt:1-1 repaired", "cat /repo/note.txt\nfinish Fixed the issue"]
+    result, worker = run_execution_goal(tmp_path, monkeypatch, commands, scope=scope)
+    assert result.status == "completed", result.final_message
+    assert result.validation_passed
+    assert note.read_text() == "repaired\n"
+    assert worker._execution_delivery.state()["runtime_progress_turns"] == MAX_RUNTIME_PROGRESS_TURNS
+
+
+def test_runtime_progress_uses_one_bounded_allowance_without_refilling_reads():
+    progress = ExecutionProgress(read_only_turns=READ_ONLY_RECOVERY_TURNS, repository_reads=2, focused_reads_used=2)
+
+    def probe(index, *, ok=True, operation="call"):
+        return CommandResult(ok, "Observed browser state", "tool",
+                             tool_action={"type": "mcp", "operation": operation, "server": "playwright",
+                                          "name": "browser_evaluate", "arguments": {"function": f"() => {index}"}})
+
+    first = probe(0)
+    progress.observe_turn(["mcp"], [first], goal_scope="write")
+    progress.observe_turn(["mcp"], [first], goal_scope="write")
+    progress.observe_turn(["mcp"], [probe(-1, ok=False)], goal_scope="write")
+    progress.observe_turn(["mcp"], [probe(-2, operation="describe")], goal_scope="write")
+    assert progress.runtime_progress_turns == 1
+    assert progress.exhausted
+
+    progress = ExecutionProgress(read_only_turns=READ_ONLY_RECOVERY_TURNS, repository_reads=2, focused_reads_used=2)
+    for index in range(MAX_RUNTIME_PROGRESS_TURNS):
+        progress.observe_turn(["mcp"], [probe(index)], goal_scope="mixed")
+    assert progress.read_only_turns == READ_ONLY_RECOVERY_TURNS
+    assert progress.repository_reads == 2 and progress.focused_reads_used == 2
+    for index in range(MAX_RUNTIME_PROGRESS_TURNS, MAX_RUNTIME_PROGRESS_TURNS + RECOVERY_TURN_ALLOWANCE):
+        progress.observe_turn(["mcp"], [probe(index)], goal_scope="mixed")
+    assert progress.exhausted
+    assert progress.runtime_progress_turns == MAX_RUNTIME_PROGRESS_TURNS

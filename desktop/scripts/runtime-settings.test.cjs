@@ -94,6 +94,28 @@ test('shared helper environment refreshes saved CLI settings without modifying t
   assert.deepEqual(await settings.environment(base), base);
 });
 
+test('gemini CLI path persists alongside codex CLI path and injects GEMINI_CLI_PATH', async t => {
+  const { root, executable, settingsPath, settings } = fixture(t);
+  const geminiExe = path.join(root, 'gemini');
+  fs.writeFileSync(geminiExe, 'fixture');
+  t.mock.method(childProcess, 'execFile', (exe, _args, _options, callback) => {
+    callback(null, exe === executable ? 'codex-cli 1.2.3' : '0.4.1', '');
+  });
+  await settings.setCodexCliPath(executable);
+  await settings.setGeminiCliPath(geminiExe);
+  const reloaded = new RuntimeSettingsService(settingsPath);
+  assert.equal(await reloaded.codexCliPath(), executable);
+  assert.equal(await reloaded.geminiCliPath(), geminiExe);
+  assert.deepEqual(await reloaded.environment({ KEEP: '1' }), {
+    KEEP: '1',
+    CODEX_CLI_PATH: executable,
+    GEMINI_CLI_PATH: geminiExe,
+  });
+  await settings.setGeminiCliPath(null);
+  assert.equal(await new RuntimeSettingsService(settingsPath).geminiCliPath(), '');
+  assert.equal(await new RuntimeSettingsService(settingsPath).codexCliPath(), executable);
+});
+
 test('reasoning preferences persist per repo, provider, model and phase', async t => {
   const { root } = fixture(t);
   const artifact = fs.mkdtempSync(path.join(root, 'artifact '));

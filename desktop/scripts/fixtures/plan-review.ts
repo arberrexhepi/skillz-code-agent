@@ -1,4 +1,4 @@
-import type { AgentBridgeState, PlannerPlan } from '../../src/shared/agentTypes';
+import type { AgentBridgeState, PlannerPlan, PlannerState } from '../../src/shared/agentTypes';
 
 export const reviewPlan: PlannerPlan = {
   original_request: 'Make the shared Pro experience prerequisite-aware.',
@@ -19,3 +19,24 @@ export const reviewPlan: PlannerPlan = {
   confirmation_prompt: 'Approve this plan, reject it, or suggest changes before implementation.',
 };
 export const reviewFixture: AgentBridgeState = { planner: { pending_plan: reviewPlan }, transcript: [{ role: 'assistant', content: 'The plan is ready for your review.' }] };
+
+const verificationStop = 'The verification turn budget was exhausted (12/12 turns).';
+export const pausedVerification: PlannerState = {
+  execution_paused: true,
+  paused_plan: reviewPlan,
+  paused_failed_goal_id: 'g5',
+  paused_failure_reason: 'Verification: 1/5 required checks passed.',
+  last_completed_results: [{
+    goal_id: 'g5', status: 'failed',
+    verification: {
+      stop_reason: verificationStop, attempt_limit: 3,
+      checks: [
+        { id: 'check-1', requirement: 'Build completes', status: 'pass', attempts: 1, evidence: 'npm run build exited 0.', reused_from: ['Implementation goal'] },
+        { id: 'check-2', requirement: 'Clips split at the playhead', status: 'fail', attempts: 2, evidence: 'Both halves started at frame 0.', stop_reason: 'The same failure was observed again.', next_step: 'Confirm the selected clip and retest the split boundary.' },
+        { id: 'check-3', requirement: 'Undo restores the saved timeline', status: 'unverified', attempts: 3, evidence: 'The tool ran without a usable check verdict.', stop_reason: 'The check used all 3 attempts.' },
+        { id: 'check-4', requirement: 'Viewport fills its container', status: 'blocked', attempts: 1, evidence: 'Preview is unavailable.' },
+        { id: 'check-5', requirement: 'Event markers render with standard non-keyframe marker styling in the live preview', status: 'not_run', attempts: 0, stop_reason: verificationStop },
+      ],
+    },
+  }],
+};

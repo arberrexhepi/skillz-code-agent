@@ -9,6 +9,7 @@ modes:
 ---
 
 Playground OS shortcuts:
+- Prefer a literal `patch /repo/file.ts --literal <<<` block for exact source edits. Paste the search text, put `=== REPLACE ===` on its own line, paste the replacement text, then close with `>>>` on its own line. Preserve indentation and paste arrows, quotes and backslashes as they appear in the file. The search must occur exactly once.
 - `edit-symbol /repo/src/App.tsx handleProduce hash=<file_hash> <<<` followed by a complete replacement declaration and `>>>` edits by name. Python uses AST; script files require the local TypeScript parser. Ambiguous spans and stale hashes leave source unchanged.
 - `edit-batch {"atomic":true,"operations":[...]}` runs up to 32 existing mutation operations with rollback if any operation fails. Each supplied `expected_hash` describes the file at batch start: reuse the same inspected hash for multiple edits to that file. All declared hashes are checked before any write; the host advances its own guards after each internal edit. Concurrent changes are rejected, and rollback preserves external edits and reports a conflict rather than overwriting them. Do not calculate or supply intermediate hashes for later operations.
 - Use `batch start` / `batch end` for linked edits across commands. Automatic diagnostics are deferred until the batch closes; close the batch and repair any resulting diagnostics before finishing.

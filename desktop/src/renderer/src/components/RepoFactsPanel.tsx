@@ -49,11 +49,11 @@ export function RepoFactsView({ ledger, onOpenIssue }: { ledger: RepoFactsLedger
   const facts = ledger.issues.flatMap(issue => issue.facts);
   const change = (next: Partial<RepoFactsFilter>): void => { setFilter(current => ({ ...current, ...next })); setLimit(40); };
   return <>
-    <dl className="repo-facts-counts facts-only-counts" aria-label="Saved fact counts"><div><dt>Architecture</dt><dd>{facts.filter(fact => fact.kind === 'architecture').length}</dd></div><div><dt>Goal facts</dt><dd>{facts.filter(fact => fact.kind === 'goal').length}</dd></div></dl>
+    <dl className="repo-facts-counts" aria-label="Saved fact counts"><div><dt>Architecture</dt><dd>{facts.filter(fact => fact.kind === 'architecture').length}</dd></div><div><dt>Goal facts</dt><dd>{facts.filter(fact => fact.kind === 'goal').length}</dd></div><div><dt>Verification</dt><dd>{facts.filter(fact => fact.kind === 'verification').length}</dd></div></dl>
     {ledger.warnings.map(warning => <p className="repo-facts-warning" role="status" key={warning}><PathText>{warning}</PathText></p>)}
     {ledger.legacy && <p className="repo-facts-note">Legacy facts are shown as repository architecture. The file has not been changed.</p>}
     <div className="repo-facts-filters"><label>Search records<input type="search" placeholder="Fact key, value, or source…" value={filter.query} onChange={event => change({ query: event.target.value })} /></label>
-      <label>Record type<select value={filter.kind} onChange={event => change({ kind: event.target.value as RepoFactsFilter['kind'] })}><option value="all">All facts</option><option value="architecture">Architecture facts</option><option value="goal">Goal facts</option></select></label>
+      <label>Record type<select value={filter.kind} onChange={event => change({ kind: event.target.value as RepoFactsFilter['kind'] })}><option value="all">All facts</option><option value="architecture">Architecture facts</option><option value="goal">Goal facts</option><option value="verification">Verification facts</option></select></label>
       <label>Scope<select value={scope} onChange={event => change({ scope: event.target.value })}><option value="all">Repository and all issues</option>{scopes.map(issue => <option value={issue.id} key={issue.id}>{issue.repositoryScope ? 'Repository' : issue.id}</option>)}</select></label>
     </div>
     <p className="repo-facts-match-count" role="status">{records.length} of {facts.length} saved facts</p>
@@ -64,7 +64,8 @@ export function RepoFactsView({ ledger, onOpenIssue }: { ledger: RepoFactsLedger
   </>;
 }
 function FactRecord({ fact, issue, onOpenIssue }: { fact: RepoFact; issue: RepoFactsIssue; onOpenIssue?: (id: string) => void }): React.JSX.Element {
-  return <article className="repo-fact-record standalone"><span className={`repo-fact-kind ${fact.kind}`}>{fact.kind === 'goal' ? 'Goal fact' : 'Architecture'}</span><h4><code><PathText>{fact.key}</PathText></code></h4><p className="repo-fact-value"><PathText>{fact.value}</PathText></p>
+  const kindLabel = { architecture: 'Architecture', goal: 'Goal fact', verification: 'Verification' }[fact.kind];
+  return <article className="repo-fact-record standalone"><span className={`repo-fact-kind ${fact.kind}`}>{kindLabel}</span><h4><code><PathText>{fact.key}</PathText></code></h4><p className="repo-fact-value"><PathText>{fact.value}</PathText></p>
     <div className="repo-fact-owner"><span>Recorded for </span>{issue.repositoryScope ? <span>Repository</span> : onOpenIssue ? <button type="button" onClick={() => onOpenIssue(issue.id)} aria-label={`View ${issue.id} in Issues`}>{issue.id} ↗</button> : <code>{issue.id}</code>}</div>
     <details><summary>Provenance{fact.run ? ` · Run ${fact.run}` : ''}{fact.step ? ` · Step ${fact.step}` : ''}</summary><dl className="repo-facts-metadata"><Meta label="Source action" value={fact.source || 'Not recorded'} /><Meta label="Run" value={fact.run ? String(fact.run) : 'Not recorded'} /><Meta label="Step" value={fact.step ? String(fact.step) : 'Not recorded'} /></dl></details>
   </article>;

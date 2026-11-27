@@ -75,6 +75,9 @@ def preview_guidance(*, tree: bool = False) -> str:
     return (
         f"Use {action} to start this artifact's Workbench preview or retrieve its running URL. {route_check}"
         "When Playwright MCP is enabled, pass it the returned host URL for browser checks. "
+        "Run browser tests that write app data in disposable fixtures. Keep those changes out of existing projects, "
+        "and clean up records created for the test through the app when it ends. "
+        "If a probe hits a missing prerequisite, return what you observed and the blocker to guide the next probe. "
         "The artifact's container loopback is separate from the host browser."
         + verification
     )

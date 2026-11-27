@@ -80,6 +80,38 @@ class MutationTextTests(unittest.TestCase):
                 self.assertFalse(result.ok)
                 self.assertFalse(result.needs_tool)
 
+    def test_literal_patch_keeps_arrows_quotes_whitespace_and_strategy_looking_text(self):
+        old = "\n\t  A -> B -> C  \ncan't decode \\n\ns1: cat /repo/example.txt\n"
+        new = '  C -> D -> E\n<div>{s99}</div>\n>>th: literal content\n\n'
+        for replacement in (new, ""):
+            block = f"patch /repo/example.txt --literal <<<\n{old}\n  === REPLACE === \n"
+            if replacement:
+                block += replacement + "\n"
+            block += ">>>"
+            for strategy in (False, True):
+                with self.subTest(replacement=replacement, strategy=strategy):
+                    command = ("s1: " if strategy else "") + block
+                    action = self.through_pipeline(command, strategy=strategy)
+                    self.assertEqual(action, {
+                        "type": "patch_file", "path": "example.txt", "search": old, "replace": replacement,
+                    })
+
+    def test_literal_patch_rejects_invalid_blocks_without_dispatch(self):
+        for body in (
+            "old -> new\n>>>",
+            "old\n=== REPLACE ===\nnew\n=== REPLACE ===\nmore\n>>>",
+            "=== REPLACE ===\nnew\n>>>",
+            "old\n=== REPLACE ===\nnew",
+        ):
+            with self.subTest(body=body):
+                result = self.parser.parse_and_execute("patch /repo/example.txt --literal <<<\n" + body)
+                self.assertFalse(result.ok)
+                self.assertFalse(result.needs_tool)
+
+    def test_legacy_patch_heredoc_still_accepts_quoted_operands(self):
+        action = self.through_pipeline('patch /repo/example.txt <<<\n"A -> B" -> "B -> C"\n>>>')
+        self.assertEqual((action["search"], action["replace"]), ("A -> B", "B -> C"))
+
     def test_inline_payload_whitespace_survives_all_stages(self):
         for header in (
             'write /repo/example.txt',
@@ -177,11 +209,11 @@ class MutationTextTests(unittest.TestCase):
                 worker.discovery_budget = None
                 worker._patch_resolution_blocks_action = lambda action_type: None
                 worker._discovery_remediation_blocks_action = lambda action_type: None
-                old = '  first\n  second'
-                new = '  first -> next\n  second'
+                old = '  first -> second -> third\n  other'
+                new = '  first -> next -> third\n  other'
                 model = RecordingMessageModel([
                     'write /repo/runtime.txt <<<\n' + old + '\n>>>',
-                    's1: patch /repo/runtime.txt ' + json.dumps(old) + ' -> ' + json.dumps(new),
+                    f's1: patch /repo/runtime.txt --literal <<<\n{old}\n=== REPLACE ===\n{new}\n>>>',
                     's1: replace-lines /repo/runtime.txt:2-2 <<<\n\t  last, literal -> s2  \n>>>',
                 ])
                 loop = TreeLoop(
@@ -195,7 +227,7 @@ class MutationTextTests(unittest.TestCase):
                 for turn in run.turns:
                     for result in turn.results:
                         self.assertTrue(result.ok, result.output)
-                self.assertEqual((self.root / 'runtime.txt').read_text(), '  first -> next\n\t  last, literal -> s2  ')
+                self.assertEqual((self.root / 'runtime.txt').read_text(), '  first -> next -> third\n\t  last, literal -> s2  ')
 
     def test_runtime_never_dispatches_writes_from_an_unterminated_batch(self):
         from tests.test_tree_loop_messages import RecordingMessageModel

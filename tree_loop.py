@@ -73,6 +73,59 @@ _BATCH_DIAGNOSTIC_INSPECTIONS = frozenset({
     "list-issues", "list-run-issues", "show-issue", "show-run-issue", "diagnose",
 })
 _BATCH_DIAGNOSTICS_LIMIT = 8
+_RECOVERY_INSPECTIONS = (_BATCH_DIAGNOSTIC_INSPECTIONS - {"diagnose"}) | {
+    "ls", "stat", "find", "references", "inspect-file",
+}
+
+
+def _can_inspect_after_failure(command: str) -> bool:
+    parts = command.split(None, 2)
+    if not parts:
+        return False
+    verb = parts[0].lower().replace("_", "-")
+    if verb in _RECOVERY_INSPECTIONS:
+        return True
+    if verb == "git":
+        return len(parts) > 1 and parts[1] in {"diff", "status", "log", "show", "blame", "branch", "remote", "rev-parse"}
+    if verb != "mcp":
+        return False
+    try:
+        action = json.loads(command.split(None, 1)[1])
+    except (IndexError, ValueError):
+        return False
+    return isinstance(action, dict) and (
+        action.get("operation") in ("servers", "list", "search", "describe")
+        or (action.get("operation") == "call" and action.get("server") == "playwright"
+            and action.get("name") == "browser_snapshot")
+    )
+
+
+def _inspection_failure_reason(result: CommandResult) -> str:
+    action = result.tool_action or {}
+    message = result.output
+    try:
+        payload = json.loads(message)
+    except (ValueError, TypeError):
+        payload = None
+    if isinstance(payload, dict):
+        error = payload.get("error")
+        if isinstance(error, str) and error.strip():
+            message = error
+        elif isinstance(tool_result := payload.get("result"), dict):
+            content = tool_result.get("content")
+            for item in content if isinstance(content, list) else ():
+                if not isinstance(item, dict) or not isinstance(text := item.get("text"), str):
+                    continue
+                if text.startswith("### Error\n"):
+                    lines = _strip_ansi(text).splitlines()[1:]
+                    summary = lines[0] if lines else "Tool failed."
+                    if intercept := next((line for line in lines if "intercepts pointer events" in line), ""):
+                        summary += " " + intercept.strip().removeprefix("- ")
+                    message = summary
+                    break
+    summary = " ".join(str(message or "").split()) or "command failed"
+    label = action.get("name")
+    return (f"{label}: " if isinstance(label, str) and label else "") + summary[:360]
 
 
 def _model_error_metadata(exc: Exception) -> Dict[str, Any]:
@@ -283,8 +336,9 @@ def _build_output_repair_instruction(format_error: str = "") -> str:
             ">>pl: <one concrete action>",
             "<at least one executable command>",
             "Put each annotation and each executable command on its own line; never attach prose before `>>th:`.",
-            "Valid commands include `patch /repo/path \"exact source\" -> \"replacement\"`, "
-            "`run-check build`, `read-context /repo/path \"exact anchor\" before=4 after=8 limit=1`, and `finish <summary>`.",
+            "For patch, use `patch /repo/path --literal <<<`, followed by exact search text, a standalone "
+            "`=== REPLACE ===` line, exact replacement text, and a standalone `>>>` line.",
+            "Other commands include `run-check build`, `read-context /repo/path \"exact anchor\" before=4 after=8 limit=1`, and `finish <summary>`.",
             "Do not return bullets, a numbered plan, a promise to act later, a bare JSON action, or a fenced code block. Command arguments may contain JSON where the grammar permits it.",
         ]
     )
@@ -1839,7 +1893,7 @@ class TreeLoop:
         for command in _executable_commands(raw):
             verb = command.split(None, 1)[0].lower()
             # These parsers only translate arguments. Other commands may inspect or change the workspace while parsing.
-            if not (_is_file_edit_command(command) or verb in {"mutate", "discover", "mcp"}):
+            if not (_is_file_edit_command(command) or verb in {"mutate", "discover", "mcp", "verify"}):
                 continue
             if strategy is not None and has_strategy_placeholders(command):
                 continue
@@ -1852,15 +1906,18 @@ class TreeLoop:
         """Complete commands in execution order, including tools and observers."""
         commands: List[str] = []
         results: List[CommandResult] = []
-        remaining = len(_executable_commands(raw))
+        strategy = parse_strategy(raw) if is_strategy(raw) else None
+        remaining = sum(len(step.commands) for step in strategy.steps.values()) if strategy is not None else len(_executable_commands(raw))
         blocked_reason = ""
         blocked_prefix = "skipped after prior command failure"
         batch_diagnostic_failure = False
         batch_diagnostic_paths: set[str] = set()
+        inspection_after_failure = False
+        failed_steps: set[str] = set()
         self._same_turn_halt_reason = ""
 
         def execute(command: str, label: str) -> CommandResult:
-            nonlocal remaining, blocked_reason, blocked_prefix, batch_diagnostic_failure
+            nonlocal remaining, blocked_reason, blocked_prefix, batch_diagnostic_failure, inspection_after_failure
             annotation = parse_annotation(command)
             if annotation is not None:
                 result = CommandResult(ok=True, output=annotation.compact(), command_type="annotation")
@@ -1868,7 +1925,12 @@ class TreeLoop:
                 remaining -= 1
                 parts = command.split(None, 2)
                 verb = parts[0].lower().replace("_", "-") if parts else ""
-                if blocked_reason and not (batch_diagnostic_failure and verb in _BATCH_DIAGNOSTIC_INSPECTIONS):
+                step = strategy.steps.get(label) if strategy is not None and label else None
+                safe_inspection = inspection_after_failure and _can_inspect_after_failure(command) and (
+                    step is None or (failed_steps.isdisjoint(step.depends_on)
+                                     and not any(has_strategy_placeholders(item) for item in step.commands))
+                )
+                if blocked_reason and not safe_inspection and not (batch_diagnostic_failure and verb in _BATCH_DIAGNOSTIC_INSPECTIONS):
                     result = CommandResult(ok=False, output=f"{blocked_prefix}: {blocked_reason}", command_type="skipped")
                 else:
                     local_read = len(parts) >= 2 and verb in {"cat", "read-line-range"}
@@ -1917,6 +1979,8 @@ class TreeLoop:
             self._read_working_set.record(preview, result)
             if result.command_type == "read" and (observation := repository_observation(preview, result)) and observation.source_lines:
                 self._remember_range(observation.source_path, observation.source_lines)
+            if label and not result.ok:
+                failed_steps.add(label)
             if annotation is None and not blocked_reason:
                 if not result.ok:
                     blocked_reason = result.output or "command failed"
@@ -1928,11 +1992,17 @@ class TreeLoop:
                         blocked_reason = "repair the reported diagnostics, then rerun validation"
                     elif result.command_type == "skipped":
                         blocked_prefix = "skipped by runtime"
+                    elif not self._same_turn_halt_reason and (
+                        (result.tool_action or {}).get("type") in {"mcp", "artifact_preview", "verify"} or _can_inspect_after_failure(command)
+                    ):
+                        inspection_after_failure = True
+                        blocked_reason = _inspection_failure_reason(result)
                 elif self._same_turn_halt_reason:
                     blocked_reason = self._same_turn_halt_reason
                     blocked_prefix = "skipped by runtime"
-            elif batch_diagnostic_failure and self._same_turn_halt_reason:
+            elif (batch_diagnostic_failure or inspection_after_failure) and self._same_turn_halt_reason:
                 batch_diagnostic_failure = False
+                inspection_after_failure = False
                 blocked_reason = self._same_turn_halt_reason
                 blocked_prefix = "skipped by runtime"
             if self.verbose:
@@ -1944,7 +2014,7 @@ class TreeLoop:
                     _log(f"  ⟶ {_truncate_for_cli(result.output)}")
             return result
 
-        if is_strategy(raw):
+        if strategy is not None:
             self.bridge.execute_strategy_full(raw, command_executor=execute)
             annotations = [annotation for command in parse_multi_command(raw)
                            if (annotation := parse_annotation(command)) is not None]
@@ -1973,9 +2043,13 @@ class TreeLoop:
 
         self._emit_live_progress("tool_start", turn, summary=label)
         try:
+            facts = getattr(self, "_goal_verification_facts", None)
+            source = facts.before(action) if facts is not None else ""
             provenance = self.diagnostic_provenance
             with provenance.track(action, shell_tracks_changes=True):
                 output = execute(result)
+            if facts is not None:
+                facts.observe(action, result.ok, output, source)
             if action_type in {"run_check", "run_shell", "run_route_check"} and output:
                 provenance.observe(self.bridge.tree._parse_log_issues(str(output), source_path=label))
             elif action_type == "diagnose" and "diagnostics:\n" in str(output):

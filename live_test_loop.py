@@ -46,6 +46,7 @@ from main import (  # noqa: E402
 )
 from issue_facts import (  # noqa: E402
     CompletedGoalCheckpoint,
+    FACT_TYPES,
     FACT_TYPE_ARCHITECTURE,
     FACT_TYPE_GOAL,
     IssueFactLedger,
@@ -68,8 +69,8 @@ from mcp_runtime import invoke_mcp, model_mcp_result  # noqa: E402
 from discovery_budget import DiscoveryBudget as TreeLoopDiscoveryBudget  # noqa: E402
 from execution_evidence import SourceCoverage, repository_observation  # noqa: E402
 from validation_evidence import ValidationEvidence  # noqa: E402
-from verification_repair import MAX_INVESTIGATION_TURNS, MAX_REPAIR_TURNS, repair_action_error  # noqa: E402
-from verification_run import VerificationRun, is_verification_setup, needs_verification_check  # noqa: E402
+from verification_repair import MAX_INVESTIGATION_TURNS, MAX_REPAIR_TURNS, investigation_turn_guidance, repair_action_error  # noqa: E402
+from verification_run import VERIFICATION_FIXTURE_GUIDANCE, VerificationRun, is_verification_fact, is_verification_setup, needs_verification_check  # noqa: E402
 from model_result_delivery import prepare_model_result  # noqa: E402
 from execution_progress import ExecutionProgress  # noqa: E402
 from run_observability import archive_snapshot, clear_archives  # noqa: E402
@@ -258,7 +259,7 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
         self._execution_stagnation: Optional[Dict[str, Any]] = None
         self._run_sequence = 0
         self._active_run_id = 0
-        self._last_validation = WorkerValidationResult(kind="none", passed=True, summary="No mutating actions required validation.")
+        self._last_validation = WorkerValidationResult(kind="none", passed=True, summary="No repository changes required validation.")
         self._latest_review: Optional[Dict[str, Any]] = None
         self._observability_buffer: List[str] = []
         self._observability_started_at = 0.0
@@ -521,7 +522,7 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
         self._execution_stagnation = None
         self._run_sequence = 0
         self._active_run_id = 0
-        self._last_validation = WorkerValidationResult(kind="none", passed=True, summary="No mutating actions required validation.")
+        self._last_validation = WorkerValidationResult(kind="none", passed=True, summary="No repository changes required validation.")
         self._latest_review = None
         self._observability_buffer = []
         self._observability_started_at = 0.0
@@ -1315,6 +1316,7 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
         persisted = self.issue_ledger.record_completed_goal(
             issue_id=resolved_issue_id,
             checkpoint=checkpoint,
+            verification_facts=result.get("verification_facts"),
         )
         self._persist_repo_facts()
         return persisted.to_dict()
@@ -1397,9 +1399,13 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
             self.discovery_budget.turns_used += 1
             self._refresh_loop_steering()
 
-    def configure_verification(self, requirements: list[str] | None, *, review_deferred: bool = False) -> None:
+    def configure_goal_verification_facts(self, facts) -> None:
+        self.loop._goal_verification_facts = facts
+
+    def configure_verification(self, requirements: list[str] | None, *, review_deferred: bool = False,
+                               inherited_checks: dict[str, dict] | None = None) -> None:
         self._verification = VerificationRun(
-            requirements, review_deferred=review_deferred, managed_browser=has_preview_broker(),
+            requirements, review_deferred=review_deferred, managed_browser=has_preview_broker(), inherited_checks=inherited_checks,
         ) if requirements is not None else None
 
     def configure_verification_repair(self, paths: frozenset[str] | None) -> None:
@@ -1407,6 +1413,10 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
 
     def _begin_verification_turn(self) -> None:
         self._verification.begin_turn()
+        self._refresh_loop_steering()
+
+    def _begin_investigation_turn(self) -> None:
+        self._investigation_turn += 1
         self._refresh_loop_steering()
 
     def can_resume_delivery(self) -> bool:
@@ -1439,6 +1449,8 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
         budget = getattr(self, "discovery_budget", None)
         original_limit = getattr(self.loop, "max_turns", 0)
         verification = getattr(self, "_verification", None)
+        if verification is not None and verification.passed and not verification.review_deferred:
+            return self._verification_result(verification, [])
         if budget:
             if budget.pending_extension:
                 raise ValueError("Discovery is awaiting an extension decision.")
@@ -1448,9 +1460,11 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
         if scoped_paths is not None:
             self.loop.max_turns = min(self.loop.max_turns, MAX_REPAIR_TURNS if scoped_paths else MAX_INVESTIGATION_TURNS)
         if verification is not None:
-            verification.turn_limit = min(original_limit, verification.turn_limit)
-            self.loop.max_turns = verification.turn_limit
+            self.loop.max_turns = verification.configure_turn_limit(original_limit)
             self.loop.before_turn = self._begin_verification_turn
+        elif scoped_paths == frozenset():
+            self._investigation_turn = 0
+            self.loop.before_turn = self._begin_investigation_turn
         else:
             self.loop.before_turn = self._begin_discovery_turn
         try:
@@ -1485,11 +1499,12 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
         if wrapped_finish is not None:
             final_message = wrapped_finish.group(1).strip()
         if verification is not None:
+            suspended = final_message.startswith(("interrupted by operator", "stopped by operator"))
             return self._verification_result(
                 verification, touched_paths,
-                reason=verification.stop_reason or ("" if loop_result.finished else final_message),
+                reason=final_message if suspended else verification.stop_reason or ("" if loop_result.finished else final_message),
                 notes=final_message if loop_result.finished else "",
-                suspended=final_message.startswith(("interrupted by operator", "stopped by operator")),
+                suspended=suspended,
             )
         if loop_result.finished and not validation.passed:
             final_message = f"{final_message} Validation required: {validation.summary}"
@@ -1513,13 +1528,13 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
         self._task_satisfied = run.passed
         notes = run.record_handoff(notes)
         report = run.report(reason, notes)
-        state = run.snapshot(final=True)
+        state = run.snapshot(final=True, reason=reason, notes=notes)
         self._observability_metrics["verification"] = state
         self._observability_metrics["outcome"] = "suspended" if suspended else "completed" if run.passed else "incomplete"
         self._flush_observability(report)
         return WorkerRunResult(
             ok=run.passed, final_message=report, task_satisfied=run.passed,
-            validation_ran=bool(run.tool_calls), validation_passed=run.passed,
+            validation_ran=any(check.attempts for check in run.checks.values()), validation_passed=run.passed,
             validation=WorkerValidationResult(kind="verification", passed=run.passed, summary=report.splitlines()[0]),
             touched_paths=touched_paths, verification=state, suspended=suspended,
         )
@@ -1890,7 +1905,9 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
             parts.append(delivery.guidance())
         if self.steering_prompt:
             parts.append(self.steering_prompt)
-        if self._goal_skill_mode_pending and not self._goal_skill_mode_used:
+        if getattr(self, "_verification_repair_paths", None) == frozenset():
+            parts.append(investigation_turn_guidance(getattr(self, "_investigation_turn", 0), self.loop.max_turns))
+        elif self._goal_skill_mode_pending and not self._goal_skill_mode_used:
             parts.append(
                 "GOAL-START SKILL MODE: Before normal repo work, discover and load relevant Playground OS skills once, if any would improve this goal. "
                 "Prefer starting with `skill` to inspect the catalog before any direct `skill <name>` load, then load the best matches. "
@@ -2218,7 +2235,7 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
         self._execution_seen_evidence = set()
         self._execution_source_coverage = SourceCoverage()
         self._execution_stagnation = None
-        self._last_validation = WorkerValidationResult(kind="none", passed=True, summary="No mutating actions required validation.")
+        self._last_validation = WorkerValidationResult(kind="none", passed=True, summary="No repository changes required validation.")
         self._latest_review = None
         self._llm_activity = {
             "in_flight": False,
@@ -2566,7 +2583,7 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
                              and result.command_type != "skipped" for result in turn.results)
         edit_attempted = edit_attempted or any((result.tool_action or {}).get("_changed_paths") for result in turn.results)
         self._execution_delivery.observe_turn(turn.commands_issued, turn.results, edit_attempted=edit_attempted,
-                                              allow_external_progress=getattr(self, "_goal_scope", "") in {"", "execute"})
+                                              goal_scope=getattr(self, "_goal_scope", ""))
         if self._execution_delivery.exhausted:
             self._request_execution_recovery(self._execution_delivery.stop_reason())
         self._refresh_loop_steering()
@@ -2837,6 +2854,7 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
         action_type = str(action.get("type", "") or "")
         fact_action = action_type in FACT_ACTION_TYPES
         verification = getattr(self, "_verification", None)
+        setup = verification is not None and is_verification_setup(action, unbound=not verification_check)
         repair_paths = getattr(self, "_verification_repair_paths", None)
         if repair_paths is not None:
             if not repair_paths and action_type == "finish":
@@ -2853,10 +2871,16 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
         if verification is not None and not verification_check:
             if action_type == "finish":
                 return result.output
-            if needs_verification_check(action):
+            if not setup and needs_verification_check(action):
                 result.ok = False
+                if action_type == "run_shell":
+                    return "Bind shell assertions to required checks with verify <check IDs> <command>. " + VERIFICATION_FIXTURE_GUIDANCE
                 return "Bind this tool to required checks with verify <check IDs> <command>."
-            if (action_type != "mcp" and not is_verification_setup(action)
+            issue_fact = is_verification_fact(action)
+            if issue_fact and action.get("issue_id") not in (None, "", self.active_issue_id):
+                result.ok = False
+                return "Record this fact under the active issue."
+            if (action_type != "mcp" and not setup and not issue_fact
                     and (error := repair_action_error(action, root=self.root, paths=frozenset()))):
                 result.ok = False
                 result.command_type = "skipped"
@@ -2960,8 +2984,20 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
             self._refresh_loop_steering()
             return ""
 
+        dispatched_action = action
+        try:
+            if setup:
+                dispatched_action = verification.begin_setup(action)
+            elif verification is not None and action_type == "mcp" and not verification_check:
+                verification.begin_mcp_discovery()
+        except ValueError as exc:
+            result.ok = False
+            return str(exc)
+
         if action_type == "artifact_preview":
             payload = run_artifact_preview(action)
+            if setup:
+                payload = verification.record_setup(action, payload)
             result.ok = payload["ok"]
             if verification_check and action.get("operation") == "browser-check":
                 action["_verification_output"] = payload
@@ -2969,8 +3005,15 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
                     action["_validation_unavailable"] = True
             return json.dumps(payload, ensure_ascii=False)
         if action_type == "mcp":
-            payload = invoke_mcp(self.root, action)
-            if not verification_check:
+            payload = (
+                verification.invoke_setup_mcp(dispatched_action, lambda candidate: invoke_mcp(self.root, candidate))
+                if setup else invoke_mcp(self.root, dispatched_action)
+            )
+            if setup:
+                payload = verification.record_setup(action, payload)
+            if verification_check:
+                action["_verification_output"] = payload
+            else:
                 payload = model_mcp_result(payload)
             result.ok = payload["ok"]
             return json.dumps(payload, ensure_ascii=False)
@@ -3007,7 +3050,7 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
         inner = self.loop.bridge.execute_single(command)
         tool_action = inner.tool_action or {}
         if inner.ok and inner.needs_tool and is_verification_setup(tool_action):
-            output = self.loop._dispatch_tool_with_progress(inner, verification.turns)
+            output = self.loop._dispatch_tool_with_progress(inner, verification.turns, dispatch=self._dispatch_tool_action)
             result.ok = inner.ok
             return output
         if not inner.ok or not inner.needs_tool or not needs_verification_check(tool_action):
@@ -3026,8 +3069,10 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
             inner.ok, inner.output = False, str(exc)
         kind = tool_action.get("type", "")
         ok = inner.ok and not TreeLoop._tool_message_indicates_failure(kind, inner.output)
-        state = verification.record(ids, kind=kind, ok=ok, output=tool_action.get("_verification_output", inner.output),
-                                    unavailable=bool(tool_action.get("_validation_unavailable") or tool_action.get("_managed_process")),
+        output = tool_action.pop("_verification_output", inner.output)
+        state = verification.record(ids, kind=kind, ok=ok, output=output,
+                                    unavailable=bool(tool_action.get("_validation_unavailable") or tool_action.get("_managed_process")
+                                                     or (isinstance(output, dict) and output.get("unavailable"))),
                                     action=tool_action)
         self._refresh_loop_steering()
         return json.dumps(state, ensure_ascii=False)
@@ -3213,7 +3258,9 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
             self._refresh_loop_steering()
 
         if action_type in {"git_diff", "show_diff", "review_changes"}:
-            self._maybe_resolve_patch_resolution(action_type, str(action.get("path", "") or "").strip())
+            for path in action.get("paths") or [str(action.get("path", "") or "").strip()]:
+                if self._maybe_resolve_patch_resolution(action_type, path):
+                    break
 
         if action_type in {"run_check", "run_route_check"} and self._command_reported_issue_count(result) > 0:
             self._enter_discovery_remediation(source_action=action_type)
@@ -3240,7 +3287,7 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
         elif not self._has_mutation and getattr(getattr(self, "_validation_evidence", None), "passed", False):
             validation = WorkerValidationResult(kind="check", passed=True, summary="A concrete validation check succeeded; no mutations were made.")
         elif not self._has_mutation:
-            validation = WorkerValidationResult(kind="none", passed=True, summary="No mutating actions required validation.")
+            validation = WorkerValidationResult(kind="none", passed=True, summary="No repository changes required validation.")
         elif self._validation_after_mutation and self._pending_verification is None:
             validation = WorkerValidationResult(kind="read_or_check", passed=True, summary="A concrete validation step succeeded after mutation.")
         else:
@@ -3306,7 +3353,7 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
 
     def _set_fact_record(self, key: str, value: str, *, source_action: str, fact_type: str, issue_id: str = "") -> IssueFactRecord:
         resolved_fact_type = str(fact_type or "").strip().lower()
-        if resolved_fact_type not in {FACT_TYPE_GOAL, FACT_TYPE_ARCHITECTURE}:
+        if resolved_fact_type not in FACT_TYPES:
             resolved_fact_type = FACT_TYPE_GOAL
         record = self.issue_ledger.upsert_fact(
             key=str(key or "").strip(),
@@ -3777,6 +3824,7 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
 
     def _exec_git_diff(self, action: Dict[str, Any]) -> str:
         path = str(action.get("path", "") or "").strip()
+        paths = action.get("paths") or ([path] if path else [])
         args = ["diff"]
         if action.get("staged"):
             args.append("--staged")
@@ -3784,8 +3832,8 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
             args.append("--stat")
         if action.get("name_only"):
             args.append("--name-only")
-        if path:
-            args.extend(["--", path])
+        if paths:
+            args.extend(["--", *paths])
         code, stdout, stderr = self._run_git(args)
         if code != 0:
             return f"git diff failed: {stderr or stdout or code}"
@@ -3793,7 +3841,7 @@ class TreeLoopPlannerWorker(ProposalRuntimeMixin):
             "action_type": "git_diff",
             "path": path,
             "diff": stdout or "",
-            "summary": f"Git diff rendered for {path or 'workspace'}.",
+            "summary": f"Git diff rendered for {', '.join(paths) or 'workspace'}.",
         }
         return stdout or "no diff"
 

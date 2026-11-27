@@ -41,6 +41,18 @@ def capabilities(request):
                     'detail': 'Codex CLI discovered.' if authenticated else 'Sign in to Codex with ChatGPT under Agent runtime.'}
         except Exception as error:
             return {'sdkReady': False, 'keyReady': False, 'label': info['label'], 'detail': str(error)}
+    if provider == 'gemini-subscription':
+        from gemini_subscription import resolve_gemini_executable, quick_gemini_auth_status
+        try:
+            executable = resolve_gemini_executable()
+        except Exception as error:
+            return {'sdkReady': False, 'keyReady': False, 'label': info['label'], 'detail': str(error)}
+        try:
+            authenticated = quick_gemini_auth_status(executable)['authenticated']
+            return {'sdkReady': True, 'keyReady': authenticated, 'label': info['label'],
+                    'detail': 'Gemini CLI discovered.' if authenticated else 'Sign in to Gemini CLI with Google under Agent runtime.'}
+        except Exception as error:
+            return {'sdkReady': False, 'keyReady': False, 'label': info['label'], 'detail': str(error)}
     package = info.get('package')
     if provider in {'local', 'ollama', 'ollama-local', 'ollama-runpod'}:
         package = 'openai'

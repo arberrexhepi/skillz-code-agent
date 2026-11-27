@@ -9,11 +9,22 @@ import re
 
 TEXT_MUTATION_VERBS = {"write", "replace-lines", "replace_lines", "patch", "edit-symbol", "edit-batch", "replace-regex"}
 PARSE_ERROR_PREFIX = "__command_parse_error__ "
+_LITERAL_PATCH_HEADER = re.compile(r"(?P<path>\S+)[ \t]+--literal[ \t]+<<<[ \t]*", re.I)
+_PATCH_REPLACE_LINE = "=== REPLACE ==="
+_LITERAL_PATCH_HINT = (
+    "Use `patch <path> --literal <<<`, then exact search text, a standalone "
+    "`=== REPLACE ===` line, exact replacement text, and a standalone `>>>` line."
+)
 
 
 def is_text_mutation(command: str) -> bool:
     parts = command.lstrip().split(None, 1)
     return bool(parts and parts[0].lower() in TEXT_MUTATION_VERBS)
+
+
+def is_literal_patch(command: str) -> bool:
+    header = command.partition("\n")[0].split(None, 1)
+    return len(header) == 2 and header[0].lower() == "patch" and bool(_LITERAL_PATCH_HEADER.fullmatch(header[1]))
 
 
 def split_path_payload(text: str) -> tuple[str, str]:
@@ -87,14 +98,37 @@ def _decode_patch_operand(text: str) -> str:
     return value
 
 
-def parse_patch_payload(text: str) -> tuple[str, str, str]:
-    path, payload = split_path_payload(text)
+def _parse_inline_patch(payload: str) -> tuple[str, str]:
     arrows = unquoted_arrows(payload)
     if len(arrows) != 1:
-        raise ValueError("patch requires exactly one unquoted ' -> ' separator; quote operands containing arrows")
+        raise ValueError("Inline patch requires exactly one unquoted ' -> ' separator.")
     offset = arrows[0]
-    search = _decode_patch_operand(payload[:offset])
-    replacement = _decode_patch_operand(payload[offset + 4:])
-    if not search:
-        raise ValueError("patch requires non-empty search text")
+    return _decode_patch_operand(payload[:offset]), _decode_patch_operand(payload[offset + 4:])
+
+
+def _parse_literal_patch(block: str) -> tuple[str, str]:
+    lines = block.removesuffix("\n").split("\n")
+    if lines[-1].strip() != ">>>":
+        raise ValueError("Literal patch requires a closing '>>>' line.")
+    body = lines[:-1]
+    separators = [index for index, line in enumerate(body) if line.strip() == _PATCH_REPLACE_LINE]
+    if len(separators) != 1:
+        raise ValueError(f"Literal patch requires exactly one standalone '{_PATCH_REPLACE_LINE}' line.")
+    split_at = separators[0]
+    return "\n".join(body[:split_at]), "\n".join(body[split_at + 1:])
+
+
+def parse_patch_payload(text: str) -> tuple[str, str, str]:
+    header, _, block = text.lstrip().partition("\n")
+    try:
+        if literal := _LITERAL_PATCH_HEADER.fullmatch(header):
+            path = literal.group("path")
+            search, replacement = _parse_literal_patch(block)
+        else:
+            path, payload = split_path_payload(text)
+            search, replacement = _parse_inline_patch(payload)
+        if not search:
+            raise ValueError("Patch requires non-empty search text.")
+    except ValueError as exc:
+        raise ValueError(f"{exc} {_LITERAL_PATCH_HINT}") from exc
     return path, search, replacement
