@@ -33,3 +33,5 @@ Use [artifact-chatbot](artifact-chatbot.md) for an artifact's in-app Skillz
 chatbot, including its UI shell, Express route, and Preview verification.
 Use [artifact-mcp-authoring](artifact-mcp-authoring.md) to write, classify,
 and verify custom MCP tools in the artifact.
+Use [playwright-verification](playwright-verification.md) for browser and UI
+verification using managed Artifact Preview `browser-check` or Playwright MCP.

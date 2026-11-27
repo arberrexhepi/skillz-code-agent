@@ -62,23 +62,77 @@ export type ArtifactAppMcpRequest = z.infer<typeof artifactAppMcpRequestSchema>;
 const previewRoute = z.string().max(4096).regex(/^\/(?![\/\\])[^\\\r\n]*$/);
 const browserSelector = z.string().trim().min(1).max(500);
 const browserLabel = z.string().trim().min(1).max(140);
+const optionalBrowserLabel = browserLabel.optional();
+const browserStepTimeout = z.number().int().min(100).max(90000).optional();
+const browserViewport = z.strictObject({
+  width: z.number().int().min(320).max(2560),
+  height: z.number().int().min(240).max(1600),
+});
 const browserCheckStep = z.discriminatedUnion('type', [
-  z.strictObject({ type: z.literal('assert-visible'), selector: browserSelector, label: browserLabel }),
-  z.strictObject({ type: z.literal('click'), selector: browserSelector, label: browserLabel }),
-  z.strictObject({ type: z.literal('goto'), route: previewRoute, label: browserLabel }),
+  z.strictObject({ type: z.literal('assert-visible'), selector: browserSelector, label: optionalBrowserLabel, timeoutMs: browserStepTimeout }),
+  z.strictObject({ type: z.literal('assert-hidden'), selector: browserSelector, label: optionalBrowserLabel, timeoutMs: browserStepTimeout }),
+  z.strictObject({
+    type: z.literal('assert-text'),
+    selector: browserSelector,
+    text: z.string().min(1).max(500),
+    exact: z.boolean().optional(),
+    label: optionalBrowserLabel,
+    timeoutMs: browserStepTimeout,
+  }),
+  z.strictObject({ type: z.literal('assert-focused'), selector: browserSelector, label: optionalBrowserLabel, timeoutMs: browserStepTimeout }),
+  z.strictObject({ type: z.literal('click'), selector: browserSelector, label: optionalBrowserLabel, timeoutMs: browserStepTimeout }),
+  z.strictObject({ type: z.literal('fill'), selector: browserSelector, value: z.string().max(4000), label: optionalBrowserLabel, timeoutMs: browserStepTimeout }),
+  z.strictObject({ type: z.literal('select'), selector: browserSelector, value: z.string().max(500), label: optionalBrowserLabel, timeoutMs: browserStepTimeout }),
+  z.strictObject({
+    type: z.literal('press'),
+    key: z.string().trim().min(1).max(60),
+    selector: browserSelector.optional(),
+    label: optionalBrowserLabel,
+    timeoutMs: browserStepTimeout,
+  }),
+  z.strictObject({ type: z.literal('hover'), selector: browserSelector, label: optionalBrowserLabel, timeoutMs: browserStepTimeout }),
+  z.strictObject({
+    type: z.literal('drag'),
+    selector: browserSelector,
+    dx: z.number().finite().min(-2000).max(2000),
+    dy: z.number().finite().min(-2000).max(2000),
+    steps: z.number().int().min(1).max(30).optional(),
+    label: optionalBrowserLabel,
+    timeoutMs: browserStepTimeout,
+  }),
+  z.strictObject({
+    type: z.literal('wheel'),
+    selector: browserSelector,
+    deltaX: z.number().finite().min(-4000).max(4000).optional(),
+    deltaY: z.number().finite().min(-4000).max(4000),
+    label: optionalBrowserLabel,
+    timeoutMs: browserStepTimeout,
+  }),
+  z.strictObject({ type: z.literal('wait'), ms: z.number().int().min(1).max(60000), label: optionalBrowserLabel }),
+  z.strictObject({ type: z.literal('goto'), route: previewRoute, label: optionalBrowserLabel, timeoutMs: browserStepTimeout }),
+  z.strictObject({ type: z.literal('evaluate'), script: z.string().trim().min(1).max(12000), label: optionalBrowserLabel, timeoutMs: browserStepTimeout }),
 ]);
 export type ArtifactBrowserCheckStep = z.infer<typeof browserCheckStep>;
+const browserAssertionStepTypes = new Set<ArtifactBrowserCheckStep['type']>([
+  'assert-visible', 'assert-hidden', 'assert-text', 'assert-focused', 'evaluate',
+]);
+export const browserCheckInputSchema = z.strictObject({
+  route: previewRoute,
+  viewport: browserViewport.optional(),
+  reducedMotion: z.enum(['reduce', 'no-preference']).optional(),
+  colorScheme: z.enum(['light', 'dark', 'no-preference']).optional(),
+  timeoutMs: z.number().int().min(1000).max(90000).optional(),
+  steps: z.array(browserCheckStep).min(1).max(24).refine(
+    steps => steps.some(step => browserAssertionStepTypes.has(step.type)),
+    'Include at least one assertion or evaluate step.',
+  ),
+});
+export type ArtifactBrowserCheckInput = z.infer<typeof browserCheckInputSchema>;
 
 export const artifactPreviewActionSchema = z.discriminatedUnion('operation', [
   z.strictObject({ operation: z.literal('restart') }),
   z.strictObject({ operation: z.literal('route-check'), route: previewRoute }),
-  z.strictObject({
-    operation: z.literal('browser-check'),
-    input: z.strictObject({
-      route: previewRoute,
-      steps: z.array(browserCheckStep).min(1).max(8).refine(steps => steps.some(step => step.type === 'assert-visible')),
-    }),
-  }),
+  z.strictObject({ operation: z.literal('browser-check'), input: browserCheckInputSchema }),
   z.strictObject({ operation: z.literal('mcp'), input: artifactAppMcpRequestSchema.omit({ approveMutations: true }).strict() }),
   z.strictObject({ operation: z.literal('chat'), input: z.strictObject({ message: z.string().trim().min(1).max(4000) }) }),
 ]);

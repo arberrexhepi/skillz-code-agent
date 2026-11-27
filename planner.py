@@ -18,10 +18,11 @@ from execution_evidence import external_execution_identity
 from mutation_runtime import EXPLICIT_MUTATION_TYPES
 from verification_repair import (
     MAX_REPAIR_ROUNDS, MAX_REPAIR_TURNS, approved_write_paths, excluded_source_paths, existing_source_path, named_source_paths,
-    verification_failure_identity,
+    verification_diagnosis, verification_failure_identity,
 )
 from verification_run import VerificationRun, all_required_checks_passed
-from issue_facts import IssueFactLedger
+from verification_handoff import GoalVerificationFacts, inherited_verification_checks
+from issue_facts import FACT_TYPE_VERIFICATION, IssueFactLedger
 from model_output_progress import ModelOutputObserver
 from reasoning_effort import active_reasoning_effort, repo_reasoning_effort, resolve_reasoning_effort
 from pathlib import Path
@@ -293,6 +294,7 @@ class GoalExecutionResult:
     verification: Optional[Dict[str, Any]] = None
     deferred_findings: List[Dict[str, Any]] = field(default_factory=list)
     mutation_paths: List[str] = field(default_factory=list)
+    verification_facts: List[Dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -1018,9 +1020,33 @@ class PlannerAgent:
                 return self.decide_discovery_extension(self.session.pending_discovery_extension["request_id"], accept=self._is_approval(text))
             return self._render_discovery_extension()
 
+        # Artifact submissions wrap the user request in workspace instructions.
+        marker = "\n\nUser request:\n"
+        prefix, separator, request = text.rpartition(marker) if text.startswith(
+            "You are working in an independent skillz artifact repository: /repo."
+        ) else ("", "", text)
+        proceed_with_next_steps = re.fullmatch(
+            r"(?:proceed|continue|go ahead) with (?:the )?(?:suggested )?next steps[.!]?",
+            (request or text).strip(),
+            re.IGNORECASE,
+        )
         if self.session.execution_paused and self.session.paused_plan is not None:
             if text.lower() in {"retry", "/retry", "resume", "/resume", "continue", "/continue"}:
                 return self.resume_paused_execution()
+            if self._paused_verification_awaits_manual_approval():
+                normalized_request = (request or text).strip().lower().rstrip(".!")
+                if normalized_request in {
+                    "approve", "approve and close", "approve and close issue",
+                    "approve close", "close issue", "manual approval",
+                }:
+                    return self.approve_verification_close()
+                if proceed_with_next_steps:
+                    return (
+                        "Playwright verification has unverified or failed checks and is awaiting manual approval to close the issue. "
+                        "Use Approve & close issue to close manually, or Resume to rerun verification."
+                    )
+            elif proceed_with_next_steps and self._paused_verification_report():
+                return self.proceed_with_verification_next_steps()
             if not self._is_rejection(text):
                 return self.request_plan_revision(text)
             save = getattr(self.worker, "save_pending_approval", None)
@@ -1085,16 +1111,7 @@ class PlannerAgent:
             return self._handle_intake_turn()
 
         if self.session.last_completed_plan is not None:
-            # Preserve the artifact submission's workspace instructions when it wraps the user text.
-            marker = "\n\nUser request:\n"
-            prefix, separator, request = text.rpartition(marker) if text.startswith(
-                "You are working in an independent skillz artifact repository: /repo."
-            ) else ("", "", text)
-            if re.fullmatch(
-                r"(?:proceed|continue|go ahead) with (?:the )?(?:suggested )?next steps[.!]?",
-                request.strip(),
-                re.IGNORECASE,
-            ):
+            if proceed_with_next_steps:
                 if not self.session.last_next_steps:
                     return "The completed plan has no suggested next steps."
                 request = "Plan the following suggested actions from the completed work:\n" + "\n".join(
@@ -1415,6 +1432,8 @@ class PlannerAgent:
         resume_delivery: bool = False,
         repair_paths: Optional[frozenset[str]] = None,
         diagnostic_goal_key: str = "",
+        verification_facts: GoalVerificationFacts | None = None,
+        inherited_checks: Optional[Dict[str, dict]] = None,
     ) -> Dict[str, Any]:
         target_worker = worker or self.worker
         progress_domain = "discovery" if discovery_budget is not None else "plan"
@@ -1440,6 +1459,7 @@ class PlannerAgent:
         configure_verification = getattr(target_worker, "configure_verification", None)
         configure_repair = getattr(target_worker, "configure_verification_repair", None)
         configure_diagnostics = getattr(target_worker, "configure_goal_diagnostics", None)
+        configure_facts = getattr(target_worker, "configure_goal_verification_facts", None)
         try:
             if callable(set_goal_scope):
                 set_goal_scope(goal_scope)
@@ -1447,11 +1467,15 @@ class PlannerAgent:
                 configure_repair(repair_paths)
             if diagnostic_goal_key and callable(configure_diagnostics):
                 configure_diagnostics(diagnostic_goal_key)
+            if verification_facts is not None and callable(configure_facts):
+                configure_facts(verification_facts)
             if verification_checks is not None and callable(configure_verification):
+                options: dict = {}
                 if review_deferred:
-                    configure_verification(verification_checks, review_deferred=True)
-                else:
-                    configure_verification(verification_checks)
+                    options["review_deferred"] = True
+                if inherited_checks:
+                    options["inherited_checks"] = inherited_checks
+                configure_verification(verification_checks, **options)
             phase = "discovery" if discovery_budget is not None else (
                 "verification" if verification_checks is not None or repair_paths == frozenset() else "goals"
             )
@@ -1475,6 +1499,8 @@ class PlannerAgent:
                 },
             }
         finally:
+            if verification_facts is not None and callable(configure_facts):
+                configure_facts(None)
             if diagnostic_goal_key and callable(configure_diagnostics):
                 configure_diagnostics("")
             if repair_paths is not None:
@@ -1594,7 +1620,7 @@ class PlannerAgent:
     ) -> bool:
         scope = str(goal.estimated_scope or "mixed").strip().lower()
         return (
-            str(getattr(self.config, "provider", "") or "").strip().lower() == "codex-subscription"
+            str(getattr(self.config, "provider", "") or "").strip().lower() in {"codex-subscription", "gemini-subscription"}
             and scope not in {"read", "validation", "analysis", "discovery", "execute"}
             and bool(worker_result["ok"])
             and not bool(worker_result["validation_ran"])
@@ -1666,6 +1692,32 @@ class PlannerAgent:
         history_start = len(getattr(worker, "history", []))
         verification_checks = self._verification_requirements(goal)
         verifier = self._final_verification_goal(plan)
+        final_checks = self._verification_requirements(verifier) if verifier is not None else None
+        capture = GoalVerificationFacts(self.root, final_checks, goal.title) if final_checks and verification_checks is None else None
+        inherited: dict = {}
+        if verification_checks:
+            if verifier is not None and goal.goal_id == verifier.goal_id:
+                allowed = ", ".join(sorted(self._verification_repair_scope(plan)))
+                task += (
+                    "\n\nApproved automatic repair files: " + (allowed or "None") + ". "
+                    "Use a repair handoff for a demonstrated failure you can ground in that scope. "
+                    "If the failure needs a file outside that scope, report which file and why, "
+                    "and continue checks that can run independently."
+                )
+            saved = (self._load_repo_facts_payload() or {}).get("context_facts", [])
+            facts = {fact["key"]: fact for fact in saved if fact.get("fact_type") == FACT_TYPE_VERIFICATION}
+            facts.update({
+                fact["key"]: {**fact, "source_action": "verification_tool"}
+                for result in self.session.completed_results if result.status == "completed"
+                for fact in result.verification_facts
+            })
+            inherited = inherited_verification_checks(self.root, verification_checks, list(facts.values()))
+            if facts:
+                findings = "\n".join(f"- {fact['key']}: {fact['value'][:650]}" for fact in list(facts.values())[-12:])
+                task += (
+                    "\n\nPrior verification facts\n" + findings +
+                    "\nUse them to identify coverage gaps. The checklist already includes the tool-backed passes that match the current source."
+                )
         collect_deferred = verifier is not None and goal.goal_id != verifier.goal_id
         review_deferred = verifier is not None and goal.goal_id == verifier.goal_id and any(
             result.deferred_findings for result in self.session.completed_results if result.status == "completed"
@@ -1687,6 +1739,8 @@ class PlannerAgent:
                 review_deferred=review_deferred,
                 resume_delivery=resume_delivery,
                 diagnostic_goal_key=diagnostic_goal_key,
+                verification_facts=capture,
+                inherited_checks=inherited,
             )
             deferred_findings = execution.get("deferred_findings", [])
             history_slice = list(execution["history_slice"])
@@ -1722,6 +1776,7 @@ class PlannerAgent:
                     goal_scope=goal.estimated_scope,
                     collect_deferred=collect_deferred,
                     diagnostic_goal_key=diagnostic_goal_key,
+                    verification_facts=capture,
                 )
                 deferred_findings = [*deferred_findings, *recovery.get("deferred_findings", [])]
                 history_slice.extend(list(recovery["history_slice"]))
@@ -1782,6 +1837,7 @@ class PlannerAgent:
                 verification=worker_result["verification"],
                 deferred_findings=list({finding["id"]: finding for finding in deferred_findings}.values()),
                 mutation_paths=self._worker_mutation_paths(history_slice),
+                verification_facts=list(capture.facts.values()) if capture is not None else [],
             )
         except Exception as exc:
             history_slice = list(getattr(worker, "history", [])[history_start:])
@@ -1865,10 +1921,16 @@ class PlannerAgent:
             getattr(self.worker, "configure_verification_repair", None)
         ):
             return result
+
+        def add_follow_up(note: str) -> None:
+            result.final_message += f"\n\n{note}"
+            if result.verification is not None:
+                result.verification.setdefault("follow_up", []).append(note)
+
         allowed_paths = self._verification_repair_scope(plan)
         if not allowed_paths:
             if any(check["status"] == "fail" for check in result.verification["checks"]):
-                result.final_message += "\n\nAutomatic repair paused because the approved plan has no eligible source files."
+                add_follow_up("Automatic repair paused because the approved plan has no eligible source files.")
             return result
 
         scope = "\n".join(f"- {item}" for item in plan.not_in_scope)
@@ -1882,15 +1944,16 @@ class PlannerAgent:
             failed_checks = [check for check in checks if check["status"] == "fail"]
             if not failed_checks:
                 break
-            identity = verification_failure_identity(checks)
+            identity = verification_failure_identity(failed_checks)
             if identity in seen_failures:
-                result.final_message += "\n\nAutomatic repair paused because verification reproduced the same failures."
+                add_follow_up("Automatic repair paused because verification reproduced the same failures.")
                 break
             seen_failures.add(identity)
             record: Dict[str, Any] = {"round": round_number, "checks_before_repair": checks}
             rounds.append(record)
             check_evidence = "\n".join(
                 f"{check['id']} {check['requirement']} — {check['evidence']}\n"
+                + (f"Suggested next step: {check['next_step']}\n" if check.get("next_step") else "")
                 + "\n".join(f"- {error['evidence']}" for error in check.get("source_errors", []))
                 for check in failed_checks
             )
@@ -1900,12 +1963,21 @@ class PlannerAgent:
                 findings = json.dumps(reported_handoff, ensure_ascii=False)
             else:
                 record["diagnosis_source"] = "investigation"
+                prior_diagnosis = (
+                    reported_handoff["diagnosis"] if reported_handoff else (result.verification.get("worker_notes") or "")
+                )
+                prior_context = ""
+                if prior_diagnosis:
+                    prior_context += f"Verifier's prior diagnosis to confirm against source: {prior_diagnosis}\n"
+                if proposed := result.verification.get("proposed_repair_targets"):
+                    prior_context += f"Files named by the verifier for investigation: {', '.join(proposed)}\n"
                 investigation = (
                     f"Original request: {plan.original_request}\n"
                     f"Investigate these failed required checks in read-only mode.\n{check_evidence}\n"
                     f"Approved repair files: {', '.join(sorted(allowed_paths))}\n"
                     f"Out of scope:\n{scope}\n"
                     f"Earlier repair rounds: {json.dumps(rounds[:-1], ensure_ascii=False)}\n"
+                    f"{prior_context}"
                     "Trace the failure to its source with focused reads or file diagnostics. A diagnostic can be reported "
                     "in a file that consumes the affected source. Submit the smallest repair you can justify. "
                     'Use finish with a JSON object containing "targets" (an array of approved paths) and "diagnosis" '
@@ -1916,34 +1988,42 @@ class PlannerAgent:
                 findings = self._run_verification_work(goal, investigation, "Investigate failed checks and report a scoped repair.", frozenset())
             if findings.startswith(("interrupted by operator", "stopped by operator")):
                 result.status = "suspended"
-                result.final_message += f"\n\n{findings}"
+                add_follow_up(findings)
                 break
             try:
                 handoff = json.loads(findings)
             except ValueError:
                 handoff = None
             targets = handoff.get("targets") if isinstance(handoff, dict) else None
-            diagnosis = handoff.get("diagnosis") if isinstance(handoff, dict) else None
-            if not isinstance(targets, list) or not isinstance(diagnosis, str) or not diagnosis.strip():
-                result.final_message += "\n\nVerification investigation ended without a usable repair handoff. " + findings[:600]
+            diagnosis = verification_diagnosis(handoff.get("diagnosis")) if isinstance(handoff, dict) else ""
+            if not isinstance(targets, list) or not diagnosis:
+                add_follow_up("Verification investigation ended without a usable repair handoff. " + findings[:600])
                 break
-            diagnosis = diagnosis.strip()[:2000]
             record["diagnosis"] = diagnosis
             if not targets:
-                result.final_message += f"\n\nInvestigation found no in-scope repair. {diagnosis}"
+                detail = handoff.get("diagnosis")
+                blocker = detail.get("blocker") if isinstance(detail, dict) else None
+                if isinstance(blocker, str) and blocker.strip():
+                    default_ids = [failed_checks[0]["id"]] if len(failed_checks) == 1 else []
+                    cited_checks = handoff.get("check_ids", default_ids)
+                    if isinstance(cited_checks, list):
+                        for check in failed_checks:
+                            if check["id"] in cited_checks:
+                                check["next_step"] = blocker.strip()[:500]
+                add_follow_up(f"Investigation found no in-scope repair. {diagnosis}")
                 break
             paths = frozenset(
                 existing_source_path(self.root, path.removeprefix("/repo/")) if isinstance(path, str) else ""
                 for path in targets
             )
             if not paths <= allowed_paths:
-                result.final_message += f"\n\nInvestigation requested edits outside the approved repair scope. {diagnosis}"
+                add_follow_up(f"Investigation requested edits outside the approved repair scope. {diagnosis}")
                 break
             label = ", ".join(sorted(paths))
             try:
                 before = {path: (self.root / path).read_bytes() for path in paths}
             except OSError as exc:
-                result.final_message += f"\n\nCould not read the approved repair files: {exc}"
+                add_follow_up(f"Could not read the approved repair files: {exc}")
                 break
 
             steering = f"Repair the verified failure in {label} within {MAX_REPAIR_TURNS} model turns."
@@ -1970,10 +2050,10 @@ class PlannerAgent:
             record["worker_result"] = repair_message[:1000]
             if repair_message.startswith(("interrupted by operator", "stopped by operator")):
                 result.status = "suspended"
-                result.final_message += f"\n\n{repair_message}. Checks above ran before this repair attempt."
+                add_follow_up(f"{repair_message}. These checks ran before this repair attempt.")
                 break
             if not changed_paths:
-                result.final_message += f"\n\nRepair round {round_number} left the source unchanged. {repair_message[:1000]}"
+                add_follow_up(f"Repair round {round_number} left the source unchanged. {repair_message[:1000]}")
                 break
 
             self._fire_plan_callback("goal_handoff", {"summary": f"Rechecking every requirement after repair round {round_number}."})
@@ -1981,10 +2061,10 @@ class PlannerAgent:
                 *goal.delegation_notes, f"Repair round {round_number} edited {label}. Run every required check on the updated source.",
             ])
             result = self._execute_goal_with_worker(self.worker, plan, recheck, index)
-            result.final_message += f"\n\nRepair round {round_number} edited {', '.join(changed_paths)} before this verification."
+            add_follow_up(f"Repair round {round_number} edited {', '.join(changed_paths)} before this verification.")
         else:
             if result.status == "failed":
-                result.final_message += f"\n\nAutomatic repair paused after {MAX_REPAIR_ROUNDS} repair rounds."
+                add_follow_up(f"Automatic repair paused after {MAX_REPAIR_ROUNDS} repair rounds.")
 
         if rounds:
             result.verification["repair_rounds"] = rounds
@@ -2012,7 +2092,7 @@ class PlannerAgent:
         run = VerificationRun(requirements)
         message = run.report(reason)
         result.update(final_message=message, validation_summary=message.splitlines()[0],
-                      verification=run.snapshot(final=True))
+                      verification=run.snapshot(final=True, reason=reason))
 
     def execute_discovery(self, mode_key: str, *, resume: bool = False) -> str:
         if self.session.pending_discovery_extension is not None:
@@ -2221,7 +2301,90 @@ class PlannerAgent:
             issue_prepared=callable(approver),
         )
 
-    def resume_paused_execution(self) -> str:
+    def _paused_verification_report(self) -> Dict[str, Any]:
+        if not self.session.execution_paused or not self.session.paused_failed_goal_id:
+            return {}
+        failed_goal_id = self.session.paused_failed_goal_id
+        for result in self.session.last_completed_results:
+            if result.goal_id == failed_goal_id and result.verification:
+                return result.verification
+        return {}
+
+    def _paused_verification_awaits_manual_approval(self) -> bool:
+        report = self._paused_verification_report()
+        return bool(report.get("awaiting_manual_approval"))
+
+    def approve_verification_close(self) -> str:
+        if self.session.executing:
+            raise ValueError("A plan is already executing.")
+        report = self._paused_verification_report()
+        if not report:
+            raise ValueError("No paused verification report is awaiting manual approval.")
+        active_issue_id = str(self.session.active_issue_id or "").strip()
+        close_note = "Manually approved to close after Playwright verification."
+        closed_id = ""
+        if active_issue_id:
+            close_issue = getattr(self.worker, "close_issue", None)
+            close_active_issue = getattr(self.worker, "close_active_issue", None)
+            if callable(close_issue):
+                issue = close_issue(active_issue_id, note=close_note)
+                closed_id = str((issue or {}).get("issue_id", active_issue_id) or active_issue_id)
+            elif callable(close_active_issue):
+                issue = close_active_issue(note=close_note)
+                closed_id = str((issue or {}).get("issue_id", active_issue_id) or active_issue_id)
+            else:
+                closed_id = active_issue_id
+        else:
+            close_active_issue = getattr(self.worker, "close_active_issue", None)
+            if callable(close_active_issue):
+                issue = close_active_issue(note=close_note)
+                closed_id = str((issue or {}).get("issue_id", "") or "")
+        self._discard_discovery_extension()
+        self.session.last_completed_plan = self.session.paused_plan
+        self._clear_pending_plan()
+        self.session.last_presented_plan = None
+        self.session.awaiting_plan_revision = False
+        self.session.plan_revision_feedback = []
+        self.session.last_next_steps = []
+        self.session.last_auto_next_steps = []
+        self._clear_paused_execution()
+        self.session.active_issue_id = ""
+        if closed_id:
+            return f"Manual approval received. Closed issue {closed_id}."
+        return "Manual approval received. Paused verification approved and closed."
+
+    def proceed_with_verification_next_steps(self) -> str:
+        if self.session.executing:
+            raise ValueError("A plan is already executing.")
+        report = self._paused_verification_report()
+        if report.get("awaiting_manual_approval"):
+            raise ValueError(
+                "Unverified or failed Playwright verification is awaiting manual approval to close the issue, or Resume to rerun."
+            )
+        checks = report.get("checks", [])
+        outstanding = [check for check in checks if check["status"] != "pass" and check.get("next_step")]
+        if not outstanding:
+            raise ValueError("This paused verification has no suggested next steps.")
+        lines = [
+            "Continue verification using the previous report. Address these outstanding checks first and reuse passes already shown in the checklist. "
+            "Confirm reported test preconditions before proposing a source repair. Keep work within the approved scope.",
+        ]
+        for check in outstanding:
+            lines.extend((
+                f"{check['id']} [{check['status']}] {check['requirement']}",
+                f"Recorded evidence: {check['evidence']}",
+                f"Next step: {check['next_step']}",
+            ))
+            if check.get("progress_evidence"):
+                lines.append(f"Last progress: {check['progress_evidence']}")
+            if check.get("latest_attempt"):
+                lines.append(f"Latest attempt: {check['latest_attempt']}")
+        if investigation := report.get("follow_up"):
+            lines.append("Earlier verification investigation:")
+            lines.extend(investigation[-3:])
+        return self.resume_paused_execution(verification_followup="\n".join(lines))
+
+    def resume_paused_execution(self, *, verification_followup: str = "") -> str:
         plan = self.session.paused_plan
         if not self.session.execution_paused or plan is None:
             return "No paused execution to resume."
@@ -2238,8 +2401,12 @@ class PlannerAgent:
         ]
         can_resume_delivery = getattr(self.worker, "can_resume_delivery", None)
         live_goal_id = self.session.paused_suspended_goal_id if callable(can_resume_delivery) and can_resume_delivery() else ""
+        followup_goal_id = self.session.paused_failed_goal_id if verification_followup else ""
         self._clear_paused_execution()
-        return self._execute_plan(plan, checkpoint_results=checkpoint_results, resumed=True, live_goal_id=live_goal_id)
+        return self._execute_plan(
+            plan, checkpoint_results=checkpoint_results, resumed=True, live_goal_id=live_goal_id,
+            **({"verification_followup": (followup_goal_id, verification_followup)} if followup_goal_id else {}),
+        )
 
     def _execute_plan(
         self,
@@ -2249,6 +2416,7 @@ class PlannerAgent:
         resumed: bool,
         live_goal_id: str = "",
         issue_prepared: bool = False,
+        verification_followup: tuple[str, str] = ("", ""),
     ) -> str:
 
         self._mark_discovery_complete_for_plan_approval()
@@ -2304,10 +2472,11 @@ class PlannerAgent:
                     # Preserve evidence/outcomes across the sequence. The beta
                     # worker starts a bounded handoff, not a raw transcript chain.
                     effective_preserve = goal.preserve_context or bool(completed_ids) or resumed
+                    worker_goal = _dataclass_replace(goal, preserve_context=effective_preserve)
+                    if goal.goal_id == verification_followup[0]:
+                        worker_goal.delegation_notes = [*goal.delegation_notes, verification_followup[1]]
                     result = self._execute_goal_with_worker(
-                        self.worker, plan,
-                        _dataclass_replace(goal, preserve_context=effective_preserve),
-                        index,
+                        self.worker, plan, worker_goal, index,
                         **({"resume_delivery": True} if resume_delivery else {}),
                     )
                     if goal is self._final_verification_goal(plan):
@@ -2836,6 +3005,7 @@ class PlannerAgent:
         if run_prompt:
             output.append(f"Auto run prompt: {run_prompt}")
         failures = 0
+        verification_followup_used = False
         prompted_issue: Optional[Dict[str, Any]] = self._create_prompted_continuous_issue(run_prompt) if run_prompt else None
         try:
             for cycle in range(1, self.continuous_config.max_cycles + 1):
@@ -3021,6 +3191,32 @@ class PlannerAgent:
                 if self.session.paused_suspended_goal_id:
                     self.continuous_state.stop_reason = "goal_suspended"
                     break
+                if review.decision != "accepted" and self._paused_verification_awaits_manual_approval():
+                    self.continuous_state.stop_reason = "awaiting_manual_approval"
+                    output.append(
+                        f"Cycle {cycle}: Playwright verification has unverified or failed checks and is awaiting manual approval to close the issue."
+                    )
+                    break
+                if review.decision != "accepted" and not verification_followup_used:
+                    checks = self._paused_verification_report().get("checks", [])
+                    actionable = any(
+                        check["status"] in {"fail", "unverified"} and check.get("attempts") and check.get("next_step")
+                        for check in checks
+                    ) or (
+                        any(check["status"] == "pass" for check in checks)
+                        and any(check["status"] == "not_run" and check.get("next_step") for check in checks)
+                    )
+                    if actionable:
+                        verification_followup_used = True
+                        self.continuous_state.status = "executing"
+                        output.append(f"Cycle {cycle}: continuing with the verification next steps once.")
+                        output.append(self.proceed_with_verification_next_steps())
+                        if self.session.paused_suspended_goal_id:
+                            self.continuous_state.stop_reason = "goal_suspended"
+                            break
+                        self.continuous_state.status = "reviewing"
+                        review = self._review_completed_plan(plan)
+                        self.continuous_state.latest_review_decision = review.decision
                 if review.decision != "accepted":
                     failures += 1
                     self.continuous_state.stop_reason = f"review_{review.decision}"
@@ -3582,6 +3778,17 @@ class PlannerAgent:
                 f"Verify your own goal. If an observed run diagnostic is unrelated to it, use propose_issue with "
                 f"the linked run_issue_ids and explain why. The planner will add it to {verifier.title} for final verification."
             )
+            if self._verification_requirements(goal) is None:
+                final_checks = self._verification_requirements(verifier) or []
+                sections.append(
+                    "Record verification facts for tests run during this goal. Include the observed behavior, test inputs, "
+                    "and any scenario the test leaves unverified. Use the active issue with fact <issue>/verification/<key> <finding> "
+                    "in TreeLoop, or set_fact with fact_type=verification in Stable. "
+                    "When a test you already need to run covers a final check below in full, return its check ID in the tool output's "
+                    "verification_results map with status, concrete evidence, and browser_observations for Playwright. "
+                    "Run the tests needed for this goal. The final verifier will handle the remaining checks.\n"
+                    + "\n".join(f"- check-{i}: {check}" for i, check in enumerate(dict.fromkeys(final_checks), 1))
+                )
         elif any(note.startswith("Deferred diagnostic ") for note in goal.delegation_notes):
             sections.append(
                 "Review deferred diagnostics against the original issue intent. Mark unrelated findings as irrelevant to that intent "
@@ -3802,7 +4009,7 @@ class PlannerAgent:
         # validation evidence, touched paths, and preserved worker context in
         # _build_goal_task. A second model call here is redundant and can make
         # the UI appear frozen for minutes between otherwise completed goals.
-        if str(getattr(self.config, "provider", "") or "").strip().lower() == "codex-subscription":
+        if str(getattr(self.config, "provider", "") or "").strip().lower() in {"codex-subscription", "gemini-subscription"}:
             return ""
 
         prompt = json.dumps(
@@ -3857,6 +4064,13 @@ class PlannerAgent:
                     check["next_step"] for check in failed_result.verification["checks"]
                     if check["status"] != "pass"
                 ]
+                if failed_result.verification.get("awaiting_manual_approval"):
+                    return (
+                        f"Execution paused at verification goal {failed_result.title}. "
+                        "Manual Approval Required: Playwright verification has unverified or failed checks "
+                        "and is awaiting manual approval to close the issue.\n\n"
+                        f"{failed_result.final_message}"
+                    )
                 return f"Execution paused at verification goal {failed_result.title}.\n\n{failed_result.final_message}"
             partial_changes = bool(failed_result.touched_paths)
             self.session.last_next_steps = [
@@ -3964,7 +4178,17 @@ class PlannerAgent:
             "Execution Summary",
             f"- {summary}",
         ]
-        if next_steps:
+        awaiting_manual_approval = any(
+            isinstance(result.verification, dict) and result.verification.get("awaiting_manual_approval")
+            for result in results
+        )
+        if awaiting_manual_approval:
+            lines.extend([
+                "",
+                "Manual Approval Required",
+                "- Playwright verification has unverified or failed checks. Review the verification checklist and manually approve to close the issue, or resume to rerun verification.",
+            ])
+        elif next_steps:
             lines.extend(["", "Next Steps"])
             lines.extend(f"{index}. {item}" for index, item in enumerate(next_steps, start=1))
             lines.extend(["", "Say “Proceed with next steps” to plan these actions."])
@@ -4244,6 +4468,7 @@ class PlannerAgent:
             **({"verification": result.verification} if result.verification is not None else {}),
             **({"deferred_findings": result.deferred_findings} if result.deferred_findings else {}),
             **({"mutation_paths": result.mutation_paths} if result.mutation_paths else {}),
+            **({"verification_facts": result.verification_facts} if result.verification_facts else {}),
         }
 
     def _revision_context_payload(self) -> Optional[Dict[str, Any]]:

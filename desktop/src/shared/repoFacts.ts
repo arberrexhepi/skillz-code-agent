@@ -3,7 +3,7 @@ export const REPO_FACTS_PATH = 'repo_facts.md';
 export function matchRepoFactsJsonBlock(source: string): RegExpExecArray | null {
   return /```json[ \t]*\r?\n([\s\S]*?)\r?\n[ \t]*```[ \t]*(?=\r?$)/m.exec(source) || /```json\s*([\s\S]*?)\s*```/.exec(source);
 }
-export type RepoFactKind = 'architecture' | 'goal';
+export type RepoFactKind = 'architecture' | 'goal' | 'verification';
 export interface RepoFact {
   key: string;
   value: string;
@@ -94,7 +94,8 @@ export function parseRepoFacts(markdown: string): RepoFactsLedger {
     const facts: RepoFact[] = [];
     for (const fact of (raw.facts || []) as unknown[]) {
       if (!map(fact) || !text(fact.key).trim() || !text(fact.value).trim()) { skipped++; continue; }
-      facts.push({ key: text(fact.key), value: text(fact.value), kind: !legacy && text(fact.fact_type).trim().toLowerCase() === 'goal' ? 'goal' : 'architecture',
+      const kind = text(fact.fact_type).trim().toLowerCase();
+      facts.push({ key: text(fact.key), value: text(fact.value), kind: !legacy && (kind === 'goal' || kind === 'verification') ? kind : 'architecture',
         source: text(fact.source_action), run: number(fact.updated_run_id), step: number(fact.updated_step) });
     }
     const checkpoints: RepoGoalCheckpoint[] = [];

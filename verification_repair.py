@@ -13,6 +13,35 @@ from mutation_runtime import EXPLICIT_MUTATION_TYPES
 MAX_REPAIR_ROUNDS = 2
 MAX_INVESTIGATION_TURNS = 4
 MAX_REPAIR_TURNS = 8
+
+
+def investigation_turn_guidance(turn: int, limit: int) -> str:
+    if turn >= limit:
+        return (
+            f"VERIFICATION INVESTIGATION · Final reporting turn ({limit}/{limit}). "
+            'Use finish now with JSON containing "targets" and "diagnosis". State the cause and supporting observations, '
+            "or give empty targets and explain the precise blocker or additional approval needed."
+        )
+    return (
+        f"VERIFICATION INVESTIGATION · Turn {max(1, turn)} of {limit}. "
+        "Start with the reported failure and prior diagnosis. Inspect the narrow source needed to confirm them. "
+        "Reserve the final turn for the JSON handoff."
+    )
+
+
+def verification_diagnosis(value: Any) -> str:
+    if isinstance(value, str):
+        return value.strip()[:2000]
+    if not isinstance(value, dict):
+        return ""
+    parts = []
+    for key in ("cause", "blocker", "evidence", "repair_steps"):
+        details = value.get(key)
+        entries = details if isinstance(details, list) else [details]
+        parts.extend(item.strip() for item in entries if isinstance(item, str) and item.strip())
+    return "\n".join(parts)[:2000]
+
+
 _SOURCE_PATH = r"(?:[\w.@-]+/)*[\w.@-]+\.(?:[cm]?[jt]s|[jt]sx|py|html?|css)"
 _COMPILER_ERROR = re.compile(
     rf"(?<![\w./@-])(?P<path>/?{_SOURCE_PATH})"

@@ -21,7 +21,10 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple, cast
-from issue_facts import CompletedGoalCheckpoint, FACT_TYPE_ARCHITECTURE, FACT_TYPE_GOAL, IssueFactLedger, IssueFactRecord
+from issue_facts import (
+    CompletedGoalCheckpoint, FACT_TYPES, FACT_TYPE_ARCHITECTURE, FACT_TYPE_GOAL, FACT_TYPE_VERIFICATION,
+    ISSUE_LOCAL_FACT_TYPES, IssueFactLedger, IssueFactRecord,
+)
 from memory_manager import MemoryManager, MemoryQuery
 from project_diagnostics import run_backend_diagnostics
 from diagnostics import changed_files_check as run_changed_files_check
@@ -37,12 +40,13 @@ from runtime_catalog import (
 )
 from skill_loader import MarkdownSkill, load_markdown_skills_from_dir
 from codex_subscription import run_codex_subscription_completion
+from gemini_subscription import run_gemini_subscription_completion
 from bridge_presentation import bridge_exchange
 from model_output_progress import ModelOutputObserver, ModelOutputProgress
 from structured_command_response import COMMAND_BLOCK_INSTRUCTION, COMMAND_BLOCK_SCHEMA, StructuredCommandResponse
 from reasoning_effort import REASONING_EFFORTS, active_reasoning_effort, gemini_thinking_api, resolve_reasoning_effort
-from verification_repair import MAX_INVESTIGATION_TURNS, MAX_REPAIR_TURNS, repair_action_error
-from verification_run import VerificationRun, is_verification_setup, needs_verification_check
+from verification_repair import MAX_INVESTIGATION_TURNS, MAX_REPAIR_TURNS, investigation_turn_guidance, repair_action_error
+from verification_run import VERIFICATION_FIXTURE_GUIDANCE, VerificationRun, is_verification_fact, is_verification_setup, needs_verification_check
 from discovery_budget import DiscoveryBudget
 from mcp_runtime import invoke_mcp, mcp_guidance, model_mcp_result
 from artifact_preview import has_preview_broker, preview_guidance, run_artifact_preview
@@ -264,6 +268,7 @@ ESTIMATED_MODEL_PRICING: List[Dict[str, Any]] = [
     {"provider": "openai", "match": "gpt-5.3-codex", "input_per_million": 1.50, "output_per_million": 6.00},
     {"provider": "openai", "match": "gpt-5.2", "input_per_million": 1.00, "output_per_million": 8.00},
     {"provider": "codex-subscription", "match": "", "input_per_million": 0.0, "output_per_million": 0.0},
+    {"provider": "gemini-subscription", "match": "", "input_per_million": 0.0, "output_per_million": 0.0},
     {"provider": "anthropic", "match": "claude-sonnet-4", "input_per_million": 3.00, "output_per_million": 15.00},
     {"provider": "anthropic", "match": "claude-opus-4", "input_per_million": 15.00, "output_per_million": 75.00},
     {"provider": "anthropic", "match": "claude-3-7-sonnet", "input_per_million": 3.00, "output_per_million": 15.00},
@@ -1782,6 +1787,71 @@ class CodexSubscriptionModelClient(BaseModelClient):
         return text
 
 
+class GeminiSubscriptionModelClient(BaseModelClient):
+    """Model adapter using the local Gemini CLI's Google OAuth session."""
+
+    def __init__(
+        self,
+        model: str,
+        thinking_mode: str = "medium",
+        verbosity: str = "medium",
+    ) -> None:
+        self.model = model
+        self.thinking_mode = thinking_mode
+        self.verbosity = verbosity
+        self.backoff = BackoffStrategy()
+        self.progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None
+
+    def set_progress_callback(
+        self,
+        callback: Optional[Callable[[Dict[str, Any]], None]],
+    ) -> None:
+        self.progress_callback = callback
+
+    def clone(self) -> BaseModelClient:
+        client = GeminiSubscriptionModelClient(
+            model=self.model,
+            thinking_mode=self.thinking_mode,
+            verbosity=self.verbosity,
+        )
+        client.backoff = BackoffStrategy(
+            enabled=self.backoff.enabled,
+            token_limit_k=self.backoff.token_limit_k,
+        )
+        client.progress_callback = self.progress_callback
+        return client
+
+    def complete(self, system: str, prompt: str) -> str:
+        return self._complete_with_backoff(system, prompt)
+
+    def _do_complete(self, system: str, prompt: str) -> str:
+        return self._invoke(system, [{"role": "user", "content": prompt}])
+
+    def _do_complete_messages(self, system: str, messages: Sequence[Dict[str, str]]) -> str:
+        return self._invoke(system, _normalize_chat_messages(messages))
+
+    def _do_complete_messages_with_progress(
+        self, system: str, messages: Sequence[Dict[str, str]], on_summary: Callable[[str], None],
+        *, on_output: Optional[ModelOutputObserver] = None,
+    ) -> str:
+        return self._invoke(system, _normalize_chat_messages(messages), on_summary=on_summary)
+
+    def _invoke(
+        self, system: str, messages: Sequence[Dict[str, str]], *,
+        on_summary: Optional[Callable[[str], None]] = None,
+    ) -> str:
+        text, metrics = run_gemini_subscription_completion(
+            model=self.model,
+            thinking_mode=self.thinking_mode,
+            system=system,
+            messages=messages,
+            progress_callback=self.progress_callback,
+            on_summary=on_summary,
+        )
+        self._set_last_metrics(metrics)
+        return text
+
+
 class LocalModelClient(OpenAIModelClient):
     provider_name = "local"
 
@@ -2265,15 +2335,16 @@ class FactSubagent:
                 "type": "set_fact" | "update_fact",
                 "key": "fact_key",
                 "value": "concise fact",
-                "fact_type": "goal" | "architecture"
+                "fact_type": "goal" | "architecture" | "verification"
               }
             }
 
             Rules:
             - Every exploration produces a fact. Choose set_fact for a new fact or update_fact to refine an existing one.
-            - Always include fact_type as either goal or architecture.
+            - Always include fact_type as goal, architecture, or verification.
             - Use fact_type=goal for issue-local execution findings, tactical constraints, and facts tied to this specific task.
             - Use fact_type=architecture for reusable repo knowledge that should remain available across unrelated future tasks.
+            - Use fact_type=verification for observed test results, inputs, and gaps in coverage.
             - If a finding is mainly about a write attempt, diff, verification latch, or other tactical execution state, use fact_type=goal.
             - Facts must be concise and durable. Prefer one or two sentences.
             - Do not include line numbers, step-by-step plans, risks, or broad run summaries.
@@ -2304,7 +2375,8 @@ class FactSubagent:
             {json.dumps(recent_events, indent=2)}
 
             Record a fact from these recent exploration events.
-            Use fact_type=goal for task-local findings, fact_type=architecture for cross-task repo knowledge.
+            Use fact_type=goal for task-local findings, fact_type=architecture for cross-task repo knowledge,
+            and fact_type=verification for observed test results and coverage gaps.
             """
         ).strip()
 
@@ -2705,9 +2777,13 @@ class WorkingFolderAgent(ProposalRuntimeMixin):
             self._clear_facts()
         self._current_task = ""
 
-    def configure_verification(self, requirements: list[str] | None, *, review_deferred: bool = False) -> None:
+    def configure_goal_verification_facts(self, facts) -> None:
+        self._goal_verification_facts = facts
+
+    def configure_verification(self, requirements: list[str] | None, *, review_deferred: bool = False,
+                               inherited_checks: dict[str, dict] | None = None) -> None:
         self._verification = VerificationRun(
-            requirements, review_deferred=review_deferred, managed_browser=has_preview_broker(),
+            requirements, review_deferred=review_deferred, managed_browser=has_preview_broker(), inherited_checks=inherited_checks,
         ) if requirements is not None else None
 
     def configure_verification_repair(self, paths: frozenset[str] | None) -> None:
@@ -3560,7 +3636,9 @@ class WorkingFolderAgent(ProposalRuntimeMixin):
             plan_summary=plan_summary, goal=goal, result=result,
             original_index=original_index, total_goal_count=total_goal_count,
         )
-        persisted = self.issue_ledger.record_completed_goal(issue_id=issue_id, checkpoint=checkpoint)
+        persisted = self.issue_ledger.record_completed_goal(
+            issue_id=issue_id, checkpoint=checkpoint, verification_facts=result.get("verification_facts"),
+        )
         self.issue_ledger.save(self._repo_facts_path())
         return persisted.to_dict()
 
@@ -3606,7 +3684,7 @@ class WorkingFolderAgent(ProposalRuntimeMixin):
     def _set_fact_record(self, key: str, value: str, *, source_action: str, fact_type: str) -> FactRecord:
         normalized_key = key.strip()
         resolved_fact_type = str(fact_type or "").strip().lower()
-        if resolved_fact_type not in {FACT_TYPE_GOAL, FACT_TYPE_ARCHITECTURE}:
+        if resolved_fact_type not in FACT_TYPES:
             resolved_fact_type = FACT_TYPE_GOAL
         record = self.issue_ledger.upsert_fact(
             key=normalized_key,
@@ -4087,8 +4165,8 @@ class WorkingFolderAgent(ProposalRuntimeMixin):
 
     def _validate_fact_quality(self, action_type: str, key: str, value: str, fact_type: str) -> Optional[ActionResult]:
         resolved_fact_type = str(fact_type or "").strip().lower()
-        # Goal facts are issue-local tactical findings — skip the durable-quality gate.
-        if resolved_fact_type == FACT_TYPE_GOAL:
+        # Issue-local facts can describe observations specific to the current task.
+        if resolved_fact_type in ISSUE_LOCAL_FACT_TYPES:
             return None
         assessment = self._assess_fact_quality(key, value)
         issues = list(assessment.get("issues", [])) if isinstance(assessment, dict) else []
@@ -4204,7 +4282,7 @@ class WorkingFolderAgent(ProposalRuntimeMixin):
             if step.result.ok and self._is_mutating_action(str(step.action.get("type", "") or ""))
         ]
         if not successful_mutations:
-            return WorkerValidationResult(kind="none", passed=True, summary="No mutating actions required validation.")
+            return WorkerValidationResult(kind="none", passed=True, summary="No repository changes required validation.")
 
         latest_mutation = successful_mutations[-1]
         latest_mutation_index = steps.index(latest_mutation)
@@ -4247,15 +4325,19 @@ class WorkingFolderAgent(ProposalRuntimeMixin):
         verification = getattr(self, "_verification", None)
         if verification is not None:
             notes = verification.record_handoff(final_message) if ok else ""
-            report = verification.report(verification.stop_reason or ("" if ok else final_message), notes)
+            reason = verification.stop_reason or ("" if ok else final_message)
+            if final_message.startswith("Worker execution failed:"):
+                reason = final_message
+            report = verification.report(reason, notes)
+            state = verification.snapshot(final=True, reason=reason, notes=notes)
             if self._run_metrics:
-                self._run_metrics["verification"] = verification.snapshot(final=True)
+                self._run_metrics["verification"] = state
             return WorkerRunResult(
                 ok=verification.passed, final_message=report, task_satisfied=verification.passed,
                 validation_ran=any(check.attempts for check in verification.checks.values()),
                 validation_passed=verification.passed, touched_paths=touched_paths,
                 validation=WorkerValidationResult(kind="verification", passed=verification.passed, summary=report.splitlines()[0]),
-                verification=verification.snapshot(final=True),
+                verification=state,
             )
         validation = self._validation_result_for_run(steps)
         validation = WorkerValidationResult(kind=validation.kind, passed=validation.passed, summary=validation.summary + self._proposal_deferral_summary())
@@ -6603,8 +6685,7 @@ class WorkingFolderAgent(ProposalRuntimeMixin):
             if scoped_paths is not None:
                 turn_limit = min(turn_limit, MAX_REPAIR_TURNS if scoped_paths else MAX_INVESTIGATION_TURNS)
             if verification is not None:
-                verification.turn_limit = min(turn_limit, verification.turn_limit)
-                turn_limit = verification.turn_limit
+                turn_limit = verification.configure_turn_limit(turn_limit)
             for _turn in range(1, turn_limit + 1):
                 if verification is not None:
                     if verification_turn_open:
@@ -6619,7 +6700,10 @@ class WorkingFolderAgent(ProposalRuntimeMixin):
                     budget.turns_used += 1
                 step_num = len(self.history) + 1
                 context_mode = self._model_context_mode()
-                prompt = self._build_model_turn_prompt(task)
+                turn_task = task
+                if scoped_paths == frozenset():
+                    turn_task += "\n\n" + investigation_turn_guidance(_turn, turn_limit)
+                prompt = self._build_model_turn_prompt(turn_task)
                 self._mark_recent_resolution_handoff_delivered()
                 if self.config.show_prompts:
                     print("\n--- PROMPT ---\n")
@@ -6705,9 +6789,13 @@ class WorkingFolderAgent(ProposalRuntimeMixin):
                         self._clear_completion_check(keep_satisfaction=True)
 
                     self._current_thought = thought
+                    facts = getattr(self, "_goal_verification_facts", None)
+                    source = facts.before(action) if facts is not None else ""
                     result = self._execute_action(action)
-                    if verification is not None and result.ok and action.get("type") in {"read_file", "read_symbol"}:
-                        verification.observe_source(str(action.get("path") or ""))
+                    if facts is not None:
+                        facts.observe(action, result.ok, result.payload, source)
+                    if verification is not None and result.ok and action.get("type") in {"read_file", "read_symbol", "read_context"}:
+                        verification.observe_source(str(result.payload.get("file_path") or action.get("path") or ""))
                     if result.ok:
                         self._clear_output_format_recovery()
                     error_cleared = self._maybe_clear_active_error(action, result)
@@ -7854,7 +7942,7 @@ class WorkingFolderAgent(ProposalRuntimeMixin):
         normalized.setdefault("auto", True)
         if str(normalized.get("type", "") or "").strip() in {"set_fact", "update_fact"}:
             raw_type = str(normalized.get("fact_type", "") or "").strip().lower()
-            if raw_type not in {FACT_TYPE_GOAL, FACT_TYPE_ARCHITECTURE}:
+            if raw_type not in FACT_TYPES:
                 raw_type = FACT_TYPE_GOAL
             normalized["fact_type"] = raw_type
 
@@ -9249,12 +9337,12 @@ class WorkingFolderAgent(ProposalRuntimeMixin):
         key = str(action.get("key", "") or "").strip()
         value = str(action.get("value", "") or "").strip()
         fact_type = str(action.get("fact_type", "") or "").strip().lower()
-        if fact_type not in {FACT_TYPE_GOAL, FACT_TYPE_ARCHITECTURE}:
+        if fact_type not in FACT_TYPES:
             return self._error_action_result(
                 action_type,
                 {
-                    "error": 'set_fact requires fact_type as "goal" or "architecture".',
-                    "next_hint": 'Retry set_fact with fact_type "goal" for task-local findings or "architecture" for reusable repo knowledge.',
+                    "error": 'set_fact requires fact_type "goal", "architecture", or "verification".',
+                    "next_hint": 'Use "goal" for task-local findings, "architecture" for reusable repo knowledge, and "verification" for observed test results.',
                 },
             )
         if not key or not value:
@@ -9265,7 +9353,11 @@ class WorkingFolderAgent(ProposalRuntimeMixin):
                     "next_hint": "Retry with a concise durable finding, for example {\"type\":\"set_fact\",\"key\":\"goal/findings/<short_key>\",\"value\":\"<specific finding>\",\"fact_type\":\"goal\"}.",
                 },
             )
-        existing = self.issue_ledger.find_fact(key)
+        if fact_type == FACT_TYPE_VERIFICATION:
+            issue_id = self.issue_ledger.active_issue_id
+            existing = self.issue_ledger.find_fact(key, fact_type=fact_type, issue_id=issue_id) if issue_id else None
+        else:
+            existing = self.issue_ledger.find_fact(key)
         if existing is not None:
             return self._error_action_result(
                 action_type,
@@ -9301,7 +9393,12 @@ class WorkingFolderAgent(ProposalRuntimeMixin):
                     "next_hint": "Retry update_fact with the exact existing fact key, or use set_fact with a non-empty key for a new finding.",
                 },
             )
-        existing = self.issue_ledger.find_fact(key)
+        issue_id = self.issue_ledger.active_issue_id
+        existing = (self.issue_ledger.find_fact(key, fact_type=FACT_TYPE_VERIFICATION, issue_id=issue_id)
+                    if issue_id else None)
+        requested_type = str(action.get("fact_type") or "").strip().lower()
+        if requested_type != FACT_TYPE_VERIFICATION and (requested_type or existing is None):
+            existing = self.issue_ledger.find_fact(key)
         if existing is None:
             return self._error_action_result(
                 action_type,
@@ -9315,7 +9412,7 @@ class WorkingFolderAgent(ProposalRuntimeMixin):
             action.get("value", action.get("resolution", "")) or existing.value
         ).strip() or existing.value
         fact_type = str(action.get("fact_type", existing.fact_type) or existing.fact_type).strip().lower()
-        if fact_type not in {FACT_TYPE_GOAL, FACT_TYPE_ARCHITECTURE}:
+        if fact_type not in FACT_TYPES:
             fact_type = existing.fact_type
         quality_error = self._validate_fact_quality(action_type, key, next_value, fact_type)
         if quality_error is not None:
@@ -9443,6 +9540,7 @@ class WorkingFolderAgent(ProposalRuntimeMixin):
         t = action.get("type")
         action_type = str(t or "")
         verification = getattr(self, "_verification", None)
+        setup = verification is not None and is_verification_setup(action, unbound=not verification_check)
         provenance = getattr(self, "diagnostic_provenance", None)
 
         try:
@@ -9470,9 +9568,14 @@ class WorkingFolderAgent(ProposalRuntimeMixin):
             if verification is not None and not verification_check:
                 if action_type == "finish":
                     return ActionResult(ok=True, name="finish", payload={"message": str(action.get("message") or "")})
-                if needs_verification_check(action):
+                if not setup and needs_verification_check(action):
+                    if action_type == "run_shell":
+                        raise ValueError("Bind shell assertions to required checks with the verify action. " + VERIFICATION_FIXTURE_GUIDANCE)
                     raise ValueError("Bind this tool to required checks with the verify action.")
-                if (action_type != "mcp" and not is_verification_setup(action)
+                issue_fact = is_verification_fact(action)
+                if issue_fact and action.get("issue_id") not in (None, "", self.issue_ledger.active_issue_id):
+                    raise ValueError("Record this fact under the active issue.")
+                if (action_type != "mcp" and not setup and not issue_fact
                         and (error := repair_action_error(action, root=self.root, paths=frozenset()))):
                     return self._error_action_result(action_type, {"error": error})
             if self.discovery_budget is not None and self.discovery_budget.pending_extension:
@@ -9513,12 +9616,24 @@ class WorkingFolderAgent(ProposalRuntimeMixin):
             if blocked_result is not None:
                 return blocked_result
 
+            dispatched_action = verification.begin_setup(action) if setup else action
+            if verification is not None and action_type == "mcp" and not setup and not verification_check:
+                verification.begin_mcp_discovery()
             if action_type == "artifact_preview":
                 payload = run_artifact_preview(action)
+                if setup:
+                    payload = verification.record_setup(action, payload)
                 return ActionResult(ok=payload["ok"], name=action_type, payload=payload)
             if action_type == "mcp":
                 with provenance.track(action) if provenance is not None else nullcontext():
-                    payload = invoke_mcp(self.root, action)
+                    payload = (
+                        verification.invoke_setup_mcp(dispatched_action, lambda candidate: invoke_mcp(self.root, candidate))
+                        if setup else invoke_mcp(self.root, dispatched_action)
+                    )
+                if verification is not None:
+                    verification.observe_mcp_availability(action, payload)
+                if setup:
+                    payload = verification.record_setup(action, payload)
                 if not verification_check:
                     payload = model_mcp_result(payload)
                 return ActionResult(ok=payload["ok"], name="mcp", payload=payload)
@@ -9652,6 +9767,12 @@ def create_model_client(
         return GeminiModelClient(
             model=normalized_model,
             thinking_mode=thinking_mode,
+        )
+    if normalized_provider == "gemini-subscription":
+        return GeminiSubscriptionModelClient(
+            model=normalized_model,
+            thinking_mode=thinking_mode,
+            verbosity=verbosity,
         )
     if normalized_provider == "local":
         return LocalModelClient(
@@ -10005,7 +10126,7 @@ def _handle_bridge_planner_action(
         return message
     if getattr(getattr(planner, "session", None), "pending_discovery_extension", None) is not None and action_name in {
         "approve_plan", "reject_plan", "revise_plan", "select_discovery_mode", "skip_discovery",
-        "retry_failed_goal", "resume_execution",
+        "retry_failed_goal", "resume_execution", "proceed_verification_next_steps", "approve_verification_close",
     }:
         raise ValueError("Discovery is awaiting an extension decision. Review the current request before continuing.")
     if action_name in {"accept_issue_proposal", "ignore_issue_proposal"}:
@@ -10013,9 +10134,13 @@ def _handle_bridge_planner_action(
         decision = "accept" if action_name == "accept_issue_proposal" else "ignore"
         proposal = planner.worker.decide_issue_proposal(proposal_id, decision)
         return f"Suggestion {proposal_id} {proposal['status']}." + (f" Created {proposal['accepted_issue_id']} without changing the active task." if decision == "accept" else "")
-    if action_name in {"approve_plan", "reject_plan", "continue_issue", "revise_plan", "resume_execution"} and ("expected_plan" in request or action_name == "revise_plan"):
+    plan_actions = {
+        "approve_plan", "reject_plan", "continue_issue", "revise_plan",
+        "resume_execution", "proceed_verification_next_steps", "approve_verification_close",
+    }
+    if action_name in plan_actions and ("expected_plan" in request or action_name in {"revise_plan", "proceed_verification_next_steps", "approve_verification_close"}):
         paused_plan = planner.session.paused_plan if planner.session.execution_paused else None
-        current = paused_plan if action_name == "resume_execution" else planner.session.pending_plan or paused_plan
+        current = paused_plan if action_name in {"resume_execution", "proceed_verification_next_steps", "approve_verification_close"} else planner.session.pending_plan or paused_plan
         if current is None or planner.session.executing or request.get("expected_plan") != planner._plan_payload(current):
             raise ValueError("The plan changed. Review the current plan before deciding.")
     if action_name == "revise_plan":
@@ -10029,6 +10154,16 @@ def _handle_bridge_planner_action(
     if action_name == "approve_plan":
         add_exchange("user", "approve")
         message = planner.execute_pending_plan()
+        add_exchange("assistant", message)
+        return message
+    if action_name == "proceed_verification_next_steps":
+        add_exchange("user", "Proceed with next steps")
+        message = planner.proceed_with_verification_next_steps()
+        add_exchange("assistant", message)
+        return message
+    if action_name == "approve_verification_close":
+        add_exchange("user", "Approve and close issue")
+        message = planner.approve_verification_close()
         add_exchange("assistant", message)
         return message
     if action_name in {"retry_failed_goal", "resume_execution"}:
@@ -10250,6 +10385,8 @@ def _run_extension_bridge(args: argparse.Namespace) -> int:
             "turn.started": "Codex is processing the next agent step.",
             "turn.completed": "Subscription model step completed.",
             "turn.failed": "Subscription model step failed.",
+            "init": "Gemini CLI session started.",
+            "result": "Gemini CLI step completed.",
             "error": "Subscription model reported an error.",
         }
         if event_type in {"item.started", "item.updated", "item.completed"}:
@@ -10288,7 +10425,7 @@ def _run_extension_bridge(args: argparse.Namespace) -> int:
             "inspected_files": [],
             "state": safe_bridge_state(),
         }
-        if event_type in {"turn.completed"}:
+        if event_type in {"turn.completed", "result"}:
             packet["ok"] = True
         elif event_type in {"turn.failed", "error"}:
             packet["ok"] = False

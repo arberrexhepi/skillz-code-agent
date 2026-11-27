@@ -9,7 +9,7 @@ import type {
   AgentResponse,
   AgentStartOptions,
 } from '../../shared/contracts';
-import type { CodexSubscriptionStatus, JsonMap, RuntimeOptionsPayload } from '../../shared/agentTypes';
+import type { CodexSubscriptionStatus, GeminiSubscriptionStatus, JsonMap, RuntimeOptionsPayload } from '../../shared/agentTypes';
 import type { WorkspaceService } from './workspace';
 import { pythonEnvironment, resolvePythonCommand } from './python';
 import type { RuntimeSettingsService } from './runtimeSettings';
@@ -27,6 +27,7 @@ export class AgentService {
   private process: ChildProcessWithoutNullStreams | null = null;
   private buffer = '';
   private processCodexPath = '';
+  private processGeminiPath = '';
   private stopping = false;
   private launchGeneration = 0;
   private readonly pending = new Map<string, PendingRequest>();
@@ -81,6 +82,7 @@ export class AgentService {
     this.process = child;
     this.mcpBroker = this.mcp?.broker({ root: this.workspace.requireRoot(), profile: this.mcpProfile });
     this.processCodexPath = env.CODEX_CLI_PATH || '';
+    this.processGeminiPath = env.GEMINI_CLI_PATH || '';
 
     child.stdin.on('error', (error) => this.handleExit(child, new Error(`Agent input closed: ${error.message}`)));
     child.stdout.setEncoding('utf8');
@@ -185,13 +187,43 @@ export class AgentService {
     }
   }
 
-  private async launchEnvironment(): Promise<{ env: NodeJS.ProcessEnv; savedPath: string }> {
+  geminiSubscriptionStatus(): Promise<GeminiSubscriptionStatus> {
+    return this.runGeminiSubscriptionCommand('status', 20_000);
+  }
+
+  geminiSubscriptionLogin(): Promise<GeminiSubscriptionStatus> {
+    return this.runGeminiSubscriptionCommand('login', 5 * 60_000);
+  }
+
+  geminiSubscriptionLogout(): Promise<GeminiSubscriptionStatus> {
+    return this.runGeminiSubscriptionCommand('logout', 20_000);
+  }
+
+  async setGeminiCliPath(candidate: string | null): Promise<GeminiSubscriptionStatus> {
+    if (!this.runtimeSettings) throw new Error('Runtime settings storage is unavailable.');
+    await this.runtimeSettings.setGeminiCliPath(candidate);
+    try {
+      return await this.geminiSubscriptionStatus();
+    } catch (error) {
+      const { env, savedGeminiPath } = await this.launchEnvironment();
+      return {
+        available: false, authenticated: false, configured_cli_path: savedGeminiPath,
+        cli_path_source: savedGeminiPath ? 'settings' : env.GEMINI_CLI_PATH ? 'environment' : 'discovery',
+        restart_required: Boolean(this.process && this.processGeminiPath !== (env.GEMINI_CLI_PATH || '')),
+        error: `The path setting was saved, but status could not be checked: ${String(error)}`,
+      };
+    }
+  }
+
+  private async launchEnvironment(): Promise<{ env: NodeJS.ProcessEnv; savedPath: string; savedGeminiPath: string }> {
     const savedPath = await this.runtimeSettings?.codexCliPath() || '';
+    const savedGeminiPath = await this.runtimeSettings?.geminiCliPath() || '';
     const env = pythonEnvironment();
     const root = this.workspace.current()?.root;
     if (root) env.SKILLZ_OBSERVABILITY_PATH = path.join(root, 'memory_observability.md');
     if (savedPath) env.CODEX_CLI_PATH = savedPath;
-    return { env, savedPath };
+    if (savedGeminiPath) env.GEMINI_CLI_PATH = savedGeminiPath;
+    return { env, savedPath, savedGeminiPath };
   }
 
   async stop(): Promise<void> {
@@ -331,6 +363,45 @@ export class AgentService {
           return;
         }
         const detail = String(stderr || error?.message || 'Codex subscription helper returned invalid JSON.').trim();
+        reject(new Error(detail));
+      });
+    });
+  }
+
+  private async runGeminiSubscriptionCommand(
+    command: 'status' | 'login' | 'logout',
+    timeout: number,
+  ): Promise<GeminiSubscriptionStatus> {
+    const agentRoot = this.agentRoot();
+    const helper = path.join(agentRoot, 'gemini_subscription.py');
+    if (!existsSync(helper)) return Promise.reject(new Error('Gemini subscription helper is missing.'));
+    const { env, savedGeminiPath } = await this.launchEnvironment();
+    const python = await resolvePythonCommand(agentRoot, process.platform, env);
+    return new Promise<GeminiSubscriptionStatus>((resolve, reject) => {
+      execFile(python.executable, [...python.args, helper, command], {
+        cwd: agentRoot,
+        env,
+        windowsHide: true,
+        encoding: 'utf8',
+        timeout,
+        maxBuffer: 2 * 1024 * 1024,
+      }, (error, stdout, stderr) => {
+        let payload: GeminiSubscriptionStatus | undefined;
+        try {
+          payload = JSON.parse(stdout) as GeminiSubscriptionStatus;
+        } catch {
+          // The process error below carries the useful diagnostic.
+        }
+        if (payload) {
+          resolve({
+            ...payload,
+            configured_cli_path: savedGeminiPath,
+            cli_path_source: savedGeminiPath ? 'settings' : env.GEMINI_CLI_PATH ? 'environment' : 'discovery',
+            restart_required: Boolean(this.process && this.processGeminiPath !== (env.GEMINI_CLI_PATH || '')),
+          });
+          return;
+        }
+        const detail = String(stderr || error?.message || 'Gemini subscription helper returned invalid JSON.').trim();
         reject(new Error(detail));
       });
     });

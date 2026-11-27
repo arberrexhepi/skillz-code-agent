@@ -188,6 +188,35 @@ export interface DiscoveryResult extends JsonMap {
   usage_summary?: string;
 }
 
+export interface VerificationCheckResult {
+  id: string;
+  requirement: string;
+  status: 'pass' | 'fail' | 'blocked' | 'unverified' | 'not_run' | 'pending';
+  attempts: number;
+  mcp_backed?: boolean;
+  browser_backed?: boolean;
+  mcp_attempts?: number;
+  mcp_attempt_checkpoint?: number;
+  reused_from?: string[];
+  progress_evidence?: string;
+  evidence?: string;
+  stop_reason?: string;
+  latest_attempt?: string;
+  next_step?: string;
+}
+
+export interface VerificationReport {
+  checks: VerificationCheckResult[];
+  attempt_limit?: number;
+  awaiting_manual_approval?: boolean;
+  mcp_session?: {
+    decisions: Array<{ turn: number; calls: number; decision: 'continue' | 'stop'; reason: string; evidence?: string[] }>;
+  };
+  stop_reason?: string;
+  worker_notes?: string;
+  follow_up?: string[];
+}
+
 export interface GoalExecutionResult extends JsonMap {
   goal_id?: string;
   title?: string;
@@ -196,6 +225,7 @@ export interface GoalExecutionResult extends JsonMap {
   validation_ran?: boolean;
   validation_passed?: boolean;
   validation_summary?: string;
+  verification?: VerificationReport;
   worker_history_summary?: JsonMap[];
   touched_paths?: string[];
   preserve_context_used?: boolean;
@@ -316,6 +346,8 @@ export interface CodexSubscriptionStatus extends JsonMap {
   error?: string;
   status_text?: string;
 }
+
+export type GeminiSubscriptionStatus = CodexSubscriptionStatus;
 
 export interface AgentProgressMessage extends JsonMap {
   type: 'progress' | 'goal_start' | 'goal_finish';

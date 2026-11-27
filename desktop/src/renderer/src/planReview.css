@@ -7,6 +7,50 @@
 .plan-pause-reason p { margin: 0 0 6px; }
 .plan-pause-reason p:last-child { margin-bottom: 0; }
 .plan-pause-reason strong { display: block; color: #f1decc; }
+.plan-review-body > .plan-pause-reason,
+.plan-review-body > .plan-pause-verification { margin-bottom: 16px; }
+.plan-pause-verification > p { margin: 7px 0 0; color: #9aa8ae; font-size: 11px; line-height: 1.45; }
+.plan-pause-verification > p:first-child { margin: 0 0 7px; }
+.verification-checklist {
+  min-width: 0; padding: 10px; border: 1px solid #34413e; border-radius: 9px;
+  background: #101716; color: #dae2df; font-size: 12px; line-height: 1.45; overflow-wrap: anywhere;
+}
+.verification-checklist-header { display: flex; align-items: baseline; justify-content: space-between; flex-wrap: wrap; gap: 4px 10px; padding: 1px 2px 8px; }
+.verification-checklist-header strong { font-size: 13px; font-weight: 650; }
+.verification-checklist-header > span { color: #aacdbb; font-variant-numeric: tabular-nums; }
+.verification-checklist .verification-stop { margin: 0; padding: 0 2px 8px; color: #aab8b2; }
+.verification-checklist > ul { list-style: none; margin: 0; padding: 0; border-top: 1px solid #28342f; }
+.verification-checklist li { border-bottom: 1px solid #28342f; }
+.verification-checklist li summary { display: grid; gap: 4px; position: relative; padding: 8px 22px 8px 2px; list-style: none; cursor: pointer; border-radius: 4px; }
+.verification-checklist summary::-webkit-details-marker { display: none; }
+.verification-checklist li summary::after {
+  content: ''; position: absolute; top: 15px; right: 5px; width: 6px; height: 6px;
+  border: solid #92a9a0; border-width: 0 1px 1px 0; transform: rotate(45deg);
+}
+.verification-checklist li details[open] > summary::after { transform: rotate(225deg); top: 18px; }
+.verification-checklist li summary:hover { background: #ffffff07; }
+.verification-check-heading { display: flex; align-items: baseline; flex-wrap: wrap; gap: 4px 8px; font-size: 11px; }
+.verification-check-status { border-radius: 4px; padding: 1px 5px; background: #242d30; color: #becbd1; font-weight: 650; }
+.verification-check-status[data-status='pass'] { background: #1b352b; color: #a0debf; }
+.verification-check-status[data-status='fail'] { background: #3a2427; color: #f0aaa8; }
+.verification-check-status[data-status='blocked'] { background: #382e22; color: #e8c08b; }
+.verification-check-status[data-status='unverified'] { background: #263040; color: #b3c8ee; }
+.verification-check-attempts, .verification-check-stop-detail { color: #a1b0a9; font-size: 11px; }
+.verification-check-requirement { font-weight: 520; }
+.verification-check-evidence { margin: 0 0 8px 2px; padding: 6px 8px; border-left: 2px solid #3a5247; background: #ffffff04; color: #b7c6bf; }
+.verification-check-evidence p, .verification-notes p { margin: 0; }
+.verification-check-evidence p + p, .verification-notes p + p { margin-top: 5px; }
+.verification-check-evidence strong { color: #d0dcd6; }
+.verification-notes { padding: 7px 2px 0; color: #a1b0a9; }
+.verification-notes summary { width: fit-content; cursor: pointer; color: #bac9c2; }
+.verification-notes p { margin-top: 5px; white-space: pre-wrap; }
+.verification-manual-approval { display: grid; gap: 6px; padding: 10px 10px 8px; margin-top: 6px; border: 1px solid #4a5c54; border-radius: 8px; background: #ffffff05; min-width: 0; }
+.verification-manual-approval p { margin: 0; color: #c7d4ce; }
+.verification-next-steps { display: grid; gap: 6px; padding: 10px 2px 2px; min-width: 0; }
+.verification-next-steps > div:not(.decision-buttons) { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 8px; }
+.verification-next-steps > div > span { color: #a1b0a9; font-variant-numeric: tabular-nums; }
+.verification-next-steps p { margin: 0; overflow-wrap: anywhere; }
+.verification-checklist summary:focus-visible { outline: 2px solid #8ad0ac; outline-offset: 2px; }
 .plan-details { color: #bac3cb; font-size: 14px; line-height: 1.65; overflow-wrap: anywhere; }
 .plan-details p { margin: 0 0 12px; white-space: pre-wrap; }
 .plan-details .plan-summary { color: #d8e0e5; }

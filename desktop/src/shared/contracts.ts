@@ -72,7 +72,7 @@ export interface AgentStartOptions {
   backendScript?: string;
 }
 
-import type { AgentBackoff, AgentBridgeState, AgentProgressMessage, CodexSubscriptionStatus, JsonMap, RuntimeOptionsPayload } from './agentTypes';
+import type { AgentBackoff, AgentBridgeState, AgentProgressMessage, CodexSubscriptionStatus, GeminiSubscriptionStatus, JsonMap, RuntimeOptionsPayload } from './agentTypes';
 import type { ReasoningEffort, ReasoningModel, ReasoningPhase, RepoReasoningPreferences } from './reasoningPreferences';
 export type { AgentBridgeState } from './agentTypes';
 
@@ -157,6 +157,11 @@ export interface WorkbenchApi {
     codexSubscriptionLogin(): Promise<CodexSubscriptionStatus>;
     chooseCodexCli(): Promise<string | null>;
     setCodexCliPath(path: string | null): Promise<CodexSubscriptionStatus>;
+    geminiSubscriptionStatus(): Promise<GeminiSubscriptionStatus>;
+    geminiSubscriptionLogin(): Promise<GeminiSubscriptionStatus>;
+    geminiSubscriptionLogout(): Promise<GeminiSubscriptionStatus>;
+    chooseGeminiCli(): Promise<string | null>;
+    setGeminiCliPath(path: string | null): Promise<GeminiSubscriptionStatus>;
     stop(): Promise<void>;
     onEvent(listener: (event: AgentEvent) => void): () => void;
   };

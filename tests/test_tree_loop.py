@@ -674,6 +674,40 @@ class TestTreeLoop(unittest.TestCase):
         self.assertIn("skipped after prior command failure", result.turns[0].results[1].output)
         self.assertIsNone(loop.bridge.tree.get_fact("test", "state", "after"))
 
+    def test_failed_browser_drag_allows_inspection_and_holds_further_input(self):
+        drag = 'mcp {"operation":"call","server":"playwright","name":"browser_drag"}'
+        snapshot = 'mcp {"operation":"call","server":"playwright","name":"browser_snapshot"}'
+        (Path(self.tmpdir) / "note.txt").write_text("Inspect the target.")
+        model = FakeModel([f"{drag}\n{drag}\n{snapshot}\ncat /repo/note.txt\nfinish done", "finish reported"])
+        loop = TreeLoop(model=model, workspace_root=Path(self.tmpdir), max_turns=2, verbose=False)
+        error = {"ok": False, "result": {"content": [{
+            "type": "text",
+            "text": "### Error\nTimeoutError: 5000ms exceeded.\n - Parent clip intercepts pointer events",
+        }]}}
+        with mock.patch("tree_loop.invoke_mcp", side_effect=[error, {"ok": True, "result": "snapshot"}]) as invoke:
+            run = loop.run("Inspect the timeline.")
+        failed, held, inspected, read, finish = run.turns[0].results
+        self.assertFalse(failed.ok)
+        self.assertIn("Parent clip intercepts pointer events", held.output)
+        self.assertEqual(held.command_type, "skipped")
+        self.assertTrue(inspected.ok)
+        self.assertIn("Inspect the target.", read.output)
+        self.assertEqual(finish.command_type, "skipped")
+        self.assertEqual([call.args[1]["name"] for call in invoke.call_args_list],
+                         ["browser_drag", "browser_snapshot"])
+
+    def test_failed_strategy_step_allows_independent_inspection(self):
+        (Path(self.tmpdir) / "note.txt").write_text("Read this independently.")
+        model = FakeModel([
+            "s1: git diff -- ../invalid\ns2: cat /repo/note.txt\ns1 -> s3: cat /repo/note.txt",
+            "finish reported",
+        ])
+        loop = TreeLoop(model=model, workspace_root=Path(self.tmpdir), max_turns=2, verbose=False)
+        failed, independent, dependent = loop.run("Inspect source.").turns[0].results
+        self.assertFalse(failed.ok)
+        self.assertIn("Read this independently.", independent.output)
+        self.assertEqual(dependent.command_type, "skipped")
+
     def test_run_shell_action_is_disabled_when_env_flag_is_false(self):
         model = FakeModel([
             "shell pwd",

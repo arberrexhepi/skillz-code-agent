@@ -69,3 +69,112 @@ test('managed browser observes the project workflow and reports interaction erro
     assert.equal(artifactPreviewActionSchema.safeParse({ ...request, input: { route: '/', steps: [...steps, extra] } }).success, false);
   }
 });
+
+test('managed browser supports viewport, reduced motion, input steps, and isolated page evaluate', { timeout: 30000 }, async t => {
+  const { ArtifactPreviewService, artifactPreviewActionSchema } = load(() => ({
+    ...require('../src/main/services/artifactPreview.ts'),
+    ...require('../src/shared/artifactAppMcp.ts'),
+  }));
+  const preview = new ArtifactPreviewService();
+  const server = createServer((_request, response) => {
+    response.setHeader('content-type', 'text/html');
+    response.end(`<!doctype html>
+      <style>#canvas{width:200px;height:120px;border:1px solid #333;}</style>
+      <input id="query" type="text" />
+      <button id="go">Go</button>
+      <div id="status">idle</div>
+      <div id="canvas">canvas</div>
+      <script>
+        let drags = 0, wheel = 0;
+        const canvas = document.querySelector('#canvas');
+        canvas.addEventListener('pointerdown', () => { drags += 1; });
+        canvas.addEventListener('wheel', (event) => { wheel += event.deltaY; });
+        document.querySelector('#go').addEventListener('click', () => {
+          document.querySelector('#status').textContent = 'ran:' + document.querySelector('#query').value;
+        });
+        window.__probe = () => ({
+          drags,
+          wheel,
+          width: window.innerWidth,
+          height: window.innerHeight,
+          reduced: window.matchMedia('(prefers-reduced-motion: reduce)').matches,
+          status: document.querySelector('#status').textContent,
+        });
+      </script>`);
+  });
+  t.after(async () => {
+    await preview.dispose();
+    server.closeAllConnections();
+    await new Promise(resolve => server.close(resolve));
+  });
+  await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
+  const url = `http://127.0.0.1:${server.address().port}`;
+  const parsed = artifactPreviewActionSchema.parse({
+    operation: 'browser-check',
+    input: {
+      route: '/',
+      viewport: { width: 960, height: 640 },
+      reducedMotion: 'reduce',
+      timeoutMs: 20000,
+      steps: [
+        { type: 'fill', selector: '#query', value: 'arber', label: 'Fill search query' },
+        { type: 'press', key: 'Tab', label: 'Tab to button' },
+        { type: 'assert-focused', selector: '#go', label: 'Button receives focus' },
+        { type: 'press', key: 'Enter', label: 'Activate button via keyboard' },
+        { type: 'assert-text', selector: '#status', text: 'ran:arber', exact: true, label: 'Status updated' },
+        { type: 'drag', selector: '#canvas', dx: 40, dy: 20, steps: 4, label: 'Drag canvas' },
+        { type: 'wheel', selector: '#canvas', deltaY: -120, label: 'Zoom canvas' },
+        {
+          type: 'evaluate',
+          label: 'Read measurements',
+          script: `() => {
+            const p = window.__probe();
+            const ok = p.width === 960 && p.height === 640 && p.reduced && p.drags === 1 && p.wheel === -120 && p.status === 'ran:arber';
+            return {
+              probe: p,
+              verification_results: {
+                'check-1': { status: ok ? 'pass' : 'fail', evidence: JSON.stringify(p) },
+              },
+            };
+          }`,
+        },
+      ],
+    },
+  });
+  const observed = await preview.checkRoute(url, parsed.input.route, parsed.input.steps, {
+    viewport: parsed.input.viewport,
+    reducedMotion: parsed.input.reducedMotion,
+    timeoutMs: parsed.input.timeoutMs,
+  });
+  assert.equal(observed.ok, true, observed.error);
+  assert.equal(observed.verification_results['check-1'].status, 'pass');
+  assert.equal(observed.measurements.length, 1);
+  assert.equal(observed.measurements[0].value.probe.reduced, true);
+  assert.equal(observed.measurements[0].value.probe.width, 960);
+
+  const unlabeled = artifactPreviewActionSchema.parse({
+    operation: 'browser-check',
+    input: {
+      route: '/',
+      timeoutMs: 60000,
+      steps: [
+        { type: 'click', selector: '#go' },
+        { type: 'evaluate', timeoutMs: 45000, script: '() => ({ ok: true })' },
+      ],
+    },
+  });
+  const ranUnlabeled = await preview.checkRoute(url, unlabeled.input.route, unlabeled.input.steps, { timeoutMs: unlabeled.input.timeoutMs });
+  assert.equal(ranUnlabeled.ok, true, ranUnlabeled.error);
+  assert.deepEqual(ranUnlabeled.observations, [
+    { type: 'click', label: 'click #go', selector: '#go' },
+    { type: 'evaluate', label: 'evaluate' },
+  ]);
+
+  const strict = await preview.checkRoute(url, '/', [
+    { type: 'click', selector: 'div', label: 'Ambiguous selector' },
+    { type: 'assert-visible', selector: '#status', label: 'Status' },
+  ]);
+  assert.equal(strict.ok, false);
+  assert.equal(strict.verifierError, true);
+  assert.match(strict.error, /strict mode violation/i);
+});
