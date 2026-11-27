@@ -2,6 +2,7 @@ import { PathText } from '../PathText';
 import { useEffect, useRef } from 'react';
 import type { AgentHandoff } from '../../../../shared/agentCore';
 import { MarkdownMessage } from './MarkdownMessage';
+import { VerificationChecklist } from './VerificationChecklist';
 
 interface GoalReportDialogProps {
   handoff: AgentHandoff;
@@ -11,6 +12,12 @@ interface GoalReportDialogProps {
 export function GoalReportDialog({ handoff, onClose }: GoalReportDialogProps): React.JSX.Element {
   const closeRef = useRef<HTMLButtonElement>(null);
   const inProgress = handoff.executionState === 'executing';
+  const paused = handoff.executionState === 'paused';
+  const verificationLog = paused ? handoff.goalResults.find(result =>
+    result.status !== 'completed' && result.verification?.checks?.length)?.final_message : undefined;
+  const summary = verificationLog && handoff.executionSummary?.endsWith(verificationLog)
+    ? handoff.executionSummary.slice(0, -verificationLog.length).trim()
+    : handoff.executionSummary;
 
   useEffect(() => {
     closeRef.current?.focus();
@@ -30,17 +37,19 @@ export function GoalReportDialog({ handoff, onClose }: GoalReportDialogProps): R
         </header>
         <div className="goal-report-body">
           {inProgress && <div className="goal-report-summary"><h4>In progress</h4><p>{handoff.completedGoalCount} of {handoff.totalGoalCount || '?'} goals completed. <PathText>{handoff.currentGoalTitle ? `Currently executing ${handoff.currentGoalTitle}.` : 'Preparing the next goal.'}</PathText></p></div>}
-          {handoff.executionSummary && <div className="goal-report-summary"><h4>{handoff.executionState === 'paused' ? 'Pause summary' : 'Final summary'}</h4><MarkdownMessage content={handoff.executionSummary} /></div>}
+          {summary && <div className="goal-report-summary"><h4>{paused ? 'Pause summary' : 'Final summary'}</h4><MarkdownMessage content={summary} /></div>}
           <div className="goal-report-list">
             {handoff.goalResults.map((result, index) => {
               const complete = result.status === 'completed';
               const suspended = result.status === 'suspended';
+              const verification = result.verification?.checks?.length ? result.verification : undefined;
               return (
                 <article className="goal-report-item" key={result.goal_id || index}>
                   <header><span className={complete ? 'complete' : suspended ? 'suspended' : 'failed'} aria-hidden="true">{complete ? '✓' : suspended ? 'Ⅱ' : '!'}</span><div><small>GOAL {index + 1}</small><strong><PathText>{result.title || result.goal_id || 'Untitled goal'}</PathText></strong></div><em>{result.status || 'unknown'}</em></header>
-                  {result.final_message && <MarkdownMessage content={result.final_message} />}
+                  {verification ? <VerificationChecklist report={verification} legacyLog={result.final_message} />
+                    : result.final_message && <MarkdownMessage content={result.final_message} />}
                   <dl>
-                    {result.validation_summary && <><dt>Validation</dt><dd><PathText>{result.validation_summary}</PathText></dd></>}
+                    {!verification && result.validation_summary && <><dt>Validation</dt><dd><PathText>{result.validation_summary}</PathText></dd></>}
                     {result.touched_paths?.length ? <><dt>Touched paths</dt><dd><PathText>{result.touched_paths.join(' · ')}</PathText></dd></> : null}
                     {result.duration_s !== undefined && <><dt>Duration</dt><dd>{result.duration_s.toFixed(1)}s</dd></>}
                   </dl>

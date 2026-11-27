@@ -4,7 +4,7 @@ import { createRoot } from 'react-dom/client';
 import { AgentWorkspaceContext, type AgentWorkspaceValue } from '../../src/renderer/src/agent/agentWorkspace';
 import { PlanDecisionCard } from '../../src/renderer/src/components/agent/PlanDecisionCard';
 import { initialAgentUiState } from '../../src/shared/agentCore';
-import { reviewPlan } from './plan-review';
+import { pausedVerification, reviewPlan } from './plan-review';
 import '../../src/renderer/src/styles.css';
 import '../../src/renderer/src/agentTypography.css';
 import '../../src/renderer/src/planReview.css';
@@ -29,7 +29,7 @@ const fill = async (text: string): Promise<void> => {
     input().dispatchEvent(new Event('input', { bubbles: true }));
   });
 };
-const mount = async (paused = false) => {
+const mount = async (paused: boolean | 'verification' = false) => {
   const root = createRoot(host);
   let finish!: (ok: boolean) => void;
   let reject!: (error: Error) => void;
@@ -38,7 +38,7 @@ const mount = async (paused = false) => {
   const response = new Promise<boolean>((resolve, fail) => { finish = resolve; reject = fail; });
   // Only the fields used by this component are needed in this isolated fixture.
   const agent = {
-    state: { ...initialAgentUiState, bridge: { transcript: [], planner: paused
+    state: { ...initialAgentUiState, bridge: { transcript: [], planner: paused === 'verification' ? pausedVerification : paused
       ? { execution_paused: true, paused_plan: reviewPlan, paused_suspended_goal_id: 'goal-2',
           last_completed_results: [{ goal_id: 'goal-2', status: 'suspended', title: 'Update export', final_message: 'Read allowance exhausted.' }] }
       : { pending_plan: reviewPlan } } },
@@ -48,7 +48,7 @@ const mount = async (paused = false) => {
   return { finish, reject, count: () => calls, action: () => action, cleanup: async () => { await act(async () => { finish(true); root.unmount(); }); } };
 };
 
-const cases: Array<[string, (fixture: Awaited<ReturnType<typeof mount>>) => Promise<void>, boolean?]> = [
+const cases: Array<[string, (fixture: Awaited<ReturnType<typeof mount>>) => Promise<void>, (boolean | 'verification')?]> = [
   ['Approval dismisses before execution finishes; reopened review can close while pending', async (fixture) => {
     await click('Review full plan ↗');
     await click('Approve plan');
@@ -77,6 +77,18 @@ const cases: Array<[string, (fixture: Awaited<ReturnType<typeof mount>>) => Prom
     assert(fixture.action() === 'resume_execution', 'Wrong resume action');
     assert(button('Resume').disabled && fixture.count() === 1, 'Resume did not lock while running');
   }, true],
+  ['Verification evidence expands and the full-plan actions stay accessible', async () => {
+    const checklist = host.querySelector<HTMLElement>('.verification-checklist')!;
+    const row = checklist.querySelector<HTMLDetailsElement>('li:nth-child(2) details')!;
+    assert(!row.open, 'Evidence should start collapsed');
+    row.querySelector('summary')!.click();
+    assert(row.open && row.innerText.includes('Both halves started at frame 0.'), 'Evidence is not accessible');
+    assert(checklist.scrollWidth <= checklist.clientWidth, 'Checks horizontally overflow the card');
+    await click('Review full plan ↗');
+    assert(Boolean(host.querySelector('.plan-review-body .verification-checklist')), 'Checklist is outside the scrollable review body');
+    await click('Suggest plan changes');
+    assert(Boolean(input()), 'Checklist hid the revision controls');
+  }, 'verification'],
   ['Rejection dismisses before acknowledgement', async () => {
     await click('Review full plan ↗');
     await click('Reject');

@@ -269,7 +269,12 @@ export class ArtifactsService {
       const preview = await this.start(id);
       if (preview.status !== 'running' || !preview.url) return { ok: false, unavailable: true, error: 'Artifact preview has no published URL.' };
       return action.operation === 'browser-check'
-        ? this.preview.checkRoute(preview.url, action.input.route, action.input.steps)
+        ? this.preview.checkRoute(preview.url, action.input.route, action.input.steps, {
+          viewport: action.input.viewport,
+          reducedMotion: action.input.reducedMotion,
+          colorScheme: action.input.colorScheme,
+          timeoutMs: action.input.timeoutMs,
+        })
         : this.preview.checkRoute(preview.url, action.route);
     }
     if (action.operation === 'restart') {

@@ -66,15 +66,25 @@ def preview_guidance(*, tree: bool = False) -> str:
     verification = ""
     if _request is not None:
         verification = (
-            " Use `artifact-preview browser-check <JSON>` for managed Playwright interactions and visible-state assertions. "
+            " Use `artifact-preview browser-check <JSON>` for managed Playwright verification on the host preview "
+            "(supports route, optional viewport/reducedMotion/colorScheme/timeoutMs, and up to 24 steps: "
+            "goto, click, fill, select, press, hover, drag, wheel, wait, assert-visible, assert-hidden, "
+            "assert-text, assert-focused, and evaluate; TreeLoop also supports a trailing `<<< ... >>>` literal JS block for evaluate). "
+            "Load `skill playwright-verification` for detailed Playwright patterns. "
             "During goal execution, use `artifact-preview restart`, `artifact-preview mcp <JSON>`, or `artifact-preview chat <JSON>` for this app."
             if tree else
-            ' For app verification, use artifact_preview with operation browser-check and input for managed Playwright interactions, or use restart, mcp, or chat.'
+            ' For app verification, use artifact_preview with operation browser-check and input (route, optional viewport/reducedMotion/colorScheme/timeoutMs, '
+            'and up to 24 steps including goto, click, fill, select, press, hover, drag, wheel, wait, assert-visible, assert-hidden, assert-text, assert-focused, evaluate), '
+            'or use restart, mcp, or chat. Load skill "playwright-verification" for detailed Playwright verification guidance.'
         )
     route_check = "`run-route-check /path` checks the managed preview using the Workbench inspection browser. " if tree and _request is not None else ""
     return (
         f"Use {action} to start this artifact's Workbench preview or retrieve its running URL. {route_check}"
         "When Playwright MCP is enabled, pass it the returned host URL for browser checks. "
-        "The artifact's container loopback is separate from the host browser."
+        "Do not install Playwright/Chromium or probe localhost preview ports from the container shell; "
+        "the artifact's container loopback is separate from the host browser. "
+        "Run browser tests that write app data in disposable fixtures. Keep those changes out of existing projects, "
+        "and clean up records created for the test through the app when it ends. "
+        "If a probe hits a missing prerequisite, return what you observed and the blocker to guide the next probe."
         + verification
     )

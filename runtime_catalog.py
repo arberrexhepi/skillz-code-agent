@@ -95,6 +95,32 @@ BASE_RUNTIME_PROVIDER_CATALOG: Dict[str, Dict[str, Any]] = {
         ],
         "notes": "Any valid Gemini model string is allowed.",
     },
+    "gemini-subscription": {
+        "label": "Gemini CLI / Google OAuth",
+        "package": None,
+        "env_var": None,
+        "default_model": "gemini-4-neon",
+        "models": [
+            "gemini-4-hydrogen",
+            "gemini-4-neon",
+            "gemini-4-carbon",
+            "gemini-4-argon",
+            "gemini-3.8-flash",
+            "gemini-3.1-pro-preview",
+            "gemini-3-flash-preview",
+            "gemini-3.1-flash-lite-preview",
+            "gemini-2.5-pro",
+            "gemini-2.5-flash",
+            "gemini-2.5-flash-lite",
+        ],
+        "notes": (
+            "Uses the locally installed official Gemini CLI and its Google OAuth session "
+            "(free Google account, Google AI Pro, or Google AI Ultra). "
+            "This is separate from the Gemini API provider and never reads GEMINI_API_KEY."
+        ),
+        "accepts_custom_model": True,
+        "authentication": "google_oauth_subscription",
+    },
     "local": {
         "label": "Local OpenAI-compatible",
         "package": None,
@@ -204,7 +230,7 @@ def _looks_like_supported_runtime_model(provider: str, model_name: str) -> bool:
         return normalized.startswith("muse-")
     if provider == "anthropic":
         return normalized.startswith("claude-")
-    if provider == "gemini":
+    if provider in {"gemini", "gemini-subscription"}:
         if not normalized.startswith("gemini-"):
             return False
         blocked_terms = ("embedding", "image", "veo", "lyria", "robotics", "tts", "live", "audio", "computer-use", "deep-research")
@@ -394,6 +420,7 @@ def validate_provider_model_selection(provider: Optional[str], model: Optional[s
         "meta": ("muse-",),
         "anthropic": ("claude-",),
         "gemini": ("gemini-",),
+        "gemini-subscription": ("gemini-",),
         "local": tuple(),
         "ollama": tuple(),
         "ollama-local": tuple(),
@@ -404,6 +431,7 @@ def validate_provider_model_selection(provider: Optional[str], model: Optional[s
         for provider_name, prefixes in known_provider_prefixes.items()
         if provider_name != key
         and {provider_name, key} != {"openai", "codex-subscription"}
+        and {provider_name, key} != {"gemini", "gemini-subscription"}
         and any(normalized_model.startswith(prefix) for prefix in prefixes)
     }
 

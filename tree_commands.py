@@ -29,14 +29,15 @@ READ (free, in-context — no tool call):
 WRITE (real tool dispatch):
   write <path> <content>           Write full file
   replace-lines <path>:10-20 <content>  Replace a bounded line range
-  patch <path> <search> -> <replace>  Search/replace edit
+  patch <path> --literal <<<         Exact search/replace block, split by a standalone === REPLACE === line and closed with >>>
+  patch <path> <search> -> <replace>  Inline search/replace shorthand
     npm <args>                       Run a package-manager dependency command behind operator approval
     show-diff [path]                 Show git diff for the workspace or one path
     review-changes [path] [limit=N]  Review changed files and surface risk summary
   shell <command>                  Run shell command
   shell <<< ... >>>                Run one multi-line script block
   git status [--branch]            Git status
-  git diff [--staged] [--stat|--name-only] [path]
+  git diff [--staged] [--stat|--name-only] [--] [paths...]
   git log [-N] [ref|left..right] [-- path]  Recent/ahead commits
   git show [ref] [--stat|--name-only] [-- path]
   git blame [-L start,end] <path>  Line ownership
@@ -85,7 +86,14 @@ from context_tree import ContextTree
 from command_extensions import EXTENSION_VERBS, extension_action
 from discovery import repo_map
 from discovery.dispatch import DISCOVERY_ACTION_TYPES
-from mutation_text import PARSE_ERROR_PREFIX, is_text_mutation, parse_patch_payload, parse_range_payload, split_path_payload
+from mutation_text import (
+    PARSE_ERROR_PREFIX,
+    is_literal_patch,
+    is_text_mutation,
+    parse_patch_payload,
+    parse_range_payload,
+    split_path_payload,
+)
 from issue_facts import (
     format_issue_not_found,
     format_issue_summary_detail,
@@ -362,12 +370,38 @@ class TreeCommandParser:
         argument = parts[1] if len(parts) > 1 else ""
         action = {"type": "artifact_preview", "operation": operation}
         if operation in {"mcp", "chat", "browser-check"}:
+            header, delimiter, script = argument.partition("\n")
+            literal_script: Optional[str] = None
+            raw_json = argument
+            if operation == "browser-check" and delimiter and header.rstrip().endswith("<<<"):
+                raw_json = header.rstrip().removesuffix("<<<").strip()
+                body, _, end = script.rstrip().rpartition("\n")
+                if end.strip() != ">>>" or not body.strip():
+                    return CommandResult(False, "Preview browser-check literal script must be a nonempty <<< … >>> block.", "error")
+                literal_script = body
             try:
-                payload = json.loads(argument)
-            except ValueError:
-                payload = None
+                payload = json.loads(raw_json)
+            except ValueError as exc:
+                hint = (
+                    " Put JavaScript in a literal <<< … >>> block after the JSON header, "
+                    "or escape backslashes inside JSON strings."
+                    if operation == "browser-check" and isinstance(exc, json.JSONDecodeError) and exc.msg.startswith("Invalid \\escape") else ""
+                )
+                return CommandResult(False, f"Preview {operation} requires a JSON object. {exc}{hint}", "error")
             if not isinstance(payload, dict):
                 return CommandResult(False, f"Preview {operation} requires a JSON object.", "error")
+            if literal_script is not None:
+                steps = payload.get("steps")
+                if not isinstance(steps, list):
+                    return CommandResult(False, "Preview browser-check with a literal script requires a steps array.", "error")
+                targets = [step for step in steps if isinstance(step, dict) and step.get("type") == "evaluate" and "script" not in step]
+                if len(targets) != 1:
+                    return CommandResult(
+                        False,
+                        "Preview browser-check with a literal <<< … >>> script requires exactly one evaluate step omitting script.",
+                        "error",
+                    )
+                targets[0]["script"] = literal_script
             action["input"] = payload
         elif operation not in {"start", "restart"} or argument:
             return CommandResult(False, "Usage: artifact-preview start|restart|mcp <JSON>|chat <JSON>|browser-check <JSON>", "error")
@@ -377,11 +411,35 @@ class TreeCommandParser:
         from mcp_runtime import OPERATIONS
 
         try:
-            action = json.loads(rest)
+            header, delimiter, script = rest.partition("\n")
+            script_argument = None
+            if delimiter and header.rstrip().endswith("<<<"):
+                action = json.loads(header.rstrip().removesuffix("<<<"))
+                if isinstance(action, dict) and action.get("operation") == "call":
+                    name = action.get("name")
+                    if name == "browser_evaluate":
+                        script_argument = "function"
+                    elif name == "browser_run_code":
+                        script_argument = "code"
+                script, _, end = script.rstrip().rpartition("\n")
+                if not script_argument or end.strip() != ">>>" or not script.strip():
+                    raise ValueError("Use a nonempty literal script with browser_evaluate or browser_run_code.")
+            else:
+                action = json.loads(rest)
             if not isinstance(action, dict) or not isinstance(action.get("operation"), str) or action["operation"] not in OPERATIONS:
                 raise ValueError("Specify a valid MCP operation.")
+            if script_argument:
+                arguments = action.get("arguments", {})
+                if not isinstance(arguments, dict) or script_argument in arguments:
+                    raise ValueError(f"Omit arguments.{script_argument} from the header when using a literal script.")
+                action["arguments"] = {**arguments, script_argument: script}
         except ValueError as exc:
-            return CommandResult(False, f"MCP requires a JSON action object. {exc}", "error")
+            hint = (
+                " Put JavaScript in a literal <<< … >>> block after the JSON header, "
+                "or escape backslashes inside JSON strings."
+                if isinstance(exc, json.JSONDecodeError) and exc.msg.startswith("Invalid \\escape") else ""
+            )
+            return CommandResult(False, f"MCP requires a JSON action object. {exc}{hint}", "error")
         return CommandResult(True, "[dispatch: MCP]", "tool" if action["operation"] == "call" else "read",
                              needs_tool=True, tool_action={**action, "type": "mcp"})
 
@@ -1056,11 +1114,11 @@ class TreeCommandParser:
             paths, path_error = explicit_paths(path_tokens)
             if path_error:
                 return error(path_error)
-            if len(paths) > 1:
-                return error("git diff accepts at most one explicit path in beta")
+            if any(path.startswith(":") for path in paths):
+                return error("git diff accepts explicit paths. Git pathspec expressions are unsupported.")
             return dispatch(
                 "git_diff",
-                path=paths[0] if paths else "",
+                **({"paths": paths} if len(paths) > 1 else {"path": paths[0] if paths else ""}),
                 staged=staged,
                 stat=stat,
                 name_only=name_only,
@@ -1351,6 +1409,15 @@ class TreeCommandParser:
         parts = rest.split(None, 1)
         if len(parts) != 2:
             return CommandResult(False, "Usage: verify check-1,check-2 <tool command>", "error")
+        nested = parts[1].split(None, 1)
+        if nested[0].lower() == "mcp":
+            mcp = self._cmd_mcp(nested[1] if len(nested) == 2 else "")
+            if not mcp.ok:
+                return mcp
+        elif nested[0].lower() == "artifact-preview":
+            preview = self._cmd_artifact_preview(nested[1] if len(nested) == 2 else "")
+            if not preview.ok:
+                return preview
         return CommandResult(True, "[dispatch: verification]", "read", needs_tool=True,
                              tool_action={"type": "verify", "checks": parts[0].split(","), "command": parts[1]})
 
@@ -1453,6 +1520,7 @@ def collapse_heredocs(lines: List[str]) -> List[str]:
     logical line no matter how many physical lines the block spans.
 
     Works for **every** prefix — ``write``, ``s2: write``, ``>>th:``, etc.
+    Literal patches and MCP scripts keep their delimiters for their own parsers.
     Native shell heredocs and quoted multiline shell arguments are grouped too,
     while their own delimiters are left intact for the shell to interpret.
     """
@@ -1460,9 +1528,19 @@ def collapse_heredocs(lines: List[str]) -> List[str]:
     for block in group_command_blocks(lines):
         physical = block.split("\n")
         if physical[0].rstrip().endswith("<<<"):
-            prefix = physical[0].rstrip()[:-3].rstrip()
-            content = "\n".join(physical[1:-1])
-            result.append(f"{prefix}\n{content}" if prefix else content)
+            header = physical[0].rstrip()
+            strategy_header = _STRATEGY_LINE_RE.match(header.lstrip())
+            command = strategy_header.group("body") if strategy_header else header
+            if is_literal_patch(command) or re.match(
+                r"^\s*(?:verify\s+\S+\s+)?(?:mcp|artifact-preview\s+browser-check)(?:\s|<<<$|$)",
+                command,
+                re.I,
+            ):
+                result.append(block)
+            else:
+                prefix = header[:-3].rstrip()
+                content = "\n".join(physical[1:-1])
+                result.append(f"{prefix}\n{content}" if prefix else content)
         else:
             result.append(block)
     return result
@@ -2054,6 +2132,9 @@ def _evaluate_placeholder_expression(expr: str, steps: Dict[str, StrategyStep]) 
 
 
 def _resolve_strategy_placeholders(command: str, steps: Dict[str, StrategyStep]) -> str:
+    if is_literal_patch(command):
+        return command
+
     def _replace(match: re.Match[str]) -> str:
         expr = match.group(1)
         return _evaluate_placeholder_expression(expr, steps)
@@ -2062,7 +2143,7 @@ def _resolve_strategy_placeholders(command: str, steps: Dict[str, StrategyStep])
 
 
 def has_strategy_placeholders(command: str) -> bool:
-    return _PLACEHOLDER_RE.search(command) is not None
+    return not is_literal_patch(command) and _PLACEHOLDER_RE.search(command) is not None
 
 
 def is_strategy(raw: str) -> bool:

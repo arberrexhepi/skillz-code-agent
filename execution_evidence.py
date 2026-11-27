@@ -36,6 +36,8 @@ def external_execution_identity(action: dict) -> str | None:
             return f"artifact_preview:{identity}" if identity else None
         if operation == "chat":
             return "artifact_preview:chat:" + json.dumps(payload.get("message"))
+        if operation == "browser-check":
+            return "artifact_preview:browser-check:" + json.dumps(payload, sort_keys=True)
         return f"artifact_preview:{operation}" if operation in ("start", "restart") else None
     if kind == "mcp" and action.get("operation") in ("call", "read-resource", "get-prompt"):
         fields = ("operation", "server", "name", "uri")

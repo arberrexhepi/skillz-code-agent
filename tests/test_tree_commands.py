@@ -193,6 +193,16 @@ class IssueListCommandTests(unittest.TestCase):
         self.assertFalse(multiple.ok)
         self.assertFalse(malformed.ok)
 
+    def test_beta_git_diff_accepts_multiple_explicit_paths(self):
+        diff = self._parse_git('git diff --staged --name-only -- /repo/src/app.ts "src/other file.ts"')
+        self.assertTrue(diff.ok)
+        self.assertEqual(diff.tool_action, {
+            "type": "git_diff", "paths": ["src/app.ts", "src/other file.ts"],
+            "staged": True, "stat": False, "name_only": True,
+        })
+        self.assertFalse(self._parse_git("git diff -- src/app.ts ../outside").ok)
+        self.assertFalse(self._parse_git("git diff -- src/app.ts ':(exclude)src/other.ts'").ok)
+
     def test_beta_git_mutations_are_typed_and_path_bounded(self):
         restore = self._parse_git("git restore --staged -- src/a.ts src/b.ts")
         remove = self._parse_git("git rm src/old.ts")

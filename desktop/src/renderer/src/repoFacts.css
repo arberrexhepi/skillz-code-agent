@@ -47,6 +47,5 @@
 .repo-facts-error p { margin: 4px 0 8px; }
 .repo-facts-more { width: 100%; margin: 8px 0; }
 
-.facts-only-counts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 .repo-fact-record.standalone { border: 1px solid var(--border); border-radius: 5px; padding: 10px; margin: 10px 0; }
 .repo-fact-owner { color: #99a8b6; font-size: 10px; margin: 7px 0; }

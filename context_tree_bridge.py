@@ -189,8 +189,14 @@ WRITE (dispatches to real tools):
   replace-lines <path>:10-20 <<<    Replace a bounded line range
     replacement lines here
   >>>
-  patch <path> <search> -> <replace>  Search/replace edit
-    Prefer JSON-quoted patch operands; escapes decode once. Quote arrows inside operands.
+  patch /repo/rules.txt --literal <<<
+  A -> B -> C
+  === REPLACE ===
+  A -> D -> C
+  >>>
+    Prefer this literal patch form for source edits. Copy both operands exactly, including indentation.
+    Put === REPLACE === and >>> on their own lines. Omit replacement lines to delete the search text.
+    Inline shorthand: patch <path> "search" -> "replacement" (JSON strings, useful if source contains a block delimiter line).
     Patch requires exactly one source match; missing/ambiguous matches leave the file unchanged.
     Write/replace payloads stay literal: one separator follows the header; extra spaces are content.
     Heredocs preserve indentation and blank lines; an unterminated block rejects the batch.

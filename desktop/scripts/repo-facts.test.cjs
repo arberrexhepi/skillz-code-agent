@@ -92,6 +92,17 @@ test('renderer uses human-readable cards and escapes stored values as text', () 
   assert.doesNotMatch(html, /<script>/);
 });
 
+test('verification facts retain their type and can be filtered and rendered', () => {
+  const ledger = parseRepoFacts(JSON.stringify({ schema_version: 2, issues: [{
+    issue_id: 'issue-001', facts: [{ key: 'preview', value: 'Opened the published preview.', fact_type: 'verification' }],
+  }] }));
+  const [issue] = filterRepoFacts(ledger, { query: '', kind: 'verification', scope: 'all' });
+  assert.equal(issue.facts[0].kind, 'verification');
+  const html = renderToStaticMarkup(React.createElement(RepoFactsView, { ledger }));
+  assert.match(html, /repo-fact-kind verification">Verification/);
+  assert.match(html, /Opened the published preview/);
+});
+
 test('reader works without Python, preserves the original file, and reports deletion as missing', async (t) => {
   const { root, file } = fixture(t);
   assert.equal((await readRepoFacts(root)).status, 'missing');

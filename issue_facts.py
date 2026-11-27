@@ -14,6 +14,9 @@ from typing import Any, Dict, List, Optional
 SCHEMA_VERSION = 2
 FACT_TYPE_GOAL = "goal"
 FACT_TYPE_ARCHITECTURE = "architecture"
+FACT_TYPE_VERIFICATION = "verification"
+FACT_TYPES = {FACT_TYPE_GOAL, FACT_TYPE_ARCHITECTURE, FACT_TYPE_VERIFICATION}
+ISSUE_LOCAL_FACT_TYPES = {FACT_TYPE_GOAL, FACT_TYPE_VERIFICATION}
 ISSUE_STATUS_OPEN = "open"
 ISSUE_STATUS_CLOSED = "closed"
 AUTO_COMPACT_CLOSED_ISSUE_DETAIL_LIMIT = 3
@@ -29,9 +32,7 @@ def _utc_timestamp() -> str:
 
 def _normalize_fact_type(value: Any) -> str:
     normalized = str(value or "").strip().lower()
-    if normalized == FACT_TYPE_GOAL:
-        return FACT_TYPE_GOAL
-    return FACT_TYPE_ARCHITECTURE
+    return normalized if normalized in FACT_TYPES else FACT_TYPE_ARCHITECTURE
 
 
 def _normalize_issue_status(value: Any) -> str:
@@ -67,6 +68,7 @@ class IssueFactRecord:
     updated_step: int = 0
     updated_run_id: int = 0
     issue_status: str = ""
+    verification_proof: Optional[Dict[str, Any]] = None
 
     def clone(self, *, issue_status: Optional[str] = None) -> "IssueFactRecord":
         return IssueFactRecord(
@@ -78,6 +80,7 @@ class IssueFactRecord:
             updated_step=self.updated_step,
             updated_run_id=self.updated_run_id,
             issue_status=self.issue_status if issue_status is None else issue_status,
+            verification_proof=self.verification_proof,
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -89,6 +92,7 @@ class IssueFactRecord:
             "source_action": self.source_action,
             "updated_step": self.updated_step,
             "updated_run_id": self.updated_run_id,
+            **({"verification_proof": self.verification_proof} if self.verification_proof is not None else {}),
         }
         if self.issue_status:
             payload["issue_status"] = self.issue_status
@@ -102,6 +106,7 @@ class IssueFactRecord:
             "source_action": self.source_action,
             "updated_step": self.updated_step,
             "updated_run_id": self.updated_run_id,
+            **({"verification_proof": self.verification_proof} if self.verification_proof is not None else {}),
         }
 
     @classmethod
@@ -119,6 +124,7 @@ class IssueFactRecord:
             updated_step=int(item.get("updated_step", 0) or 0),
             updated_run_id=int(item.get("updated_run_id", 0) or 0),
             issue_status=issue_status,
+            verification_proof=item["verification_proof"] if isinstance(item.get("verification_proof"), dict) else None,
         )
 
 
@@ -262,6 +268,7 @@ class IssueRecord:
             "fact_count": len(self.facts),
             "architecture_fact_count": architecture_count,
             "goal_fact_count": goal_count,
+            "verification_fact_count": sum(record.fact_type == FACT_TYPE_VERIFICATION for record in self.facts),
             "completed_goal_count": len(self.completed_goals),
         }
 
@@ -745,6 +752,7 @@ class IssueFactLedger:
         *,
         issue_id: str,
         checkpoint: CompletedGoalCheckpoint,
+        verification_facts: Optional[List[Dict[str, Any]]] = None,
     ) -> CompletedGoalCheckpoint:
         issue = self.get_issue(issue_id) if issue_id else self.active_issue()
         if issue is None:
@@ -774,6 +782,12 @@ class IssueFactLedger:
             issue.completed_goals[match_index] = checkpoint
         else:
             issue.completed_goals.append(checkpoint)
+        for fact in verification_facts or []:
+            self.upsert_fact(
+                key=fact["key"], value=fact["value"], fact_type=FACT_TYPE_VERIFICATION,
+                source_action="verification_tool", updated_step=0, updated_run_id=0,
+                issue_id=issue.issue_id, verification_proof=fact["verification_proof"],
+            )
         return checkpoint
 
     def deduplicate_legacy_completed_goals(self, issue_id: str) -> int:
@@ -873,11 +887,12 @@ class IssueFactLedger:
         updated_run_id: int,
         issue_id: str = "",
         task_summary: str = "",
+        verification_proof: Optional[Dict[str, Any]] = None,
     ) -> IssueFactRecord:
         normalized_key = str(key or "").strip()
         normalized_value = str(value or "").strip()
         normalized_type = _normalize_fact_type(fact_type)
-        if normalized_type == FACT_TYPE_GOAL:
+        if normalized_type in ISSUE_LOCAL_FACT_TYPES:
             target_issue = self.get_issue(issue_id) if issue_id else None
             if target_issue is None:
                 target_issue = self.ensure_goal_issue(task_summary=task_summary)
@@ -896,6 +911,7 @@ class IssueFactLedger:
             updated_step=int(updated_step or 0),
             updated_run_id=int(updated_run_id or 0),
             issue_status=target_issue.status,
+            verification_proof=verification_proof if normalized_type == FACT_TYPE_VERIFICATION else None,
         )
         existing_index = self._find_fact_index(target_issue, key=normalized_key, fact_type=normalized_type)
         if existing_index >= 0:
@@ -924,7 +940,7 @@ class IssueFactLedger:
         goal_records = [
             record.clone(issue_status=active_issue.status)
             for record in active_issue.facts
-            if record.fact_type == FACT_TYPE_GOAL
+            if record.fact_type in ISSUE_LOCAL_FACT_TYPES
         ]
         return architecture_records + sorted(goal_records, key=lambda item: item.key)
 
